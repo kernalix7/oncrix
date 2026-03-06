@@ -1,0 +1,13 @@
+[package]
+name = "oncrix-vfs"
+description = "ONCRIX - Virtual File System"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+oncrix-lib.workspace = true
+oncrix-ipc.workspace = true

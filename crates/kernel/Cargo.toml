@@ -1,0 +1,17 @@
+[package]
+name = "oncrix-kernel"
+description = "ONCRIX - Microkernel core (scheduler, IPC, memory management)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+oncrix-lib.workspace = true
+oncrix-hal.workspace = true
+oncrix-mm.workspace = true
+oncrix-ipc.workspace = true
+oncrix-process.workspace = true
+oncrix-syscall.workspace = true

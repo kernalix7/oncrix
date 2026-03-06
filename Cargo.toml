@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
+repository = "https://github.com/kernalix7/oncrix"
+
+[workspace.dependencies]
+oncrix-kernel = { path = "crates/kernel" }
+oncrix-hal = { path = "crates/hal" }
+oncrix-bootloader = { path = "crates/bootloader" }
+oncrix-drivers = { path = "crates/drivers" }
+oncrix-vfs = { path = "crates/vfs" }
+oncrix-process = { path = "crates/process" }
+oncrix-ipc = { path = "crates/ipc" }
+oncrix-mm = { path = "crates/mm" }
+oncrix-syscall = { path = "crates/syscall" }
+oncrix-lib = { path = "crates/lib" }

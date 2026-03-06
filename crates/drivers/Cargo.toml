@@ -1,0 +1,15 @@
+[package]
+name = "oncrix-drivers"
+description = "ONCRIX - User-space device drivers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+oncrix-lib.workspace = true
+oncrix-hal.workspace = true
+oncrix-ipc.workspace = true
+oncrix-mm.workspace = true
