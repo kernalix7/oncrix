@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# AI config (actual files in .priv-storage/, root has symlinks)
+.priv-storage/
+CLAUDE.md
+.cursorrules
+.claude
+.vscode
+WORK_STATUS.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup toolkit temp files
+tmp-igbkp/.work/
+tmp-igbkp/output/
+
+# Debug
+*.log
+core.[0-9]*
+
+# QEMU
+*.iso
+*.img
+*.bin
