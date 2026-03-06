@@ -1,0 +1,13 @@
+[package]
+name = "oncrix-bootloader"
+description = "ONCRIX - Boot protocol and early initialization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+oncrix-lib.workspace = true
+oncrix-hal.workspace = true

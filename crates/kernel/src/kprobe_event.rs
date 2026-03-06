@@ -1,0 +1,846 @@
+// Copyright 2026 ONCRIX Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Kprobe-based tracing events.
+//!
+//! Provides dynamic tracepoint insertion via kprobes — when a kprobe
+//! fires at a kernel symbol+offset, an event record is generated that
+//! can be formatted and written to the trace buffer.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌──────────────┐   register    ┌────────────────────┐
+//! │ User / ftrace │ ──────────► │  KprobeEventManager  │
+//! └──────────────┘              │  ┌────────────────┐  │
+//!                               │  │ KprobeEvent[0]  │  │
+//!        probe hit ◄────────── │  │ KprobeEvent[1]  │  │
+//!        ▼                      │  │ ...             │  │
+//! ┌──────────────┐              │  └────────────────┘  │
+//! │ TraceRecord   │              └────────────────────┘
+//! │ format + emit │
+//! └──────────────┘
+//! ```
+//!
+//! # Reference
+//!
+//! Linux `kernel/trace/trace_kprobe.c`, `include/linux/trace_events.h`.
+
+use oncrix_lib::{Error, Result};
+
+// ======================================================================
+// Constants
+// ======================================================================
+
+/// Maximum number of registered kprobe events.
+const MAX_KPROBE_EVENTS: usize = 256;
+
+/// Maximum length of a symbol name.
+const MAX_SYMBOL_LEN: usize = 128;
+
+/// Maximum length of an event name.
+const MAX_EVENT_NAME_LEN: usize = 64;
+
+/// Maximum length of a filter expression string.
+const MAX_FILTER_LEN: usize = 256;
+
+/// Maximum number of format fields per event.
+const MAX_FORMAT_FIELDS: usize = 16;
+
+/// Maximum length of a trace output line.
+const MAX_TRACE_LINE_LEN: usize = 512;
+
+/// Maximum number of arguments captured per probe.
+const MAX_PROBE_ARGS: usize = 8;
+
+/// Size of the per-CPU trace record ring buffer (number of entries).
+const TRACE_RING_SIZE: usize = 1024;
+
+// ======================================================================
+// Probe argument fetch types
+// ======================================================================
+
+/// Describes how to fetch a single argument when a kprobe fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchType {
+    /// Fetch from a CPU register by index.
+    Register(u8),
+    /// Fetch from stack at a byte offset.
+    Stack(u32),
+    /// Fetch from memory at a fixed address.
+    Memory(u64),
+    /// Fetch the return value (only valid for kretprobes).
+    ReturnValue,
+    /// Fetch the instruction pointer at probe hit.
+    InstructionPointer,
+    /// Immediate constant value.
+    Immediate(u64),
+}
+
+/// Describes one argument definition attached to a kprobe event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeArgDef {
+    /// Argument name (short, e.g. "arg0").
+    name: [u8; 16],
+    /// Length of the name in bytes.
+    name_len: usize,
+    /// How to fetch this argument.
+    fetch: FetchType,
+    /// Size of the fetched value in bytes (1, 2, 4, 8).
+    size: u8,
+    /// Whether the value is signed.
+    signed: bool,
+}
+
+impl ProbeArgDef {
+    /// Creates a new argument definition.
+    pub const fn new() -> Self {
+        Self {
+            name: [0u8; 16],
+            name_len: 0,
+            fetch: FetchType::Register(0),
+            size: 8,
+            signed: false,
+        }
+    }
+
+    /// Creates an argument definition with the given fetch type and size.
+    pub fn with_fetch(name_bytes: &[u8], fetch: FetchType, size: u8, signed: bool) -> Result<Self> {
+        if name_bytes.is_empty() || name_bytes.len() > 16 {
+            return Err(Error::InvalidArgument);
+        }
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return Err(Error::InvalidArgument);
+        }
+        let mut arg = Self::new();
+        arg.name[..name_bytes.len()].copy_from_slice(name_bytes);
+        arg.name_len = name_bytes.len();
+        arg.fetch = fetch;
+        arg.size = size;
+        arg.signed = signed;
+        Ok(arg)
+    }
+}
+
+// ======================================================================
+// Event format field
+// ======================================================================
+
+/// A field in the event format description (for /sys/kernel/tracing/events).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatField {
+    /// Field name.
+    name: [u8; 32],
+    /// Length of the name.
+    name_len: usize,
+    /// Byte offset within the trace record.
+    offset: u16,
+    /// Size in bytes.
+    size: u16,
+    /// Whether this field is signed.
+    signed: bool,
+}
+
+impl FormatField {
+    /// Creates a new empty format field.
+    pub const fn new() -> Self {
+        Self {
+            name: [0u8; 32],
+            name_len: 0,
+            offset: 0,
+            size: 0,
+            signed: false,
+        }
+    }
+}
+
+// ======================================================================
+// Trace record
+// ======================================================================
+
+/// A single trace record generated by a kprobe hit.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceRecord {
+    /// Timestamp in nanoseconds.
+    timestamp_ns: u64,
+    /// CPU on which the probe fired.
+    cpu: u32,
+    /// PID of the current task.
+    pid: u32,
+    /// Event ID that generated this record.
+    event_id: u32,
+    /// Instruction pointer at probe site.
+    ip: u64,
+    /// Captured argument values.
+    args: [u64; MAX_PROBE_ARGS],
+    /// Number of valid argument values.
+    nr_args: u8,
+    /// Whether this record is from a return probe.
+    is_return: bool,
+}
+
+impl TraceRecord {
+    /// Creates an empty trace record.
+    pub const fn new() -> Self {
+        Self {
+            timestamp_ns: 0,
+            cpu: 0,
+            pid: 0,
+            event_id: 0,
+            ip: 0,
+            args: [0u64; MAX_PROBE_ARGS],
+            nr_args: 0,
+            is_return: false,
+        }
+    }
+
+    /// Formats this trace record into a human-readable line.
+    pub fn format_line(&self, buf: &mut [u8]) -> Result<usize> {
+        if buf.len() < 64 {
+            return Err(Error::InvalidArgument);
+        }
+        // Format: "<pid> <cpu> <ts> <ip> arg0=<val> arg1=<val> ..."
+        let mut pos = 0;
+        pos += write_u32(buf, pos, self.pid);
+        if pos < buf.len() {
+            buf[pos] = b' ';
+            pos += 1;
+        }
+        pos += write_u32(&mut buf[pos..], 0, self.cpu);
+        if pos < buf.len() {
+            buf[pos] = b' ';
+            pos += 1;
+        }
+        pos += write_u64(&mut buf[pos..], 0, self.timestamp_ns);
+        if pos < buf.len() {
+            buf[pos] = b' ';
+            pos += 1;
+        }
+        pos += write_hex_u64(&mut buf[pos..], 0, self.ip);
+        for i in 0..self.nr_args as usize {
+            if pos + 8 >= buf.len() {
+                break;
+            }
+            buf[pos] = b' ';
+            pos += 1;
+            pos += write_hex_u64(&mut buf[pos..], 0, self.args[i]);
+        }
+        Ok(pos)
+    }
+
+    /// Returns the timestamp in nanoseconds.
+    pub fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    /// Returns the CPU number.
+    pub fn cpu(&self) -> u32 {
+        self.cpu
+    }
+
+    /// Returns the PID.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+// ======================================================================
+// Kprobe event state
+// ======================================================================
+
+/// State of a kprobe event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KprobeEventState {
+    /// Event is registered but disabled.
+    Disabled,
+    /// Event is enabled and generating trace records.
+    Enabled,
+    /// Event is being removed.
+    Removing,
+}
+
+/// Filter comparison operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    /// Equal.
+    Eq,
+    /// Not equal.
+    Ne,
+    /// Less than.
+    Lt,
+    /// Less than or equal.
+    Le,
+    /// Greater than.
+    Gt,
+    /// Greater than or equal.
+    Ge,
+    /// Bitwise AND non-zero.
+    BitAnd,
+}
+
+/// A parsed filter expression for event filtering.
+#[derive(Debug, Clone, Copy)]
+pub struct FilterExpr {
+    /// Source field index in the format description.
+    field_index: u8,
+    /// Comparison operator.
+    op: FilterOp,
+    /// Comparison value.
+    value: u64,
+    /// Whether this filter is active.
+    active: bool,
+}
+
+impl FilterExpr {
+    /// Creates an inactive filter.
+    pub const fn new() -> Self {
+        Self {
+            field_index: 0,
+            op: FilterOp::Eq,
+            value: 0,
+            active: false,
+        }
+    }
+
+    /// Creates an active filter expression.
+    pub fn with_condition(field_index: u8, op: FilterOp, value: u64) -> Self {
+        Self {
+            field_index,
+            op,
+            value,
+            active: true,
+        }
+    }
+
+    /// Evaluates this filter against a captured argument value.
+    pub fn matches(&self, val: u64) -> bool {
+        if !self.active {
+            return true;
+        }
+        match self.op {
+            FilterOp::Eq => val == self.value,
+            FilterOp::Ne => val != self.value,
+            FilterOp::Lt => val < self.value,
+            FilterOp::Le => val <= self.value,
+            FilterOp::Gt => val > self.value,
+            FilterOp::Ge => val >= self.value,
+            FilterOp::BitAnd => (val & self.value) != 0,
+        }
+    }
+}
+
+// ======================================================================
+// Kprobe event
+// ======================================================================
+
+/// Describes a single kprobe-based tracing event.
+pub struct KprobeEvent {
+    /// Event name.
+    name: [u8; MAX_EVENT_NAME_LEN],
+    /// Length of event name.
+    name_len: usize,
+    /// Symbol name to probe.
+    symbol: [u8; MAX_SYMBOL_LEN],
+    /// Length of symbol name.
+    symbol_len: usize,
+    /// Byte offset from symbol start.
+    offset: u64,
+    /// Whether this is a return probe (kretprobe).
+    is_return: bool,
+    /// Current state.
+    state: KprobeEventState,
+    /// Event ID (unique within the manager).
+    event_id: u32,
+    /// Argument definitions.
+    args: [ProbeArgDef; MAX_PROBE_ARGS],
+    /// Number of defined arguments.
+    nr_args: u8,
+    /// Format fields for trace output.
+    format_fields: [FormatField; MAX_FORMAT_FIELDS],
+    /// Number of format fields.
+    nr_format_fields: u8,
+    /// Filter expression.
+    filter: FilterExpr,
+    /// Hit counter.
+    hit_count: u64,
+    /// Miss counter (filtered out).
+    miss_count: u64,
+}
+
+impl KprobeEvent {
+    /// Creates a new empty kprobe event.
+    pub const fn new() -> Self {
+        Self {
+            name: [0u8; MAX_EVENT_NAME_LEN],
+            name_len: 0,
+            symbol: [0u8; MAX_SYMBOL_LEN],
+            symbol_len: 0,
+            offset: 0,
+            is_return: false,
+            state: KprobeEventState::Disabled,
+            event_id: 0,
+            args: [const { ProbeArgDef::new() }; MAX_PROBE_ARGS],
+            nr_args: 0,
+            format_fields: [const { FormatField::new() }; MAX_FORMAT_FIELDS],
+            nr_format_fields: 0,
+            filter: FilterExpr::new(),
+            hit_count: 0,
+            miss_count: 0,
+        }
+    }
+
+    /// Returns the event name as a byte slice.
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len]
+    }
+
+    /// Returns the probed symbol name as a byte slice.
+    pub fn symbol(&self) -> &[u8] {
+        &self.symbol[..self.symbol_len]
+    }
+
+    /// Returns the offset from the symbol start.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns whether this is a return probe.
+    pub fn is_return(&self) -> bool {
+        self.is_return
+    }
+
+    /// Returns the current state.
+    pub fn state(&self) -> KprobeEventState {
+        self.state
+    }
+
+    /// Returns the event ID.
+    pub fn event_id(&self) -> u32 {
+        self.event_id
+    }
+
+    /// Returns the hit count.
+    pub fn hit_count(&self) -> u64 {
+        self.hit_count
+    }
+
+    /// Returns the miss count.
+    pub fn miss_count(&self) -> u64 {
+        self.miss_count
+    }
+
+    /// Enables the event.
+    pub fn enable(&mut self) -> Result<()> {
+        if self.state == KprobeEventState::Removing {
+            return Err(Error::Busy);
+        }
+        self.state = KprobeEventState::Enabled;
+        Ok(())
+    }
+
+    /// Disables the event.
+    pub fn disable(&mut self) -> Result<()> {
+        if self.state == KprobeEventState::Removing {
+            return Err(Error::Busy);
+        }
+        self.state = KprobeEventState::Disabled;
+        Ok(())
+    }
+
+    /// Sets the filter expression.
+    pub fn set_filter(&mut self, filter: FilterExpr) {
+        self.filter = filter;
+    }
+
+    /// Clears the filter expression.
+    pub fn clear_filter(&mut self) {
+        self.filter = FilterExpr::new();
+    }
+
+    /// Adds an argument definition.
+    pub fn add_arg(&mut self, arg: ProbeArgDef) -> Result<()> {
+        if self.nr_args as usize >= MAX_PROBE_ARGS {
+            return Err(Error::OutOfMemory);
+        }
+        self.args[self.nr_args as usize] = arg;
+        self.nr_args += 1;
+        Ok(())
+    }
+
+    /// Adds a format field.
+    pub fn add_format_field(&mut self, field: FormatField) -> Result<()> {
+        if self.nr_format_fields as usize >= MAX_FORMAT_FIELDS {
+            return Err(Error::OutOfMemory);
+        }
+        self.format_fields[self.nr_format_fields as usize] = field;
+        self.nr_format_fields += 1;
+        Ok(())
+    }
+
+    /// Processes a probe hit, returning a trace record if the filter
+    /// passes.
+    pub fn process_hit(
+        &mut self,
+        ip: u64,
+        timestamp_ns: u64,
+        cpu: u32,
+        pid: u32,
+        arg_values: &[u64],
+    ) -> Option<TraceRecord> {
+        if self.state != KprobeEventState::Enabled {
+            return None;
+        }
+        // Apply filter on first argument if available.
+        if self.filter.active && !arg_values.is_empty() {
+            if !self.filter.matches(arg_values[0]) {
+                self.miss_count = self.miss_count.saturating_add(1);
+                return None;
+            }
+        }
+        self.hit_count = self.hit_count.saturating_add(1);
+        let mut record = TraceRecord::new();
+        record.timestamp_ns = timestamp_ns;
+        record.cpu = cpu;
+        record.pid = pid;
+        record.event_id = self.event_id;
+        record.ip = ip;
+        record.is_return = self.is_return;
+        let copy_len = arg_values.len().min(MAX_PROBE_ARGS);
+        record.args[..copy_len].copy_from_slice(&arg_values[..copy_len]);
+        record.nr_args = copy_len as u8;
+        Some(record)
+    }
+}
+
+// ======================================================================
+// Trace ring buffer
+// ======================================================================
+
+/// Per-CPU ring buffer holding trace records.
+pub struct TraceRingBuffer {
+    /// Ring buffer entries.
+    entries: [TraceRecord; TRACE_RING_SIZE],
+    /// Write position (next slot to write).
+    head: usize,
+    /// Number of valid entries (may wrap).
+    count: usize,
+    /// Number of dropped records due to full buffer.
+    dropped: u64,
+}
+
+impl TraceRingBuffer {
+    /// Creates a new empty trace ring buffer.
+    pub const fn new() -> Self {
+        Self {
+            entries: [const { TraceRecord::new() }; TRACE_RING_SIZE],
+            head: 0,
+            count: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Pushes a record into the ring buffer.
+    pub fn push(&mut self, record: TraceRecord) {
+        self.entries[self.head] = record;
+        self.head = (self.head + 1) % TRACE_RING_SIZE;
+        if self.count < TRACE_RING_SIZE {
+            self.count += 1;
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// Returns the number of valid records.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Returns whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Returns the number of dropped records.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Reads a record at the given logical index (0 = oldest).
+    pub fn read(&self, index: usize) -> Option<&TraceRecord> {
+        if index >= self.count {
+            return None;
+        }
+        let start = if self.count < TRACE_RING_SIZE {
+            0
+        } else {
+            self.head
+        };
+        let actual = (start + index) % TRACE_RING_SIZE;
+        Some(&self.entries[actual])
+    }
+
+    /// Clears all records.
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+}
+
+// ======================================================================
+// Kprobe event manager
+// ======================================================================
+
+/// Manages all registered kprobe events.
+pub struct KprobeEventManager {
+    /// Registered events.
+    events: [KprobeEvent; MAX_KPROBE_EVENTS],
+    /// Which slots are occupied.
+    occupied: [bool; MAX_KPROBE_EVENTS],
+    /// Number of registered events.
+    count: usize,
+    /// Next event ID to assign.
+    next_event_id: u32,
+    /// Global enable flag (master switch).
+    global_enabled: bool,
+    /// Trace ring buffer (simplified: single buffer).
+    ring: TraceRingBuffer,
+}
+
+impl KprobeEventManager {
+    /// Creates a new empty kprobe event manager.
+    pub const fn new() -> Self {
+        Self {
+            events: [const { KprobeEvent::new() }; MAX_KPROBE_EVENTS],
+            occupied: [false; MAX_KPROBE_EVENTS],
+            count: 0,
+            next_event_id: 1,
+            global_enabled: true,
+            ring: TraceRingBuffer::new(),
+        }
+    }
+
+    /// Returns the number of registered events.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Returns whether the global enable flag is set.
+    pub fn is_global_enabled(&self) -> bool {
+        self.global_enabled
+    }
+
+    /// Sets the global enable flag.
+    pub fn set_global_enabled(&mut self, enabled: bool) {
+        self.global_enabled = enabled;
+    }
+
+    /// Returns a reference to the trace ring buffer.
+    pub fn ring(&self) -> &TraceRingBuffer {
+        &self.ring
+    }
+
+    /// Registers a new kprobe event.
+    pub fn register(
+        &mut self,
+        name: &[u8],
+        symbol: &[u8],
+        offset: u64,
+        is_return: bool,
+    ) -> Result<u32> {
+        if name.is_empty() || name.len() > MAX_EVENT_NAME_LEN {
+            return Err(Error::InvalidArgument);
+        }
+        if symbol.is_empty() || symbol.len() > MAX_SYMBOL_LEN {
+            return Err(Error::InvalidArgument);
+        }
+        // Check for duplicate name.
+        for i in 0..MAX_KPROBE_EVENTS {
+            if self.occupied[i]
+                && self.events[i].name_len == name.len()
+                && self.events[i].name[..name.len()] == *name
+            {
+                return Err(Error::AlreadyExists);
+            }
+        }
+        // Find a free slot.
+        let slot = self.find_free_slot()?;
+        let event_id = self.next_event_id;
+        self.next_event_id = self.next_event_id.wrapping_add(1);
+
+        self.events[slot].name[..name.len()].copy_from_slice(name);
+        self.events[slot].name_len = name.len();
+        self.events[slot].symbol[..symbol.len()].copy_from_slice(symbol);
+        self.events[slot].symbol_len = symbol.len();
+        self.events[slot].offset = offset;
+        self.events[slot].is_return = is_return;
+        self.events[slot].event_id = event_id;
+        self.events[slot].state = KprobeEventState::Disabled;
+        self.events[slot].hit_count = 0;
+        self.events[slot].miss_count = 0;
+        self.events[slot].nr_args = 0;
+        self.events[slot].nr_format_fields = 0;
+        self.events[slot].filter = FilterExpr::new();
+        self.occupied[slot] = true;
+        self.count += 1;
+        Ok(event_id)
+    }
+
+    /// Unregisters a kprobe event by event ID.
+    pub fn unregister(&mut self, event_id: u32) -> Result<()> {
+        let slot = self.find_by_id(event_id)?;
+        self.events[slot].state = KprobeEventState::Removing;
+        self.occupied[slot] = false;
+        self.count -= 1;
+        Ok(())
+    }
+
+    /// Enables an event by ID.
+    pub fn enable(&mut self, event_id: u32) -> Result<()> {
+        let slot = self.find_by_id(event_id)?;
+        self.events[slot].enable()
+    }
+
+    /// Disables an event by ID.
+    pub fn disable(&mut self, event_id: u32) -> Result<()> {
+        let slot = self.find_by_id(event_id)?;
+        self.events[slot].disable()
+    }
+
+    /// Sets a filter on an event.
+    pub fn set_filter(&mut self, event_id: u32, filter: FilterExpr) -> Result<()> {
+        let slot = self.find_by_id(event_id)?;
+        self.events[slot].set_filter(filter);
+        Ok(())
+    }
+
+    /// Processes a probe hit on the given event ID.
+    pub fn process_hit(
+        &mut self,
+        event_id: u32,
+        ip: u64,
+        timestamp_ns: u64,
+        cpu: u32,
+        pid: u32,
+        arg_values: &[u64],
+    ) -> Result<()> {
+        if !self.global_enabled {
+            return Ok(());
+        }
+        let slot = self.find_by_id(event_id)?;
+        if let Some(record) = self.events[slot].process_hit(ip, timestamp_ns, cpu, pid, arg_values)
+        {
+            self.ring.push(record);
+        }
+        Ok(())
+    }
+
+    /// Finds a free slot in the events array.
+    fn find_free_slot(&self) -> Result<usize> {
+        self.occupied
+            .iter()
+            .position(|&o| !o)
+            .ok_or(Error::OutOfMemory)
+    }
+
+    /// Finds the slot index for a given event ID.
+    fn find_by_id(&self, event_id: u32) -> Result<usize> {
+        for i in 0..MAX_KPROBE_EVENTS {
+            if self.occupied[i] && self.events[i].event_id == event_id {
+                return Ok(i);
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    /// Looks up an event by name.
+    pub fn find_by_name(&self, name: &[u8]) -> Option<&KprobeEvent> {
+        for i in 0..MAX_KPROBE_EVENTS {
+            if self.occupied[i]
+                && self.events[i].name_len == name.len()
+                && self.events[i].name[..name.len()] == *name
+            {
+                return Some(&self.events[i]);
+            }
+        }
+        None
+    }
+}
+
+// ======================================================================
+// Helper: integer formatting
+// ======================================================================
+
+/// Writes a u32 in decimal to `buf` at `pos`, returning bytes written.
+fn write_u32(buf: &mut [u8], pos: usize, val: u32) -> usize {
+    if pos >= buf.len() {
+        return 0;
+    }
+    let mut tmp = [0u8; 10];
+    let mut v = val;
+    let mut i = 0;
+    if v == 0 {
+        if pos < buf.len() {
+            buf[pos] = b'0';
+        }
+        return 1;
+    }
+    while v > 0 && i < 10 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    let len = i.min(buf.len() - pos);
+    for j in 0..len {
+        buf[pos + j] = tmp[i - 1 - j];
+    }
+    len
+}
+
+/// Writes a u64 in decimal to `buf` at `pos`, returning bytes written.
+fn write_u64(buf: &mut [u8], pos: usize, val: u64) -> usize {
+    if pos >= buf.len() {
+        return 0;
+    }
+    let mut tmp = [0u8; 20];
+    let mut v = val;
+    let mut i = 0;
+    if v == 0 {
+        if pos < buf.len() {
+            buf[pos] = b'0';
+        }
+        return 1;
+    }
+    while v > 0 && i < 20 {
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    let len = i.min(buf.len() - pos);
+    for j in 0..len {
+        buf[pos + j] = tmp[i - 1 - j];
+    }
+    len
+}
+
+/// Writes a u64 in hexadecimal (with 0x prefix) to `buf` at `pos`.
+fn write_hex_u64(buf: &mut [u8], pos: usize, val: u64) -> usize {
+    if pos + 2 >= buf.len() {
+        return 0;
+    }
+    buf[pos] = b'0';
+    buf[pos + 1] = b'x';
+    let hex = b"0123456789abcdef";
+    let mut started = false;
+    let mut written = 2;
+    for shift in (0..16).rev() {
+        let nibble = ((val >> (shift * 4)) & 0xf) as usize;
+        if nibble != 0 || started || shift == 0 {
+            started = true;
+            if pos + written < buf.len() {
+                buf[pos + written] = hex[nibble];
+                written += 1;
+            }
+        }
+    }
+    written
+}

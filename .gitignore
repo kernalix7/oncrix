@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Local config and editor settings
+.priv-storage/
+CLAUDE.md
+.cursorrules
+.claude
+.vscode
+WORK_STATUS.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug
+*.log
+core.[0-9]*
+
+# QEMU
+*.iso
+*.img
+*.bin
