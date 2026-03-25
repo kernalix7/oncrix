@@ -31,3 +31,23 @@ pub mod binder_ipc;
 // --- Batch 11 ---
 #[allow(dead_code, clippy::all)]
 pub mod tipc;
+
+// --- Batch 12 ---
+#[allow(dead_code, clippy::all)]
+pub mod vsock;
+
+// --- Batch 13 ---
+#[allow(dead_code, clippy::all)]
+pub mod kcm;
+
+// --- Batch 14 ---
+#[allow(dead_code, clippy::all)]
+pub mod netlink_ipc;
+#[allow(dead_code, clippy::all)]
+pub mod posix_sem;
+
+// --- Batch 15 ---
+#[allow(dead_code, clippy::all)]
+pub mod dbus_bus;
+#[allow(dead_code, clippy::all)]
+pub mod rpmsg;

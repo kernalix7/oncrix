@@ -89,3 +89,47 @@ pub mod splice_calls;
 pub mod cachestat;
 #[allow(dead_code, clippy::all)]
 pub mod io_uring_enter;
+
+// --- Batch 12 ---
+#[allow(dead_code, clippy::all)]
+pub mod epoll_pwait2;
+#[allow(dead_code, clippy::all)]
+pub mod listxattr_calls;
+#[allow(dead_code, clippy::all)]
+pub mod quotactl;
+
+// --- Batch 13 ---
+#[allow(dead_code, clippy::all)]
+pub mod fchmodat2;
+#[allow(dead_code, clippy::all)]
+pub mod io_uring_cmd;
+#[allow(dead_code, clippy::all)]
+pub mod mseal;
+
+// --- Batch 14 ---
+#[allow(dead_code, clippy::all)]
+pub mod eventfd_calls;
+#[allow(dead_code, clippy::all)]
+pub mod futex_waitv;
+#[allow(dead_code, clippy::all)]
+pub mod map_shadow_stack;
+#[allow(dead_code, clippy::all)]
+pub mod membarrier;
+#[allow(dead_code, clippy::all)]
+pub mod signalfd_ext;
+#[allow(dead_code, clippy::all)]
+pub mod timerfd_calls;
+
+// --- Batch 15 ---
+#[allow(dead_code, clippy::all)]
+pub mod bpf_calls;
+#[allow(dead_code, clippy::all)]
+pub mod io_uring_register;
+#[allow(dead_code, clippy::all)]
+pub mod kcmp;
+#[allow(dead_code, clippy::all)]
+pub mod mempolicy;
+#[allow(dead_code, clippy::all)]
+pub mod perf_event_open;
+#[allow(dead_code, clippy::all)]
+pub mod rseq_calls;

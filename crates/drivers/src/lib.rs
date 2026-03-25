@@ -92,3 +92,35 @@ pub mod drm_kms;
 pub mod mmc_sd;
 #[allow(dead_code, clippy::all)]
 pub mod usb_typec;
+
+// --- Batch 12 ---
+#[allow(dead_code, clippy::all)]
+pub mod usb_cdc_acm;
+#[allow(dead_code, clippy::all)]
+pub mod virtio_scsi;
+
+// --- Batch 13 ---
+#[allow(dead_code, clippy::all)]
+pub mod usb_net;
+#[allow(dead_code, clippy::all)]
+pub mod virtio_mem;
+
+// --- Batch 14 ---
+#[allow(dead_code, clippy::all)]
+pub mod fpga_manager;
+#[allow(dead_code, clippy::all)]
+pub mod mei;
+#[allow(dead_code, clippy::all)]
+pub mod nvme_tcp;
+#[allow(dead_code, clippy::all)]
+pub mod thunderbolt;
+
+// --- Batch 15 ---
+#[allow(dead_code, clippy::all)]
+pub mod drm_gem;
+#[allow(dead_code, clippy::all)]
+pub mod nvme_pci;
+#[allow(dead_code, clippy::all)]
+pub mod tty_core;
+#[allow(dead_code, clippy::all)]
+pub mod v4l2;

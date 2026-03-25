@@ -123,3 +123,45 @@ pub mod cifs;
 pub mod fs_freeze;
 #[allow(dead_code, clippy::all)]
 pub mod fsnotify;
+
+// --- Batch 12 ---
+#[allow(dead_code, clippy::all)]
+pub mod binderfs;
+#[allow(dead_code, clippy::all)]
+pub mod kernfs;
+#[allow(dead_code, clippy::all)]
+pub mod ntfs;
+
+// --- Batch 13 ---
+#[allow(dead_code, clippy::all)]
+pub mod overlayfs_copy_up;
+#[allow(dead_code, clippy::all)]
+pub mod zonefs;
+
+// --- Batch 14 ---
+#[allow(dead_code, clippy::all)]
+pub mod cramfs;
+#[allow(dead_code, clippy::all)]
+pub mod ecryptfs;
+#[allow(dead_code, clippy::all)]
+pub mod efivarfs;
+#[allow(dead_code, clippy::all)]
+pub mod exfat;
+#[allow(dead_code, clippy::all)]
+pub mod nilfs2;
+#[allow(dead_code, clippy::all)]
+pub mod tmpfs_huge;
+
+// --- Batch 15 ---
+#[allow(dead_code, clippy::all)]
+pub mod buffer_head;
+#[allow(dead_code, clippy::all)]
+pub mod dcache_ops;
+#[allow(dead_code, clippy::all)]
+pub mod fscache;
+#[allow(dead_code, clippy::all)]
+pub mod mount_ns;
+#[allow(dead_code, clippy::all)]
+pub mod readahead;
+#[allow(dead_code, clippy::all)]
+pub mod writeback;

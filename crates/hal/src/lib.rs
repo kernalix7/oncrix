@@ -58,3 +58,25 @@ pub mod efi_runtime;
 // --- Batch 9 ---
 #[allow(dead_code, clippy::all)]
 pub mod smbios;
+
+// --- Batch 12 ---
+#[allow(dead_code, clippy::all)]
+pub mod pmu;
+
+// --- Batch 13 ---
+#[allow(dead_code, clippy::all)]
+pub mod numa_topology;
+#[allow(dead_code, clippy::all)]
+pub mod tsc;
+
+// --- Batch 14 ---
+#[allow(dead_code, clippy::all)]
+pub mod dma_buf;
+#[allow(dead_code, clippy::all)]
+pub mod tpm_hw;
+
+// --- Batch 15 ---
+#[allow(dead_code, clippy::all)]
+pub mod gpio_controller;
+#[allow(dead_code, clippy::all)]
+pub mod thermal_zone;

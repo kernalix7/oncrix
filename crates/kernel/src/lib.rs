@@ -201,3 +201,47 @@ pub mod bpf_btf;
 pub mod lockdep;
 #[allow(dead_code, clippy::all)]
 pub mod sched_ext;
+
+// --- Batch 12 ---
+#[allow(dead_code, clippy::all)]
+pub mod bpf_ringbuf;
+#[allow(dead_code, clippy::all)]
+pub mod cgroup_net_cls;
+#[allow(dead_code, clippy::all)]
+pub mod tcp_bbr;
+
+// --- Batch 13 ---
+#[allow(dead_code, clippy::all)]
+pub mod bpf_lsm;
+#[allow(dead_code, clippy::all)]
+pub mod cgroup_rdma;
+#[allow(dead_code, clippy::all)]
+pub mod nftables;
+
+// --- Batch 14 ---
+#[allow(dead_code, clippy::all)]
+pub mod bpf_cgroup;
+#[allow(dead_code, clippy::all)]
+pub mod cgroup_misc;
+#[allow(dead_code, clippy::all)]
+pub mod perf_event;
+#[allow(dead_code, clippy::all)]
+pub mod rcu_nocb;
+#[allow(dead_code, clippy::all)]
+pub mod sched_autogroup;
+#[allow(dead_code, clippy::all)]
+pub mod tcp_cubic;
+
+// --- Batch 15 ---
+#[allow(dead_code, clippy::all)]
+pub mod bpf_trampoline;
+#[allow(dead_code, clippy::all)]
+pub mod cgroup_v2;
+#[allow(dead_code, clippy::all)]
+pub mod ipvlan;
+#[allow(dead_code, clippy::all)]
+pub mod sched_idle_class;
+#[allow(dead_code, clippy::all)]
+pub mod tcp_metrics;
+#[allow(dead_code, clippy::all)]
+pub mod tcp_vegas;

@@ -113,3 +113,35 @@ pub mod damon_ops;
 pub mod maple_tree;
 #[allow(dead_code, clippy::all)]
 pub mod memfd_secret;
+
+// --- Batch 12 ---
+#[allow(dead_code, clippy::all)]
+pub mod hmm;
+#[allow(dead_code, clippy::all)]
+pub mod page_alloc;
+
+// --- Batch 13 ---
+#[allow(dead_code, clippy::all)]
+pub mod page_ext;
+#[allow(dead_code, clippy::all)]
+pub mod zsmalloc;
+
+// --- Batch 14 ---
+#[allow(dead_code, clippy::all)]
+pub mod cleancache;
+#[allow(dead_code, clippy::all)]
+pub mod dax;
+#[allow(dead_code, clippy::all)]
+pub mod mincore;
+#[allow(dead_code, clippy::all)]
+pub mod page_idle;
+
+// --- Batch 15 ---
+#[allow(dead_code, clippy::all)]
+pub mod frontswap;
+#[allow(dead_code, clippy::all)]
+pub mod khugepaged;
+#[allow(dead_code, clippy::all)]
+pub mod rmap;
+#[allow(dead_code, clippy::all)]
+pub mod zram;
