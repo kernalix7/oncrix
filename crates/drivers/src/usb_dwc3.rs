@@ -385,11 +385,18 @@ impl Dwc3Controller {
             write_mmio32(self.mmio_base, DWC3_GEVNTADRLO, evt_lo);
             write_mmio32(self.mmio_base, DWC3_GEVNTADRHI, evt_hi);
             write_mmio32(self.mmio_base, DWC3_GEVNTSIZ, EVENT_BUF_SIZE);
-            // Clear the event count to acknowledge any stale events.
-            write_mmio32(self.mmio_base, DWC3_GEVNTCOUNT, 0);
+            // Acknowledge all stale events by reading the current count and
+            // writing it back. GEVNTCOUNT is decremented (not zeroed) by the
+            // driver, so writing 0 has no effect; the hardware only acknowledges
+            // bytes when you write back the count it reported.
+            // SAFETY: GEVNTCOUNT is a valid DWC3 register; the lower 16 bits
+            // hold the pending event byte count.
+            let stale = read_mmio32(self.mmio_base, DWC3_GEVNTCOUNT);
+            write_mmio32(self.mmio_base, DWC3_GEVNTCOUNT, stale & 0xFFFF);
         }
 
         // Configure GCTL: clear scale-down and scramble-disable, set host.
+        // SAFETY: mmio_base is a valid DWC3 MMIO region; reading 32-bit GCTL register.
         let mut new_gctl = unsafe { read_mmio32(self.mmio_base, DWC3_GCTL) };
         new_gctl &= !(DWC3_GCTL_SCALEDOWN_MASK | DWC3_GCTL_DISSCRAMBLE);
         new_gctl &= !DWC3_GCTL_PRTCAPDIR_MASK;

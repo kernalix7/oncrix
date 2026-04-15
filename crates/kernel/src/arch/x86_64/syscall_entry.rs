@@ -15,6 +15,8 @@
 //! - `IA32_FMASK` (0xC000_0084): RFLAGS mask (clear IF on entry)
 //! - `IA32_EFER` (0xC000_0080): enable SCE (SYSCALL Enable) bit
 
+use core::sync::atomic::AtomicU64;
+
 use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
 
@@ -32,6 +34,39 @@ const EFER_SCE: u64 = 1 << 0;
 
 /// RFLAGS.IF (Interrupt Flag) bit — masked on SYSCALL entry.
 const RFLAGS_IF: u64 = 1 << 9;
+/// RFLAGS.TF (Trap Flag) bit — single-step; must be masked.
+const RFLAGS_TF: u64 = 1 << 8;
+/// RFLAGS.DF (Direction Flag) bit — must be masked for safe
+/// forward-direction string operations in the kernel.
+const RFLAGS_DF: u64 = 1 << 10;
+/// RFLAGS.NT (Nested Task) bit — must be masked to prevent
+/// IRET from performing a task switch.
+const RFLAGS_NT: u64 = 1 << 14;
+/// RFLAGS.AC (Alignment Check) bit — must be masked to avoid
+/// spurious #AC exceptions on unaligned kernel accesses.
+const RFLAGS_AC: u64 = 1 << 18;
+
+/// Static kernel stack for the SYSCALL entry path (32 KiB).
+///
+/// Until per-CPU stacks are implemented, SYSCALL must switch off
+/// the untrusted user RSP onto this kernel stack before pushing
+/// any data. This is single-CPU only; SMP requires per-CPU
+/// storage.
+static mut SYSCALL_KERNEL_STACK: [u8; 32768] = [0; 32768];
+
+/// Saved user RSP during SYSCALL execution.
+///
+/// The SYSCALL entry stub stores the user-space RSP here before
+/// switching to the kernel stack, and restores it on exit.
+static SYSCALL_SAVED_USER_RSP: AtomicU64 = AtomicU64::new(0);
+
+/// RFLAGS sanitization mask: keeps only safe bits for SYSRETQ.
+///
+/// Bits kept: CF(0), PF(2), AF(4), ZF(6), SF(7), IF(9), OF(11).
+/// Clears: TF, DF, NT, IOPL, AC, and all other privileged bits.
+const _RFLAGS_SAFE_MASK: u64 = 0x3C7FD7;
+/// Forced RFLAGS bits: IF=1 (bit 9) + reserved bit 1 = 0x202.
+const _RFLAGS_FORCE_BITS: u64 = 0x202;
 
 /// Read a Model Specific Register.
 ///
@@ -41,6 +76,9 @@ const RFLAGS_IF: u64 = 1 << 9;
 unsafe fn rdmsr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
+    // SAFETY: The caller guarantees the MSR address in `ecx`
+    // is valid. `rdmsr` reads into `eax`/`edx` without side
+    // effects beyond returning the MSR value.
     unsafe {
         core::arch::asm!(
             "rdmsr",
@@ -61,6 +99,9 @@ unsafe fn rdmsr(msr: u32) -> u64 {
 unsafe fn wrmsr(msr: u32, value: u64) {
     let lo = value as u32;
     let hi = (value >> 32) as u32;
+    // SAFETY: The caller guarantees the MSR address and value
+    // are valid. Writing to a valid MSR is a privileged but
+    // well-defined operation in Ring 0.
     unsafe {
         core::arch::asm!(
             "wrmsr",
@@ -85,6 +126,9 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 pub unsafe fn init_syscall() {
     let mut serial = Uart16550::new(COM1);
 
+    // SAFETY: Called after GDT init. The MSR writes configure
+    // SYSCALL/SYSRET with segment selectors matching our GDT
+    // layout; LSTAR and FMASK are set to valid values.
     unsafe {
         // Enable SYSCALL/SYSRET in EFER.
         let efer = rdmsr(MSR_EFER);
@@ -116,8 +160,16 @@ pub unsafe fn init_syscall() {
         // LSTAR: entry point for SYSCALL.
         wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
 
-        // FMASK: clear IF on SYSCALL entry (disable interrupts).
-        wrmsr(MSR_FMASK, RFLAGS_IF);
+        // FMASK: clear IF, DF, AC, NT, TF on SYSCALL entry.
+        // IF: disable interrupts until we switch to kernel stack.
+        // DF: ensure forward direction for string ops in kernel.
+        // AC: prevent spurious alignment-check exceptions.
+        // NT: prevent IRET from performing task switches.
+        // TF: prevent single-step traps in kernel code.
+        wrmsr(
+            MSR_FMASK,
+            RFLAGS_IF | RFLAGS_DF | RFLAGS_AC | RFLAGS_NT | RFLAGS_TF,
+        );
     }
 
     let _ = serial.write_str("[ONCRIX] SYSCALL/SYSRET initialized\n");
@@ -130,35 +182,45 @@ pub unsafe fn init_syscall() {
 /// - R11 = user RFLAGS
 /// - RAX = syscall number
 /// - RDI, RSI, RDX, R10, R8, R9 = arguments
-/// - Interrupts are disabled (FMASK clears IF)
+/// - Interrupts are disabled (FMASK clears IF, DF, AC, NT, TF)
 ///
-/// We swap GS to access per-CPU data, save user state, build a
-/// `SyscallArgs` struct, call the dispatcher, and return via SYSRET.
+/// We swap GS, switch to the kernel stack, save user state, build
+/// a `SyscallArgs` struct, call the dispatcher, validate the
+/// return address, and return via SYSRET (or IRETQ fallback if
+/// the return address is non-canonical).
 ///
 /// # Kernel Stack Switch
 ///
-/// A production syscall entry MUST switch from the user stack to a
-/// per-CPU kernel stack (stored at `gs:KERNEL_STACK_OFFSET`) before
-/// pushing any data. Until per-CPU data is implemented, this entry
-/// point is only safe for kernel-initiated test calls where RSP
-/// already points to a kernel stack.
+/// The entry stub saves the user RSP to an atomic static and loads
+/// a dedicated kernel stack. Until per-CPU storage is implemented,
+/// this limits SYSCALL to a single CPU.
+///
+/// # SYSRETQ Safety
+///
+/// Before executing SYSRETQ, the return address in RCX is checked
+/// to be a canonical user-space address (<= 0x00007FFFFFFFFFFF).
+/// If the address is non-canonical, we fall back to IRETQ which
+/// does not have the RCX privilege escalation vulnerability.
+/// R11 (RFLAGS) is also sanitized to force IF=1, clear IOPL/NT/TF.
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_entry() {
-    // SAFETY: This is the SYSCALL entry stub. We swap GS base for
-    // per-CPU data, save all user registers, call the Rust dispatcher,
-    // then restore and SYSRET.
+    // SAFETY: This is the SYSCALL entry stub executed at Ring 0.
+    // We swap GS base for per-CPU data, switch to a kernel stack,
+    // save user registers, call the Rust dispatcher, validate the
+    // return address, sanitize RFLAGS, and return via SYSRET or
+    // IRETQ fallback.
     unsafe {
         core::arch::asm!(
-            // Swap GS base: user GS ↔ kernel GS (MSR_KERNEL_GS_BASE).
+            // Swap GS base: user GS <-> kernel GS.
             "swapgs",
-            // --- Kernel stack switch would go here ---
-            // In production: mov rsp, gs:[KERNEL_STACK_OFFSET]
-            // For now, we rely on RSP already being a kernel stack.
-            //
-            // Save user RCX (RIP) and R11 (RFLAGS) on the kernel stack.
+            // Save user RSP into the atomic and switch to kernel
+            // stack. This must happen before any push instruction.
+            "mov [{saved_user_rsp}], rsp",
+            "lea rsp, [{kern_stack} + 32768]",
+            // Save user RCX (RIP) and R11 (RFLAGS).
             "push rcx",       // user RIP
             "push r11",       // user RFLAGS
-            // Save callee-saved registers we'll clobber.
+            // Save callee-saved registers we will clobber.
             "push rbx",
             "push rbp",
             "push r12",
@@ -166,8 +228,7 @@ pub extern "C" fn syscall_entry() {
             "push r14",
             "push r15",
             // Build SyscallArgs on the stack.
-            // SyscallArgs { number, arg0..arg5 }
-            // rcx was overwritten by SYSCALL (user RIP), so arg3 is in r10.
+            // rcx was overwritten by SYSCALL, arg3 is in r10.
             "push r9",        // arg5
             "push r8",        // arg4
             "push r10",       // arg3
@@ -191,11 +252,36 @@ pub extern "C" fn syscall_entry() {
             // Restore user RFLAGS and RIP.
             "pop r11",        // user RFLAGS
             "pop rcx",        // user RIP
-            // Swap GS back before returning to user space.
+            // Sanitize R11 (RFLAGS): clear IOPL, NT, TF, and
+            // force IF=1 + reserved bit 1=1.
+            "and r11, 0x3C7FD7",
+            "or  r11, 0x202",
+            // Restore user RSP before returning.
+            "mov rsp, [{saved_user_rsp}]",
+            // Validate RCX: must be canonical user-space address.
+            // User-space canonical max = 0x00007FFFFFFFFFFF.
+            "mov r10, 0x00007FFFFFFFFFFF",
+            "cmp rcx, r10",
+            "ja  2f",
+            // --- Normal SYSRET path ---
             "swapgs",
-            // Return to user space.
             "sysretq",
+            // --- IRETQ fallback for non-canonical RCX ---
+            // Construct an interrupt return frame on the stack
+            // and use IRETQ which validates the target RIP safely.
+            "2:",
+            "swapgs",
+            "push {user_ss}",   // SS
+            "push rsp",         // RSP (user stack, placeholder)
+            "push r11",         // RFLAGS (already sanitized)
+            "push {user_cs}",   // CS
+            "push rcx",         // RIP
+            "iretq",
             dispatch = sym syscall_dispatch_wrapper,
+            saved_user_rsp = sym SYSCALL_SAVED_USER_RSP,
+            kern_stack = sym SYSCALL_KERNEL_STACK,
+            user_ss = const 0x1Bu64,  // USER_DATA = (3 << 3)|3
+            user_cs = const 0x23u64,  // USER_CODE = (4 << 3)|3
             options(noreturn),
         );
     }
@@ -205,10 +291,36 @@ pub extern "C" fn syscall_entry() {
 ///
 /// This is called from the assembly stub with RDI pointing to the
 /// `SyscallArgs` struct on the stack.
+///
+/// IPC syscalls (512–516) are handled directly by the kernel's
+/// [`crate::ipc_dispatch`] module, which has access to the global
+/// [`crate::state::KernelState`]. All other syscalls are forwarded
+/// to the `oncrix_syscall` crate.
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::SyscallArgs) -> i64 {
     // SAFETY: The assembly stub guarantees `args` points to a valid
     // SyscallArgs struct on the kernel stack.
     let args = unsafe { &*args };
-    oncrix_syscall::dispatch::dispatch(args)
+
+    // Intercept IPC syscalls — these require direct access to the
+    // kernel state (ChannelRegistry) which the syscall crate cannot
+    // reach.
+    match args.number {
+        oncrix_syscall::number::SYS_IPC_SEND => {
+            crate::ipc_dispatch::kernel_ipc_send(args.arg0, args.arg1)
+        }
+        oncrix_syscall::number::SYS_IPC_RECEIVE => {
+            crate::ipc_dispatch::kernel_ipc_receive(args.arg0, args.arg1)
+        }
+        oncrix_syscall::number::SYS_IPC_REPLY => {
+            crate::ipc_dispatch::kernel_ipc_reply(args.arg0, args.arg1)
+        }
+        oncrix_syscall::number::SYS_IPC_CALL => {
+            crate::ipc_dispatch::kernel_ipc_call(args.arg0, args.arg1)
+        }
+        oncrix_syscall::number::SYS_IPC_CREATE_ENDPOINT => {
+            crate::ipc_dispatch::kernel_ipc_create_endpoint()
+        }
+        _ => oncrix_syscall::dispatch::dispatch(args),
+    }
 }

@@ -745,6 +745,7 @@ impl I2cBus {
         } else {
             ctrl & !I2C_CTRL_10BIT_MASTER
         };
+        // SAFETY: mmio_base is valid; I2C_CTRL_OFF is a 32-bit RW control register.
         unsafe {
             write_mmio32(self.config.mmio_base, I2C_CTRL_OFF, new_ctrl);
         }

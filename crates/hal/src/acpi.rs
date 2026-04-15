@@ -73,8 +73,12 @@ pub fn parse_rsdp(data: &[u8]) -> Result<RsdpInfo> {
     }
 
     // ACPI 2.0+ has extended checksum over full structure.
+    // Use rsdp.length (not hardcoded 36) and clamp to available data for safety.
     if rsdp.revision >= 2 {
-        let full_sum: u8 = data[..36].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        let check_len = (rsdp.length as usize).min(data.len());
+        let full_sum: u8 = data[..check_len]
+            .iter()
+            .fold(0u8, |acc, &b| acc.wrapping_add(b));
         if full_sum != 0 {
             return Err(Error::InvalidArgument);
         }
@@ -356,6 +360,8 @@ pub fn parse_madt(data: &[u8]) -> Result<MadtInfo> {
                 info.local_apics[info.local_apic_count] = MadtLocalApic {
                     acpi_id: data[offset + 2],
                     apic_id: data[offset + 3],
+                    // SAFETY: Pointer is within bounds (offset + 4..offset + 8 < data.len()).
+                    // read_unaligned handles potentially misaligned u32 in the ACPI table.
                     flags: unsafe {
                         core::ptr::read_unaligned(data.as_ptr().add(offset + 4) as *const u32)
                     },
@@ -366,9 +372,13 @@ pub fn parse_madt(data: &[u8]) -> Result<MadtInfo> {
                 // SAFETY: Bounds checked: offset + 12 <= offset + entry_len <= bound <= data.len().
                 info.io_apics[info.io_apic_count] = MadtIoApic {
                     id: data[offset + 2],
+                    // SAFETY: Pointer is within bounds (offset + 4..offset + 8 < data.len()).
+                    // read_unaligned handles potentially misaligned u32.
                     address: unsafe {
                         core::ptr::read_unaligned(data.as_ptr().add(offset + 4) as *const u32)
                     },
+                    // SAFETY: Pointer is within bounds (offset + 8..offset + 12 < data.len()).
+                    // read_unaligned handles potentially misaligned u32.
                     gsi_base: unsafe {
                         core::ptr::read_unaligned(data.as_ptr().add(offset + 8) as *const u32)
                     },
@@ -380,9 +390,13 @@ pub fn parse_madt(data: &[u8]) -> Result<MadtInfo> {
                 info.overrides[info.override_count] = MadtOverride {
                     bus: data[offset + 2],
                     irq_source: data[offset + 3],
+                    // SAFETY: Pointer is within bounds (offset + 4..offset + 8 < data.len()).
+                    // read_unaligned handles potentially misaligned u32.
                     gsi: unsafe {
                         core::ptr::read_unaligned(data.as_ptr().add(offset + 4) as *const u32)
                     },
+                    // SAFETY: Pointer is within bounds (offset + 8..offset + 10 < data.len()).
+                    // read_unaligned handles potentially misaligned u16.
                     flags: unsafe {
                         core::ptr::read_unaligned(data.as_ptr().add(offset + 8) as *const u16)
                     },
@@ -413,10 +427,16 @@ pub unsafe fn find_rsdp() -> Option<u64> {
     // SAFETY: Scanning well-known BIOS memory regions in Ring 0.
     unsafe {
         // Search main BIOS area: 0xE0000 - 0xFFFFF (on 16-byte boundaries).
+        // Volatile read required: BIOS ROM is device memory; the compiler must
+        // not optimise away or reorder these accesses.
         let mut addr = 0xE0000u64;
         while addr < 0x100000 {
             let ptr = addr as *const [u8; 8];
-            if *ptr == RSDP_SIGNATURE {
+            // SAFETY: Address is within the identity-mapped BIOS ROM window
+            // (0xE0000–0xFFFFF). Volatile read prevents compiler from caching
+            // or eliding the load from device/firmware memory.
+            let sig = core::ptr::read_volatile(ptr);
+            if sig == RSDP_SIGNATURE {
                 return Some(addr);
             }
             addr += 16;

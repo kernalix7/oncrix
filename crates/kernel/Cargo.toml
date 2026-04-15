@@ -15,3 +15,4 @@ oncrix-mm.workspace = true
 oncrix-ipc.workspace = true
 oncrix-process.workspace = true
 oncrix-syscall.workspace = true
+oncrix-vfs.workspace = true

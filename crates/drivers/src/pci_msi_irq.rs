@@ -617,6 +617,8 @@ pub fn build_msix_disable_ctrl(base_ctrl: u16) -> u16 {
 /// `(entry_idx + 1) * MSIX_ENTRY_SIZE_BYTES` bytes.
 pub unsafe fn write_msix_entry(table_base: *mut u32, entry_idx: usize, entry: &MsixTableEntry) {
     let words_per_entry = MSIX_ENTRY_SIZE_BYTES / 4;
+    // SAFETY: Caller guarantees table_base is valid and covers at least
+    // (entry_idx + 1) entries. pointer arithmetic is within the mapped region.
     let base = unsafe { table_base.add(entry_idx * words_per_entry) };
     // SAFETY: Caller guarantees `table_base` is a valid MMIO mapping covering
     // the full entry range. Volatile writes ensure the device sees each field.
@@ -635,6 +637,8 @@ pub unsafe fn write_msix_entry(table_base: *mut u32, entry_idx: usize, entry: &M
 /// Same requirements as [`write_msix_entry`].
 pub unsafe fn read_msix_entry(table_base: *const u32, entry_idx: usize) -> MsixTableEntry {
     let words_per_entry = MSIX_ENTRY_SIZE_BYTES / 4;
+    // SAFETY: Caller guarantees table_base is valid and covers at least
+    // (entry_idx + 1) entries. Pointer arithmetic is within the mapped region.
     let base = unsafe { table_base.add(entry_idx * words_per_entry) };
     // SAFETY: Caller guarantees valid MMIO mapping. Volatile reads ensure we get
     // the actual device-visible state, not a cached copy.

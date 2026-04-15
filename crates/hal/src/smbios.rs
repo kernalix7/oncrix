@@ -1088,6 +1088,8 @@ pub fn parse_structures(data: &[u8], table_length: usize, info: &mut SmbiosInfo)
         // SAFETY: offset + HEADER_SIZE <= bound <= data.len().
         // SmbiosHeader is repr(C, packed), read_unaligned handles
         // alignment.
+        // SAFETY: Pointer is within bounds (offset + HEADER_SIZE <= data.len()).
+        // SmbiosHeader is repr(C, packed); read_unaligned handles misalignment.
         let header =
             unsafe { core::ptr::read_unaligned(data.as_ptr().add(offset) as *const SmbiosHeader) };
 

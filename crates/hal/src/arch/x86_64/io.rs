@@ -10,12 +10,18 @@
 /// Caller must ensure `port` is a valid I/O port for the current
 /// privilege level.
 pub unsafe fn outb(port: u16, value: u8) {
+    // SAFETY: Port I/O is architecturally safe on x86_64 when the port
+    // is valid for the current privilege level. This is guaranteed by
+    // the caller as documented in the function safety contract.
+    // `nomem` is intentionally omitted: port I/O has hardware side effects
+    // (device register writes) that the compiler must not reorder relative
+    // to surrounding memory accesses.
     unsafe {
         core::arch::asm!(
             "out dx, al",
             in("dx") port,
             in("al") value,
-            options(nomem, nostack, preserves_flags),
+            options(nostack, preserves_flags),
         );
     }
 }
@@ -28,12 +34,18 @@ pub unsafe fn outb(port: u16, value: u8) {
 /// privilege level.
 pub unsafe fn inb(port: u16) -> u8 {
     let value: u8;
+    // SAFETY: Port I/O is architecturally safe on x86_64 when the port
+    // is valid for the current privilege level. This is guaranteed by
+    // the caller as documented in the function safety contract.
+    // `nomem` is intentionally omitted: port I/O has hardware side effects
+    // (device register reads) that the compiler must not reorder relative
+    // to surrounding memory accesses.
     unsafe {
         core::arch::asm!(
             "in al, dx",
             out("al") value,
             in("dx") port,
-            options(nomem, nostack, preserves_flags),
+            options(nostack, preserves_flags),
         );
     }
     value

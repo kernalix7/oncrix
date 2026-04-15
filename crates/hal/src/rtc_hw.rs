@@ -1024,6 +1024,8 @@ impl RtcDevice {
         if alarm.enabled {
             // Compute match value from alarm fields.
             // For PL031, alarm is a simple seconds-since-epoch comparison.
+            // SAFETY: mmio_base is a valid PL031 RTC MMIO region; PL031_DR_OFF
+            // is the 32-bit RO data register holding the current RTC count.
             let now = unsafe { read_mmio32(self.config.mmio_base, PL031_DR_OFF) };
             let now_time = RtcTime::from_unix_timestamp(now as u64);
 

@@ -216,6 +216,8 @@ impl EfuseController {
         }
         // SAFETY: writing to ADDR and DATA followed by PROG triggers an
         // irreversible fuse-blow cycle. All safety preconditions documented above.
+        // SAFETY: self.base is a valid eFuse MMIO region. Writes to control registers
+        // initiate hardware fuse programming; the controller enforces write-once.
         unsafe {
             write32(self.base, EFUSE_ADDR, word_idx);
             write32(self.base, EFUSE_DATA, value);
@@ -223,6 +225,7 @@ impl EfuseController {
         }
         self.wait_idle()?;
         // Verify by reading back.
+        // SAFETY: self.base is valid; writing read command to CTRL register.
         unsafe { write32(self.base, EFUSE_CTRL, EFUSE_CTRL_RD) }
         self.wait_idle()?;
         let readback = unsafe { read32(self.base, EFUSE_READ_DATA) };

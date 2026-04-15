@@ -132,10 +132,12 @@ impl VirtioRng {
     /// Validate the VirtIO MMIO magic and device ID.
     fn check_magic(&self) -> Result<()> {
         // SAFETY: mmio_base is valid VirtIO MMIO.
+        // SAFETY: mmio_base is a valid VirtIO MMIO region; reading 32-bit magic register.
         let magic = unsafe { read32(self.mmio_base, reg::MAGIC) };
         if magic != VIRTIO_MAGIC {
             return Err(Error::NotFound);
         }
+        // SAFETY: mmio_base is a valid VirtIO MMIO region; reading 32-bit device ID register.
         let dev_id = unsafe { read32(self.mmio_base, reg::DEVICE_ID) };
         if dev_id != VIRTIO_ID_RNG {
             return Err(Error::InvalidArgument);
@@ -174,12 +176,15 @@ impl VirtioRng {
         }
 
         // Verify FEATURES_OK was accepted.
+        // SAFETY: mmio_base is a valid VirtIO MMIO region; reading 32-bit status register.
         let st = unsafe { read32(self.mmio_base, reg::STATUS) };
         if st & status::FEATURES_OK == 0 {
             return Err(Error::IoError);
         }
 
         // Mark driver ready.
+        // SAFETY: MMIO base address was validated during device probe
+        // and the status register is within the mapped device region.
         unsafe {
             write32(
                 self.mmio_base,

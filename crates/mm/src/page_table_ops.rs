@@ -74,12 +74,7 @@ pub struct MappingRequest {
 
 impl MappingRequest {
     /// Create a new mapping request.
-    pub const fn new(
-        virt_start: u64,
-        phys_start: u64,
-        page_count: usize,
-        flags: u64,
-    ) -> Self {
+    pub const fn new(virt_start: u64, phys_start: u64, page_count: usize, flags: u64) -> Self {
         Self {
             virt_start,
             phys_start,
@@ -109,6 +104,9 @@ impl MappingRequest {
     }
 
     /// Validate the request.
+    ///
+    /// Checks page alignment, page count bounds, and that the virtual
+    /// and physical address ranges do not wrap around the address space.
     pub fn validate(&self) -> Result<()> {
         if self.virt_start % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
@@ -119,6 +117,18 @@ impl MappingRequest {
         if self.page_count == 0 || self.page_count > MAX_BATCH_PAGES {
             return Err(Error::InvalidArgument);
         }
+        // Check for address wrapping: the end of the range must not
+        // overflow u64. `page_count * PAGE_SIZE` could itself overflow
+        // on extreme inputs, so check with checked arithmetic.
+        let byte_count = (self.page_count as u64)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        self.virt_start
+            .checked_add(byte_count)
+            .ok_or(Error::InvalidArgument)?;
+        self.phys_start
+            .checked_add(byte_count)
+            .ok_or(Error::InvalidArgument)?;
         Ok(())
     }
 }
@@ -256,23 +266,27 @@ impl PageTableOps {
     }
 
     /// Map a range of pages.
+    ///
+    /// Pages that are already mapped are skipped and counted in the
+    /// `failed` field of the returned [`MappingResult`]. If the slot
+    /// table runs out of space, the operation returns a partial result.
     pub fn map_range(&mut self, request: &MappingRequest) -> Result<MappingResult> {
         request.validate()?;
         let mut mapped = 0usize;
+        let mut skipped = 0usize;
 
         for i in 0..request.page_count() {
             let virt = request.virt_start() + (i as u64) * PAGE_SIZE;
             let phys = request.phys_start() + (i as u64) * PAGE_SIZE;
 
             if self.find_slot(virt).is_some() {
-                // Already mapped — skip.
+                // Already mapped -- count as skipped.
+                skipped += 1;
                 continue;
             }
             if self.slot_count >= MAX_SLOTS {
-                return Ok(MappingResult::partial(
-                    mapped,
-                    request.page_count() - mapped,
-                ));
+                let remaining = request.page_count() - i;
+                return Ok(MappingResult::partial(mapped, skipped + remaining));
             }
             self.slots[self.slot_count] = PteSlot {
                 virt_addr: virt,
@@ -286,15 +300,15 @@ impl PageTableOps {
 
         self.tlb_flush_count += 1;
         self.map_ops += 1;
-        Ok(MappingResult::success(mapped))
+        if skipped > 0 {
+            Ok(MappingResult::partial(mapped, skipped))
+        } else {
+            Ok(MappingResult::success(mapped))
+        }
     }
 
     /// Unmap a range of pages starting at `virt_start`.
-    pub fn unmap_range(
-        &mut self,
-        virt_start: u64,
-        page_count: usize,
-    ) -> Result<usize> {
+    pub fn unmap_range(&mut self, virt_start: u64, page_count: usize) -> Result<usize> {
         if virt_start % PAGE_SIZE != 0 || page_count == 0 {
             return Err(Error::InvalidArgument);
         }
@@ -331,8 +345,7 @@ impl PageTableOps {
         for i in 0..page_count {
             let virt = virt_start + (i as u64) * PAGE_SIZE;
             if let Some(slot_idx) = self.find_slot(virt) {
-                self.slots[slot_idx].flags =
-                    (new_flags | PTE_PRESENT) & !0; // keep present
+                self.slots[slot_idx].flags = new_flags | PTE_PRESENT;
                 updated += 1;
             }
         }
@@ -379,12 +392,7 @@ pub const fn kernel_rw_flags() -> u64 {
 }
 
 /// Map a single page and return the result.
-pub fn map_single_page(
-    ops: &mut PageTableOps,
-    virt: u64,
-    phys: u64,
-    flags: u64,
-) -> Result<()> {
+pub fn map_single_page(ops: &mut PageTableOps, virt: u64, phys: u64, flags: u64) -> Result<()> {
     let req = MappingRequest::new(virt, phys, 1, flags);
     let result = ops.map_range(&req)?;
     if result.is_complete() {

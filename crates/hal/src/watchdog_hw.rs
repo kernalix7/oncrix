@@ -408,17 +408,23 @@ impl WatchdogHwDevice {
         }
         match self.hw_type {
             WatchdogHwType::IntelItco => {
+                // TCO_STS1 and TCO_STS2 are RW1C (Read/Write-1-to-Clear) registers.
+                // Writing 1 to a bit clears it; reading first would clear whatever
+                // bits happen to be set, potentially masking other status events.
+                // Write the exact mask bits to clear only the intended flags.
+                //
+                // TCO_STS1 bit 3: TIMEOUT — clear prior watchdog expiry flag.
                 // SAFETY: mmio_base is checked non-zero above; iTCO MMIO is a
                 // valid 16-bit I/O range mapped via PMBase from ACPI.
-                let sts1 = unsafe { read_mmio16(self.config.mmio_base, ITCO_TCO_STS1_OFF) };
-                // Clear TIMEOUT bit (bit 3) to acknowledge prior expiry
+                // TCO_STS1 is RW1C — write 1 to clear specific status bits only;
+                // do NOT read-modify-write, as that would clear all currently-set bits.
                 unsafe {
-                    write_mmio16(self.config.mmio_base, ITCO_TCO_STS1_OFF, sts1 | 0x08);
+                    write_mmio16(self.config.mmio_base, ITCO_TCO_STS1_OFF, 0x0008);
                 }
-                let sts2 = unsafe { read_mmio16(self.config.mmio_base, ITCO_TCO_STS2_OFF) };
-                // Clear BOOT_STS (bit 2) and SECOND_TO_STS (bit 1)
+                // TCO_STS2 bit 1: SECOND_TO_STS, bit 2: BOOT_STS — clear prior flags.
+                // SAFETY: TCO_STS2 is RW1C — write 1 to clear, no read needed.
                 unsafe {
-                    write_mmio16(self.config.mmio_base, ITCO_TCO_STS2_OFF, sts2 | 0x06);
+                    write_mmio16(self.config.mmio_base, ITCO_TCO_STS2_OFF, 0x0006);
                 }
                 self.no_reboot_cleared = true;
             }
@@ -426,6 +432,7 @@ impl WatchdogHwDevice {
                 let ticks = self.load_value();
                 // SAFETY: mmio_base is checked; SP805 MMIO is a standard ARM
                 // peripheral block mapped at a known physical address.
+                // SAFETY: mmio_base is valid SP805 MMIO; writing 32-bit load register.
                 unsafe {
                     write_mmio32(self.config.mmio_base, SP805_LOAD_OFF, ticks);
                 }
@@ -458,21 +465,26 @@ impl WatchdogHwDevice {
             WatchdogHwType::IntelItco => {
                 // Write timeout count to TCO_TIMEOUT register (16-bit)
                 // SAFETY: mmio_base valid; TCO_TIMEOUT is a 16-bit RW register.
+                // SAFETY: mmio_base is valid iTCO MMIO; writing 16-bit timeout register.
                 unsafe {
                     write_mmio16(self.config.mmio_base, ITCO_TCO_TIMEOUT_OFF, load as u16);
                 }
                 // Reload the counter
+                // SAFETY: mmio_base is valid; writing to 16-bit iTCO reload register.
                 unsafe {
                     write_mmio16(self.config.mmio_base, ITCO_TCO_RLD_OFF, load as u16);
                 }
                 // Clear TCO_EN_HALT bit in SMI_TCO_CTRL to start timer
+                // SAFETY: mmio_base is valid iTCO MMIO; reading 16-bit control register.
                 let ctrl = unsafe { read_mmio16(self.config.mmio_base, ITCO_SMI_TCO_CTRL_OFF) };
+                // SAFETY: mmio_base is valid; writing to 16-bit iTCO control register.
                 unsafe {
                     write_mmio16(self.config.mmio_base, ITCO_SMI_TCO_CTRL_OFF, ctrl & !0x0800);
                 }
             }
             WatchdogHwType::ArmSp805 => {
                 // SAFETY: mmio_base valid; SP805_LOAD is a 32-bit WO load register.
+                // SAFETY: mmio_base is valid SP805 MMIO; writing 32-bit load and control registers.
                 unsafe {
                     write_mmio32(self.config.mmio_base, SP805_LOAD_OFF, load);
                     write_mmio32(

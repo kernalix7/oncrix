@@ -457,6 +457,7 @@ impl BacklightDevice {
             if self.config.pwm_inverted {
                 ctrl |= BL_CTRL_INVERT;
             }
+            // SAFETY: mmio_base is valid; BL_CTRL_OFF is a 32-bit RW control register.
             unsafe {
                 write_mmio32(self.config.mmio_base, BL_CTRL_OFF, ctrl);
             }

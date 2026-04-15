@@ -171,6 +171,8 @@ impl Tpm {
     pub fn release_locality(&self) {
         let base = self.loc_base();
         // SAFETY: writing ACCESS_ACTIVE clears the locality in TIS.
+        // SAFETY: base is a valid TPM TIS MMIO region; writing to ACCESS
+        // register to release locality is a standard TIS operation.
         unsafe { write8(base, TPM_ACCESS, ACCESS_ACTIVE) }
     }
 
@@ -178,6 +180,7 @@ impl Tpm {
     fn wait_status(&self, mask: u32, expected: u32) -> Result<()> {
         let base = self.loc_base();
         for _ in 0..1_000_000 {
+            // SAFETY: base is a valid TPM TIS MMIO region; reading 32-bit status register.
             let sts = unsafe { read32(base, TPM_STS) };
             if sts & STS_VALID != 0 && (sts & mask) == expected {
                 return Ok(());
@@ -191,6 +194,8 @@ impl Tpm {
         let base = self.loc_base();
         // Writing STS_COMMAND_READY transitions to commandReady.
         // SAFETY: TPM_STS write to set command-ready state.
+        // SAFETY: base is a valid TPM TIS MMIO region; writing to 32-bit status
+        // register to set command-ready state is a standard TIS operation.
         unsafe { write32(base, TPM_STS, STS_COMMAND_READY) }
         self.wait_status(STS_COMMAND_READY, STS_COMMAND_READY)
     }
@@ -202,6 +207,8 @@ impl Tpm {
             // Wait until TPM expects more data.
             self.wait_status(STS_EXPECT, STS_EXPECT)?;
             // SAFETY: TPM_DATA_FIFO write.
+            // SAFETY: base is a valid TPM TIS MMIO region; writing to 8-bit
+            // data FIFO register is a standard TIS command write operation.
             unsafe { write8(base, TPM_DATA_FIFO, byte) }
         }
         Ok(())
@@ -220,6 +227,8 @@ impl Tpm {
         self.wait_status(STS_DATA_AVAIL, STS_DATA_AVAIL)?;
         let mut n = 0;
         while n < buf.len() {
+            // SAFETY: `base` is the TIS locality base validated during init;
+            // TPM_STS is a valid register offset within the locality region.
             let sts = unsafe { read32(base, TPM_STS) };
             if sts & STS_VALID == 0 {
                 return Err(Error::IoError);
@@ -227,6 +236,7 @@ impl Tpm {
             if sts & STS_DATA_AVAIL == 0 {
                 break;
             }
+            // SAFETY: Data FIFO read is valid after STS_DATA_AVAIL check above.
             buf[n] = unsafe { read8(base, TPM_DATA_FIFO) };
             n += 1;
         }

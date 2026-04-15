@@ -259,6 +259,8 @@ impl Pat {
     pub fn read_msr() -> Result<PatTable> {
         #[cfg(target_arch = "x86_64")]
         {
+            // SAFETY: IA32_PAT (MSR 0x277) is architecturally defined on
+            // all x86_64 CPUs that support PAT; reading it has no side effects.
             let raw = unsafe { rdmsr(MSR_IA32_PAT) };
             Ok(PatTable { raw })
         }
@@ -272,6 +274,8 @@ impl Pat {
         {
             // SAFETY: WRMSR at CPL 0; IA32_PAT is an architectural MSR
             // safe to modify when MTRR/PAT usage is correctly coordinated.
+            // SAFETY: Writing to MSR_IA32_PAT is safe at CPL 0 with correct
+            // coordination. The caller ensures this is invoked in kernel context.
             unsafe { wrmsr(MSR_IA32_PAT, self.table.raw) };
             Ok(())
         }

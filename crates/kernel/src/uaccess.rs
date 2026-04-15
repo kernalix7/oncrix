@@ -18,6 +18,10 @@ use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 /// if any part falls outside or wraps around.
 pub fn validate_user_range(ptr: u64, len: u64) -> Result<()> {
     if len == 0 {
+        // Still reject null pointers even for zero-length operations
+        if ptr == 0 {
+            return Err(Error::InvalidArgument);
+        }
         return Ok(());
     }
 

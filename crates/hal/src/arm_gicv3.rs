@@ -158,7 +158,15 @@ impl Gicd {
     }
 
     /// Set the priority of an SPI (0 = highest, 0xFF = lowest).
+    ///
+    /// Only SPIs (intid >= 32) are managed by the Distributor priority
+    /// registers. SGIs and PPIs (intid < 32) use Redistributor registers
+    /// and must be configured via [`Gicr::set_ppi_priority`].
     pub fn set_priority(&mut self, intid: u32, priority: u8) -> Result<()> {
+        if intid < 32 {
+            // SGIs/PPIs are not routed through GICD priority registers.
+            return Err(Error::InvalidArgument);
+        }
         if (intid as usize) >= self.num_spis + 32 {
             return Err(Error::InvalidArgument);
         }
@@ -213,10 +221,28 @@ impl Gicr {
         let waker = unsafe { read32(self.base, GICR_WAKER) };
         let waker = waker & !(1 << 1); // clear ProcessorSleep
         unsafe { write32(self.base, GICR_WAKER, waker) }
+        // DSB ensures the ProcessorSleep write is visible to the GIC hardware
+        // before we poll ChildrenAsleep. Without this barrier the CPU may
+        // observe the old ChildrenAsleep value from its store buffer.
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: DSB SY is a full system memory barrier valid in any exception
+        // level. It has no side effects beyond ordering memory operations.
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        }
         // Poll until ChildrenAsleep (bit 2) clears.
         for _ in 0..100_000 {
+            // SAFETY: self.base is a valid GICR MMIO region.
             let w = unsafe { read32(self.base, GICR_WAKER) };
             if w & (1 << 2) == 0 {
+                // ISB flushes the instruction pipeline so that any subsequent
+                // system-register accesses (e.g. ICC_* CPU interface regs) see
+                // the redistributor in its fully-awake state.
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: ISB is a pipeline flush with no memory side effects.
+                unsafe {
+                    core::arch::asm!("isb", options(nostack, preserves_flags));
+                }
                 return Ok(());
             }
         }

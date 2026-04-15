@@ -539,9 +539,13 @@ impl KdbOutputBuffer {
     }
 
     /// Append a single byte to the buffer.
+    ///
+    /// Non-ASCII bytes are replaced with `b'.'` to maintain the
+    /// UTF-8 invariant required by [`as_str`].
     fn write_byte(&mut self, b: u8) {
         if self.pos < OUTPUT_BUFFER_SIZE {
-            self.data[self.pos] = b;
+            // Ensure only valid ASCII is written to maintain UTF-8 invariant
+            self.data[self.pos] = if b.is_ascii() { b } else { b'.' };
             self.pos = self.pos.saturating_add(1);
         }
     }
@@ -820,16 +824,46 @@ impl Kdb {
         Ok(())
     }
 
+    /// Validate that an address range is safe to read from the
+    /// debugger.
+    ///
+    /// Rejects null, low, and user-space addresses. Only permits
+    /// reads within the kernel virtual address range (high-half
+    /// canonical addresses on x86-64).
+    fn is_safe_kernel_addr(addr: u64, len: usize) -> bool {
+        // Reject null and very low addresses
+        if addr < 0x1000 {
+            return false;
+        }
+        // Reject user-space addresses (below kernel base)
+        let kernel_base: u64 = 0xFFFF_8000_0000_0000;
+        if addr < kernel_base {
+            return false;
+        }
+        // Check for overflow
+        if let Some(end) = addr.checked_add(len as u64) {
+            end > addr // non-zero range
+        } else {
+            false
+        }
+    }
+
     /// Dump memory in hex + ASCII format.
     ///
     /// Formats 16 bytes per line with the address prefix,
     /// hex bytes, and printable ASCII representation.
     ///
     /// Internally reads raw memory at the given address via
-    /// volatile pointer reads. The debugger context guarantees
-    /// the kernel address space is fully mapped.
+    /// volatile pointer reads. The address must be within the
+    /// kernel address range.
     fn cmd_memory(&mut self, addr: u64, len: usize) -> Result<(), Error> {
         if len == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Validate address before any memory access
+        if !Self::is_safe_kernel_addr(addr, len) {
+            self.output
+                .write_str("Error: address outside kernel range\n");
             return Err(Error::InvalidArgument);
         }
         // Cap length to avoid buffer overflow in output.
@@ -877,6 +911,8 @@ impl Kdb {
             self.output.write_str("|");
             col = 0;
             while col < line_len {
+                // SAFETY: The caller guarantees the address range
+                // is mapped. Volatile read prevents optimization.
                 let byte = unsafe {
                     core::ptr::read_volatile(line_addr.wrapping_add(col as u64) as *const u8)
                 };
@@ -901,10 +937,17 @@ impl Kdb {
 
     /// Set a breakpoint at the given address.
     fn cmd_breakpoint(&mut self, addr: u64) -> Result<(), Error> {
+        // Validate that the address is in kernel text before any
+        // memory access.
+        if !Self::is_safe_kernel_addr(addr, 1) {
+            self.output
+                .write_str("Error: address outside kernel text\n");
+            return Err(Error::InvalidArgument);
+        }
         // Read the original byte at the target address.
         // SAFETY: Breakpoint insertion requires reading the
-        // instruction byte. The caller must ensure the address is
-        // in mapped kernel text.
+        // instruction byte. We have validated that `addr` is
+        // within the kernel address range above.
         let original = unsafe { core::ptr::read_volatile(addr as *const u8) };
         let bp = KdbBreakpoint::new(addr, original);
         match self.breakpoints.add(bp) {

@@ -313,10 +313,14 @@ pub struct CrashInfo {
     pub name: [u8; 16],
     /// Command line (null-terminated).
     pub cmdline: [u8; 80],
-    /// UID.
+    /// Real UID.
     pub uid: u32,
-    /// GID.
+    /// Real GID.
     pub gid: u32,
+    /// Effective UID (used for SUID dump check).
+    pub euid: u32,
+    /// Effective GID (used for SGID dump check).
+    pub egid: u32,
 }
 
 impl CrashInfo {
@@ -331,7 +335,18 @@ impl CrashInfo {
             cmdline: [0; 80],
             uid: 0,
             gid: 0,
+            euid: 0,
+            egid: 0,
         }
+    }
+
+    /// Check if this process is dumpable.
+    ///
+    /// POSIX: Processes with mismatched real/effective UIDs or GIDs
+    /// (SUID/SGID) must not produce core dumps to prevent
+    /// privilege-escalation information leakage.
+    pub fn is_dumpable(&self) -> bool {
+        self.uid == self.euid && self.gid == self.egid
     }
 
     /// Set the process name.
@@ -386,7 +401,14 @@ impl CoreDumpBuilder {
     }
 
     /// Compute the total size of the core file.
-    pub fn compute_size(&self) -> usize {
+    ///
+    /// Uses checked arithmetic to prevent integer overflow when
+    /// summing region sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the total size overflows.
+    pub fn compute_size(&self) -> Result<usize> {
         let note_size = self.note_segment_size();
         // 1 PT_NOTE + N PT_LOAD segments
         let phdr_count = 1 + self.region_count;
@@ -394,8 +416,17 @@ impl CoreDumpBuilder {
         let data_size: u64 = self.regions[..self.region_count]
             .iter()
             .map(|r| r.size)
-            .sum();
-        header_size + note_size + data_size as usize
+            .try_fold(0u64, |acc, size| acc.checked_add(size))
+            .ok_or(Error::OutOfMemory)?;
+        let total = (header_size as u64)
+            .checked_add(note_size as u64)
+            .and_then(|v| v.checked_add(data_size))
+            .ok_or(Error::OutOfMemory)?;
+        // Ensure the total fits in usize
+        if total > usize::MAX as u64 {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(total as usize)
     }
 
     /// Serialize the core dump into the provided buffer.
@@ -407,7 +438,7 @@ impl CoreDumpBuilder {
     /// Returns [`Error::OutOfMemory`] if the buffer is too small or
     /// the core file exceeds [`MAX_CORE_SIZE`].
     pub fn serialize(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let total = self.compute_size();
+        let total = self.compute_size()?;
         if total > buf.len() || total > MAX_CORE_SIZE {
             return Err(Error::OutOfMemory);
         }
@@ -531,6 +562,9 @@ impl CoreDumpBuilder {
 
         // NT_PRSTATUS
         let prstatus = self.build_prstatus();
+        // SAFETY: `prstatus` is a valid, initialized `Prstatus`
+        // struct; we create a byte slice over its memory for
+        // serialization. The reference keeps it alive.
         let prstatus_bytes = unsafe {
             core::slice::from_raw_parts(
                 &prstatus as *const Prstatus as *const u8,
@@ -546,6 +580,9 @@ impl CoreDumpBuilder {
 
         // NT_PRPSINFO
         let prpsinfo = self.build_prpsinfo();
+        // SAFETY: `prpsinfo` is a valid, initialized `Prpsinfo`
+        // struct; we create a byte slice over its memory for
+        // serialization. The reference keeps it alive.
         let prpsinfo_bytes = unsafe {
             core::slice::from_raw_parts(
                 &prpsinfo as *const Prpsinfo as *const u8,
@@ -615,7 +652,36 @@ pub enum CoreDumpPolicy {
 
 /// Check if a signal should generate a core dump under the default
 /// policy.
-pub fn should_dump(signal: u8) -> bool {
+///
+/// Also checks SUID/SGID status: processes whose effective UID/GID
+/// differs from the real UID/GID must not dump core, to prevent
+/// privilege-escalation information leakage.
+pub fn should_dump(signal: u8, uid: u32, euid: u32, gid: u32, egid: u32) -> bool {
+    let is_crash_signal = matches!(
+        signal,
+        3  // SIGQUIT
+        | 4  // SIGILL
+        | 6  // SIGABRT
+        | 7  // SIGBUS
+        | 8  // SIGFPE
+        | 11 // SIGSEGV
+    );
+    if !is_crash_signal {
+        return false;
+    }
+    // POSIX: Do not dump SUID/SGID processes (privilege escalation risk)
+    if uid != euid || gid != egid {
+        return false;
+    }
+    true
+}
+
+/// Check if a signal is a crash signal (without credential checks).
+///
+/// Use this when you only need to test the signal number. For full
+/// dump-eligibility checking, use [`should_dump`] which also
+/// validates SUID/SGID status.
+pub fn is_crash_signal(signal: u8) -> bool {
     matches!(
         signal,
         3  // SIGQUIT

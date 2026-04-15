@@ -77,6 +77,59 @@ fn kernel_main() -> ! {
         }
 
         let _ = serial.write_str("[ONCRIX] All early initialization complete.\n");
+
+        // Allocate unified kernel state on the heap.
+        let mut state = alloc::boxed::Box::new(oncrix_kernel::state::KernelState::new());
+
+        // Phase 8: Root filesystem (ramfs + standard dirs)
+        let _ = serial.write_str("[ONCRIX] Mounting root filesystem...\n");
+        match state.init_rootfs() {
+            Ok(()) => {
+                let _ = serial.write_str("[ONCRIX] Root filesystem mounted (ramfs on /)\n");
+                let _ = serial.write_str("[ONCRIX] Created /dev /proc /tmp /sbin\n");
+            }
+            Err(_) => {
+                let _ = serial.write_str("[ONCRIX] WARNING: Root filesystem mount failed\n");
+            }
+        }
+
+        // Phase 9: IPC channels for core services
+        let _ = serial.write_str("[ONCRIX] Initializing IPC channels...\n");
+        match state.init_ipc() {
+            Ok(()) => {
+                let _ = serial.write_str(
+                    "[ONCRIX] IPC channels ready (kernel<->console, \
+                     kernel<->devmgr, kernel<->netd)\n",
+                );
+            }
+            Err(_) => {
+                let _ = serial.write_str("[ONCRIX] WARNING: IPC initialization failed\n");
+            }
+        }
+
+        // Phase 10: Process table + service manager boot
+        let _ = serial.write_str("[ONCRIX] Starting service manager...\n");
+        match state.init_services() {
+            Ok(()) => {
+                let _ = serial.write_str("[ONCRIX] Service manager boot complete\n");
+            }
+            Err(_) => {
+                let _ = serial.write_str("[ONCRIX] WARNING: Service manager boot failed\n");
+            }
+        }
+
+        // Keep kernel state alive — leaked into a static reference
+        // so subsystems can access it after kernel_main returns to
+        // the halt loop. Publish through the global accessor in
+        // state.rs so IPC dispatch and other subsystems can reach it.
+        let state = alloc::boxed::Box::leak(state);
+        // SAFETY: `state` is a valid, heap-allocated KernelState
+        // that will live for the kernel's lifetime. Called exactly
+        // once during single-threaded boot.
+        unsafe {
+            oncrix_kernel::state::set_global(state as *mut oncrix_kernel::state::KernelState);
+        }
+
         let _ = serial.write_str("[ONCRIX] Entering halt loop.\n");
     }
 
@@ -95,11 +148,15 @@ fn halt_loop() -> ! {
             core::arch::asm!("hlt");
         }
 
+        // SAFETY: `wfi` (Wait For Interrupt) halts the CPU until
+        // the next interrupt and does not corrupt any state.
         #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("wfi");
         }
 
+        // SAFETY: `wfi` (Wait For Interrupt) halts the CPU until
+        // the next interrupt and does not corrupt any state.
         #[cfg(target_arch = "riscv64")]
         unsafe {
             core::arch::asm!("wfi");

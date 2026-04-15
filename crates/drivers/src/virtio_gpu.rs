@@ -828,6 +828,8 @@ impl Framebuffer {
         // copy is correct when dst < src).
         if copy_bytes > 0 && shift_bytes < total_bytes {
             let ptr = self.buffer.as_mut_ptr();
+            // SAFETY: Both src (ptr + shift_bytes) and dst (ptr) are within self.buffer.
+            // Forward copy is safe because dst < src (correct for overlapping regions).
             unsafe {
                 core::ptr::copy(ptr.add(shift_bytes), ptr, copy_bytes);
             }

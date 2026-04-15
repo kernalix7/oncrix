@@ -45,6 +45,7 @@ dependencies = [
  "oncrix-mm",
  "oncrix-process",
  "oncrix-syscall",
+ "oncrix-vfs",
 ]
 
 [[package]]

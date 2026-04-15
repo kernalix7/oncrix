@@ -1457,13 +1457,17 @@ impl AhciDisk {
         for i in 0..4u64 {
             // SAFETY: buf_virt points to a 512-byte buffer, and
             // words 100..103 are within the 256-word range.
+            // SAFETY: buf_virt points to a valid 512-byte DMA buffer (256 words).
+            // Words 100..103 are within bounds. Volatile read prevents reordering.
             let w = unsafe { core::ptr::read_volatile(words.add(100 + i as usize)) };
             sectors |= (w as u64) << (i * 16);
         }
 
         // Fallback to LBA28 count (words 60-61) if LBA48 is zero.
         if sectors == 0 {
+            // SAFETY: buf_virt is valid; words 60-61 are within the 256-word range.
             let lo = unsafe { core::ptr::read_volatile(words.add(60)) } as u64;
+            // SAFETY: buf_virt is valid; words 60-61 are within the 256-word range.
             let hi = unsafe { core::ptr::read_volatile(words.add(61)) } as u64;
             sectors = lo | (hi << 16);
         }

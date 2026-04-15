@@ -265,6 +265,10 @@ impl Credentials {
     /// Returns [`Error::InvalidArgument`] if `groups` contains more
     /// than [`NGROUPS_MAX`] entries.
     pub fn set_groups(&mut self, groups: &[Gid]) -> Result<()> {
+        // POSIX: setgroups(2) requires CAP_SETGID (or euid == 0)
+        if self.euid != ROOT_UID {
+            return Err(Error::PermissionDenied);
+        }
         if groups.len() > NGROUPS_MAX {
             return Err(Error::InvalidArgument);
         }

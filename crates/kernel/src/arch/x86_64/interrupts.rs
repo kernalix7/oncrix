@@ -16,28 +16,37 @@ use oncrix_hal::timer::Timer;
 
 use super::init::PIC;
 
-/// IRQ 0 — Timer interrupt (PIT).
+/// IRQ 0 -- Timer interrupt (PIT).
+///
+/// Acknowledges the interrupt (EOI) before running the scheduler
+/// so that higher-priority interrupts are not blocked during
+/// scheduling. The interrupt gate guarantees IF=0 (interrupts
+/// disabled) on entry.
 pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // Increment the PIT tick counter.
-    // SAFETY: Single-threaded access; interrupts are disabled by gate type.
+    // SAFETY: Accessed only in interrupt context with IF=0
+    // (interrupt gate); no concurrent mutation.
     unsafe {
         let pit_ptr = &raw mut super::init::PIT_TIMER;
         (*pit_ptr).tick();
     }
 
-    // Run the scheduler on each timer tick.
-    // SAFETY: Raw pointer to static mut, accessed only in interrupt context
-    // with interrupts disabled (interrupt gate).
-    unsafe {
-        let sched_ptr = &raw mut super::init::SCHEDULER;
-        let _ = (*sched_ptr).schedule();
-    }
-
-    // Acknowledge IRQ 0 via PIC.
-    // SAFETY: Raw pointer to static mut, interrupt context.
+    // Acknowledge IRQ 0 via PIC *before* running the scheduler.
+    // Sending EOI first allows higher-priority interrupts to be
+    // serviced if the scheduler re-enables interrupts.
+    // SAFETY: Raw pointer to static mut, interrupt context with
+    // IF=0. EOI is idempotent for the current vector.
     unsafe {
         let pic_ptr = &raw mut PIC;
         let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET));
+    }
+
+    // Run the scheduler on each timer tick.
+    // SAFETY: Raw pointer to static mut, accessed only in
+    // interrupt context with IF=0 (interrupt gate).
+    unsafe {
+        let sched_ptr = &raw mut super::init::SCHEDULER;
+        let _ = (*sched_ptr).schedule();
     }
 }
 
@@ -63,11 +72,59 @@ pub extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {
     // No EOI for spurious interrupts from master PIC.
 }
 
+/// Execute a closure with interrupts disabled, restoring the
+/// previous interrupt state on return.
+///
+/// Saves RFLAGS (including IF), disables interrupts with `cli`,
+/// runs the closure, then restores IF only if it was previously
+/// set. This prevents nested enable/disable mismatches.
+///
+/// # Safety
+///
+/// The closure must not enable interrupts itself. The caller
+/// must ensure that disabling interrupts for the duration of `f`
+/// does not cause missed deadlines.
+#[inline]
+unsafe fn with_interrupts_disabled<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let flags: u64;
+    // SAFETY: `pushfq` saves RFLAGS and `cli` disables
+    // interrupts. This is a standard critical-section pattern.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) flags,
+            options(preserves_flags),
+        );
+    }
+    let result = f();
+    if flags & 0x200 != 0 {
+        // IF was set before we disabled -- restore it.
+        // SAFETY: `sti` re-enables interrupts. We verified
+        // that IF was previously set, so this is safe.
+        unsafe {
+            core::arch::asm!("sti", options(preserves_flags, nomem, nostack),);
+        }
+    }
+    result
+}
+
 /// Debug: print the current tick count to serial.
+///
+/// Disables interrupts while reading `PIT_TIMER` to prevent a
+/// torn read if the timer interrupt fires mid-access.
 pub fn print_tick_count() {
+    // SAFETY: Interrupts are disabled for the duration of the
+    // read, preventing concurrent mutation by the timer handler.
     let ticks = unsafe {
-        let pit_ptr = &raw const super::init::PIT_TIMER;
-        (*pit_ptr).current_ticks()
+        with_interrupts_disabled(|| {
+            let pit_ptr = &raw const super::init::PIT_TIMER;
+            (*pit_ptr).current_ticks()
+        })
     };
     let mut serial = Uart16550::new(COM1);
     let _ = serial.write_str("[ONCRIX] PIT ticks: ");

@@ -566,6 +566,8 @@ fn encode_stereo_vol(mute: bool, left_att: u8, right_att: u8) -> u16 {
 
 fn port_inb(port: u16) -> u8 {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Reads from NABM I/O ports assigned by PCI BAR configuration.
+    // Port I/O is safe when the port is within the device's assigned range.
     unsafe {
         // SAFETY: Reads from NABM I/O ports assigned by PCI BAR configuration.
         let v: u8;
@@ -582,6 +584,8 @@ fn port_inb(port: u16) -> u8 {
 
 fn port_outb(port: u16, value: u8) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Writes to NABM I/O ports assigned by PCI BAR configuration.
+    // Port I/O is safe when the port is within the device's assigned range.
     unsafe {
         // SAFETY: Writes to NABM I/O ports assigned by PCI BAR configuration.
         core::arch::asm!("out dx, al", in("dx") port, in("al") value,
@@ -595,6 +599,8 @@ fn port_outb(port: u16, value: u8) {
 
 fn port_inw(port: u16) -> u16 {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Reads from NAM or NABM I/O ports assigned by PCI BARs.
+    // Port I/O is safe when the port is within the device's assigned range.
     unsafe {
         // SAFETY: Reads from NAM or NABM I/O ports assigned by PCI BARs.
         let v: u16;
@@ -611,6 +617,8 @@ fn port_inw(port: u16) -> u16 {
 
 fn port_outw(port: u16, value: u16) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Writes to NAM or NABM I/O ports assigned by PCI BARs.
+    // Port I/O is safe when the port is within the device's assigned range.
     unsafe {
         // SAFETY: Writes to NAM or NABM I/O ports assigned by PCI BARs.
         core::arch::asm!("out dx, ax", in("dx") port, in("ax") value,
@@ -624,6 +632,8 @@ fn port_outw(port: u16, value: u16) {
 
 fn port_ind(port: u16) -> u32 {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Reads a 32-bit NABM register from an I/O port.
+    // Port I/O is safe when the port is within the device's assigned range.
     unsafe {
         // SAFETY: Reads a 32-bit NABM register from an I/O port.
         let v: u32;
@@ -640,6 +650,8 @@ fn port_ind(port: u16) -> u32 {
 
 fn port_outd(port: u16, value: u32) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Writes a 32-bit value to a NABM register via I/O port.
+    // Port I/O is safe when the port is within the device's assigned range.
     unsafe {
         // SAFETY: Writes a 32-bit value to a NABM register via I/O port.
         core::arch::asm!("out dx, eax", in("dx") port, in("eax") value,

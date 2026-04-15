@@ -715,12 +715,14 @@ impl CanController {
         if ir & IR_EI != 0 || ir & IR_EPI != 0 || ir & IR_BEI != 0 {
             // Update error counters from hardware.
             // SAFETY: mmio_base is valid MMIO.
+            // SAFETY: mmio_base is valid CAN controller MMIO; reading 8-bit error counters.
             unsafe {
                 self.errors.tx_errors = read_reg8(base, REG_TXERR);
                 self.errors.rx_errors = read_reg8(base, REG_RXERR);
             }
 
             // Update error state based on TEC/REC.
+            // SAFETY: mmio_base is valid; reading 8-bit status register.
             let status = unsafe { read_reg8(base, REG_STATUS) };
             if status & SR_BS != 0 {
                 self.state = CanState::BusOff;

@@ -15,6 +15,18 @@
 //! Linux `mm/slub.c`.
 //!
 //! Reference: `.kernelORG/` — `mm/slub.rst`, `mm/slab_common.c`.
+//!
+//! # Double-Free Detection
+//!
+//! Each slab maintains a bitmap (`alloc_bitmap`) with one bit per
+//! object slot. A bit is set when the slot is allocated and cleared
+//! on free. Attempting to free a slot whose bit is already clear
+//! returns `Error::InvalidArgument` (double-free detected).
+//!
+//! # Bounds Validation
+//!
+//! `Slab::free` validates that the pointer is within the slab region
+//! and aligned to the object size before modifying any state.
 
 use core::ptr;
 
@@ -26,13 +38,19 @@ const MAX_CACHES: usize = 16;
 /// Maximum number of slabs per cache.
 const MAX_SLABS_PER_CACHE: usize = 8;
 
-/// Slab size in bytes (4 KiB — one page).
+/// Slab size in bytes (4 KiB -- one page).
 const SLAB_SIZE: usize = 4096;
 
 /// Minimum object size (must fit a free-list pointer).
 const MIN_OBJECT_SIZE: usize = core::mem::size_of::<usize>();
 
-/// A single slab — a page-sized block of memory divided into
+/// Maximum number of objects per slab.
+///
+/// `SLAB_SIZE / MIN_OBJECT_SIZE = 4096 / 8 = 512` on 64-bit.
+/// We need `ceil(512 / 64) = 8` u64 words for the bitmap.
+const MAX_BITMAP_WORDS: usize = (SLAB_SIZE / MIN_OBJECT_SIZE).div_ceil(64);
+
+/// A single slab -- a page-sized block of memory divided into
 /// equal-sized objects.
 #[derive(Debug)]
 pub struct Slab {
@@ -44,6 +62,11 @@ pub struct Slab {
     in_use: usize,
     /// Total number of objects that fit in this slab.
     capacity: usize,
+    /// Object size for this slab (in bytes, aligned to pointer size).
+    obj_size: usize,
+    /// Allocation bitmap: bit `i` is set when slot `i` is allocated.
+    /// Used for double-free detection.
+    alloc_bitmap: [u64; MAX_BITMAP_WORDS],
 }
 
 impl Slab {
@@ -59,8 +82,12 @@ impl Slab {
 
         // Build the free list by writing next-pointers into each free slot.
         for i in 0..capacity {
+            // SAFETY: `i * obj_size` is within the slab region
+            // (i < capacity and capacity * obj_size <= SLAB_SIZE).
             let slot = unsafe { base.add(i * obj_size) };
             let next = if i + 1 < capacity {
+                // SAFETY: `(i+1) * obj_size` is within the slab
+                // region because i+1 < capacity.
                 unsafe { base.add((i + 1) * obj_size) }
             } else {
                 ptr::null_mut()
@@ -77,7 +104,54 @@ impl Slab {
             free_head: base,
             in_use: 0,
             capacity,
+            obj_size,
+            alloc_bitmap: [0u64; MAX_BITMAP_WORDS],
         }
+    }
+
+    /// Compute the slot index for a pointer within this slab.
+    ///
+    /// Returns `None` if the pointer is out of bounds or not aligned
+    /// to the object size.
+    fn slot_index(&self, ptr: *mut u8) -> Option<usize> {
+        let base = self.base as usize;
+        let addr = ptr as usize;
+        if addr < base {
+            return None;
+        }
+        let offset = addr - base;
+        if offset >= SLAB_SIZE {
+            return None;
+        }
+        if offset % self.obj_size != 0 {
+            return None;
+        }
+        let index = offset / self.obj_size;
+        if index >= self.capacity {
+            return None;
+        }
+        Some(index)
+    }
+
+    /// Check whether the bitmap bit for `slot` is set (allocated).
+    fn is_slot_allocated(&self, slot: usize) -> bool {
+        let word = slot / 64;
+        let bit = slot % 64;
+        self.alloc_bitmap[word] & (1u64 << bit) != 0
+    }
+
+    /// Set the bitmap bit for `slot` (mark as allocated).
+    fn set_slot_allocated(&mut self, slot: usize) {
+        let word = slot / 64;
+        let bit = slot % 64;
+        self.alloc_bitmap[word] |= 1u64 << bit;
+    }
+
+    /// Clear the bitmap bit for `slot` (mark as free).
+    fn clear_slot_allocated(&mut self, slot: usize) {
+        let word = slot / 64;
+        let bit = slot % 64;
+        self.alloc_bitmap[word] &= !(1u64 << bit);
     }
 
     /// Allocate one object from this slab.
@@ -92,24 +166,45 @@ impl Slab {
         // a valid next pointer (or null for the last free slot).
         self.free_head = unsafe { (obj as *const *mut u8).read() };
         self.in_use += 1;
+
+        // Mark the slot as allocated in the bitmap.
+        if let Some(slot) = self.slot_index(obj) {
+            self.set_slot_allocated(slot);
+        }
+
         Some(obj)
     }
 
     /// Free an object back to this slab.
     ///
+    /// Validates that the pointer belongs to this slab, is correctly
+    /// aligned to the object size, and has not already been freed
+    /// (double-free detection via bitmap).
+    ///
     /// # Safety
     ///
     /// - `ptr` must have been allocated from this slab via [`alloc`](Self::alloc).
-    /// - `ptr` must not be freed more than once (no double-free).
-    pub unsafe fn free(&mut self, ptr: *mut u8) {
+    pub unsafe fn free(&mut self, ptr: *mut u8) -> Result<()> {
+        // Validate bounds and alignment.
+        let slot = self.slot_index(ptr).ok_or(Error::InvalidArgument)?;
+
+        // Double-free detection: the bit must be set (allocated).
+        if !self.is_slot_allocated(slot) {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Clear the allocation bit.
+        self.clear_slot_allocated(slot);
+
         // Write the current free_head into the freed slot.
-        // SAFETY: ptr was allocated from this slab, so it has room
-        // for a pointer and is properly aligned.
+        // SAFETY: ptr was allocated from this slab (validated above),
+        // so it has room for a pointer and is properly aligned.
         unsafe {
             (ptr as *mut *mut u8).write(self.free_head);
         }
         self.free_head = ptr;
         self.in_use = self.in_use.saturating_sub(1);
+        Ok(())
     }
 
     /// Check if this slab has free objects.
@@ -140,7 +235,7 @@ impl Slab {
     }
 }
 
-/// A slab cache — manages slabs for objects of a single fixed size.
+/// A slab cache -- manages slabs for objects of a single fixed size.
 ///
 /// Each cache holds up to `MAX_SLABS_PER_CACHE` slabs. When all
 /// existing slabs are full and `grow()` is called, a new slab is
@@ -233,15 +328,19 @@ impl SlabCache {
 
     /// Free an object back to its slab.
     ///
+    /// Validates that the pointer belongs to one of this cache's slabs,
+    /// is correctly aligned, and has not already been freed.
+    ///
     /// # Safety
     ///
     /// - `ptr` must have been allocated from this cache via [`alloc`](Self::alloc).
-    /// - `ptr` must not be freed more than once.
     pub unsafe fn free(&mut self, ptr: *mut u8) -> Result<()> {
         for slab in self.slabs.iter_mut().flatten() {
             if slab.contains(ptr) {
-                // SAFETY: Caller guarantees ptr was allocated from this cache.
-                unsafe { slab.free(ptr) };
+                // SAFETY: Caller guarantees ptr was allocated from
+                // this cache. Slab::free validates alignment and
+                // double-free via bitmap.
+                unsafe { slab.free(ptr)? };
                 self.total_frees += 1;
                 return Ok(());
             }
@@ -342,10 +441,10 @@ impl ShrinkResult {
 /// Global slab cache registry.
 ///
 /// Manages all named slab caches in the kernel. Typical caches:
-/// - `"pcb"` — process control blocks
-/// - `"fd"` — file descriptors
-/// - `"ipc_msg"` — IPC messages
-/// - `"vma"` — virtual memory area descriptors
+/// - `"pcb"` -- process control blocks
+/// - `"fd"` -- file descriptors
+/// - `"ipc_msg"` -- IPC messages
+/// - `"vma"` -- virtual memory area descriptors
 pub struct SlabRegistry {
     /// Named caches.
     caches: [Option<SlabCache>; MAX_CACHES],

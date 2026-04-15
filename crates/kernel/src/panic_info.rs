@@ -207,6 +207,9 @@ impl StackTrace {
             // On x86_64 with frame pointers:
             //   [rbp]     = previous rbp (caller's frame pointer)
             //   [rbp + 8] = return address
+            // SAFETY: `fp` was validated above to be a non-null
+            // kernel address and 8-byte aligned, so reading a
+            // u64 at `fp` and `fp + 8` is within the stack frame.
             let prev_fp = unsafe { core::ptr::read_volatile(fp as *const u64) };
             let ret_addr = unsafe { core::ptr::read_volatile((fp as *const u64).add(1)) };
 
@@ -339,12 +342,14 @@ impl CrashLog {
     /// Record a panic in the ring buffer.
     ///
     /// If the buffer is full, the oldest entry is overwritten.
+    /// Uses an atomic `fetch_add` to obtain a unique slot index,
+    /// which is safe even if two CPUs panic simultaneously (e.g.,
+    /// NMI + panic). The previous load-then-store sequence had a
+    /// TOCTOU race where two concurrent callers could obtain the
+    /// same index and clobber each other's record.
     pub fn log(&mut self, record: PanicRecord) {
-        let idx = self.total.load(Ordering::Relaxed) % CRASH_LOG_SIZE;
+        let idx = self.total.fetch_add(1, Ordering::AcqRel) % CRASH_LOG_SIZE;
         self.entries[idx] = record;
-        // Use wrapping add to avoid overflow on the counter.
-        let prev = self.total.load(Ordering::Relaxed);
-        self.total.store(prev.wrapping_add(1), Ordering::Release);
     }
 
     /// Return the most recently logged panic record, if any.
@@ -496,6 +501,9 @@ pub unsafe fn handle_kernel_oops(oops: KernelOops, regs: &CrashRegisters) -> Pan
     record.registers = *regs;
 
     // Capture stack trace from the crash-time RBP.
+    // SAFETY: The caller guarantees the kernel stack is valid
+    // and mapped, so walking the frame chain from `regs.rbp`
+    // is sound.
     record.stack_trace = unsafe { StackTrace::capture(regs.rbp) };
 
     // Format the oops description into the message buffer.
@@ -781,6 +789,8 @@ impl<'a> BufWriter<'a> {
             }
             i = i.saturating_sub(1);
         }
+        // SAFETY: `tmp` contains only ASCII hex digits (0-9,
+        // a-f) and the "0x" prefix — all valid UTF-8.
         self.write_str(unsafe { core::str::from_utf8_unchecked(&tmp) });
     }
 
@@ -805,6 +815,8 @@ impl<'a> BufWriter<'a> {
         // i+1. When i == 0, last digit was written at 0, so
         // start should be 0.
         let actual_start = if val > 0 && i == 0 { 0 } else { start };
+        // SAFETY: `tmp` contains only ASCII decimal digits
+        // (0-9), which are valid UTF-8.
         self.write_str(unsafe { core::str::from_utf8_unchecked(&tmp[actual_start..]) });
     }
 
@@ -829,6 +841,8 @@ impl<'a> BufWriter<'a> {
         } else {
             i.saturating_add(1)
         };
+        // SAFETY: `tmp` contains only ASCII decimal digits
+        // (0-9), which are valid UTF-8.
         self.write_str(unsafe { core::str::from_utf8_unchecked(&tmp[start..]) });
     }
 

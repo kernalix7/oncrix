@@ -579,29 +579,44 @@ impl LinearFramebuffer {
         let ptr = self.base.saturating_add(offset) as *mut u8;
 
         match self.format {
-            VbePixelFormat::Rgb888 => unsafe {
+            VbePixelFormat::Rgb888 =>
+            // SAFETY: ptr is within the framebuffer bounds (checked above). Writes
+            // are to a valid mapped region; 3-byte RGB888 write is within bounds.
+            unsafe {
                 ptr.write((color >> 24) as u8);
                 ptr.add(1).write((color >> 16) as u8);
                 ptr.add(2).write((color >> 8) as u8);
             },
-            VbePixelFormat::Bgr888 => unsafe {
+            VbePixelFormat::Bgr888 =>
+            // SAFETY: ptr is within the framebuffer bounds (checked above). Writes
+            // are to a valid mapped region; 3-byte BGR888 write is within bounds.
+            unsafe {
                 ptr.write((color >> 8) as u8);
                 ptr.add(1).write((color >> 16) as u8);
                 ptr.add(2).write((color >> 24) as u8);
             },
-            VbePixelFormat::Rgba8888 => unsafe {
+            VbePixelFormat::Rgba8888 =>
+            // SAFETY: ptr is within the framebuffer bounds (checked above). Writes
+            // are to a valid mapped region; 4-byte RGBA8888 write is within bounds.
+            unsafe {
                 ptr.write((color >> 24) as u8);
                 ptr.add(1).write((color >> 16) as u8);
                 ptr.add(2).write((color >> 8) as u8);
                 ptr.add(3).write(color as u8);
             },
-            VbePixelFormat::Bgra8888 => unsafe {
+            VbePixelFormat::Bgra8888 =>
+            // SAFETY: ptr is within the framebuffer bounds (checked above). Writes
+            // are to a valid mapped region; 4-byte BGRA8888 write is within bounds.
+            unsafe {
                 ptr.write((color >> 8) as u8);
                 ptr.add(1).write((color >> 16) as u8);
                 ptr.add(2).write((color >> 24) as u8);
                 ptr.add(3).write(color as u8);
             },
-            VbePixelFormat::Indexed => unsafe {
+            VbePixelFormat::Indexed =>
+            // SAFETY: ptr is within the framebuffer bounds (checked above). Single-byte
+            // write to indexed mode framebuffer is within bounds.
+            unsafe {
                 // For indexed mode, use the red channel as index.
                 ptr.write((color >> 24) as u8);
             },
@@ -686,6 +701,8 @@ impl LinearFramebuffer {
         // destination < source.
         if copy_len > 0 && shift < total {
             let ptr = self.base as *mut u8;
+            // SAFETY: Both src (ptr + shift) and dst (ptr) are within the framebuffer
+            // bounds. Forward copy is safe because dst < src (non-overlapping direction).
             unsafe {
                 core::ptr::copy(ptr.add(shift), ptr, copy_len);
             }
@@ -1134,6 +1151,8 @@ impl DoubleBuffer {
             // mapping of at least `front_pitch * height` bytes.
             // `src` is a bounded slice. We copy at most
             // `copy_width` bytes per row within both buffers.
+            // SAFETY: dst_base is within the front framebuffer bounds (dst_off < front_pitch * height).
+            // src_off + copy_width <= src.len() is validated. Non-overlapping copy is safe.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr().add(src_off),

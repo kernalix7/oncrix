@@ -13,18 +13,36 @@ use oncrix_hal::serial::SerialPort;
 use oncrix_process::pid::{Pid, Tid, alloc_tid};
 use oncrix_process::thread::{Priority, Thread};
 
-/// Kernel thread stack size (8 KiB per thread).
-const KTHREAD_STACK_SIZE: usize = 8192;
+/// Kernel thread stack size (16 KiB per thread).
+///
+/// 8 KiB is too small for threads that may call nested functions
+/// or handle interrupts on their kernel stack. 16 KiB matches
+/// the Linux kernel default for x86_64.
+const KTHREAD_STACK_SIZE: usize = 16384;
 
 /// Maximum number of kernel threads.
 const MAX_KTHREADS: usize = 32;
 
+/// 16-byte aligned stack buffer.
+///
+/// The System V AMD64 ABI requires RSP to be 16-byte aligned
+/// before a `call` instruction. Wrapping the stack array ensures
+/// the base address is properly aligned.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct AlignedStack([u8; KTHREAD_STACK_SIZE]);
+
+impl AlignedStack {
+    const fn zero() -> Self {
+        Self([0; KTHREAD_STACK_SIZE])
+    }
+}
+
 /// Static pool of kernel thread stacks.
 ///
-/// Each thread gets a dedicated 8 KiB stack from this pool.
-/// In BSS, so doesn't bloat the kernel image.
-static mut KTHREAD_STACKS: [[u8; KTHREAD_STACK_SIZE]; MAX_KTHREADS] =
-    [[0; KTHREAD_STACK_SIZE]; MAX_KTHREADS];
+/// Each thread gets a dedicated 16 KiB, 16-byte-aligned stack.
+/// Placed in BSS so it does not bloat the kernel image.
+static mut KTHREAD_STACKS: [AlignedStack; MAX_KTHREADS] = [AlignedStack::zero(); MAX_KTHREADS];
 
 /// CPU contexts for kernel threads (parallel array with stacks).
 static mut KTHREAD_CONTEXTS: [CpuContext; MAX_KTHREADS] =
@@ -32,6 +50,39 @@ static mut KTHREAD_CONTEXTS: [CpuContext; MAX_KTHREADS] =
 
 /// Allocation bitmap: true = slot in use.
 static mut KTHREAD_USED: [bool; MAX_KTHREADS] = [false; MAX_KTHREADS];
+
+/// Execute a closure with interrupts disabled, restoring the
+/// previous interrupt state on return.
+///
+/// # Safety
+///
+/// The closure must not enable interrupts itself.
+#[inline]
+unsafe fn with_interrupts_disabled<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let flags: u64;
+    // SAFETY: Standard critical-section entry: save RFLAGS and
+    // disable interrupts.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            "cli",
+            out(reg) flags,
+            options(preserves_flags),
+        );
+    }
+    let result = f();
+    if flags & 0x200 != 0 {
+        // SAFETY: IF was set before; re-enable interrupts.
+        unsafe {
+            core::arch::asm!("sti", options(preserves_flags, nomem, nostack),);
+        }
+    }
+    result
+}
 
 /// Kernel thread descriptor returned after spawning.
 #[derive(Debug, Clone, Copy)]
@@ -52,42 +103,54 @@ pub struct KernelThread {
 ///
 /// # Safety
 ///
-/// `entry` must point to a valid kernel function that never returns.
+/// `entry` must point to a valid kernel function that never
+/// returns.
 pub unsafe fn spawn_kthread(
     entry: extern "C" fn() -> !,
     priority: Priority,
 ) -> oncrix_lib::Result<(KernelThread, Thread)> {
+    // All access to the static arrays is wrapped in a
+    // critical section (cli/sti) to prevent races with
+    // interrupt handlers that might also inspect thread state.
+
     // Find a free slot.
-    // SAFETY: Single-threaded boot context or called with interrupts
-    // disabled during runtime.
+    // SAFETY: Interrupts are disabled for the duration of the
+    // search, preventing concurrent modification.
     let slot = unsafe {
-        let used_ptr = &raw mut KTHREAD_USED;
-        let mut found = None;
-        for (i, used) in (*used_ptr).iter_mut().enumerate() {
-            if !*used {
-                *used = true;
-                found = Some(i);
-                break;
+        with_interrupts_disabled(|| {
+            let used_ptr = &raw mut KTHREAD_USED;
+            let mut found = None;
+            for (i, used) in (*used_ptr).iter_mut().enumerate() {
+                if !*used {
+                    *used = true;
+                    found = Some(i);
+                    break;
+                }
             }
-        }
-        found
+            found
+        })
     }
     .ok_or(oncrix_lib::Error::OutOfMemory)?;
 
     // Compute stack top (stacks grow downward on x86_64).
-    // SAFETY: Raw pointer to static array.
+    // The stack is 16-byte aligned via AlignedStack, and
+    // KTHREAD_STACK_SIZE is a multiple of 16.
+    // SAFETY: Interrupts disabled, raw pointer to our pool.
     let stack_top = unsafe {
-        let stacks_ptr = &raw const KTHREAD_STACKS;
-        let base = (*stacks_ptr)[slot].as_ptr();
-        base as u64 + KTHREAD_STACK_SIZE as u64
+        with_interrupts_disabled(|| {
+            let stacks_ptr = &raw const KTHREAD_STACKS;
+            let base = (*stacks_ptr)[slot].0.as_ptr();
+            base as u64 + KTHREAD_STACK_SIZE as u64
+        })
     };
 
     // Initialize the CPU context.
     //
-    // The context switch code expects callee-saved registers pushed
-    // on the stack with a return address at the top. We set up the
-    // stack so that when the context is "restored", it pops zeroed
-    // registers and then `ret` jumps to `entry`.
+    // The context switch code expects callee-saved registers
+    // pushed on the stack with a return address at the top.
+    // We set up the stack so that when the context is
+    // "restored", it pops zeroed registers and then `ret`
+    // jumps to `entry`.
     //
     // Stack layout (growing down):
     //   [stack_top - 8]  = entry (return address for `ret`)
@@ -98,22 +161,26 @@ pub unsafe fn spawn_kthread(
     //   [stack_top - 48] = 0 (rbp)
     //   [stack_top - 56] = 0 (rbx)
     //   RSP points here ^
-    // SAFETY: Writing to our own stack buffer.
+    // SAFETY: Interrupts disabled; writing to our own stack
+    // buffer and context array.
     unsafe {
-        let ret_addr_ptr = (stack_top - 8) as *mut u64;
-        *ret_addr_ptr = entry as *const () as u64;
+        with_interrupts_disabled(|| {
+            let ret_addr_ptr = (stack_top - 8) as *mut u64;
+            *ret_addr_ptr = entry as *const () as u64;
 
-        // Zero out the 6 callee-saved register slots.
-        for i in 1..7 {
-            let slot_ptr = (stack_top - 8 - i * 8) as *mut u64;
-            *slot_ptr = 0;
-        }
+            // Zero out the 6 callee-saved register slots.
+            for i in 1..7 {
+                let slot_ptr = (stack_top - 8 - i * 8) as *mut u64;
+                *slot_ptr = 0;
+            }
 
-        let ctx_ptr = &raw mut KTHREAD_CONTEXTS;
-        (*ctx_ptr)[slot] = CpuContext::new(
-            entry as *const () as u64,
-            stack_top - 56, // RSP after 7 pushes (ret + 6 regs)
-        );
+            let ctx_ptr = &raw mut KTHREAD_CONTEXTS;
+            (*ctx_ptr)[slot] = CpuContext::new(
+                entry as *const () as u64,
+                // RSP after 7 pushes (ret + 6 regs)
+                stack_top - 56,
+            );
+        });
     }
 
     let tid = alloc_tid();
@@ -130,9 +197,13 @@ pub unsafe fn spawn_kthread(
 ///
 /// The slot must be a valid, in-use kernel thread slot.
 pub unsafe fn kthread_context(slot: usize) -> *mut CpuContext {
+    // SAFETY: Interrupts are disabled to prevent concurrent
+    // modification. The caller guarantees `slot` is valid.
     unsafe {
-        let ctx_ptr = &raw mut KTHREAD_CONTEXTS;
-        &raw mut (*ctx_ptr)[slot]
+        with_interrupts_disabled(|| {
+            let ctx_ptr = &raw mut KTHREAD_CONTEXTS;
+            &raw mut (*ctx_ptr)[slot]
+        })
     }
 }
 
@@ -143,9 +214,13 @@ pub unsafe fn kthread_context(slot: usize) -> *mut CpuContext {
 /// The thread must no longer be scheduled or running.
 pub unsafe fn free_kthread(slot: usize) {
     if slot < MAX_KTHREADS {
+        // SAFETY: Interrupts disabled to prevent concurrent
+        // access. `slot` is bounds-checked above.
         unsafe {
-            let used_ptr = &raw mut KTHREAD_USED;
-            (*used_ptr)[slot] = false;
+            with_interrupts_disabled(|| {
+                let used_ptr = &raw mut KTHREAD_USED;
+                (*used_ptr)[slot] = false;
+            });
         }
     }
 }
@@ -169,6 +244,8 @@ pub extern "C" fn init_thread_entry() -> ! {
     // In a full kernel, this would load and execute /sbin/init.
     // For now, just loop.
     loop {
+        // SAFETY: `hlt` halts the CPU until an interrupt;
+        // it does not corrupt state and is safe in Ring 0.
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack));
         }

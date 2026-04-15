@@ -438,6 +438,12 @@ impl DmaCoherentPool {
                     for offset in 0..total_bytes {
                         core::ptr::write_volatile(ptr.add(offset), 0);
                     }
+                    // SFENCE ensures all preceding stores (the zero-init above)
+                    // are globally visible before the device may observe the buffer.
+                    // SAFETY: SFENCE is a valid x86_64 store-fence instruction with
+                    // no side effects beyond serializing store operations.
+                    #[cfg(target_arch = "x86_64")]
+                    core::arch::asm!("sfence", options(nostack, preserves_flags));
                 }
 
                 return Ok(buf);
@@ -571,6 +577,8 @@ impl DmaCoherentPool {
         // an SFENCE to ensure all preceding stores are globally
         // visible, which is sufficient for device synchronisation.
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: SFENCE is a valid x86_64 instruction that serializes store
+        // operations. It has no memory side effects and is safe to execute.
         unsafe {
             core::arch::asm!("sfence", options(nostack, preserves_flags));
         }
@@ -587,11 +595,17 @@ impl DmaCoherentPool {
             return Err(Error::InvalidArgument);
         }
 
-        // SAFETY: x86_64 is cache-coherent. LFENCE ensures all
-        // preceding loads are complete before subsequent reads.
+        // SAFETY: MFENCE is a full memory barrier that serializes all
+        // preceding load and store operations. It ensures that device
+        // writes (stores to shared memory visible via DMA) are ordered
+        // before any subsequent CPU reads. LFENCE alone is insufficient
+        // because it only orders loads, not device-side stores.
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: MFENCE is a valid x86_64 instruction with no side effects
+        // beyond serializing memory operations. It is safe to execute at
+        // any privilege level.
         unsafe {
-            core::arch::asm!("lfence", options(nostack, preserves_flags));
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
         }
 
         Ok(())

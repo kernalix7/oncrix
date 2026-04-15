@@ -24,6 +24,9 @@ Thumbs.db
 *.log
 core.[0-9]*
 
+# Temporary / utility directories
+tmp-igbkp/
+
 # QEMU
 *.iso
 *.img

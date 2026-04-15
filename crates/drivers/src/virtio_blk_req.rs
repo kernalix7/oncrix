@@ -74,6 +74,27 @@ pub const VDESC_NEXT: u16 = 0x01;
 pub const VDESC_WRITE: u16 = 0x02;
 
 // ---------------------------------------------------------------------------
+// Address translation
+// ---------------------------------------------------------------------------
+
+/// Convert a virtual address to a physical (DMA bus) address.
+///
+/// During early boot the kernel uses identity mapping, so virtual and
+/// physical addresses are equal. This function is the single callsite
+/// that must be updated when a proper virtual-memory layer is enabled.
+///
+/// # TODO
+/// Replace with a real page-table walk or IOMMU translation once the
+/// virtual-memory subsystem is fully initialised.
+#[inline]
+fn virt_to_phys(vaddr: u64) -> u64 {
+    // TODO: Implement proper virtual-to-physical translation.
+    // Currently assumes identity mapping during early boot; all callers
+    // must go through this helper so the transition is a single change.
+    vaddr
+}
+
+// ---------------------------------------------------------------------------
 // Virtqueue descriptor
 // ---------------------------------------------------------------------------
 
@@ -303,17 +324,17 @@ impl BlkRequestQueue {
 
     /// Return the physical address of the descriptor table.
     pub fn desc_addr(&self) -> u64 {
-        self.descs.as_ptr() as u64
+        virt_to_phys(self.descs.as_ptr() as u64)
     }
 
     /// Return the physical address of the available ring.
     pub fn avail_addr(&self) -> u64 {
-        &self.avail as *const AvailRing as u64
+        virt_to_phys(&self.avail as *const AvailRing as u64)
     }
 
     /// Return the physical address of the used ring.
     pub fn used_addr(&self) -> u64 {
-        &self.used as *const UsedRing as u64
+        virt_to_phys(&self.used as *const UsedRing as u64)
     }
 
     /// Submit a READ request.
@@ -396,7 +417,7 @@ impl BlkRequestQueue {
         };
         self.status[slot] = BLK_S_PENDING;
         self.descs[d0 as usize] = VirtqDesc {
-            addr: &self.headers[slot] as *const BlkReqHeader as u64,
+            addr: virt_to_phys(&self.headers[slot] as *const BlkReqHeader as u64),
             len: core::mem::size_of::<BlkReqHeader>() as u32,
             flags: VDESC_NEXT,
             next: d1,
@@ -404,7 +425,7 @@ impl BlkRequestQueue {
 
         // Descriptor 1: data buffer (skipped for flush with zero-len).
         self.descs[d1 as usize] = VirtqDesc {
-            addr: buf as u64,
+            addr: virt_to_phys(buf as u64),
             len: needed as u32,
             flags: if req_type == BLK_T_IN {
                 VDESC_WRITE | VDESC_NEXT
@@ -416,7 +437,7 @@ impl BlkRequestQueue {
 
         // Descriptor 2: status byte.
         self.descs[d2 as usize] = VirtqDesc {
-            addr: &self.status[slot] as *const u8 as u64,
+            addr: virt_to_phys(&self.status[slot] as *const u8 as u64),
             len: 1,
             flags: VDESC_WRITE,
             next: 0,
@@ -454,12 +475,16 @@ impl BlkRequestQueue {
         }
         // Scan new used-ring entries.
         // SAFETY: Reading the device-written used ring index with volatile.
+        // SAFETY: Reading the used ring idx field written by the device. Volatile
+        // read ensures we see the device's latest update.
         let used_idx = unsafe { core::ptr::read_volatile(&self.used.idx as *const u16) };
         let expected_head = self.inflight[slot].head;
         let mut found = false;
 
         while self.last_used_idx != used_idx {
             let ring_slot = (self.last_used_idx as usize) % QUEUE_DEPTH;
+            // SAFETY: `ring_slot` is bounded by QUEUE_DEPTH via modular arithmetic;
+            // the used ring is part of the virtqueue DMA region set up during init.
             let elem =
                 unsafe { core::ptr::read_volatile(&self.used.ring[ring_slot] as *const UsedElem) };
             self.last_used_idx = self.last_used_idx.wrapping_add(1);

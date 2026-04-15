@@ -351,9 +351,13 @@ impl<'a> FdtNode<'a> {
                         break;
                     }
                     // SAFETY: reading prop len + nameoff.
+                    // SAFETY: Pointer is within bounds (offset + 4 <= structure.len()).
+                    // read_unaligned handles potentially misaligned u32 in FDT structure.
                     let prop_len = u32::from_be(unsafe {
                         core::ptr::read_unaligned(structure.as_ptr().add(offset) as *const u32)
                     }) as usize;
+                    // SAFETY: Pointer is within bounds (offset + 8 <= structure.len()).
+                    // read_unaligned handles potentially misaligned u32.
                     let nameoff = u32::from_be(unsafe {
                         core::ptr::read_unaligned(structure.as_ptr().add(offset + 4) as *const u32)
                     });

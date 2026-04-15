@@ -131,6 +131,8 @@ impl DaxDevice {
                 // + size check); non-temporal stores bypass the cache and go directly
                 // to the persistent medium.
                 #[cfg(target_arch = "x86_64")]
+                // SAFETY: dst is within the mapped DAX region (validated by bounds check).
+                // Volatile writes ensure stores reach persistent memory. SFENCE serializes.
                 unsafe {
                     for (i, &byte) in src.iter().enumerate() {
                         core::ptr::write_volatile(dst.add(i), byte);
@@ -139,6 +141,7 @@ impl DaxDevice {
                     core::arch::asm!("sfence", options(nostack, nomem));
                 }
                 #[cfg(not(target_arch = "x86_64"))]
+                // SAFETY: dst is within the mapped DAX region (validated by bounds check).
                 unsafe {
                     core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
                 }

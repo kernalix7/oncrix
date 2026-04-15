@@ -582,6 +582,8 @@ impl Default for I8042Controller {
 
 fn port_inb(port: u16) -> u8 {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Reading from PS/2 I/O ports (0x60, 0x64) is a well-defined
+    // x86 platform operation on all supported hardware.
     unsafe {
         // SAFETY: Reading from PS/2 I/O ports (0x60, 0x64) is a well-defined
         // x86 platform operation on all supported hardware.
@@ -603,6 +605,8 @@ fn port_inb(port: u16) -> u8 {
 
 fn port_outb(port: u16, value: u8) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Writing to PS/2 I/O ports (0x60, 0x64) is a well-defined
+    // x86 platform operation on all supported hardware.
     unsafe {
         // SAFETY: Writing to PS/2 I/O ports (0x60, 0x64) is a well-defined
         // x86 platform operation on all supported hardware.

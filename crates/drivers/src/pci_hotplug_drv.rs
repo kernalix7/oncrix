@@ -214,6 +214,8 @@ impl HotplugSlot {
         for _ in 0..100_000 {
             if self.status() & STS_CMD_CPLT != 0 {
                 // Clear the CC status bit by writing 1.
+                // SAFETY: cap_base is a valid PCIe capability MMIO region; writing
+                // to the 16-bit status register to clear command-completed bit.
                 unsafe { write16(self.cap_base, SLOT_STS, STS_CMD_CPLT) }
                 return Ok(());
             }

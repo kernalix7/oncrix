@@ -397,18 +397,35 @@ impl CmosRtc {
 
     /// Reads a byte from a CMOS register at the given index.
     ///
-    /// # Safety
-    ///
-    /// Port I/O to 0x70/0x71 is safe on x86 systems; the RTC is a
-    /// platform-standard device present on all supported hardware.
+    /// The CMOS address-select and data-read form an atomic two-step
+    /// sequence. An interrupt (e.g. an NMI handler that also accesses
+    /// CMOS) between the two I/O instructions would corrupt the address
+    /// register, causing the read to return data from the wrong register.
+    /// Interrupts are therefore disabled for the duration of the pair.
     fn read_cmos(&self, reg: u8) -> u8 {
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: CMOS access requires the address-select and data-read
+        // to be atomic with respect to other CMOS accesses. We save and
+        // restore RFLAGS so any previously-enabled interrupts are resumed
+        // after the pair completes. The NMI disable bit (bit 7) is kept
+        // clear in the register index.
         unsafe {
-            // SAFETY: Writing the register index to port 0x70 then reading
-            // from 0x71 is the standard CMOS RTC access protocol. The NMI
-            // disable bit (bit 7) is kept clear.
+            let flags: u64;
+            // Save RFLAGS and disable interrupts for the atomic select+read.
+            core::arch::asm!(
+                "pushfq",
+                "pop {flags}",
+                "cli",
+                flags = out(reg) flags,
+                options(preserves_flags),
+            );
             port_outb(CMOS_ADDR_PORT, reg & 0x7F);
-            port_inb(CMOS_DATA_PORT)
+            let val = port_inb(CMOS_DATA_PORT);
+            // Restore interrupt flag only if it was set before we disabled it.
+            if flags & 0x200 != 0 {
+                core::arch::asm!("sti", options(preserves_flags, nomem, nostack));
+            }
+            val
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -419,17 +436,28 @@ impl CmosRtc {
 
     /// Writes a byte to a CMOS register at the given index.
     ///
-    /// # Safety
-    ///
-    /// Same rationale as `read_cmos`.
+    /// Same atomic-pair rationale as [`read_cmos`]: the address-select
+    /// and data-write must not be interrupted by another CMOS access.
     #[allow(dead_code)]
     fn write_cmos(&self, reg: u8, value: u8) {
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: Same as read_cmos — save/restore RFLAGS around the
+        // atomic select+write pair to prevent CMOS register corruption
+        // by concurrent interrupt handlers that access CMOS.
         unsafe {
-            // SAFETY: Standard CMOS write sequence: select register via 0x70,
-            // write value via 0x71. NMI disable bit kept clear.
+            let flags: u64;
+            core::arch::asm!(
+                "pushfq",
+                "pop {flags}",
+                "cli",
+                flags = out(reg) flags,
+                options(preserves_flags),
+            );
             port_outb(CMOS_ADDR_PORT, reg & 0x7F);
             port_outb(CMOS_DATA_PORT, value);
+            if flags & 0x200 != 0 {
+                core::arch::asm!("sti", options(preserves_flags, nomem, nostack));
+            }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -484,6 +512,9 @@ fn bin_to_bcd(bin: u8) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// Reads one byte from an x86 I/O port.
+///
+/// `nomem` is intentionally absent: port I/O has device-side effects that
+/// must not be reordered by the compiler relative to surrounding memory ops.
 #[cfg(target_arch = "x86_64")]
 unsafe fn port_inb(port: u16) -> u8 {
     let value: u8;
@@ -493,13 +524,16 @@ unsafe fn port_inb(port: u16) -> u8 {
             "in al, dx",
             in("dx") port,
             out("al") value,
-            options(nomem, nostack, preserves_flags),
+            options(nostack, preserves_flags),
         );
     }
     value
 }
 
 /// Writes one byte to an x86 I/O port.
+///
+/// `nomem` is intentionally absent: port I/O has device-side effects that
+/// must not be reordered by the compiler relative to surrounding memory ops.
 #[cfg(target_arch = "x86_64")]
 unsafe fn port_outb(port: u16, value: u8) {
     // SAFETY: Caller must ensure the port is valid for the target hardware.
@@ -508,7 +542,7 @@ unsafe fn port_outb(port: u16, value: u8) {
             "out dx, al",
             in("dx") port,
             in("al") value,
-            options(nomem, nostack, preserves_flags),
+            options(nostack, preserves_flags),
         );
     }
 }

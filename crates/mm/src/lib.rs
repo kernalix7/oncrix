@@ -456,6 +456,8 @@ pub mod page_buddy;
 #[allow(dead_code, clippy::all)]
 pub mod page_table_map;
 #[allow(dead_code, clippy::all)]
+pub mod page_table_ops;
+#[allow(dead_code, clippy::all)]
 pub mod slab_obj_cache;
 #[allow(dead_code, clippy::all)]
 pub mod swap_cgroup;
