@@ -152,6 +152,10 @@ pub struct VethEnd {
     rx_count: usize,
     /// Per-end traffic statistics.
     pub stats: VethStats,
+    /// Network namespace identifier (0 = initial namespace).
+    ns_id: u32,
+    /// Interface index within the namespace.
+    ifindex: u32,
 }
 
 impl VethEnd {
@@ -167,6 +171,8 @@ impl VethEnd {
             rx_tail: 0,
             rx_count: 0,
             stats: VethStats::new(),
+            ns_id: 0,
+            ifindex: 0,
         }
     }
 
@@ -256,6 +262,62 @@ impl VethEnd {
     /// Return the number of packets waiting in the receive ring.
     pub const fn rx_pending(&self) -> usize {
         self.rx_count
+    }
+
+    /// Return the network namespace identifier for this end.
+    pub const fn ns_id(&self) -> u32 {
+        self.ns_id
+    }
+
+    /// Set the network namespace identifier for this end.
+    ///
+    /// Moving an end to a different namespace allows veth pairs to
+    /// bridge traffic between network namespaces, which is the
+    /// primary use case for container networking.
+    pub fn set_ns_id(&mut self, ns_id: u32) {
+        self.ns_id = ns_id;
+    }
+
+    /// Return the interface index within the namespace.
+    pub const fn ifindex(&self) -> u32 {
+        self.ifindex
+    }
+
+    /// Set the interface index within the namespace.
+    pub fn set_ifindex(&mut self, ifindex: u32) {
+        self.ifindex = ifindex;
+    }
+
+    /// Bring the link up.
+    pub fn link_up(&mut self) {
+        self.link = LinkState::Up;
+    }
+
+    /// Bring the link down and drain the receive ring.
+    ///
+    /// When a link goes down, all buffered packets are discarded.
+    /// Returns the number of packets that were drained.
+    pub fn link_down(&mut self) -> usize {
+        self.link = LinkState::Down;
+        let drained = self.rx_count;
+        self.rx_head = 0;
+        self.rx_tail = 0;
+        self.rx_count = 0;
+        drained
+    }
+
+    /// Set the MAC address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the MAC is all-zeros
+    /// (reserved).
+    pub fn set_mac(&mut self, mac: [u8; 6]) -> Result<()> {
+        if mac == [0; 6] {
+            return Err(Error::InvalidArgument);
+        }
+        self.mac = mac;
+        Ok(())
     }
 }
 
@@ -364,19 +426,57 @@ pub enum VethSide {
 }
 
 // =========================================================================
+// VethLinkEvent — link state change notification
+// =========================================================================
+
+/// Notification generated when a veth end's link state changes.
+///
+/// Higher layers (e.g. routing, ARP) subscribe to these events
+/// to update their state when interfaces come up or go down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VethLinkEvent {
+    /// Pair identifier.
+    pub pair_id: u32,
+    /// Which side of the pair changed.
+    pub side: VethSide,
+    /// New link state after the change.
+    pub new_state: LinkState,
+    /// Network namespace of the affected end.
+    pub ns_id: u32,
+}
+
+// =========================================================================
 // VethRegistry
 // =========================================================================
+
+/// Maximum number of pending link events in the event ring.
+const MAX_LINK_EVENTS: usize = 64;
 
 /// System-wide registry of virtual Ethernet pairs.
 ///
 /// Manages up to [`MAX_PAIRS`] (32) veth pairs.  Each pair is
-/// identified by a monotonically increasing ID.
+/// identified by a monotonically increasing ID.  The registry also
+/// maintains a ring buffer of link state change events that can
+/// be polled by upper layers.
 pub struct VethRegistry {
     /// Pair slots.
     pairs: [VethPair; MAX_PAIRS],
     /// Next pair ID to assign.
     next_id: u32,
+    /// Next interface index to assign.
+    next_ifindex: u32,
+    /// Pending link events ring buffer.
+    events: [Option<VethLinkEvent>; MAX_LINK_EVENTS],
+    /// Write head for events ring.
+    event_head: usize,
+    /// Read tail for events ring.
+    event_tail: usize,
+    /// Number of events pending.
+    event_count: usize,
 }
+
+/// Compile-time initialiser for the event array.
+const EMPTY_EVENT: Option<VethLinkEvent> = None;
 
 impl Default for VethRegistry {
     fn default() -> Self {
@@ -390,12 +490,19 @@ impl VethRegistry {
         Self {
             pairs: [VethPair::EMPTY; MAX_PAIRS],
             next_id: 1,
+            next_ifindex: 1,
+            events: [EMPTY_EVENT; MAX_LINK_EVENTS],
+            event_head: 0,
+            event_tail: 0,
+            event_count: 0,
         }
     }
 
     /// Create a new veth pair with the given MAC addresses.
     ///
-    /// Both ends start in the [`LinkState::Down`] state.
+    /// Both ends start in the [`LinkState::Down`] state and are
+    /// assigned to the initial network namespace (ns_id = 0).
+    /// Each end receives a unique interface index.
     /// Returns the pair ID on success.
     ///
     /// # Errors
@@ -408,6 +515,13 @@ impl VethRegistry {
                 self.next_id = self.next_id.wrapping_add(1);
                 self.pairs[i] = VethPair::new(id, mac_a, mac_b);
                 self.pairs[i].in_use = true;
+                // Assign unique interface indexes
+                let if_a = self.next_ifindex;
+                self.next_ifindex = self.next_ifindex.wrapping_add(1);
+                let if_b = self.next_ifindex;
+                self.next_ifindex = self.next_ifindex.wrapping_add(1);
+                self.pairs[i].end_a.ifindex = if_a;
+                self.pairs[i].end_b.ifindex = if_b;
                 return Ok(id);
             }
         }
@@ -469,6 +583,201 @@ impl VethRegistry {
             }
         }
         count
+    }
+
+    /// Move one side of a veth pair to a different network
+    /// namespace.
+    ///
+    /// This is the core operation for container networking: one end
+    /// stays in the host namespace, the other is moved into the
+    /// container namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the pair does not exist.
+    pub fn set_ns(&mut self, pair_id: u32, side: VethSide, ns_id: u32) -> Result<()> {
+        let pair = self.find_pair(pair_id)?;
+        let end = match side {
+            VethSide::A => &mut pair.end_a,
+            VethSide::B => &mut pair.end_b,
+        };
+        end.ns_id = ns_id;
+        Ok(())
+    }
+
+    /// Return the network namespace IDs for both ends of a pair.
+    ///
+    /// Returns `(ns_id_a, ns_id_b)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the pair does not exist.
+    pub fn get_ns(&mut self, pair_id: u32) -> Result<(u32, u32)> {
+        let pair = self.find_pair(pair_id)?;
+        Ok((pair.end_a.ns_id, pair.end_b.ns_id))
+    }
+
+    /// Set the link state with event generation.
+    ///
+    /// Changes the link state and enqueues a [`VethLinkEvent`]
+    /// for upper-layer notification.  If bringing the link down,
+    /// the receive ring is drained.
+    ///
+    /// Returns the number of packets drained (0 for link-up).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the pair does not exist.
+    pub fn set_link_with_event(
+        &mut self,
+        pair_id: u32,
+        side: VethSide,
+        state: LinkState,
+    ) -> Result<usize> {
+        let pair = self.find_pair(pair_id)?;
+        let end = match side {
+            VethSide::A => &mut pair.end_a,
+            VethSide::B => &mut pair.end_b,
+        };
+        let drained = match state {
+            LinkState::Up => {
+                end.link_up();
+                0
+            }
+            LinkState::Down => end.link_down(),
+        };
+        let ns_id = end.ns_id;
+        self.push_event(VethLinkEvent {
+            pair_id,
+            side,
+            new_state: state,
+            ns_id,
+        });
+        Ok(drained)
+    }
+
+    /// Push a link event into the ring buffer.
+    ///
+    /// If the ring is full the oldest event is silently discarded.
+    fn push_event(&mut self, event: VethLinkEvent) {
+        if self.event_count >= MAX_LINK_EVENTS {
+            // Overwrite oldest
+            self.event_tail = (self.event_tail + 1) % MAX_LINK_EVENTS;
+            self.event_count -= 1;
+        }
+        self.events[self.event_head] = Some(event);
+        self.event_head = (self.event_head + 1) % MAX_LINK_EVENTS;
+        self.event_count += 1;
+    }
+
+    /// Poll the next pending link event.
+    ///
+    /// Returns `None` if no events are pending.
+    pub fn poll_event(&mut self) -> Option<VethLinkEvent> {
+        if self.event_count == 0 {
+            return None;
+        }
+        let event = self.events[self.event_tail].take();
+        self.event_tail = (self.event_tail + 1) % MAX_LINK_EVENTS;
+        self.event_count -= 1;
+        event
+    }
+
+    /// Return the number of pending link events.
+    pub const fn pending_events(&self) -> usize {
+        self.event_count
+    }
+
+    /// Transmit multiple packets from one side to the peer.
+    ///
+    /// Each packet slice in `packets` is transmitted in order.
+    /// Returns the number of packets successfully enqueued on the
+    /// peer.  Stops early if any single packet exceeds the MTU.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the pair does not exist.
+    /// Returns [`Error::InvalidArgument`] if any packet exceeds
+    /// the MTU.
+    pub fn bulk_xmit(&mut self, pair_id: u32, side: VethSide, packets: &[&[u8]]) -> Result<usize> {
+        let pair = self.find_pair(pair_id)?;
+        let mut sent = 0;
+        for packet in packets {
+            let result = match side {
+                VethSide::A => pair.xmit_a_to_b(packet)?,
+                VethSide::B => pair.xmit_b_to_a(packet)?,
+            };
+            if result {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Set the MTU on one side of a veth pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the pair does not exist.
+    /// Returns [`Error::InvalidArgument`] if the MTU is invalid.
+    pub fn set_mtu(&mut self, pair_id: u32, side: VethSide, mtu: u16) -> Result<()> {
+        let pair = self.find_pair(pair_id)?;
+        let end = match side {
+            VethSide::A => &mut pair.end_a,
+            VethSide::B => &mut pair.end_b,
+        };
+        end.set_mtu(mtu)
+    }
+
+    /// Return statistics for one side of a veth pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the pair does not exist.
+    pub fn get_stats(&mut self, pair_id: u32, side: VethSide) -> Result<VethStats> {
+        let pair = self.find_pair(pair_id)?;
+        let end = match side {
+            VethSide::A => &pair.end_a,
+            VethSide::B => &pair.end_b,
+        };
+        Ok(end.stats)
+    }
+
+    /// Reset statistics for one side of a veth pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the pair does not exist.
+    pub fn reset_stats(&mut self, pair_id: u32, side: VethSide) -> Result<()> {
+        let pair = self.find_pair(pair_id)?;
+        let end = match side {
+            VethSide::A => &mut pair.end_a,
+            VethSide::B => &mut pair.end_b,
+        };
+        end.stats.reset();
+        Ok(())
+    }
+
+    /// Find a pair by the interface index of either end.
+    ///
+    /// Returns the pair ID and which side matched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if no pair has the given
+    /// ifindex.
+    pub fn find_by_ifindex(&self, ifindex: u32) -> Result<(u32, VethSide)> {
+        for pair in &self.pairs {
+            if pair.in_use {
+                if pair.end_a.ifindex == ifindex {
+                    return Ok((pair.id, VethSide::A));
+                }
+                if pair.end_b.ifindex == ifindex {
+                    return Ok((pair.id, VethSide::B));
+                }
+            }
+        }
+        Err(Error::NotFound)
     }
 }
 

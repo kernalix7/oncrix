@@ -352,6 +352,12 @@ pub struct ConnTrackTable {
 /// Helper to create the `None`-initialised array at compile time.
 const EMPTY_ENTRY: Option<ConnTrackEntry> = None;
 
+impl Default for ConnTrackTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnTrackTable {
     /// Create a new empty connection tracking table.
     pub const fn new() -> Self {
@@ -684,6 +690,446 @@ impl ConnTrackTable {
         }
         n
     }
+
+    /// Perform a full GC sweep, removing all expired entries.
+    ///
+    /// Unlike [`Self::tick`], which decrements timeouts and
+    /// removes entries that drop to zero, `gc_sweep` scans for
+    /// entries that are already marked expired or inactive and
+    /// reclaims their slots.  This is useful for periodic
+    /// housekeeping independent of the tick rate.
+    ///
+    /// Returns the number of entries reclaimed.
+    pub fn gc_sweep(&mut self) -> usize {
+        let mut reclaimed = 0;
+        for slot in self.entries.iter_mut() {
+            if let Some(entry) = slot {
+                if !entry.active || entry.is_expired() {
+                    *slot = None;
+                    self.count = self.count.saturating_sub(1);
+                    self.total_expired = self.total_expired.saturating_add(1);
+                    reclaimed += 1;
+                }
+            }
+        }
+        reclaimed
+    }
+
+    /// Perform a targeted GC sweep, removing entries in a specific
+    /// state that have exceeded a given age threshold.
+    ///
+    /// Returns the number of entries removed.
+    pub fn gc_sweep_by_state(&mut self, state: ConnTrackState, max_age: u64) -> usize {
+        let threshold = self.current_tick.saturating_sub(max_age);
+        let mut removed = 0;
+        for slot in self.entries.iter_mut() {
+            if let Some(entry) = slot {
+                if entry.active && entry.state == state && entry.created_tick < threshold {
+                    *slot = None;
+                    self.count = self.count.saturating_sub(1);
+                    self.total_expired = self.total_expired.saturating_add(1);
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
+    /// Apply a custom timeout configuration when refreshing an
+    /// entry.
+    ///
+    /// Looks up the entry matching `tuple` and sets its timeout
+    /// according to the provided [`ConnTrackTimeouts`] table rather
+    /// than the compiled-in defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if no matching entry exists.
+    pub fn refresh_with_timeouts(
+        &mut self,
+        tuple: &ConnTrackTuple,
+        timeouts: &ConnTrackTimeouts,
+    ) -> Result<()> {
+        match self.lookup_mut(tuple) {
+            Some((entry, _)) => {
+                entry.timeout = timeouts.timeout_for(entry.original.protocol, entry.state);
+                Ok(())
+            }
+            None => Err(Error::NotFound),
+        }
+    }
+}
+
+// =========================================================================
+// NatType — SNAT / DNAT classification
+// =========================================================================
+
+/// Type of NAT applied to a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NatType {
+    /// No NAT is applied.
+    #[default]
+    None,
+    /// Source NAT — rewrite the source address/port of outgoing
+    /// packets and the destination of returning packets.
+    Snat,
+    /// Destination NAT — rewrite the destination address/port of
+    /// incoming packets and the source of returning packets.
+    Dnat,
+}
+
+// =========================================================================
+// NatBinding — per-connection NAT translation
+// =========================================================================
+
+/// NAT binding attached to a conntrack entry.
+///
+/// Stores the rewritten address and port so that packets in both
+/// the original and reply directions can be translated correctly.
+///
+/// For SNAT the binding records the translated source; for DNAT
+/// the binding records the translated destination.
+#[derive(Debug, Clone, Copy)]
+pub struct NatBinding {
+    /// Type of NAT.
+    pub nat_type: NatType,
+    /// Rewritten IPv4 address.
+    pub rewrite_ip: [u8; 4],
+    /// Rewritten port (0 means port is unchanged).
+    pub rewrite_port: u16,
+    /// Original IPv4 address before translation.
+    pub original_ip: [u8; 4],
+    /// Original port before translation.
+    pub original_port: u16,
+    /// Number of packets translated.
+    pub translated_packets: u64,
+}
+
+impl NatBinding {
+    /// A binding with no translation.
+    pub const fn none() -> Self {
+        Self {
+            nat_type: NatType::None,
+            rewrite_ip: [0; 4],
+            rewrite_port: 0,
+            original_ip: [0; 4],
+            original_port: 0,
+            translated_packets: 0,
+        }
+    }
+
+    /// Create a SNAT binding.
+    ///
+    /// Records that the original source address/port should be
+    /// rewritten to `new_ip`/`new_port` on outgoing packets, and
+    /// the reverse translation applied on reply packets.
+    pub const fn snat(
+        original_ip: [u8; 4],
+        original_port: u16,
+        new_ip: [u8; 4],
+        new_port: u16,
+    ) -> Self {
+        Self {
+            nat_type: NatType::Snat,
+            rewrite_ip: new_ip,
+            rewrite_port: new_port,
+            original_ip,
+            original_port,
+            translated_packets: 0,
+        }
+    }
+
+    /// Create a DNAT binding.
+    ///
+    /// Records that the original destination address/port should be
+    /// rewritten to `new_ip`/`new_port` on incoming packets, and
+    /// the reverse translation applied on reply packets.
+    pub const fn dnat(
+        original_ip: [u8; 4],
+        original_port: u16,
+        new_ip: [u8; 4],
+        new_port: u16,
+    ) -> Self {
+        Self {
+            nat_type: NatType::Dnat,
+            rewrite_ip: new_ip,
+            rewrite_port: new_port,
+            original_ip,
+            original_port,
+            translated_packets: 0,
+        }
+    }
+
+    /// Return whether this binding performs any translation.
+    pub const fn is_active(&self) -> bool {
+        !matches!(self.nat_type, NatType::None)
+    }
+
+    /// Apply the NAT translation to a mutable 5-tuple.
+    ///
+    /// For SNAT: rewrites `tuple.src_ip` and `tuple.src_port`.
+    /// For DNAT: rewrites `tuple.dst_ip` and `tuple.dst_port`.
+    ///
+    /// Returns `true` if a translation was applied.
+    pub fn translate(&mut self, tuple: &mut ConnTrackTuple) -> bool {
+        match self.nat_type {
+            NatType::None => false,
+            NatType::Snat => {
+                tuple.src_ip = self.rewrite_ip;
+                if self.rewrite_port != 0 {
+                    tuple.src_port = self.rewrite_port;
+                }
+                self.translated_packets = self.translated_packets.wrapping_add(1);
+                true
+            }
+            NatType::Dnat => {
+                tuple.dst_ip = self.rewrite_ip;
+                if self.rewrite_port != 0 {
+                    tuple.dst_port = self.rewrite_port;
+                }
+                self.translated_packets = self.translated_packets.wrapping_add(1);
+                true
+            }
+        }
+    }
+
+    /// Apply the reverse NAT translation to a reply-direction
+    /// tuple.
+    ///
+    /// For SNAT: rewrites `tuple.dst_ip` and `tuple.dst_port`
+    /// back to the original source.
+    /// For DNAT: rewrites `tuple.src_ip` and `tuple.src_port`
+    /// back to the original destination.
+    ///
+    /// Returns `true` if a translation was applied.
+    pub fn reverse_translate(&mut self, tuple: &mut ConnTrackTuple) -> bool {
+        match self.nat_type {
+            NatType::None => false,
+            NatType::Snat => {
+                tuple.dst_ip = self.original_ip;
+                if self.original_port != 0 {
+                    tuple.dst_port = self.original_port;
+                }
+                self.translated_packets = self.translated_packets.wrapping_add(1);
+                true
+            }
+            NatType::Dnat => {
+                tuple.src_ip = self.original_ip;
+                if self.original_port != 0 {
+                    tuple.src_port = self.original_port;
+                }
+                self.translated_packets = self.translated_packets.wrapping_add(1);
+                true
+            }
+        }
+    }
+}
+
+// =========================================================================
+// ConnTrackTimeouts — configurable per-protocol timeouts
+// =========================================================================
+
+/// Per-protocol timeout configuration for connection tracking.
+///
+/// Allows the administrator to override the compiled-in defaults
+/// for each protocol and state.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnTrackTimeouts {
+    /// Timeout for new TCP connections (SYN sent, awaiting
+    /// SYN-ACK).
+    pub tcp_new: u64,
+    /// Timeout for established TCP connections.
+    pub tcp_established: u64,
+    /// Timeout for TCP connections in FIN-WAIT / CLOSE-WAIT.
+    pub tcp_close: u64,
+    /// Timeout for new/established UDP flows.
+    pub udp_timeout: u64,
+    /// Timeout for ICMP flows.
+    pub icmp_timeout: u64,
+    /// Default timeout for protocols not otherwise configured.
+    pub generic_timeout: u64,
+}
+
+impl Default for ConnTrackTimeouts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnTrackTimeouts {
+    /// Create timeout configuration using compiled-in defaults.
+    pub const fn new() -> Self {
+        Self {
+            tcp_new: NEW_TIMEOUT,
+            tcp_established: TCP_ESTABLISHED_TIMEOUT,
+            tcp_close: 120,
+            udp_timeout: UDP_ESTABLISHED_TIMEOUT,
+            icmp_timeout: ICMP_TIMEOUT,
+            generic_timeout: NEW_TIMEOUT,
+        }
+    }
+
+    /// Return the timeout for a protocol in a given conntrack state.
+    pub const fn timeout_for(&self, protocol: ConnTrackProtocol, state: ConnTrackState) -> u64 {
+        match protocol {
+            ConnTrackProtocol::Tcp => match state {
+                ConnTrackState::New => self.tcp_new,
+                ConnTrackState::Established => self.tcp_established,
+                ConnTrackState::Related => self.tcp_established,
+                ConnTrackState::Invalid => self.tcp_close,
+            },
+            ConnTrackProtocol::Udp => self.udp_timeout,
+            ConnTrackProtocol::Icmp => self.icmp_timeout,
+            ConnTrackProtocol::Other(_) => self.generic_timeout,
+        }
+    }
+}
+
+// =========================================================================
+// NatTable — system-wide NAT binding table
+// =========================================================================
+
+/// Maximum number of NAT bindings in the system.
+const NAT_TABLE_SIZE: usize = 128;
+
+/// A single NAT table entry associating a conntrack 5-tuple with
+/// a NAT binding.
+#[derive(Debug, Clone, Copy)]
+struct NatEntry {
+    /// Whether this slot is active.
+    active: bool,
+    /// The original 5-tuple of the tracked connection.
+    original: ConnTrackTuple,
+    /// The NAT binding applied to this connection.
+    binding: NatBinding,
+}
+
+impl NatEntry {
+    /// An empty entry.
+    const EMPTY: Self = Self {
+        active: false,
+        original: ConnTrackTuple::new([0; 4], [0; 4], 0, 0, ConnTrackProtocol::Tcp),
+        binding: NatBinding::none(),
+    };
+}
+
+/// System-wide NAT binding table.
+///
+/// Maps conntrack 5-tuples to their NAT bindings (SNAT or DNAT).
+/// Used by the forwarding path to translate packet headers.
+pub struct NatTable {
+    /// NAT entries.
+    entries: [NatEntry; NAT_TABLE_SIZE],
+    /// Number of active bindings.
+    count: usize,
+}
+
+impl Default for NatTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NatTable {
+    /// Create an empty NAT table.
+    pub const fn new() -> Self {
+        Self {
+            entries: [NatEntry::EMPTY; NAT_TABLE_SIZE],
+            count: 0,
+        }
+    }
+
+    /// Return the number of active NAT bindings.
+    pub const fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Add a NAT binding for a connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the table is full.
+    /// Returns [`Error::AlreadyExists`] if a binding already
+    /// exists for this tuple.
+    pub fn add(&mut self, original: &ConnTrackTuple, binding: NatBinding) -> Result<()> {
+        // Check for duplicate
+        for entry in self.entries.iter() {
+            if entry.active && entry.original == *original {
+                return Err(Error::AlreadyExists);
+            }
+        }
+        // Find a free slot
+        for entry in self.entries.iter_mut() {
+            if !entry.active {
+                entry.active = true;
+                entry.original = *original;
+                entry.binding = binding;
+                self.count += 1;
+                return Ok(());
+            }
+        }
+        Err(Error::OutOfMemory)
+    }
+
+    /// Look up the NAT binding for a connection.
+    pub fn lookup(&self, original: &ConnTrackTuple) -> Option<&NatBinding> {
+        for entry in self.entries.iter() {
+            if entry.active && entry.original == *original {
+                return Some(&entry.binding);
+            }
+        }
+        None
+    }
+
+    /// Look up the NAT binding for a connection (mutable).
+    pub fn lookup_mut(&mut self, original: &ConnTrackTuple) -> Option<&mut NatBinding> {
+        for entry in self.entries.iter_mut() {
+            if entry.active && entry.original == *original {
+                return Some(&mut entry.binding);
+            }
+        }
+        None
+    }
+
+    /// Remove the NAT binding for a connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if no binding exists.
+    pub fn remove(&mut self, original: &ConnTrackTuple) -> Result<()> {
+        for entry in self.entries.iter_mut() {
+            if entry.active && entry.original == *original {
+                entry.active = false;
+                self.count = self.count.saturating_sub(1);
+                return Ok(());
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    /// Remove all NAT bindings associated with entries not present
+    /// in the given conntrack table.
+    ///
+    /// Returns the number of stale bindings removed.
+    pub fn gc_stale(&mut self, ct_table: &ConnTrackTable) -> usize {
+        let mut removed = 0;
+        for entry in self.entries.iter_mut() {
+            if entry.active && ct_table.lookup(&entry.original).is_none() {
+                entry.active = false;
+                self.count = self.count.saturating_sub(1);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Remove all bindings.
+    pub fn flush(&mut self) {
+        for entry in self.entries.iter_mut() {
+            entry.active = false;
+        }
+        self.count = 0;
+    }
 }
 
 // =========================================================================
@@ -748,6 +1194,12 @@ pub struct ExpectationTable {
 
 /// Compile-time initialiser for the array.
 const EMPTY_EXPECT: Option<Expectation> = None;
+
+impl Default for ExpectationTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ExpectationTable {
     /// Create a new empty expectation table.
@@ -848,18 +1300,28 @@ impl ExpectationTable {
 // ConnTracker — top-level API
 // =========================================================================
 
-/// Top-level connection tracker combining the connection table and
-/// expectation table.
+/// Top-level connection tracker combining the connection table,
+/// expectation table, NAT table, and configurable timeouts.
 ///
 /// This is the primary API for the firewall / network stack to
-/// classify packets by connection state.
+/// classify packets by connection state and perform NAT.
 pub struct ConnTracker {
     /// Connection tracking table.
     pub table: ConnTrackTable,
     /// Expectation table for related connections.
     pub expectations: ExpectationTable,
+    /// NAT binding table.
+    pub nat: NatTable,
+    /// Per-protocol timeout configuration.
+    pub timeouts: ConnTrackTimeouts,
     /// Whether connection tracking is enabled.
     enabled: bool,
+}
+
+impl Default for ConnTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConnTracker {
@@ -868,6 +1330,8 @@ impl ConnTracker {
         Self {
             table: ConnTrackTable::new(),
             expectations: ExpectationTable::new(),
+            nat: NatTable::new(),
+            timeouts: ConnTrackTimeouts::new(),
             enabled: true,
         }
     }
@@ -905,7 +1369,7 @@ impl ConnTracker {
             return Ok(ConnTrackState::New);
         }
 
-        // Check expectations first — a matching expectation means
+        // Check expectations first -- a matching expectation means
         // the packet is RELATED
         if let Some(_master) = self.expectations.check_and_consume(tuple) {
             // Insert as a new entry but mark as RELATED
@@ -922,16 +1386,123 @@ impl ConnTracker {
         self.table.process_packet(tuple, packet_len, tcp_flags)
     }
 
-    /// Advance the tick counter on both tables.
+    /// Process a packet with NAT translation.
+    ///
+    /// First classifies the packet through connection tracking,
+    /// then applies any configured NAT binding.  The `tuple` is
+    /// modified in place if a NAT translation is applied.
+    ///
+    /// Returns a pair of (conntrack state, whether NAT was applied).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the conntrack table is
+    /// full.
+    pub fn process_with_nat(
+        &mut self,
+        tuple: &mut ConnTrackTuple,
+        packet_len: u64,
+        tcp_flags: u16,
+    ) -> Result<(ConnTrackState, bool)> {
+        // Save original tuple for NAT lookup before potential
+        // modification
+        let orig = *tuple;
+        let state = self.process(&orig, packet_len, tcp_flags)?;
+
+        // Look for an existing NAT binding
+        let (_, is_reply) = self
+            .table
+            .lookup(&orig)
+            .map(|(_, r)| ((), r))
+            .unwrap_or(((), false));
+
+        let natted = if let Some(binding) = self.nat.lookup_mut(&orig) {
+            if is_reply {
+                binding.reverse_translate(tuple)
+            } else {
+                binding.translate(tuple)
+            }
+        } else {
+            false
+        };
+
+        Ok((state, natted))
+    }
+
+    /// Add a SNAT binding for a tracked connection.
+    ///
+    /// Rewrites the source address/port of packets in the original
+    /// direction and the destination of reply packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the connection is not tracked.
+    /// Returns [`Error::OutOfMemory`] if the NAT table is full.
+    /// Returns [`Error::AlreadyExists`] if a NAT binding already
+    /// exists for this connection.
+    pub fn add_snat(
+        &mut self,
+        original: &ConnTrackTuple,
+        new_ip: [u8; 4],
+        new_port: u16,
+    ) -> Result<()> {
+        // Verify the connection is tracked
+        if self.table.lookup(original).is_none() {
+            return Err(Error::NotFound);
+        }
+        let binding = NatBinding::snat(original.src_ip, original.src_port, new_ip, new_port);
+        self.nat.add(original, binding)
+    }
+
+    /// Add a DNAT binding for a tracked connection.
+    ///
+    /// Rewrites the destination address/port of packets in the
+    /// original direction and the source of reply packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the connection is not tracked.
+    /// Returns [`Error::OutOfMemory`] if the NAT table is full.
+    /// Returns [`Error::AlreadyExists`] if a NAT binding already
+    /// exists for this connection.
+    pub fn add_dnat(
+        &mut self,
+        original: &ConnTrackTuple,
+        new_ip: [u8; 4],
+        new_port: u16,
+    ) -> Result<()> {
+        // Verify the connection is tracked
+        if self.table.lookup(original).is_none() {
+            return Err(Error::NotFound);
+        }
+        let binding = NatBinding::dnat(original.dst_ip, original.dst_port, new_ip, new_port);
+        self.nat.add(original, binding)
+    }
+
+    /// Advance the tick counter on all tables and expire stale
+    /// entries.
     pub fn tick(&mut self, ticks: u64) {
         self.table.tick(ticks);
         self.expectations.tick(ticks);
     }
 
-    /// Flush all connections and expectations.
+    /// Perform a full garbage collection sweep.
+    ///
+    /// Removes expired conntrack entries, then cleans up stale NAT
+    /// bindings that no longer have a corresponding conntrack entry.
+    ///
+    /// Returns `(conntrack_removed, nat_removed)`.
+    pub fn gc_sweep(&mut self) -> (usize, usize) {
+        let ct_removed = self.table.gc_sweep();
+        let nat_removed = self.nat.gc_stale(&self.table);
+        (ct_removed, nat_removed)
+    }
+
+    /// Flush all connections, expectations, and NAT bindings.
     pub fn flush(&mut self) {
         self.table.flush();
         self.expectations.flush();
+        self.nat.flush();
     }
 }
 

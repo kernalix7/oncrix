@@ -45,6 +45,9 @@ const MAX_MIGRATION_PATHS: usize = 16;
 /// Maximum pending migration requests.
 const MAX_MIGRATION_REQUESTS: usize = 256;
 
+/// Maximum number of tracked pages for access frequency monitoring.
+const MAX_TRACKED_PAGES: usize = 1024;
+
 /// Default promotion threshold (access count above which a page is
 /// promoted to a faster tier).
 const DEFAULT_PROMOTE_THRESHOLD: u64 = 16;
@@ -52,6 +55,12 @@ const DEFAULT_PROMOTE_THRESHOLD: u64 = 16;
 /// Default demotion threshold (idle cycles after which a page is
 /// demoted to a slower tier).
 const DEFAULT_DEMOTE_THRESHOLD: u64 = 64;
+
+/// Tier utilization percentage at which demotion pressure begins.
+const DEMOTION_PRESSURE_PCT: u8 = 85;
+
+/// Tier utilization percentage considered critical (immediate demotion).
+const CRITICAL_PRESSURE_PCT: u8 = 95;
 
 /// Standard page size in bytes (4 KiB).
 const PAGE_SIZE: u64 = 4096;
@@ -74,6 +83,86 @@ pub enum MemoryTierType {
     /// Persistent Memory (e.g., Intel Optane) — byte-addressable
     /// NVRAM with higher latency than DRAM.
     Pmem,
+}
+
+// -------------------------------------------------------------------
+// TierAllocResult
+// -------------------------------------------------------------------
+
+/// Result of a tier-aware page allocation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierAllocResult {
+    /// Tier ID where the page was allocated.
+    pub tier_id: u8,
+    /// NUMA node ID within the tier.
+    pub node_id: u8,
+}
+
+// -------------------------------------------------------------------
+// PageAccessEntry
+// -------------------------------------------------------------------
+
+/// Access frequency tracking entry for a single page.
+///
+/// Records access and idle counts so the tier scanner can decide
+/// whether a page should be promoted (hot) or demoted (cold).
+#[derive(Debug, Clone, Copy)]
+pub struct PageAccessEntry {
+    /// Physical frame number.
+    pub pfn: u64,
+    /// Tier the page currently resides in.
+    pub current_tier: u8,
+    /// Cumulative access count since last scan.
+    pub access_count: u64,
+    /// Cumulative idle cycles since last access.
+    pub idle_cycles: u64,
+    /// Whether this tracking slot is in use.
+    pub active: bool,
+}
+
+impl PageAccessEntry {
+    /// Creates an empty, inactive entry.
+    const fn empty() -> Self {
+        Self {
+            pfn: 0,
+            current_tier: 0,
+            access_count: 0,
+            idle_cycles: 0,
+            active: false,
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// PressureLevel
+// -------------------------------------------------------------------
+
+/// Memory pressure level for a tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureLevel {
+    /// Utilization below the demotion threshold; no action needed.
+    None,
+    /// Utilization above the soft threshold; background demotion
+    /// should begin.
+    Low,
+    /// Utilization above the critical threshold; aggressive demotion
+    /// required.
+    Critical,
+}
+
+// -------------------------------------------------------------------
+// ScanResult
+// -------------------------------------------------------------------
+
+/// Summary returned by [`TierRegistry::scan_and_queue`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanResult {
+    /// Number of new promotion requests queued.
+    pub promotions_queued: usize,
+    /// Number of new demotion requests queued.
+    pub demotions_queued: usize,
+    /// Number of pages skipped (thresholds not met).
+    pub skipped: usize,
 }
 
 // -------------------------------------------------------------------
@@ -128,6 +217,33 @@ impl TierNode {
     /// Returns `true` if the node has available capacity.
     pub const fn has_capacity(&self) -> bool {
         self.used_pages < self.total_pages
+    }
+
+    /// Returns the average of read and write latency in nanoseconds.
+    ///
+    /// Useful for ranking nodes within a tier when latencies are
+    /// asymmetric (e.g., PMEM write >> read).
+    pub const fn average_latency_ns(&self) -> u32 {
+        (self.read_latency_ns + self.write_latency_ns) / 2
+    }
+
+    /// Computes a composite performance score for this node.
+    ///
+    /// Lower scores indicate better performance.  The formula
+    /// weighs latency heavily and rewards higher bandwidth:
+    ///
+    /// `score = avg_latency_ns * 256 / max(read_bw_mbs, 1)`
+    ///
+    /// The factor 256 avoids floating-point while keeping the
+    /// result distinguishable for nodes with similar latencies.
+    pub const fn perf_score(&self) -> u64 {
+        let avg_lat = self.average_latency_ns() as u64;
+        let bw = if self.read_bandwidth_mbs > 0 {
+            self.read_bandwidth_mbs as u64
+        } else {
+            1
+        };
+        avg_lat.saturating_mul(256) / bw
     }
 }
 
@@ -256,6 +372,44 @@ impl MemoryTier {
             }
         }
         best_id
+    }
+
+    /// Selects the best node in this tier for allocation.
+    ///
+    /// Prefers the node with the lowest performance score (fastest)
+    /// among those that still have free capacity.  Falls back to the
+    /// node with the most free pages if all scores are identical.
+    pub fn best_alloc_node(&self) -> Option<u8> {
+        let mut best_id: Option<u8> = None;
+        let mut best_score: u64 = u64::MAX;
+        let mut best_free: u64 = 0;
+
+        for i in 0..self.node_count {
+            let node = &self.nodes[i];
+            if !node.active || !node.has_capacity() {
+                continue;
+            }
+            let score = node.perf_score();
+            let free = node.free_pages();
+            if score < best_score || (score == best_score && free > best_free) {
+                best_score = score;
+                best_free = free;
+                best_id = Some(node.node_id);
+            }
+        }
+        best_id
+    }
+
+    /// Returns the current memory pressure level of this tier.
+    pub fn pressure_level(&self) -> PressureLevel {
+        let pct = self.utilization_pct();
+        if pct >= CRITICAL_PRESSURE_PCT {
+            PressureLevel::Critical
+        } else if pct >= DEMOTION_PRESSURE_PCT {
+            PressureLevel::Low
+        } else {
+            PressureLevel::None
+        }
     }
 }
 
@@ -387,10 +541,11 @@ pub struct TierStats {
 // -------------------------------------------------------------------
 
 /// Central registry managing all memory tiers, migration paths,
-/// and pending migration requests.
+/// pending migration requests, and page access frequency tracking.
 ///
 /// The registry enforces tier ordering by rank, validates migration
-/// paths, and processes promotion/demotion requests.
+/// paths, processes promotion/demotion requests, and maintains an
+/// access tracker to decide which pages should move between tiers.
 pub struct TierRegistry {
     /// Registered memory tiers.
     tiers: [MemoryTier; MAX_TIERS],
@@ -408,6 +563,10 @@ pub struct TierRegistry {
     promote_threshold: u64,
     /// Demotion threshold (idle cycles).
     demote_threshold: u64,
+    /// Access frequency tracker for pages.
+    tracker: [PageAccessEntry; MAX_TRACKED_PAGES],
+    /// Number of active entries in the tracker.
+    tracker_count: usize,
     /// Aggregate statistics.
     stats: TierStats,
 }
@@ -430,6 +589,8 @@ impl TierRegistry {
             request_count: 0,
             promote_threshold: DEFAULT_PROMOTE_THRESHOLD,
             demote_threshold: DEFAULT_DEMOTE_THRESHOLD,
+            tracker: [PageAccessEntry::empty(); MAX_TRACKED_PAGES],
+            tracker_count: 0,
             stats: TierStats {
                 promotions_attempted: 0,
                 promotions_succeeded: 0,
@@ -934,5 +1095,444 @@ impl TierRegistry {
         self.requests[self.request_count] = req;
         self.request_count += 1;
         Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Tier-aware page allocation
+    // ---------------------------------------------------------------
+
+    /// Allocates a page from the best available tier.
+    ///
+    /// Tries the fastest tier (lowest rank) first.  If that tier has
+    /// no capacity, falls back to progressively slower tiers.
+    /// Returns the tier ID and node ID where the page was allocated,
+    /// or [`Error::OutOfMemory`] if every tier is full.
+    ///
+    /// This is the primary allocation entry point for tier-aware
+    /// code paths.  The caller is responsible for actually allocating
+    /// the physical frame from the node's frame allocator; this
+    /// method only updates tier bookkeeping.
+    pub fn alloc_page(&mut self) -> Result<TierAllocResult> {
+        // Build a rank-ordered list of active tier indices.
+        let mut ordered: [usize; MAX_TIERS] = [0; MAX_TIERS];
+        let mut count = 0usize;
+        for (i, tier) in self.tiers.iter().enumerate() {
+            if tier.active {
+                ordered[count] = i;
+                count += 1;
+            }
+        }
+        // Insertion sort by rank (tiny array).
+        for i in 1..count {
+            let key = ordered[i];
+            let key_rank = self.tiers[key].rank;
+            let mut j = i;
+            while j > 0 && self.tiers[ordered[j - 1]].rank > key_rank {
+                ordered[j] = ordered[j - 1];
+                j -= 1;
+            }
+            ordered[j] = key;
+        }
+
+        // Walk tiers in rank order and try to find a node with
+        // capacity.
+        for &idx in &ordered[..count] {
+            let tier = &self.tiers[idx];
+            if let Some(node_id) = tier.best_alloc_node() {
+                let tier_id = tier.id;
+                // Update bookkeeping.
+                self.tiers[idx].used_pages = self.tiers[idx].used_pages.saturating_add(1);
+                // Update the specific node.
+                for n in 0..self.tiers[idx].node_count {
+                    if self.tiers[idx].nodes[n].active
+                        && self.tiers[idx].nodes[n].node_id == node_id
+                    {
+                        self.tiers[idx].nodes[n].used_pages += 1;
+                        break;
+                    }
+                }
+                return Ok(TierAllocResult { tier_id, node_id });
+            }
+        }
+        Err(Error::OutOfMemory)
+    }
+
+    /// Allocates a page preferring the given NUMA `preferred_node`.
+    ///
+    /// If the preferred node has capacity, the page is allocated
+    /// there.  Otherwise falls back to the same tier, then to
+    /// slower tiers via [`alloc_page`](Self::alloc_page).
+    pub fn alloc_page_near(&mut self, preferred_node: u8) -> Result<TierAllocResult> {
+        // Search all tiers for the preferred node.
+        for (idx, tier) in self.tiers.iter().enumerate() {
+            if !tier.active {
+                continue;
+            }
+            for n in 0..tier.node_count {
+                let node = &tier.nodes[n];
+                if node.active && node.node_id == preferred_node && node.has_capacity() {
+                    let tier_id = tier.id;
+                    self.tiers[idx].used_pages = self.tiers[idx].used_pages.saturating_add(1);
+                    self.tiers[idx].nodes[n].used_pages += 1;
+                    return Ok(TierAllocResult {
+                        tier_id,
+                        node_id: preferred_node,
+                    });
+                }
+            }
+        }
+        // Preferred node full or not found; generic fallback.
+        self.alloc_page()
+    }
+
+    /// Frees a page that was previously allocated from a tier.
+    ///
+    /// Decrements the used-page counters for the given tier and
+    /// node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the tier or node does not
+    /// exist.
+    pub fn free_page(&mut self, tier_id: u8, node_id: u8) -> Result<()> {
+        let idx = self.find_tier_index(tier_id).ok_or(Error::NotFound)?;
+        self.tiers[idx].used_pages = self.tiers[idx].used_pages.saturating_sub(1);
+        for n in 0..self.tiers[idx].node_count {
+            if self.tiers[idx].nodes[n].active && self.tiers[idx].nodes[n].node_id == node_id {
+                self.tiers[idx].nodes[n].used_pages =
+                    self.tiers[idx].nodes[n].used_pages.saturating_sub(1);
+                return Ok(());
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    // ---------------------------------------------------------------
+    // Access frequency tracking
+    // ---------------------------------------------------------------
+
+    /// Begins tracking access frequency for a page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the tracker is full.
+    /// Returns [`Error::AlreadyExists`] if the PFN is already
+    /// tracked.
+    pub fn track_page(&mut self, pfn: u64, current_tier: u8) -> Result<()> {
+        // Check for duplicate.
+        for entry in &self.tracker[..self.tracker_count] {
+            if entry.active && entry.pfn == pfn {
+                return Err(Error::AlreadyExists);
+            }
+        }
+        if self.tracker_count >= MAX_TRACKED_PAGES {
+            return Err(Error::OutOfMemory);
+        }
+        self.tracker[self.tracker_count] = PageAccessEntry {
+            pfn,
+            current_tier,
+            access_count: 0,
+            idle_cycles: 0,
+            active: true,
+        };
+        self.tracker_count += 1;
+        Ok(())
+    }
+
+    /// Removes a page from access frequency tracking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the PFN is not tracked.
+    pub fn untrack_page(&mut self, pfn: u64) -> Result<()> {
+        let pos = (0..self.tracker_count)
+            .find(|&i| self.tracker[i].active && self.tracker[i].pfn == pfn)
+            .ok_or(Error::NotFound)?;
+
+        self.tracker_count -= 1;
+        if pos < self.tracker_count {
+            self.tracker[pos] = self.tracker[self.tracker_count];
+        }
+        self.tracker[self.tracker_count] = PageAccessEntry::empty();
+        Ok(())
+    }
+
+    /// Records an access to a tracked page.
+    ///
+    /// Increments the access counter and resets the idle counter.
+    /// If the page is not tracked, this is a no-op (best-effort).
+    pub fn record_access(&mut self, pfn: u64) {
+        for entry in &mut self.tracker[..self.tracker_count] {
+            if entry.active && entry.pfn == pfn {
+                entry.access_count = entry.access_count.saturating_add(1);
+                entry.idle_cycles = 0;
+                return;
+            }
+        }
+    }
+
+    /// Advances the idle cycle counter for all tracked pages.
+    ///
+    /// Call this periodically (e.g., from a timer tick) to age
+    /// pages.  Pages that are not accessed between ticks accumulate
+    /// idle cycles and eventually cross the demotion threshold.
+    pub fn tick_idle(&mut self) {
+        for entry in &mut self.tracker[..self.tracker_count] {
+            if entry.active {
+                entry.idle_cycles = entry.idle_cycles.saturating_add(1);
+            }
+        }
+    }
+
+    /// Returns the number of pages currently being tracked.
+    pub const fn tracked_page_count(&self) -> usize {
+        self.tracker_count
+    }
+
+    // ---------------------------------------------------------------
+    // Pressure-based demotion
+    // ---------------------------------------------------------------
+
+    /// Returns the memory pressure level of the given tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the tier does not exist.
+    pub fn tier_pressure(&self, tier_id: u8) -> Result<PressureLevel> {
+        let idx = self.find_tier_index(tier_id).ok_or(Error::NotFound)?;
+        Ok(self.tiers[idx].pressure_level())
+    }
+
+    /// Checks whether any tier is under memory pressure that
+    /// requires demotion.
+    ///
+    /// Returns the ID of the first tier that is at or above the
+    /// low-pressure threshold, or `None` if all tiers are healthy.
+    pub fn find_pressured_tier(&self) -> Option<u8> {
+        // Walk tiers by rank so the fastest tier is checked first.
+        let mut best: Option<(u8, u8)> = None; // (rank, id)
+        for tier in &self.tiers {
+            if !tier.active {
+                continue;
+            }
+            if tier.pressure_level() != PressureLevel::None {
+                match best {
+                    Some((r, _)) if tier.rank < r => {
+                        best = Some((tier.rank, tier.id));
+                    }
+                    None => {
+                        best = Some((tier.rank, tier.id));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    // ---------------------------------------------------------------
+    // Scan and queue migrations
+    // ---------------------------------------------------------------
+
+    /// Scans all tracked pages and queues promotion/demotion
+    /// requests based on access frequency and idle time.
+    ///
+    /// This is the main periodic scanner entry point.  It:
+    /// 1. Promotes pages whose access count exceeds the promotion
+    ///    threshold.
+    /// 2. Demotes pages whose idle cycles exceed the demotion
+    ///    threshold.
+    /// 3. Resets counters for pages that were queued.
+    ///
+    /// Returns a [`ScanResult`] summarizing the scan.
+    pub fn scan_and_queue(&mut self) -> ScanResult {
+        let mut result = ScanResult::default();
+
+        for i in 0..self.tracker_count {
+            let entry = &self.tracker[i];
+            if !entry.active {
+                continue;
+            }
+
+            let pfn = entry.pfn;
+            let src = entry.current_tier;
+            let access = entry.access_count;
+            let idle = entry.idle_cycles;
+
+            if self.should_promote(access) {
+                if self.request_promote(pfn, src, access).is_ok() {
+                    result.promotions_queued += 1;
+                    self.tracker[i].access_count = 0;
+                    self.tracker[i].idle_cycles = 0;
+                } else {
+                    result.skipped += 1;
+                }
+            } else if self.should_demote(idle) {
+                if self.request_demote(pfn, src, idle).is_ok() {
+                    result.demotions_queued += 1;
+                    self.tracker[i].access_count = 0;
+                    self.tracker[i].idle_cycles = 0;
+                } else {
+                    result.skipped += 1;
+                }
+            } else {
+                result.skipped += 1;
+            }
+        }
+        result
+    }
+
+    /// Runs pressure-triggered demotion for a specific tier.
+    ///
+    /// Scans tracked pages residing in `tier_id` and queues
+    /// demotion requests for the coldest pages (highest idle
+    /// cycles) until the tier drops below the pressure threshold
+    /// or no more candidates remain.
+    ///
+    /// Returns the number of demotion requests queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the tier does not exist.
+    pub fn pressure_demote(&mut self, tier_id: u8) -> Result<usize> {
+        let idx = self.find_tier_index(tier_id).ok_or(Error::NotFound)?;
+        if self.tiers[idx].pressure_level() == PressureLevel::None {
+            return Ok(0);
+        }
+
+        // Collect candidates: tracked pages in this tier sorted by
+        // idle_cycles descending (coldest first).
+        let mut candidates: [usize; MAX_TRACKED_PAGES] = [0; MAX_TRACKED_PAGES];
+        let mut cand_count = 0usize;
+        for i in 0..self.tracker_count {
+            let e = &self.tracker[i];
+            if e.active && e.current_tier == tier_id {
+                candidates[cand_count] = i;
+                cand_count += 1;
+            }
+        }
+        // Sort by idle_cycles descending (insertion sort, small N).
+        for i in 1..cand_count {
+            let key = candidates[i];
+            let key_idle = self.tracker[key].idle_cycles;
+            let mut j = i;
+            while j > 0 && self.tracker[candidates[j - 1]].idle_cycles < key_idle {
+                candidates[j] = candidates[j - 1];
+                j -= 1;
+            }
+            candidates[j] = key;
+        }
+
+        let mut demoted = 0usize;
+        for &ci in &candidates[..cand_count] {
+            // Re-check pressure after each demotion.
+            let level = self.tiers[idx].pressure_level();
+            if level == PressureLevel::None {
+                break;
+            }
+            let pfn = self.tracker[ci].pfn;
+            let idle = self.tracker[ci].idle_cycles;
+            if self.request_demote(pfn, tier_id, idle).is_ok() {
+                self.tracker[ci].access_count = 0;
+                self.tracker[ci].idle_cycles = 0;
+                demoted += 1;
+            }
+        }
+        Ok(demoted)
+    }
+
+    // ---------------------------------------------------------------
+    // Tier topology helpers
+    // ---------------------------------------------------------------
+
+    /// Sets up a standard two-tier DRAM + CXL topology.
+    ///
+    /// Creates tier 0 (DRAM, rank 0) and tier 1 (CXL, rank 1)
+    /// with bidirectional migration paths (promote 1->0, demote
+    /// 0->1).
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`register_tier`](Self::register_tier)
+    /// and [`add_migration_path`](Self::add_migration_path).
+    pub fn setup_dram_cxl(&mut self) -> Result<()> {
+        self.register_tier(0, 0, MemoryTierType::Dram)?;
+        self.register_tier(1, 1, MemoryTierType::Cxl)?;
+        self.add_migration_path(1, 0, MigrationDirection::Promote)?;
+        self.add_migration_path(0, 1, MigrationDirection::Demote)?;
+        Ok(())
+    }
+
+    /// Sets up a three-tier DRAM + CXL + PMEM topology.
+    ///
+    /// Tiers: 0 DRAM (rank 0), 1 CXL (rank 1), 2 PMEM (rank 2).
+    /// Migration paths: promote 2->1, 1->0; demote 0->1, 1->2.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from tier/path registration.
+    pub fn setup_dram_cxl_pmem(&mut self) -> Result<()> {
+        self.register_tier(0, 0, MemoryTierType::Dram)?;
+        self.register_tier(1, 1, MemoryTierType::Cxl)?;
+        self.register_tier(2, 2, MemoryTierType::Pmem)?;
+        // Promote paths.
+        self.add_migration_path(2, 1, MigrationDirection::Promote)?;
+        self.add_migration_path(1, 0, MigrationDirection::Promote)?;
+        // Demote paths.
+        self.add_migration_path(0, 1, MigrationDirection::Demote)?;
+        self.add_migration_path(1, 2, MigrationDirection::Demote)?;
+        Ok(())
+    }
+
+    /// Returns the tiers sorted by rank (fastest first).
+    ///
+    /// The returned array has `tier_count()` valid entries.  Each
+    /// entry is a `(tier_id, rank)` pair.
+    pub fn tiers_by_rank(&self) -> ([(u8, u8); MAX_TIERS], usize) {
+        let mut out = [(0u8, 0u8); MAX_TIERS];
+        let mut count = 0usize;
+        for tier in &self.tiers {
+            if tier.active {
+                out[count] = (tier.id, tier.rank);
+                count += 1;
+            }
+        }
+        // Insertion sort by rank.
+        for i in 1..count {
+            let key = out[i];
+            let mut j = i;
+            while j > 0 && out[j - 1].1 > key.1 {
+                out[j] = out[j - 1];
+                j -= 1;
+            }
+            out[j] = key;
+        }
+        (out, count)
+    }
+
+    /// Updates the tier assignment in the access tracker after a
+    /// successful migration.
+    ///
+    /// Should be called after [`process_requests`] to keep the
+    /// tracker in sync with actual page locations.
+    pub fn update_tracker_tier(&mut self, pfn: u64, new_tier: u8) {
+        for entry in &mut self.tracker[..self.tracker_count] {
+            if entry.active && entry.pfn == pfn {
+                entry.current_tier = new_tier;
+                return;
+            }
+        }
+    }
+
+    /// Resets all access counters in the tracker.
+    ///
+    /// Useful at the beginning of a new sampling epoch.
+    pub fn reset_access_counters(&mut self) {
+        for entry in &mut self.tracker[..self.tracker_count] {
+            if entry.active {
+                entry.access_count = 0;
+                entry.idle_cycles = 0;
+            }
+        }
     }
 }

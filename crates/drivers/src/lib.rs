@@ -446,6 +446,10 @@ pub mod tpm_chip;
 #[allow(dead_code, clippy::all)]
 pub mod nvme_cq;
 #[allow(dead_code, clippy::all)]
+pub mod pcie_hotplug;
+#[allow(dead_code, clippy::all)]
 pub mod usb_descriptor;
+#[allow(dead_code, clippy::all)]
+pub mod vfio_container;
 #[allow(dead_code, clippy::all)]
 pub mod virtio_blk_req;

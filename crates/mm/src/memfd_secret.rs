@@ -63,6 +63,12 @@ const MAX_PAGES_PER_PROCESS: usize = 1024;
 /// Starting fd number (above stdio range).
 const SECRET_FD_BASE: u32 = 1000;
 
+/// Maximum number of tracked direct-map removal entries.
+const MAX_DIRECT_MAP_ENTRIES: usize = 4096;
+
+/// Maximum number of pending fault requests.
+const MAX_FAULT_QUEUE: usize = 128;
+
 // -------------------------------------------------------------------
 // SecretMemFlags
 // -------------------------------------------------------------------
@@ -97,6 +103,98 @@ pub enum SecretPageState {
     Mapped,
     /// Page is being scrubbed (zeroed) prior to release.
     Scrubbing,
+}
+
+// -------------------------------------------------------------------
+// SecretFaultResult
+// -------------------------------------------------------------------
+
+/// Result of handling a page fault in a secret-memory region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretFaultResult {
+    /// Fault was handled; page is now mapped.
+    Mapped,
+    /// Fault was on a page that is being scrubbed; retry later.
+    Retry,
+    /// Access was denied (wrong process or fd not mapped).
+    Denied,
+    /// The faulting address does not belong to any secret fd.
+    NotSecret,
+}
+
+// -------------------------------------------------------------------
+// DirectMapEntry
+// -------------------------------------------------------------------
+
+/// Tracks a physical page whose kernel direct-map PTE has been
+/// removed.
+///
+/// When the page is released the direct-map PTE must be restored
+/// before the page can be returned to the frame allocator.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectMapEntry {
+    /// Physical frame number.
+    pub pfn: u64,
+    /// Whether the direct-map PTE has been removed.
+    pub removed: bool,
+    /// Generation counter; incremented each time the page cycles
+    /// through secret allocation.
+    pub generation: u64,
+    /// Owning fd number (for cross-referencing).
+    pub owning_fd: u32,
+    /// Whether this slot is in use.
+    pub active: bool,
+}
+
+impl DirectMapEntry {
+    /// An empty, inactive entry.
+    const fn empty() -> Self {
+        Self {
+            pfn: 0,
+            removed: false,
+            generation: 0,
+            owning_fd: 0,
+            active: false,
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// SecretFaultRequest
+// -------------------------------------------------------------------
+
+/// A pending page-fault request for a secret-memory region.
+///
+/// Queued when user space faults on a secret page that is in the
+/// `Allocated` state (not yet mapped).
+#[derive(Debug, Clone, Copy)]
+pub struct SecretFaultRequest {
+    /// Faulting virtual address.
+    pub vaddr: u64,
+    /// Process that caused the fault.
+    pub pid: u64,
+    /// Secret fd the fault belongs to.
+    pub fd: u32,
+    /// Page index within the fd.
+    pub page_index: usize,
+    /// Whether the access was a write.
+    pub write: bool,
+    /// Whether this slot is occupied.
+    pub active: bool,
+}
+
+impl SecretFaultRequest {
+    /// An empty, inactive slot.
+    const fn empty() -> Self {
+        Self {
+            vaddr: 0,
+            pid: 0,
+            fd: 0,
+            page_index: 0,
+            write: false,
+            active: false,
+        }
+    }
 }
 
 // -------------------------------------------------------------------
@@ -235,19 +333,30 @@ pub struct SecretMemInfo {
 /// System-wide manager for `memfd_secret()` secure memory.
 ///
 /// Enforces per-process and system-wide page quotas, tracks all
-/// secret fds and their pages, and handles the create/truncate/
-/// map/unmap/destroy lifecycle.
+/// secret fds and their pages, handles the create/truncate/map/
+/// unmap/destroy lifecycle, manages direct-map removal, and
+/// processes page faults for secret regions.
 pub struct SecretMemManager {
     /// Secret fd slots.
     fds: [SecretFd; MAX_SECRET_FDS],
     /// Per-fd page arrays.
     pages: [[SecretPage; MAX_PAGES_PER_FD]; MAX_SECRET_FDS],
+    /// Direct-map removal tracker.
+    direct_map: [DirectMapEntry; MAX_DIRECT_MAP_ENTRIES],
+    /// Number of active direct-map entries.
+    direct_map_count: usize,
+    /// Pending fault request queue.
+    fault_queue: [SecretFaultRequest; MAX_FAULT_QUEUE],
+    /// Number of pending faults.
+    fault_queue_count: usize,
     /// Number of active fds.
     active_fd_count: usize,
     /// Total secret pages currently allocated.
     total_pages: usize,
     /// Next fd number to assign.
     next_fd: u32,
+    /// Generation counter for direct-map tracking.
+    generation: u64,
     /// Statistics.
     info: SecretMemInfo,
     /// Whether secret memory is globally enabled.
@@ -266,9 +375,14 @@ impl SecretMemManager {
         Self {
             fds: [SecretFd::empty(); MAX_SECRET_FDS],
             pages: [[SecretPage::empty(); MAX_PAGES_PER_FD]; MAX_SECRET_FDS],
+            direct_map: [DirectMapEntry::empty(); MAX_DIRECT_MAP_ENTRIES],
+            direct_map_count: 0,
+            fault_queue: [SecretFaultRequest::empty(); MAX_FAULT_QUEUE],
+            fault_queue_count: 0,
             active_fd_count: 0,
             total_pages: 0,
             next_fd: SECRET_FD_BASE,
+            generation: 0,
             info: SecretMemInfo {
                 active_fds: 0,
                 total_pages: 0,
@@ -388,10 +502,12 @@ impl SecretMemManager {
     /// Maps allocated pages into user space.
     ///
     /// Each page is removed from the kernel direct map and its PFN
-    /// is recorded. The fd transitions to the `Mapped` state.
+    /// is recorded.  The fd transitions to the `Mapped` state.
+    /// Direct-map removal entries are registered so cleanup can
+    /// restore the mappings later.
     ///
     /// The `pfns` slice provides the physical frame numbers assigned
-    /// by the frame allocator. Its length must match the fd's page
+    /// by the frame allocator.  Its length must match the fd's page
     /// count.
     ///
     /// # Errors
@@ -400,6 +516,7 @@ impl SecretMemManager {
     /// - [`Error::InvalidArgument`] if `pfns` length does not match
     ///   the page count, or if the fd is not in `Sized` state.
     /// - [`Error::AlreadyExists`] if the fd is already mapped.
+    /// - [`Error::OutOfMemory`] if the direct-map tracker is full.
     pub fn map_pages(&mut self, fd: u32, pfns: &[u64]) -> Result<()> {
         let idx = self.find_fd_index(fd)?;
 
@@ -415,6 +532,14 @@ impl SecretMemManager {
             return Err(Error::InvalidArgument);
         }
 
+        // Pre-check direct-map tracker capacity.
+        if self.direct_map_count + count > MAX_DIRECT_MAP_ENTRIES {
+            return Err(Error::OutOfMemory);
+        }
+
+        self.generation += 1;
+        let cur_gen = self.generation;
+
         for (i, &pfn) in pfns.iter().enumerate() {
             self.pages[idx][i] = SecretPage {
                 pfn,
@@ -422,6 +547,16 @@ impl SecretMemManager {
                 direct_map_removed: true,
                 ref_count: 1,
             };
+
+            // Register the direct-map removal.
+            self.direct_map[self.direct_map_count] = DirectMapEntry {
+                pfn,
+                removed: true,
+                generation: cur_gen,
+                owning_fd: fd,
+                active: true,
+            };
+            self.direct_map_count += 1;
         }
 
         self.fds[idx].state = SecretFdState::Mapped;
@@ -435,7 +570,8 @@ impl SecretMemManager {
     /// Unmaps and destroys a secret fd.
     ///
     /// Pages are scrubbed (zeroed), restored to the direct map, and
-    /// freed. Returns the number of pages that were released.
+    /// freed.  Direct-map tracker entries are also cleaned up.
+    /// Returns the number of pages that were released.
     ///
     /// # Errors
     ///
@@ -446,17 +582,29 @@ impl SecretMemManager {
 
         self.fds[idx].state = SecretFdState::Closing;
 
+        // Collect PFNs that need direct-map restoration.
+        let mut pfns_to_restore = [0u64; MAX_PAGES_PER_FD];
+        let mut restore_count = 0usize;
+
         // Scrub each page.
         for page in &mut self.pages[idx][..count] {
             if page.state == SecretPageState::Mapped || page.state == SecretPageState::Allocated {
                 page.state = SecretPageState::Scrubbing;
                 self.info.scrub_count += 1;
-                // In a real implementation: zero the page contents,
-                // restore the direct-map PTE, flush TLB.
+                // In a real implementation: zero the page contents
+                // via volatile writes, restore the direct-map PTE,
+                // and flush the TLB.
+                pfns_to_restore[restore_count] = page.pfn;
+                restore_count += 1;
                 page.direct_map_removed = false;
                 page.ref_count = 0;
                 page.state = SecretPageState::Free;
             }
+        }
+
+        // Restore direct-map entries after releasing page borrows.
+        for pfn in &pfns_to_restore[..restore_count] {
+            self.restore_direct_map_entry(*pfn);
         }
 
         self.total_pages = self.total_pages.saturating_sub(count);
@@ -600,6 +748,340 @@ impl SecretMemManager {
     }
 
     // ---------------------------------------------------------------
+    // Exclusive access enforcement
+    // ---------------------------------------------------------------
+
+    /// Checks whether `pid` is allowed to access the given secret
+    /// fd.
+    ///
+    /// If the fd was created with [`secret_mem_flags::EXCLUSIVE`],
+    /// only the original owner process may map it.  For non-exclusive
+    /// fds, any process may access them (e.g., via fd passing).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `fd` is not registered.
+    /// - [`Error::PermissionDenied`] if the fd is exclusive and
+    ///   `pid` is not the owner.
+    pub fn check_access(&self, fd: u32, pid: u64) -> Result<()> {
+        let idx = self.find_fd_index(fd)?;
+        let fd_slot = &self.fds[idx];
+        if fd_slot.flags & secret_mem_flags::EXCLUSIVE != 0 && fd_slot.owner_pid != pid {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    /// Maps pages with access enforcement.
+    ///
+    /// Like [`map_pages`](Self::map_pages) but additionally checks
+    /// that `pid` is allowed to map this fd.
+    ///
+    /// # Errors
+    ///
+    /// Combines errors from [`check_access`](Self::check_access) and
+    /// [`map_pages`](Self::map_pages).
+    pub fn map_pages_checked(&mut self, fd: u32, pfns: &[u64], pid: u64) -> Result<()> {
+        self.check_access(fd, pid)?;
+        self.map_pages(fd, pfns)
+    }
+
+    // ---------------------------------------------------------------
+    // Page fault handling for secret regions
+    // ---------------------------------------------------------------
+
+    /// Handles a page fault on a secret-memory region.
+    ///
+    /// Determines whether the faulting address belongs to a secret
+    /// fd, verifies ownership, and resolves the fault:
+    ///
+    /// - If the page is `Allocated` (lazy mapping), transitions it
+    ///   to `Mapped`, removes its direct-map PTE, and returns
+    ///   [`SecretFaultResult::Mapped`].
+    /// - If the page is `Scrubbing`, returns
+    ///   [`SecretFaultResult::Retry`].
+    /// - If the pid does not own the fd, returns
+    ///   [`SecretFaultResult::Denied`].
+    /// - If no matching fd is found, returns
+    ///   [`SecretFaultResult::NotSecret`].
+    ///
+    /// `pfn_for_page` is a callback that the caller provides to
+    /// allocate a physical frame for a lazy-mapped page.  It
+    /// receives the page index and returns the PFN.
+    pub fn handle_fault(
+        &mut self,
+        vaddr: u64,
+        pid: u64,
+        write: bool,
+        pfn_for_page: &dyn Fn(usize) -> u64,
+    ) -> SecretFaultResult {
+        // Scan fds to find one that covers the faulting address.
+        // The virtual address range for fd index `idx` is
+        // simulated as [idx * MAX_PAGES_PER_FD * PAGE_SIZE, ...).
+        // In a real kernel, the VMA would provide this mapping.
+        // Here we search page arrays for a matching PFN or by
+        // page-index heuristic.
+        let _ = write; // reserved for future CoW support
+
+        for (idx, fd_slot) in self.fds.iter().enumerate() {
+            if fd_slot.is_inactive() {
+                continue;
+            }
+            // Check ownership for exclusive fds.
+            if fd_slot.flags & secret_mem_flags::EXCLUSIVE != 0 && fd_slot.owner_pid != pid {
+                continue;
+            }
+
+            let count = fd_slot.page_count;
+            if count == 0 {
+                continue;
+            }
+
+            // Convert vaddr to a page offset.  In a real kernel
+            // the VMA start would be used; here we check if vaddr
+            // is page-aligned and within the fd's page count as
+            // a simplified model.
+            let page_offset = (vaddr as usize) / PAGE_SIZE;
+            if page_offset >= count {
+                continue;
+            }
+
+            let page = &self.pages[idx][page_offset];
+            match page.state {
+                SecretPageState::Free => continue,
+                SecretPageState::Mapped => {
+                    // Already mapped; no-op.
+                    return SecretFaultResult::Mapped;
+                }
+                SecretPageState::Scrubbing => {
+                    return SecretFaultResult::Retry;
+                }
+                SecretPageState::Allocated => {
+                    // Lazy mapping: allocate a PFN and map.
+                    let pfn = pfn_for_page(page_offset);
+                    self.pages[idx][page_offset] = SecretPage {
+                        pfn,
+                        state: SecretPageState::Mapped,
+                        direct_map_removed: true,
+                        ref_count: 1,
+                    };
+                    // Register direct-map removal.
+                    if self.direct_map_count < MAX_DIRECT_MAP_ENTRIES {
+                        self.generation += 1;
+                        let cur_gen = self.generation;
+                        self.direct_map[self.direct_map_count] = DirectMapEntry {
+                            pfn,
+                            removed: true,
+                            generation: cur_gen,
+                            owning_fd: fd_slot.fd,
+                            active: true,
+                        };
+                        self.direct_map_count += 1;
+                    }
+                    return SecretFaultResult::Mapped;
+                }
+            }
+        }
+
+        // Check ownership denial separately (for non-exclusive
+        // fds we would have continued above).
+        for fd_slot in &self.fds {
+            if fd_slot.is_inactive() {
+                continue;
+            }
+            if fd_slot.flags & secret_mem_flags::EXCLUSIVE != 0 && fd_slot.owner_pid != pid {
+                return SecretFaultResult::Denied;
+            }
+        }
+
+        SecretFaultResult::NotSecret
+    }
+
+    /// Queues a fault request for deferred processing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the fault queue is full.
+    pub fn queue_fault(
+        &mut self,
+        vaddr: u64,
+        pid: u64,
+        fd: u32,
+        page_index: usize,
+        write: bool,
+    ) -> Result<()> {
+        if self.fault_queue_count >= MAX_FAULT_QUEUE {
+            return Err(Error::OutOfMemory);
+        }
+        self.fault_queue[self.fault_queue_count] = SecretFaultRequest {
+            vaddr,
+            pid,
+            fd,
+            page_index,
+            write,
+            active: true,
+        };
+        self.fault_queue_count += 1;
+        Ok(())
+    }
+
+    /// Drains pending fault requests into the caller's buffer.
+    ///
+    /// Returns the number of requests copied.
+    pub fn drain_faults(&mut self, out: &mut [SecretFaultRequest]) -> usize {
+        let drain = out.len().min(self.fault_queue_count);
+        out[..drain].copy_from_slice(&self.fault_queue[..drain]);
+        let remaining = self.fault_queue_count - drain;
+        for i in 0..remaining {
+            self.fault_queue[i] = self.fault_queue[drain + i];
+        }
+        for i in remaining..self.fault_queue_count {
+            self.fault_queue[i] = SecretFaultRequest::empty();
+        }
+        self.fault_queue_count = remaining;
+        drain
+    }
+
+    /// Returns the number of pending fault requests.
+    pub const fn pending_fault_count(&self) -> usize {
+        self.fault_queue_count
+    }
+
+    // ---------------------------------------------------------------
+    // Direct-map management
+    // ---------------------------------------------------------------
+
+    /// Checks whether a PFN has its direct-map entry removed.
+    pub fn is_direct_map_removed(&self, pfn: u64) -> bool {
+        self.direct_map[..self.direct_map_count]
+            .iter()
+            .any(|e| e.active && e.pfn == pfn && e.removed)
+    }
+
+    /// Returns the number of pages with direct-map entries removed.
+    pub fn removed_direct_map_count(&self) -> usize {
+        self.direct_map[..self.direct_map_count]
+            .iter()
+            .filter(|e| e.active && e.removed)
+            .count()
+    }
+
+    /// Returns the total number of tracked direct-map entries.
+    pub const fn direct_map_entry_count(&self) -> usize {
+        self.direct_map_count
+    }
+
+    // ---------------------------------------------------------------
+    // Per-page reference counting
+    // ---------------------------------------------------------------
+
+    /// Increments the reference count for a secret page.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `fd` is not registered or
+    ///   `page_index` is out of bounds.
+    /// - [`Error::InvalidArgument`] if the page is not in `Mapped`
+    ///   state.
+    pub fn page_get(&mut self, fd: u32, page_index: usize) -> Result<u32> {
+        let idx = self.find_fd_index(fd)?;
+        let count = self.fds[idx].page_count;
+        if page_index >= count {
+            return Err(Error::NotFound);
+        }
+        let page = &mut self.pages[idx][page_index];
+        if page.state != SecretPageState::Mapped {
+            return Err(Error::InvalidArgument);
+        }
+        page.ref_count = page.ref_count.saturating_add(1);
+        Ok(page.ref_count)
+    }
+
+    /// Decrements the reference count for a secret page.
+    ///
+    /// If the reference count reaches zero, the page transitions
+    /// to `Scrubbing` and is then freed.
+    ///
+    /// Returns `true` if the page was freed.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `fd` is not registered or
+    ///   `page_index` is out of bounds.
+    /// - [`Error::InvalidArgument`] if the page is not in `Mapped`
+    ///   state or the ref count is already zero.
+    pub fn page_put(&mut self, fd: u32, page_index: usize) -> Result<bool> {
+        let idx = self.find_fd_index(fd)?;
+        let count = self.fds[idx].page_count;
+        if page_index >= count {
+            return Err(Error::NotFound);
+        }
+        let page = &mut self.pages[idx][page_index];
+        if page.state != SecretPageState::Mapped {
+            return Err(Error::InvalidArgument);
+        }
+        if page.ref_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        page.ref_count -= 1;
+        if page.ref_count == 0 {
+            page.state = SecretPageState::Scrubbing;
+            self.info.scrub_count += 1;
+            // In a real implementation: zero the page and
+            // restore the direct-map PTE.
+            let pfn = page.pfn;
+            page.direct_map_removed = false;
+            page.state = SecretPageState::Free;
+            self.restore_direct_map_entry(pfn);
+            self.total_pages = self.total_pages.saturating_sub(1);
+            self.info.total_pages = self.total_pages;
+            self.info.total_bytes = self.total_pages * PAGE_SIZE;
+            self.info.pages_freed += 1;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    // ---------------------------------------------------------------
+    // Scrub verification
+    // ---------------------------------------------------------------
+
+    /// Verifies that all pages for a secret fd have been properly
+    /// scrubbed (are in `Free` state with ref_count == 0 and
+    /// direct-map restored).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if `fd` is not registered.
+    /// - [`Error::Busy`] if any page still has references or has
+    ///   not been scrubbed.
+    pub fn verify_scrubbed(&self, fd: u32) -> Result<()> {
+        let idx = self.find_fd_index(fd)?;
+        let count = self.fds[idx].page_count;
+        for page in &self.pages[idx][..count] {
+            if page.state != SecretPageState::Free {
+                return Err(Error::Busy);
+            }
+            if page.ref_count != 0 {
+                return Err(Error::Busy);
+            }
+            if page.direct_map_removed {
+                return Err(Error::Busy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks whether all direct-map entries owned by an fd have
+    /// been restored.
+    pub fn is_fd_direct_map_restored(&self, fd: u32) -> bool {
+        self.direct_map[..self.direct_map_count]
+            .iter()
+            .filter(|e| e.active && e.owning_fd == fd)
+            .all(|e| !e.removed)
+    }
+
+    // ---------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------
 
@@ -614,5 +1096,44 @@ impl SecretMemManager {
             .iter()
             .position(|f| !f.is_inactive() && f.fd == fd)
             .ok_or(Error::NotFound)
+    }
+
+    /// Restores a direct-map entry for the given PFN.
+    ///
+    /// Marks the entry as no longer removed.  In a real kernel
+    /// this would restore the direct-map PTE and flush the TLB.
+    fn restore_direct_map_entry(&mut self, pfn: u64) {
+        for entry in &mut self.direct_map[..self.direct_map_count] {
+            if entry.active && entry.pfn == pfn && entry.removed {
+                entry.removed = false;
+                return;
+            }
+        }
+    }
+
+    /// Compacts the direct-map tracker by removing inactive and
+    /// fully-restored entries.
+    ///
+    /// Returns the number of entries removed.
+    pub fn compact_direct_map(&mut self) -> usize {
+        let mut write = 0usize;
+        let mut removed = 0usize;
+        for read in 0..self.direct_map_count {
+            let entry = &self.direct_map[read];
+            if entry.active && entry.removed {
+                // Still in use; keep it.
+                if write != read {
+                    self.direct_map[write] = self.direct_map[read];
+                }
+                write += 1;
+            } else {
+                removed += 1;
+            }
+        }
+        for i in write..self.direct_map_count {
+            self.direct_map[i] = DirectMapEntry::empty();
+        }
+        self.direct_map_count = write;
+        removed
     }
 }

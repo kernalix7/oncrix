@@ -719,6 +719,137 @@ fn handle_cancel(_sqe: &Sqe) -> i32 {
     -38 // ENOSYS
 }
 
+// ── CQE flags ───────────────────────────────────────────────────
+
+/// CQE flag: more completions are available after this one.
+///
+/// When set on a CQE, the application should continue consuming
+/// CQEs without returning to the kernel, as additional completions
+/// are immediately available.
+pub const IORING_CQE_F_MORE: u32 = 1 << 0;
+
+/// CQE flag: the buffer ID is stored in the upper 16 bits of
+/// `flags` (used for buffer-select mode).
+pub const IORING_CQE_F_BUFFER: u32 = 1 << 1;
+
+/// CQE flag: notification event (no I/O data, only a wakeup).
+pub const IORING_CQE_F_NOTIF: u32 = 1 << 2;
+
+// ── io_uring_enter flags ────────────────────────────────────────
+
+/// Flag for `io_uring_enter`: submit queued SQEs to the kernel.
+pub const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+
+/// Flag for `io_uring_enter`: wake the SQ polling thread.
+pub const IORING_ENTER_SQ_WAKEUP: u32 = 1 << 1;
+
+/// Flag for `io_uring_enter`: wait for completions with a timeout.
+pub const IORING_ENTER_SQ_WAIT: u32 = 1 << 2;
+
+// ── CompletionBatch ─────────────────────────────────────────────
+
+/// Maximum number of CQEs in a single completion batch.
+const MAX_BATCH_CQE: usize = 32;
+
+/// A batch buffer for collecting multiple CQEs in a single pass.
+///
+/// Used by [`IoUring::submit_and_complete_batch`] to amortise the
+/// overhead of individual SQE processing by collecting results
+/// before pushing them into the CQ ring.
+pub struct CompletionBatch {
+    /// Pre-allocated CQE buffer.
+    entries: [Cqe; MAX_BATCH_CQE],
+    /// Number of valid entries in the batch.
+    len: usize,
+}
+
+impl CompletionBatch {
+    /// Create an empty completion batch.
+    pub const fn new() -> Self {
+        Self {
+            entries: [const { Cqe::new(0, 0, 0) }; MAX_BATCH_CQE],
+            len: 0,
+        }
+    }
+
+    /// Return the number of CQEs in the batch.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check whether the batch is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Check whether the batch is full.
+    pub const fn is_full(&self) -> bool {
+        self.len >= MAX_BATCH_CQE
+    }
+
+    /// Add a CQE to the batch. Returns `false` if the batch is full.
+    fn push(&mut self, cqe: Cqe) -> bool {
+        if self.is_full() {
+            return false;
+        }
+        self.entries[self.len] = cqe;
+        self.len += 1;
+        true
+    }
+
+    /// Return the CQEs collected so far.
+    pub fn entries(&self) -> &[Cqe] {
+        &self.entries[..self.len]
+    }
+
+    /// Reset the batch for reuse.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl Default for CompletionBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── IoUringStats ────────────────────────────────────────────────
+
+/// Runtime statistics for an [`IoUring`] instance.
+///
+/// Tracks cumulative submission and completion counts for
+/// observability and debugging.
+#[derive(Debug, Clone, Copy)]
+pub struct IoUringStats {
+    /// Total SQEs submitted (popped from SQ and processed).
+    pub total_submitted: u64,
+    /// Total CQEs successfully posted to the CQ.
+    pub total_completed: u64,
+    /// Total CQEs dropped due to CQ overflow.
+    pub total_overflow: u64,
+    /// Total `io_uring_enter` calls.
+    pub total_enter_calls: u64,
+}
+
+impl IoUringStats {
+    /// Create zeroed statistics.
+    pub const fn new() -> Self {
+        Self {
+            total_submitted: 0,
+            total_completed: 0,
+            total_overflow: 0,
+            total_enter_calls: 0,
+        }
+    }
+}
+
+impl Default for IoUringStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── IoUring ──────────────────────────────────────────────────────
 
 /// Main io_uring instance binding a submission queue to a
@@ -727,8 +858,10 @@ fn handle_cancel(_sqe: &Sqe) -> i32 {
 /// The typical lifecycle is:
 ///
 /// 1. Push SQEs via [`sq_mut()`](IoUring::sq_mut).
-/// 2. Call [`submit_and_complete()`](IoUring::submit_and_complete).
-/// 3. Drain CQEs via [`cq_mut()`](IoUring::cq_mut).
+/// 2. Call [`submit_and_complete()`](IoUring::submit_and_complete)
+///    or [`io_uring_enter()`](IoUring::io_uring_enter).
+/// 3. Drain CQEs via [`cq_mut()`](IoUring::cq_mut) or
+///    [`consume_completions()`](IoUring::consume_completions).
 pub struct IoUring {
     /// Submission queue.
     sq: SubmissionQueue,
@@ -738,6 +871,8 @@ pub struct IoUring {
     params: IoUringParams,
     /// Whether this instance slot is in use.
     in_use: bool,
+    /// Runtime statistics.
+    stats: IoUringStats,
 }
 
 impl IoUring {
@@ -748,6 +883,7 @@ impl IoUring {
             cq: CompletionQueue::new(),
             params: IoUringParams::new(),
             in_use: false,
+            stats: IoUringStats::new(),
         }
     }
 
@@ -757,6 +893,7 @@ impl IoUring {
         self.cq = CompletionQueue::new();
         self.params = params;
         self.in_use = true;
+        self.stats = IoUringStats::new();
     }
 
     /// Return a shared reference to the submission queue.
@@ -784,6 +921,11 @@ impl IoUring {
         &self.params
     }
 
+    /// Return the runtime statistics.
+    pub const fn stats(&self) -> &IoUringStats {
+        &self.stats
+    }
+
     /// Drain up to `max` SQEs from the submission queue, process
     /// each one, and push the resulting CQEs onto the completion
     /// queue.
@@ -798,12 +940,164 @@ impl IoUring {
             match self.sq.pop() {
                 Some(sqe) => {
                     let cqe = process_sqe(&sqe);
-                    // Best-effort push; overflow is tracked inside CQ.
-                    let _ = self.cq.push(cqe);
+                    if self.cq.push(cqe).is_ok() {
+                        self.stats.total_completed += 1;
+                    } else {
+                        self.stats.total_overflow += 1;
+                    }
                     processed = processed.saturating_add(1);
+                    self.stats.total_submitted += 1;
                 }
                 None => break,
             }
+        }
+
+        processed
+    }
+
+    /// Process SQEs into a [`CompletionBatch`] before flushing to
+    /// the CQ.
+    ///
+    /// This two-phase approach reduces CQ ring contention by
+    /// batching CQE writes. Returns the number of SQEs processed.
+    pub fn submit_and_complete_batch(&mut self, max: u32) -> u32 {
+        let limit = if max == 0 { u32::MAX } else { max };
+        let mut batch = CompletionBatch::new();
+        let mut processed = 0u32;
+
+        // Phase 1: drain SQEs into a local batch buffer.
+        while processed < limit && !batch.is_full() {
+            match self.sq.pop() {
+                Some(sqe) => {
+                    let cqe = process_sqe(&sqe);
+                    batch.push(cqe);
+                    processed = processed.saturating_add(1);
+                    self.stats.total_submitted += 1;
+                }
+                None => break,
+            }
+        }
+
+        // Phase 2: flush the batch into the CQ ring.
+        for cqe in batch.entries() {
+            if self.cq.push(*cqe).is_ok() {
+                self.stats.total_completed += 1;
+            } else {
+                self.stats.total_overflow += 1;
+            }
+        }
+
+        processed
+    }
+
+    /// Emulate the `io_uring_enter` system call.
+    ///
+    /// This is the primary kernel entry point for io_uring
+    /// operations. It submits up to `to_submit` SQEs and
+    /// optionally waits until `min_complete` CQEs are available.
+    ///
+    /// # Arguments
+    ///
+    /// * `to_submit` — number of SQEs to submit (0 = none).
+    /// * `min_complete` — minimum CQEs to wait for (0 = no wait).
+    /// * `flags` — `IORING_ENTER_*` flags.
+    ///
+    /// # Returns
+    ///
+    /// The number of SQEs successfully submitted.
+    pub fn io_uring_enter(&mut self, to_submit: u32, min_complete: u32, flags: u32) -> Result<u32> {
+        self.stats.total_enter_calls += 1;
+
+        // Submit phase: drain up to `to_submit` SQEs.
+        let submitted = if to_submit > 0 {
+            self.submit_and_complete(to_submit)
+        } else {
+            0
+        };
+
+        // Wait phase: if GETEVENTS is set and min_complete > 0,
+        // keep processing any remaining SQEs until we have enough
+        // CQEs or there is nothing left to process.
+        if flags & IORING_ENTER_GETEVENTS != 0 && min_complete > 0 {
+            let mut attempts = 0u32;
+            while self.cq.ready() < min_complete {
+                // Process any remaining SQEs that might produce
+                // completions.
+                if self.sq.is_empty() {
+                    break;
+                }
+                let extra = self.submit_and_complete(1);
+                if extra == 0 {
+                    break;
+                }
+                attempts += 1;
+                // Safety bound: do not spin forever.
+                if attempts >= CQ_ENTRIES as u32 {
+                    break;
+                }
+            }
+            // If we still do not have enough CQEs and the caller
+            // did not set SQ_WAIT, return WouldBlock.
+            if self.cq.ready() < min_complete && flags & IORING_ENTER_SQ_WAIT == 0 {
+                return Err(Error::WouldBlock);
+            }
+        }
+
+        Ok(submitted)
+    }
+
+    /// Consume up to `max` ready CQEs into the provided buffer.
+    ///
+    /// Convenience wrapper around
+    /// [`CompletionQueue::consume_batch`].
+    /// Returns the number of entries actually consumed.
+    pub fn consume_completions(&mut self, buf: &mut [Cqe], max: usize) -> usize {
+        self.cq.consume_batch(buf, max)
+    }
+
+    /// Add the `IORING_CQE_F_MORE` flag to the most recently
+    /// produced CQE, signalling that additional completions follow.
+    ///
+    /// Callers use this when posting a batch of CQEs so that user
+    /// space can keep consuming without a syscall round-trip.
+    pub fn mark_cqe_more(&mut self) {
+        if self.cq.tail != self.cq.head {
+            let prev = self.cq.tail.wrapping_sub(1) & self.cq.mask;
+            self.cq.entries[prev as usize].flags |= IORING_CQE_F_MORE;
+        }
+    }
+
+    /// Process all pending SQEs and mark intermediate CQEs with
+    /// `IORING_CQE_F_MORE` so user space knows a burst is in
+    /// progress.
+    ///
+    /// The last CQE in the burst will NOT have the flag set,
+    /// signalling end-of-batch.
+    ///
+    /// Returns the number of SQEs processed.
+    pub fn flush_sq_with_more_flag(&mut self) -> u32 {
+        let pending = self.sq.pending();
+        if pending == 0 {
+            return 0;
+        }
+
+        let mut processed = 0u32;
+        while let Some(sqe) = self.sq.pop() {
+            let remaining = self.sq.pending();
+            let mut cqe = process_sqe(&sqe);
+
+            // Set the MORE flag on all CQEs except the last.
+            if remaining > 0 {
+                cqe.flags |= IORING_CQE_F_MORE;
+            }
+
+            if self.cq.push(cqe).is_ok() {
+                self.stats.total_completed += 1;
+            } else {
+                self.stats.total_overflow += 1;
+            }
+            processed += 1;
+            self.stats.total_submitted += 1;
         }
 
         processed

@@ -17,14 +17,28 @@
 //!   DAX, or filesystem-DAX modes.
 //! - **DaxMapping** — a direct-access mapping that bypasses the page cache,
 //!   allowing user space to `mmap` persistent memory directly.
+//! - **NvdimmSmartData** — SMART-like health attributes: temperature,
+//!   remaining life, unsafe shutdown count, media errors.
 //! - **NvdimmDevice** — represents a single NVDIMM with its regions,
 //!   namespaces, and health/flush capabilities.
 //! - **NvdimmSubsystem** — manages up to [`MAX_DEVICES`] devices.
+//!
+//! # Persistence Primitives
+//!
+//! Three x86_64 cache-flush instructions are abstracted:
+//! - `clflush_line` — invalidate and flush a single cache line (addr).
+//! - `clwb_line` — write-back without invalidation (addr), preferred.
+//! - `pmem_flush_range` — flush every cache line in `[addr, addr+size)`.
+//!
+//! Always follow a flush sequence with `sfence` before considering
+//! data durable on the persistent medium.
 //!
 //! # References
 //!
 //! - ACPI 6.4, §5.2.25 (NVDIMM Firmware Interface Table — NFIT)
 //! - UEFI 2.9, §13.6 (Block Translation Table)
+//! - Intel Architecture Software Developer's Manual, Vol. 1, §11.12 (CLWB/CLFLUSH)
+//! - JEDEC Standard No. 238A: NVDIMM-P (Health status attributes)
 
 use oncrix_lib::{Error, Result};
 
@@ -49,6 +63,12 @@ const LABEL_SIZE: usize = 64;
 
 /// UUID size in bytes.
 const UUID_SIZE: usize = 16;
+
+/// x86_64 cache line size in bytes (64 bytes for all current Intel/AMD processors).
+pub const CACHE_LINE_SIZE: u64 = 64;
+
+/// Maximum number of namespace resize history entries (informational).
+const MAX_NS_EVENTS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // NvdimmType
@@ -103,6 +123,113 @@ pub enum NamespaceMode {
 }
 
 // ---------------------------------------------------------------------------
+// NvdimmSmartData
+// ---------------------------------------------------------------------------
+
+/// SMART-like health attributes for an NVDIMM device.
+///
+/// These fields mirror attributes reported by the NVDIMM firmware
+/// via the ACPI DSM (_DSM) Get Smart and Health Info function
+/// (DSM function index 0x02 in the NVDIMM root device namespace).
+///
+/// Values are populated by reading firmware/NFIT data during init.
+/// All temperature values are in Celsius (raw), remaining life is
+/// 0–100 (percentage of endurance used), counts are monotonically
+/// increasing 32-bit counters.
+#[derive(Debug, Clone, Copy)]
+pub struct NvdimmSmartData {
+    /// Current media temperature in tenths of a degree Celsius
+    /// (e.g., 250 = 25.0 °C). `u16::MAX` means unavailable.
+    pub media_temp: u16,
+    /// Controller temperature in tenths of a degree Celsius.
+    /// `u16::MAX` means unavailable.
+    pub ctrl_temp: u16,
+    /// Remaining endurance as a percentage (0 = fully worn out,
+    /// 100 = new). `u8::MAX` means unavailable.
+    pub remaining_life_pct: u8,
+    /// Number of unsafe (unclean) shutdowns since manufacture.
+    pub unsafe_shutdowns: u32,
+    /// Total number of media error events logged by firmware.
+    pub media_errors: u32,
+    /// Number of write cycles the device has sustained.
+    pub write_cycles: u64,
+    /// Health flags bitmask (vendor-specific; 0 = no issues).
+    pub health_flags: u32,
+    /// Whether health data has been populated from firmware.
+    pub valid: bool,
+}
+
+impl NvdimmSmartData {
+    /// Returns a zeroed, invalid SMART data record.
+    pub const fn invalid() -> Self {
+        Self {
+            media_temp: u16::MAX,
+            ctrl_temp: u16::MAX,
+            remaining_life_pct: u8::MAX,
+            unsafe_shutdowns: 0,
+            media_errors: 0,
+            write_cycles: 0,
+            health_flags: 0,
+            valid: false,
+        }
+    }
+
+    /// Returns `true` if the media temperature reading is available.
+    pub const fn has_media_temp(&self) -> bool {
+        self.media_temp != u16::MAX
+    }
+
+    /// Returns `true` if remaining life data is available.
+    pub const fn has_remaining_life(&self) -> bool {
+        self.remaining_life_pct != u8::MAX
+    }
+
+    /// Returns the media temperature in whole degrees Celsius,
+    /// or `None` if the reading is unavailable.
+    pub const fn media_temp_celsius(&self) -> Option<i32> {
+        if self.media_temp == u16::MAX {
+            None
+        } else {
+            Some(self.media_temp as i32 / 10)
+        }
+    }
+
+    /// Returns `true` if any critical health flag is set.
+    pub const fn is_critical(&self) -> bool {
+        self.health_flags != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NamespaceEvent
+// ---------------------------------------------------------------------------
+
+/// A recorded namespace lifecycle event (create, delete, resize).
+#[derive(Debug, Clone, Copy)]
+pub struct NamespaceEvent {
+    /// Namespace identifier affected.
+    pub ns_id: u32,
+    /// Event kind.
+    pub kind: NsEventKind,
+    /// Size after the event (bytes). For deletion, records the
+    /// pre-deletion size.
+    pub size_after: u64,
+}
+
+/// Kind of namespace lifecycle event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NsEventKind {
+    /// Namespace was created.
+    Created,
+    /// Namespace was deleted.
+    Deleted,
+    /// Namespace was resized.
+    Resized,
+    /// Namespace mode was changed.
+    ModeChanged,
+}
+
+// ---------------------------------------------------------------------------
 // NvdimmRegion
 // ---------------------------------------------------------------------------
 
@@ -152,6 +279,13 @@ impl NvdimmRegion {
     pub const fn contains(&self, addr: u64) -> bool {
         addr >= self.base_addr && addr < self.end_addr()
     }
+
+    /// Returns `true` if this region supports DAX-mode namespaces.
+    ///
+    /// Only PMEM-type regions support byte-addressable DAX access.
+    pub const fn supports_dax(&self) -> bool {
+        matches!(self.nvdimm_type, NvdimmType::Pmem)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +296,9 @@ impl NvdimmRegion {
 ///
 /// Namespaces partition a region into independently addressable
 /// units, each with its own label, UUID, and operating mode.
+/// In DAX or Fsdax mode the namespace's physical address range
+/// can be mapped directly into a process's virtual address space,
+/// bypassing the page cache entirely.
 #[derive(Debug, Clone, Copy)]
 pub struct NvdimmNamespace {
     /// Namespace identifier.
@@ -182,6 +319,8 @@ pub struct NvdimmNamespace {
     pub mode: NamespaceMode,
     /// Whether this namespace is active.
     pub active: bool,
+    /// Whether a DAX mmap is currently outstanding for this namespace.
+    pub dax_mapped: bool,
 }
 
 impl NvdimmNamespace {
@@ -197,6 +336,7 @@ impl NvdimmNamespace {
             uuid: [0u8; UUID_SIZE],
             mode: NamespaceMode::Raw,
             active: true,
+            dax_mapped: false,
         }
     }
 
@@ -214,6 +354,34 @@ impl NvdimmNamespace {
     pub fn set_uuid(&mut self, uuid: &[u8; UUID_SIZE]) {
         self.uuid = *uuid;
     }
+
+    /// Returns `true` if this namespace supports DAX direct access.
+    pub const fn is_dax_capable(&self) -> bool {
+        matches!(self.mode, NamespaceMode::Dax | NamespaceMode::Fsdax)
+    }
+
+    /// Computes the physical address of the start of this namespace
+    /// given the base address of its parent region.
+    pub const fn phys_addr(&self, region_base: u64) -> u64 {
+        region_base + self.offset
+    }
+
+    /// Resizes the namespace to `new_size`.
+    ///
+    /// Returns [`Error::InvalidArgument`] if the new size is zero or
+    /// would overflow a u64.  The caller is responsible for ensuring
+    /// the new size fits within the parent region.
+    pub fn resize(&mut self, new_size: u64) -> Result<()> {
+        if new_size == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if self.dax_mapped {
+            // Cannot resize while a DAX mapping is active.
+            return Err(Error::Busy);
+        }
+        self.size = new_size;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +393,15 @@ impl NvdimmNamespace {
 /// DAX mappings allow user-space processes to `mmap` persistent memory
 /// directly, enabling load/store access without any file-system or
 /// block-layer overhead.
+///
+/// # DAX mmap protocol
+///
+/// 1. Caller requests a DAX mapping via [`NvdimmDevice::create_dax_mapping`].
+/// 2. The kernel virtual memory subsystem maps `phys_addr` into the
+///    process VA space at `virtual_addr` with no intermediate page cache.
+/// 3. On write, stores go directly to NVDIMM media; they become durable
+///    only after [`NvdimmDevice::flush`] or [`NvdimmDevice::persist`].
+/// 4. Caller removes the mapping via [`NvdimmDevice::remove_dax_mapping`].
 #[derive(Debug, Clone, Copy)]
 pub struct DaxMapping {
     /// Virtual address of the mapping.
@@ -233,17 +410,20 @@ pub struct DaxMapping {
     pub phys_addr: u64,
     /// Size of the mapping in bytes.
     pub size: u64,
+    /// Namespace identifier this mapping covers.
+    pub ns_id: u32,
     /// Whether this mapping is active.
     pub active: bool,
 }
 
 impl DaxMapping {
     /// Creates a new DAX mapping.
-    pub const fn new(virtual_addr: u64, phys_addr: u64, size: u64) -> Self {
+    pub const fn new(virtual_addr: u64, phys_addr: u64, size: u64, ns_id: u32) -> Self {
         Self {
             virtual_addr,
             phys_addr,
             size,
+            ns_id,
             active: true,
         }
     }
@@ -271,6 +451,106 @@ impl DaxMapping {
 }
 
 // ---------------------------------------------------------------------------
+// Cache-flush primitives
+// ---------------------------------------------------------------------------
+
+/// Flush a single cache line containing `addr` to persistent media using
+/// `CLFLUSH` (invalidate + write-back).
+///
+/// On non-x86_64 targets this is a no-op — callers must provide their
+/// own architecture-specific flush primitive.
+///
+/// # Safety
+///
+/// `addr` must be a valid virtual address that is currently mapped.
+/// The caller must ensure the address is within a persistent memory
+/// region before relying on durability.
+#[inline]
+pub unsafe fn clflush_line(addr: u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // SAFETY: CLFLUSH with a valid mapped address. Invalidates and
+        // flushes the cache line to memory. The address is passed in
+        // via a register operand so no load occurs.
+        core::arch::asm!(
+            "clflush [{addr}]",
+            addr = in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = addr;
+}
+
+/// Write-back a single cache line containing `addr` without invalidation
+/// using `CLWB`.
+///
+/// Preferred over `CLFLUSH` for NVDIMM workloads — leaves the line
+/// in the cache as clean, reducing subsequent read latency.
+///
+/// # Safety
+///
+/// `addr` must be a valid virtual address that is currently mapped.
+#[inline]
+pub unsafe fn clwb_line(addr: u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // SAFETY: CLWB writes back the cache line at addr without
+        // eviction. CPUID must confirm CLWB support (leaf 7, ECX bit 24)
+        // before use; the caller is responsible for that check.
+        core::arch::asm!(
+            "clwb [{addr}]",
+            addr = in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = addr;
+}
+
+/// Store fence (`SFENCE`) — orders all preceding stores before
+/// subsequent stores or loads.
+///
+/// Must be issued after a sequence of `clflush_line` / `clwb_line`
+/// calls to guarantee that data has reached the persistent medium.
+#[inline]
+pub fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SFENCE is a serialising store fence with no memory operand.
+    // It does not read or write any user-visible memory.
+    unsafe {
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+    }
+}
+
+/// Flush every cache line covering the byte range `[addr, addr + size)`.
+///
+/// Iterates over cache lines at [`CACHE_LINE_SIZE`]-byte intervals,
+/// calling [`clwb_line`] for each, then issues a final [`sfence`].
+///
+/// # Safety
+///
+/// The entire range `[addr, addr + size)` must be mapped and within
+/// a valid persistent memory region. `addr` and `size` must not wrap
+/// around the 64-bit address space.
+pub unsafe fn pmem_flush_range(addr: u64, size: u64) {
+    if size == 0 {
+        return;
+    }
+    let end = addr.saturating_add(size);
+    // Align start down to cache-line boundary.
+    let start = addr & !(CACHE_LINE_SIZE - 1);
+    let mut cur = start;
+    while cur < end {
+        // SAFETY: caller guarantees [addr, addr+size) is a valid mapped
+        // range; `cur` is always within or adjacent to that range.
+        unsafe { clwb_line(cur) };
+        cur = cur.saturating_add(CACHE_LINE_SIZE);
+    }
+    sfence();
+}
+
+// ---------------------------------------------------------------------------
 // NvdimmDevice
 // ---------------------------------------------------------------------------
 
@@ -295,6 +575,14 @@ pub struct NvdimmDevice {
     dax_mapping_count: usize,
     /// Overall device health.
     pub health: NvdimmHealth,
+    /// SMART health attributes.
+    pub smart: NvdimmSmartData,
+    /// Namespace event log (ring-buffer, last N events).
+    ns_events: [Option<NamespaceEvent>; MAX_NS_EVENTS],
+    /// Next write position in the event ring.
+    ns_event_head: usize,
+    /// Total events recorded (may exceed MAX_NS_EVENTS).
+    ns_event_total: usize,
     /// Whether the device has been initialized.
     initialized: bool,
 }
@@ -311,6 +599,10 @@ impl NvdimmDevice {
             dax_mappings: [const { None }; MAX_DAX_MAPPINGS],
             dax_mapping_count: 0,
             health: NvdimmHealth::Ok,
+            smart: NvdimmSmartData::invalid(),
+            ns_events: [const { None }; MAX_NS_EVENTS],
+            ns_event_head: 0,
+            ns_event_total: 0,
             initialized: false,
         }
     }
@@ -384,14 +676,109 @@ impl NvdimmDevice {
                 }
             }
         }
-        for slot in &mut self.namespaces {
-            if slot.is_none() {
-                *slot = Some(ns);
+        let free_idx = self.namespaces.iter().position(|s| s.is_none());
+        match free_idx {
+            Some(idx) => {
+                let ns_id = ns.id;
+                let ns_size = ns.size;
+                self.namespaces[idx] = Some(ns);
                 self.namespace_count += 1;
-                return Ok(());
+                self.record_ns_event(NamespaceEvent {
+                    ns_id,
+                    kind: NsEventKind::Created,
+                    size_after: ns_size,
+                });
+                Ok(())
+            }
+            None => Err(Error::OutOfMemory),
+        }
+    }
+
+    /// Deletes the namespace with the given `id`.
+    ///
+    /// Returns [`Error::Busy`] if a DAX mapping is active for the namespace.
+    /// Returns [`Error::NotFound`] if no namespace with that id exists.
+    pub fn delete_namespace(&mut self, id: u32) -> Result<()> {
+        for slot in &mut self.namespaces {
+            if let Some(ref ns) = *slot {
+                if ns.id == id {
+                    if ns.dax_mapped {
+                        return Err(Error::Busy);
+                    }
+                    let old_size = ns.size;
+                    *slot = None;
+                    self.namespace_count = self.namespace_count.saturating_sub(1);
+                    self.record_ns_event(NamespaceEvent {
+                        ns_id: id,
+                        kind: NsEventKind::Deleted,
+                        size_after: old_size,
+                    });
+                    return Ok(());
+                }
             }
         }
-        Err(Error::OutOfMemory)
+        Err(Error::NotFound)
+    }
+
+    /// Resizes the namespace with the given `id` to `new_size` bytes.
+    ///
+    /// The caller must ensure `new_size` fits within the parent region.
+    /// Returns [`Error::Busy`] if a DAX mapping is active.
+    pub fn resize_namespace(&mut self, id: u32, new_size: u64) -> Result<()> {
+        for slot in &mut self.namespaces {
+            if let Some(ref mut ns) = *slot {
+                if ns.id == id {
+                    ns.resize(new_size)?;
+                    self.record_ns_event(NamespaceEvent {
+                        ns_id: id,
+                        kind: NsEventKind::Resized,
+                        size_after: new_size,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    /// Changes the operating mode of the namespace with the given `id`.
+    ///
+    /// Returns [`Error::Busy`] if a DAX mapping is active for the namespace.
+    pub fn set_namespace_mode(&mut self, id: u32, mode: NamespaceMode) -> Result<()> {
+        // Find the namespace index and extract data needed for
+        // validation before taking a mutable borrow.
+        let idx = self
+            .namespaces
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|n| n.id == id))
+            .ok_or(Error::NotFound)?;
+        let ns = self.namespaces[idx].as_ref().ok_or(Error::NotFound)?;
+        if ns.dax_mapped {
+            return Err(Error::Busy);
+        }
+        let region_id = ns.region_id;
+        let ns_size = ns.size;
+        // Validate DAX mode requires a PMEM-capable region.
+        if matches!(mode, NamespaceMode::Dax | NamespaceMode::Fsdax) {
+            let region_ok = self
+                .regions
+                .iter()
+                .flatten()
+                .any(|r| r.id == region_id && r.supports_dax());
+            if !region_ok {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        // Now take the mutable reference and apply changes.
+        if let Some(ref mut ns) = self.namespaces[idx] {
+            ns.mode = mode;
+        }
+        self.record_ns_event(NamespaceEvent {
+            ns_id: id,
+            kind: NsEventKind::ModeChanged,
+            size_after: ns_size,
+        });
+        Ok(())
     }
 
     /// Returns a reference to the namespace with the given `id`.
@@ -407,6 +794,82 @@ impl NvdimmDevice {
     // -- DAX mapping management ---------------------------------------------
 
     /// Creates a DAX mapping for direct access to persistent memory.
+    ///
+    /// The namespace identified by `mapping.ns_id` must exist, must be
+    /// in DAX or Fsdax mode, and must not already have a mapping active.
+    /// On success the namespace's `dax_mapped` flag is set.
+    pub fn create_dax_mapping(&mut self, mapping: DaxMapping) -> Result<()> {
+        // Validate the target namespace (immutable borrow released before
+        // the mutable loop below).
+        {
+            let ns = self
+                .namespaces
+                .iter()
+                .flatten()
+                .find(|n| n.id == mapping.ns_id)
+                .ok_or(Error::NotFound)?;
+            if !ns.is_dax_capable() {
+                return Err(Error::InvalidArgument);
+            }
+            if ns.dax_mapped {
+                return Err(Error::AlreadyExists);
+            }
+        }
+
+        // Find an empty slot.
+        for slot in &mut self.dax_mappings {
+            if slot.is_none() {
+                *slot = Some(mapping);
+                self.dax_mapping_count += 1;
+                // Mark namespace as mapped.
+                for ns_slot in &mut self.namespaces {
+                    if let Some(ref mut ns) = *ns_slot {
+                        if ns.id == mapping.ns_id {
+                            ns.dax_mapped = true;
+                            break;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        Err(Error::OutOfMemory)
+    }
+
+    /// Removes the DAX mapping for namespace `ns_id`.
+    ///
+    /// Clears the namespace's `dax_mapped` flag on success.
+    /// Returns [`Error::NotFound`] if no mapping exists for `ns_id`.
+    pub fn remove_dax_mapping(&mut self, ns_id: u32) -> Result<()> {
+        let mut found = false;
+        for slot in &mut self.dax_mappings {
+            if let Some(ref m) = *slot {
+                if m.ns_id == ns_id {
+                    *slot = None;
+                    self.dax_mapping_count = self.dax_mapping_count.saturating_sub(1);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return Err(Error::NotFound);
+        }
+        // Clear the namespace mapped flag.
+        for ns_slot in &mut self.namespaces {
+            if let Some(ref mut ns) = *ns_slot {
+                if ns.id == ns_id {
+                    ns.dax_mapped = false;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds a raw DAX mapping entry (legacy helper, bypasses namespace checks).
+    ///
+    /// Prefer [`create_dax_mapping`](Self::create_dax_mapping) for new code.
     pub fn add_dax_mapping(&mut self, mapping: DaxMapping) -> Result<()> {
         for slot in &mut self.dax_mappings {
             if slot.is_none() {
@@ -433,10 +896,10 @@ impl NvdimmDevice {
 
     // -- Persistence operations ---------------------------------------------
 
-    /// Flushes a cache line to ensure data reaches persistent media.
+    /// Flushes a cache line range to ensure data reaches persistent media.
     ///
-    /// On x86_64 this would use `CLFLUSH` / `CLWB` + `SFENCE`.
-    /// Here we issue a memory barrier as a placeholder.
+    /// Uses `CLWB` + `SFENCE` on x86_64 for minimal cache disruption.
+    /// The address must fall within a known active region.
     pub fn flush(&self, addr: u64, size: u64) -> Result<()> {
         if !self.initialized {
             return Err(Error::IoError);
@@ -453,13 +916,9 @@ impl NvdimmDevice {
         if !in_region {
             return Err(Error::InvalidArgument);
         }
-        // SAFETY: Memory fence to order stores before flush.
-        // On real hardware this would be CLWB + SFENCE sequences.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("sfence", options(nostack, preserves_flags));
-        }
-        let _ = (addr, size); // used in real flush loop
+        // SAFETY: addr is confirmed to lie within a valid, active persistent
+        // memory region. The range [addr, addr+size) is safe to flush.
+        unsafe { pmem_flush_range(addr, size) };
         Ok(())
     }
 
@@ -479,11 +938,30 @@ impl NvdimmDevice {
         Ok(())
     }
 
-    // -- Health check -------------------------------------------------------
+    // -- Health / SMART monitoring ------------------------------------------
+
+    /// Updates the SMART health attributes for this device.
+    ///
+    /// In a real driver this would call an ACPI DSM or vendor-specific
+    /// NVDIMM command to retrieve the latest health counters.
+    /// Callers supply the firmware-provided data via `data`.
+    pub fn update_smart(&mut self, data: NvdimmSmartData) {
+        self.smart = data;
+        // Promote device health if critical flags are set.
+        if data.valid && data.is_critical() {
+            self.health = NvdimmHealth::Degraded;
+        }
+    }
+
+    /// Returns a reference to the current SMART data.
+    pub const fn smart_data(&self) -> &NvdimmSmartData {
+        &self.smart
+    }
 
     /// Performs a health check on this NVDIMM device.
     ///
-    /// Inspects all regions and returns the worst health status found.
+    /// Inspects all regions and the SMART data; returns the worst
+    /// health status found.
     pub fn health_check(&mut self) -> NvdimmHealth {
         let mut worst = NvdimmHealth::Ok;
         for region in self.regions.iter().flatten() {
@@ -504,8 +982,22 @@ impl NvdimmDevice {
                 _ => {}
             }
         }
+        // Also consider SMART data.
+        if worst != NvdimmHealth::Failed && self.smart.valid && self.smart.is_critical() {
+            worst = NvdimmHealth::Degraded;
+        }
         self.health = worst;
         worst
+    }
+
+    /// Returns `true` if remaining life is below `threshold_pct` percent.
+    ///
+    /// Returns `false` if SMART data is unavailable.
+    pub fn life_below_threshold(&self, threshold_pct: u8) -> bool {
+        if !self.smart.valid || !self.smart.has_remaining_life() {
+            return false;
+        }
+        self.smart.remaining_life_pct < threshold_pct
     }
 
     /// Returns the total persistent memory size across all active regions.
@@ -516,6 +1008,31 @@ impl NvdimmDevice {
             .filter(|r| r.active)
             .map(|r| r.size)
             .sum()
+    }
+
+    // -- Namespace event log ------------------------------------------------
+
+    /// Records a namespace event in the internal ring buffer.
+    fn record_ns_event(&mut self, event: NamespaceEvent) {
+        self.ns_events[self.ns_event_head] = Some(event);
+        self.ns_event_head = (self.ns_event_head + 1) % MAX_NS_EVENTS;
+        self.ns_event_total += 1;
+    }
+
+    /// Returns the most recent namespace event, if any.
+    pub fn last_ns_event(&self) -> Option<&NamespaceEvent> {
+        if self.ns_event_total == 0 {
+            return None;
+        }
+        // The previous write position holds the most recent event.
+        let last = (self.ns_event_head + MAX_NS_EVENTS - 1) % MAX_NS_EVENTS;
+        self.ns_events[last].as_ref()
+    }
+
+    /// Returns the total number of namespace events recorded (may exceed
+    /// the ring buffer capacity).
+    pub const fn ns_event_count(&self) -> usize {
+        self.ns_event_total
     }
 }
 

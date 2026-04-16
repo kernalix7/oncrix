@@ -60,6 +60,18 @@ const PROFILE_NAME_LEN: usize = 64;
 /// Maximum length of a path pattern in a file rule.
 const PATH_PATTERN_LEN: usize = 64;
 
+/// Maximum number of compiled binary match entries.
+const MAX_MATCH_ENTRIES: usize = 64;
+
+/// Maximum number of stacked profiles per PID.
+const MAX_PROFILE_STACK: usize = 4;
+
+/// Maximum number of audit log entries.
+const MAX_AUDIT_LOG: usize = 128;
+
+/// Maximum audit description length.
+const AUDIT_DESC_LEN: usize = 64;
+
 // ── ProfileMode ───────────────────────────────────────────────────
 
 /// Operating mode for an AppArmor profile.
@@ -169,13 +181,19 @@ impl FileRule {
 
     /// Check whether `request_path` matches this rule's pattern.
     ///
-    /// Uses prefix-based matching: the rule matches if the
-    /// request path starts with the rule's path pattern.
+    /// Supports glob-style matching:
+    /// - `*` matches any sequence of non-`/` characters within a
+    ///   single path component.
+    /// - `**` matches any sequence of characters including `/`
+    ///   (recursive glob).
+    /// - Trailing `/` matches any path under that directory.
+    /// - Otherwise, exact match or prefix match.
     fn matches_path(&self, request_path: &[u8]) -> bool {
-        if !self.active || request_path.len() < self.path_len {
+        if !self.active {
             return false;
         }
-        request_path[..self.path_len] == self.path[..self.path_len]
+        let pattern = &self.path[..self.path_len];
+        aa_glob_match(pattern, request_path)
     }
 }
 
@@ -412,6 +430,10 @@ pub struct AppArmorProfile {
     transitions: [ProfileTransition; MAX_TRANSITIONS],
     /// Number of active transitions.
     transition_count: usize,
+    /// Index of the parent profile, or `None` for top-level profiles.
+    pub parent_idx: Option<usize>,
+    /// Compiled binary match table for fast rule evaluation.
+    match_table: CompiledMatchTable,
     /// Whether this profile slot is active in the registry.
     pub active: bool,
 }
@@ -431,6 +453,8 @@ impl AppArmorProfile {
             cap_rule_count: 0,
             transitions: [ProfileTransition::empty(); MAX_TRANSITIONS],
             transition_count: 0,
+            parent_idx: None,
+            match_table: CompiledMatchTable::empty(),
             active: false,
         }
     }
@@ -564,17 +588,100 @@ impl AppArmorProfile {
         }
         None
     }
+
+    /// Return the number of active file rules.
+    pub fn file_rule_count(&self) -> usize {
+        self.file_rule_count
+    }
+
+    /// Return the number of active capability rules.
+    pub fn cap_rule_count(&self) -> usize {
+        self.cap_rule_count
+    }
+
+    /// Return the number of active network rules.
+    pub fn net_rule_count(&self) -> usize {
+        self.net_rule_count
+    }
+
+    /// Return the parent profile index.
+    pub fn parent(&self) -> Option<usize> {
+        self.parent_idx
+    }
+
+    /// Return a reference to the compiled match table.
+    pub fn match_table(&self) -> &CompiledMatchTable {
+        &self.match_table
+    }
+
+    /// Compile all file rules into the binary match table.
+    ///
+    /// This pre-processes file rules into a flat lookup structure
+    /// for faster runtime evaluation. Call after adding all rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if too many rules to compile.
+    pub fn compile(&mut self) -> Result<()> {
+        self.match_table = CompiledMatchTable::empty();
+        let mut idx = 0;
+        while idx < self.file_rule_count {
+            let rule = &self.file_rules[idx];
+            if rule.active {
+                if self.match_table.count >= MAX_MATCH_ENTRIES {
+                    return Err(Error::OutOfMemory);
+                }
+                let entry = &mut self.match_table.entries[self.match_table.count];
+                entry.path = rule.path;
+                entry.path_len = rule.path_len;
+                entry.permissions = rule.permissions;
+                entry.active = true;
+                self.match_table.count = self.match_table.count.saturating_add(1);
+            }
+            idx = idx.saturating_add(1);
+        }
+        self.match_table.compiled = true;
+        Ok(())
+    }
+
+    /// Check file access using the compiled match table.
+    ///
+    /// Falls back to the regular rule scan if the table has not
+    /// been compiled.
+    fn check_file_access_compiled(&self, path: &[u8], requested: FilePermission) -> bool {
+        if !self.match_table.compiled {
+            return self.check_file_access(path, requested);
+        }
+        let mut i = 0;
+        while i < self.match_table.count {
+            let entry = &self.match_table.entries[i];
+            if entry.active {
+                let pattern = &entry.path[..entry.path_len];
+                if aa_glob_match(pattern, path) && entry.permissions.contains(requested) {
+                    return true;
+                }
+            }
+            i = i.saturating_add(1);
+        }
+        false
+    }
 }
 
 // ── PidAssignment ─────────────────────────────────────────────────
 
-/// Maps a PID to a profile index in the registry.
+/// Maps a PID to one or more profile indices (stacked profiles).
+///
+/// Profile stacking allows a process to be confined by multiple
+/// profiles simultaneously. Access is allowed only if ALL stacked
+/// profiles grant the requested operation (intersection semantics).
 #[derive(Debug, Clone, Copy)]
 struct PidAssignment {
     /// Process ID.
     pid: u64,
-    /// Index into the registry's profile array.
-    profile_idx: usize,
+    /// Profile indices (stacked).
+    profile_stack: [usize; MAX_PROFILE_STACK],
+    /// Number of stacked profiles.
+    stack_depth: usize,
     /// Whether this assignment slot is in use.
     active: bool,
 }
@@ -584,7 +691,8 @@ impl PidAssignment {
     const fn empty() -> Self {
         Self {
             pid: 0,
-            profile_idx: 0,
+            profile_stack: [0; MAX_PROFILE_STACK],
+            stack_depth: 0,
             active: false,
         }
     }
@@ -618,9 +726,10 @@ impl AppArmorState {
         }
     }
 
-    /// Assign a profile to a PID.
+    /// Assign a profile to a PID (replaces any existing assignment).
     ///
-    /// If the PID already has an assignment, it is updated.
+    /// If the PID already has an assignment, its profile stack is
+    /// replaced with the single provided profile.
     ///
     /// # Errors
     ///
@@ -631,7 +740,8 @@ impl AppArmorState {
         let mut i = 0;
         while i < MAX_PIDS {
             if self.assignments[i].active && self.assignments[i].pid == pid {
-                self.assignments[i].profile_idx = profile_idx;
+                self.assignments[i].profile_stack[0] = profile_idx;
+                self.assignments[i].stack_depth = 1;
                 return Ok(());
             }
             i = i.saturating_add(1);
@@ -640,17 +750,44 @@ impl AppArmorState {
         let mut j = 0;
         while j < MAX_PIDS {
             if !self.assignments[j].active {
-                self.assignments[j] = PidAssignment {
-                    pid,
-                    profile_idx,
-                    active: true,
-                };
+                let entry = &mut self.assignments[j];
+                entry.pid = pid;
+                entry.profile_stack = [0; MAX_PROFILE_STACK];
+                entry.profile_stack[0] = profile_idx;
+                entry.stack_depth = 1;
+                entry.active = true;
                 self.count = self.count.saturating_add(1);
                 return Ok(());
             }
             j = j.saturating_add(1);
         }
         Err(Error::OutOfMemory)
+    }
+
+    /// Push an additional profile onto a PID's stack.
+    ///
+    /// Profile stacking causes all stacked profiles to be evaluated
+    /// with intersection semantics (all must allow).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the PID has no assignment.
+    /// Returns [`Error::OutOfMemory`] if the stack is full.
+    fn stack_profile(&mut self, pid: u64, profile_idx: usize) -> Result<()> {
+        let mut i = 0;
+        while i < MAX_PIDS {
+            if self.assignments[i].active && self.assignments[i].pid == pid {
+                let entry = &mut self.assignments[i];
+                if entry.stack_depth >= MAX_PROFILE_STACK {
+                    return Err(Error::OutOfMemory);
+                }
+                entry.profile_stack[entry.stack_depth] = profile_idx;
+                entry.stack_depth = entry.stack_depth.saturating_add(1);
+                return Ok(());
+            }
+            i = i.saturating_add(1);
+        }
+        Err(Error::NotFound)
     }
 
     /// Remove a PID's profile assignment.
@@ -666,12 +803,32 @@ impl AppArmorState {
         }
     }
 
-    /// Look up the profile index for a PID.
+    /// Look up the primary profile index for a PID.
     fn lookup(&self, pid: u64) -> Option<usize> {
         let mut i = 0;
         while i < MAX_PIDS {
             if self.assignments[i].active && self.assignments[i].pid == pid {
-                return Some(self.assignments[i].profile_idx);
+                if self.assignments[i].stack_depth > 0 {
+                    return Some(self.assignments[i].profile_stack[0]);
+                }
+                return None;
+            }
+            i = i.saturating_add(1);
+        }
+        None
+    }
+
+    /// Look up the full profile stack for a PID.
+    ///
+    /// Returns the stack slice and depth, or `None` if unassigned.
+    fn lookup_stack(&self, pid: u64) -> Option<(&[usize; MAX_PROFILE_STACK], usize)> {
+        let mut i = 0;
+        while i < MAX_PIDS {
+            if self.assignments[i].active && self.assignments[i].pid == pid {
+                return Some((
+                    &self.assignments[i].profile_stack,
+                    self.assignments[i].stack_depth,
+                ));
             }
             i = i.saturating_add(1);
         }
@@ -689,7 +846,8 @@ impl AppArmorState {
 /// Global AppArmor profile registry and access control engine.
 ///
 /// Manages profile loading/unloading, PID-to-profile assignment,
-/// and access checks for file, network, and capability operations.
+/// profile stacking, hierarchy, and access checks for file,
+/// network, and capability operations.
 pub struct AppArmorRegistry {
     /// Registered profiles.
     profiles: [AppArmorProfile; MAX_PROFILES],
@@ -697,6 +855,8 @@ pub struct AppArmorRegistry {
     profile_count: usize,
     /// PID-to-profile assignment state.
     state: AppArmorState,
+    /// Audit log for denied operations and mode changes.
+    audit_log: AppArmorAuditLog,
 }
 
 impl Default for AppArmorRegistry {
@@ -713,6 +873,7 @@ impl AppArmorRegistry {
             profiles: [EMPTY; MAX_PROFILES],
             profile_count: 0,
             state: AppArmorState::new(),
+            audit_log: AppArmorAuditLog::new(),
         }
     }
 
@@ -729,8 +890,32 @@ impl AppArmorRegistry {
     /// - [`Error::AlreadyExists`] if a profile with the same name
     ///   is already loaded.
     pub fn load_profile(&mut self, name: &[u8], mode: ProfileMode) -> Result<usize> {
+        self.load_profile_with_parent(name, mode, None)
+    }
+
+    /// Load a profile with an optional parent (child profile).
+    ///
+    /// Child profiles inherit the parent's restrictions: access is
+    /// allowed only if both the child and its parent permit it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::load_profile`], plus
+    /// [`Error::InvalidArgument`] if the parent index is invalid.
+    pub fn load_profile_with_parent(
+        &mut self,
+        name: &[u8],
+        mode: ProfileMode,
+        parent: Option<usize>,
+    ) -> Result<usize> {
         if name.is_empty() || name.len() > PROFILE_NAME_LEN {
             return Err(Error::InvalidArgument);
+        }
+        // Validate parent if provided.
+        if let Some(p) = parent {
+            if p >= MAX_PROFILES || !self.profiles[p].active {
+                return Err(Error::InvalidArgument);
+            }
         }
         // Check for duplicate name.
         if self.find_profile_idx(name).is_some() {
@@ -746,6 +931,7 @@ impl AppArmorRegistry {
         self.profiles[slot].name[..name.len()].copy_from_slice(name);
         self.profiles[slot].name_len = name.len();
         self.profiles[slot].mode = mode;
+        self.profiles[slot].parent_idx = parent;
         self.profiles[slot].active = true;
         self.profile_count = self.profile_count.saturating_add(1);
         Ok(slot)
@@ -764,12 +950,24 @@ impl AppArmorRegistry {
         self.profiles[idx].active = false;
         self.profile_count = self.profile_count.saturating_sub(1);
 
-        // Remove all PID assignments pointing to this profile.
+        // Remove all PID assignments that reference this profile
+        // in any position of their stack.
         let mut i = 0;
         while i < MAX_PIDS {
-            if self.state.assignments[i].active && self.state.assignments[i].profile_idx == idx {
-                self.state.assignments[i].active = false;
-                self.state.count = self.state.count.saturating_sub(1);
+            if self.state.assignments[i].active {
+                let entry = &self.state.assignments[i];
+                let mut found = false;
+                let mut j = 0;
+                while j < entry.stack_depth {
+                    if entry.profile_stack[j] == idx {
+                        found = true;
+                    }
+                    j = j.saturating_add(1);
+                }
+                if found {
+                    self.state.assignments[i].active = false;
+                    self.state.count = self.state.count.saturating_sub(1);
+                }
             }
             i = i.saturating_add(1);
         }
@@ -806,79 +1004,96 @@ impl AppArmorRegistry {
 
     /// Check file access for a process.
     ///
+    /// Evaluates all stacked profiles with intersection semantics:
+    /// access is allowed only if every profile in the stack permits
+    /// it. Parent profiles are also checked recursively.
+    ///
     /// Returns `Ok(())` if access is permitted. In Enforce mode,
     /// returns [`Error::PermissionDenied`] on denial. In Complain
-    /// mode, always returns `Ok(())`. In Kill mode, returns
-    /// [`Error::PermissionDenied`] on denial (caller must terminate
-    /// the process). Unconfined profiles always allow access.
+    /// mode, always returns `Ok(())` (denial is logged). In Kill
+    /// mode, returns [`Error::PermissionDenied`] on denial (caller
+    /// must terminate the process). Unconfined profiles allow access.
     ///
     /// If the PID has no profile assignment, access is allowed
     /// (unconfined by default).
-    pub fn check_file(&self, pid: u64, path: &[u8], requested: FilePermission) -> Result<()> {
-        let profile = match self.get_profile_for_pid(pid) {
-            Some(p) => p,
-            None => return Ok(()), // No profile = unconfined
+    pub fn check_file(&mut self, pid: u64, path: &[u8], requested: FilePermission) -> Result<()> {
+        let (stack, depth) = match self.state.lookup_stack(pid) {
+            Some(s) => s,
+            None => return Ok(()),
         };
+        // Copy stack to avoid borrow issues.
+        let mut local_stack = [0usize; MAX_PROFILE_STACK];
+        let local_depth = depth;
+        local_stack[..local_depth].copy_from_slice(&stack[..local_depth]);
 
-        match profile.mode {
-            ProfileMode::Unconfined => Ok(()),
-            ProfileMode::Complain => Ok(()), // Log only, always allow
-            ProfileMode::Enforce | ProfileMode::Kill => {
-                if profile.check_file_access(path, requested) {
-                    Ok(())
-                } else {
-                    Err(Error::PermissionDenied)
-                }
+        let mut idx = 0;
+        while idx < local_depth {
+            let profile_idx = local_stack[idx];
+            let result = self.check_file_single_with_parents(profile_idx, path, requested);
+            if let Err(e) = result {
+                self.audit_log
+                    .record(pid, profile_idx, AaAuditKind::FileDenied, path);
+                return Err(e);
             }
+            idx = idx.saturating_add(1);
         }
+        Ok(())
     }
 
     /// Check network access for a process.
     ///
-    /// Same enforcement semantics as [`Self::check_file`].
+    /// Same stacked intersection semantics as [`Self::check_file`].
     pub fn check_net(
-        &self,
+        &mut self,
         pid: u64,
         domain: AddressFamily,
         sock_type: SocketType,
         requested: NetPermission,
     ) -> Result<()> {
-        let profile = match self.get_profile_for_pid(pid) {
-            Some(p) => p,
+        let (stack, depth) = match self.state.lookup_stack(pid) {
+            Some(s) => s,
             None => return Ok(()),
         };
+        let mut local_stack = [0usize; MAX_PROFILE_STACK];
+        let local_depth = depth;
+        local_stack[..local_depth].copy_from_slice(&stack[..local_depth]);
 
-        match profile.mode {
-            ProfileMode::Unconfined | ProfileMode::Complain => Ok(()),
-            ProfileMode::Enforce | ProfileMode::Kill => {
-                if profile.check_net_access(domain, sock_type, requested) {
-                    Ok(())
-                } else {
-                    Err(Error::PermissionDenied)
-                }
+        let mut idx = 0;
+        while idx < local_depth {
+            let profile_idx = local_stack[idx];
+            if let Err(e) = self.check_net_single(profile_idx, domain, sock_type, requested) {
+                self.audit_log
+                    .record(pid, profile_idx, AaAuditKind::NetDenied, b"net");
+                return Err(e);
             }
+            idx = idx.saturating_add(1);
         }
+        Ok(())
     }
 
     /// Check capability access for a process.
     ///
-    /// Same enforcement semantics as [`Self::check_file`].
-    pub fn check_cap(&self, pid: u64, cap_id: u32) -> Result<()> {
-        let profile = match self.get_profile_for_pid(pid) {
-            Some(p) => p,
+    /// Same stacked intersection semantics as [`Self::check_file`].
+    pub fn check_cap(&mut self, pid: u64, cap_id: u32) -> Result<()> {
+        let (stack, depth) = match self.state.lookup_stack(pid) {
+            Some(s) => s,
             None => return Ok(()),
         };
+        let mut local_stack = [0usize; MAX_PROFILE_STACK];
+        let local_depth = depth;
+        local_stack[..local_depth].copy_from_slice(&stack[..local_depth]);
 
-        match profile.mode {
-            ProfileMode::Unconfined | ProfileMode::Complain => Ok(()),
-            ProfileMode::Enforce | ProfileMode::Kill => {
-                if profile.check_cap_access(cap_id) {
-                    Ok(())
-                } else {
-                    Err(Error::PermissionDenied)
-                }
+        let mut idx = 0;
+        while idx < local_depth {
+            let profile_idx = local_stack[idx];
+            if let Err(e) = self.check_cap_single(profile_idx, cap_id) {
+                self.audit_log
+                    .record(pid, profile_idx, AaAuditKind::CapDenied, b"cap");
+                return Err(e);
             }
+            idx = idx.saturating_add(1);
         }
+        Ok(())
     }
 
     /// Look up a domain transition for an exec path.
@@ -932,6 +1147,64 @@ impl AppArmorRegistry {
         Ok(&mut self.profiles[idx])
     }
 
+    /// Stack an additional profile onto a PID's confinement.
+    ///
+    /// The process will be checked against all stacked profiles
+    /// with intersection semantics (all must allow).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if the profile name or PID is not found.
+    /// - [`Error::OutOfMemory`] if the profile stack is full.
+    pub fn stack_profile(&mut self, pid: u64, name: &[u8]) -> Result<()> {
+        let idx = self.find_profile_idx(name).ok_or(Error::NotFound)?;
+        self.state.stack_profile(pid, idx)
+    }
+
+    /// Get the current label (active profile names) for a PID.
+    ///
+    /// The label is formatted as `profile1//&profile2` for stacked
+    /// profiles. Returns the label bytes and length.
+    pub fn get_label(&self, pid: u64) -> Option<([u8; PROFILE_NAME_LEN], usize)> {
+        let (stack, depth) = self.state.lookup_stack(pid)?;
+        if depth == 0 {
+            return None;
+        }
+        let mut buf = [0u8; PROFILE_NAME_LEN];
+        let mut pos = 0usize;
+        let mut idx = 0;
+        while idx < depth {
+            let profile_idx = stack[idx];
+            let profile = &self.profiles[profile_idx];
+            if !profile.active {
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if pos > 0 && pos + 3 < PROFILE_NAME_LEN {
+                buf[pos] = b'/';
+                buf[pos + 1] = b'/';
+                buf[pos + 2] = b'&';
+                pos += 3;
+            }
+            let name_len = profile.name_len.min(PROFILE_NAME_LEN.saturating_sub(pos));
+            buf[pos..pos + name_len].copy_from_slice(&profile.name[..name_len]);
+            pos += name_len;
+            idx = idx.saturating_add(1);
+        }
+        Some((buf, pos))
+    }
+
+    /// Compile a profile's rules into its binary match table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the profile is not found, or
+    /// [`Error::OutOfMemory`] if there are too many rules.
+    pub fn compile_profile(&mut self, name: &[u8]) -> Result<()> {
+        let idx = self.find_profile_idx(name).ok_or(Error::NotFound)?;
+        self.profiles[idx].compile()
+    }
+
     /// Return the number of loaded profiles.
     pub fn profile_count(&self) -> usize {
         self.profile_count
@@ -942,7 +1215,95 @@ impl AppArmorRegistry {
         self.state.count()
     }
 
+    /// Return a reference to the audit log.
+    pub fn audit_log(&self) -> &AppArmorAuditLog {
+        &self.audit_log
+    }
+
+    /// Get a profile by index (read-only).
+    pub fn get_profile(&self, idx: usize) -> Option<&AppArmorProfile> {
+        if idx < MAX_PROFILES && self.profiles[idx].active {
+            Some(&self.profiles[idx])
+        } else {
+            None
+        }
+    }
+
     // ── Internal helpers ──────────────────────────────────────────
+
+    /// Check file access for a single profile, walking up the
+    /// parent hierarchy.
+    fn check_file_single_with_parents(
+        &self,
+        profile_idx: usize,
+        path: &[u8],
+        requested: FilePermission,
+    ) -> Result<()> {
+        let mut cur = profile_idx;
+        loop {
+            let profile = &self.profiles[cur];
+            if !profile.active {
+                return Err(Error::PermissionDenied);
+            }
+            match profile.mode {
+                ProfileMode::Unconfined => {}
+                ProfileMode::Complain => {}
+                ProfileMode::Enforce | ProfileMode::Kill => {
+                    let allowed = profile.check_file_access_compiled(path, requested);
+                    if !allowed {
+                        return Err(Error::PermissionDenied);
+                    }
+                }
+            }
+            match profile.parent_idx {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Check network access for a single profile.
+    fn check_net_single(
+        &self,
+        profile_idx: usize,
+        domain: AddressFamily,
+        sock_type: SocketType,
+        requested: NetPermission,
+    ) -> Result<()> {
+        let profile = &self.profiles[profile_idx];
+        if !profile.active {
+            return Err(Error::PermissionDenied);
+        }
+        match profile.mode {
+            ProfileMode::Unconfined | ProfileMode::Complain => Ok(()),
+            ProfileMode::Enforce | ProfileMode::Kill => {
+                if profile.check_net_access(domain, sock_type, requested) {
+                    Ok(())
+                } else {
+                    Err(Error::PermissionDenied)
+                }
+            }
+        }
+    }
+
+    /// Check capability access for a single profile.
+    fn check_cap_single(&self, profile_idx: usize, cap_id: u32) -> Result<()> {
+        let profile = &self.profiles[profile_idx];
+        if !profile.active {
+            return Err(Error::PermissionDenied);
+        }
+        match profile.mode {
+            ProfileMode::Unconfined | ProfileMode::Complain => Ok(()),
+            ProfileMode::Enforce | ProfileMode::Kill => {
+                if profile.check_cap_access(cap_id) {
+                    Ok(())
+                } else {
+                    Err(Error::PermissionDenied)
+                }
+            }
+        }
+    }
 
     /// Find the index of a profile by name.
     fn find_profile_idx(&self, name: &[u8]) -> Option<usize> {
@@ -970,9 +1331,254 @@ impl AppArmorRegistry {
     }
 
     /// Get a reference to the profile assigned to a PID.
+    #[allow(dead_code)]
     fn get_profile_for_pid(&self, pid: u64) -> Option<&AppArmorProfile> {
         let idx = self.state.lookup(pid)?;
         let profile = &self.profiles[idx];
         if profile.active { Some(profile) } else { None }
     }
+}
+
+// ── CompiledMatchTable ───────────────────────────────────────────
+
+/// A single compiled match entry for fast file rule evaluation.
+#[derive(Debug, Clone, Copy)]
+pub struct CompiledMatchEntry {
+    /// Path pattern (copied from file rule).
+    pub path: [u8; PATH_PATTERN_LEN],
+    /// Valid length of the path pattern.
+    pub path_len: usize,
+    /// Permitted file operations.
+    pub permissions: FilePermission,
+    /// Whether this entry is active.
+    pub active: bool,
+}
+
+impl CompiledMatchEntry {
+    /// Create an empty, inactive entry.
+    const fn empty() -> Self {
+        Self {
+            path: [0u8; PATH_PATTERN_LEN],
+            path_len: 0,
+            permissions: FilePermission::NONE,
+            active: false,
+        }
+    }
+}
+
+/// Compiled binary match table for a profile.
+///
+/// Pre-processes file rules into a flat array for faster
+/// evaluation at access-check time. Rules are compiled once
+/// via [`AppArmorProfile::compile`] and evaluated on every
+/// file access check.
+pub struct CompiledMatchTable {
+    /// Match entries.
+    entries: [CompiledMatchEntry; MAX_MATCH_ENTRIES],
+    /// Number of active entries.
+    count: usize,
+    /// Whether the table has been compiled.
+    compiled: bool,
+}
+
+impl CompiledMatchTable {
+    /// Create an empty, uncompiled match table.
+    const fn empty() -> Self {
+        Self {
+            entries: [CompiledMatchEntry::empty(); MAX_MATCH_ENTRIES],
+            count: 0,
+            compiled: false,
+        }
+    }
+
+    /// Return whether the table has been compiled.
+    pub fn is_compiled(&self) -> bool {
+        self.compiled
+    }
+
+    /// Return the number of compiled entries.
+    pub fn entry_count(&self) -> usize {
+        self.count
+    }
+}
+
+// ── AppArmor Audit Log ──────────────────────────────────────────
+
+/// Kind of AppArmor audit event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AaAuditKind {
+    /// File access denied.
+    FileDenied,
+    /// Network access denied.
+    NetDenied,
+    /// Capability denied.
+    CapDenied,
+    /// Profile transition.
+    Transition,
+    /// Profile mode change.
+    ModeChange,
+}
+
+/// A single AppArmor audit log entry.
+#[derive(Debug, Clone, Copy)]
+pub struct AaAuditEntry {
+    /// Process ID.
+    pub pid: u64,
+    /// Profile index.
+    pub profile_idx: usize,
+    /// Kind of event.
+    pub kind: AaAuditKind,
+    /// Description (path, cap name, etc.).
+    pub desc: [u8; AUDIT_DESC_LEN],
+    /// Valid length of description.
+    pub desc_len: usize,
+    /// Whether this slot is in use.
+    pub in_use: bool,
+}
+
+impl AaAuditEntry {
+    /// Create an empty, inactive entry.
+    const fn empty() -> Self {
+        Self {
+            pid: 0,
+            profile_idx: 0,
+            kind: AaAuditKind::FileDenied,
+            desc: [0u8; AUDIT_DESC_LEN],
+            desc_len: 0,
+            in_use: false,
+        }
+    }
+}
+
+/// Ring-buffer audit log for AppArmor events.
+pub struct AppArmorAuditLog {
+    /// Audit entries.
+    entries: [AaAuditEntry; MAX_AUDIT_LOG],
+    /// Total events recorded (may exceed capacity).
+    total: usize,
+}
+
+impl Default for AppArmorAuditLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AppArmorAuditLog {
+    /// Create an empty audit log.
+    pub const fn new() -> Self {
+        Self {
+            entries: [AaAuditEntry::empty(); MAX_AUDIT_LOG],
+            total: 0,
+        }
+    }
+
+    /// Record an audit event.
+    pub fn record(&mut self, pid: u64, profile_idx: usize, kind: AaAuditKind, desc: &[u8]) {
+        let idx = self.total % MAX_AUDIT_LOG;
+        let entry = &mut self.entries[idx];
+        entry.pid = pid;
+        entry.profile_idx = profile_idx;
+        entry.kind = kind;
+        let copy_len = desc.len().min(AUDIT_DESC_LEN);
+        entry.desc = [0u8; AUDIT_DESC_LEN];
+        entry.desc[..copy_len].copy_from_slice(&desc[..copy_len]);
+        entry.desc_len = copy_len;
+        entry.in_use = true;
+        self.total = self.total.saturating_add(1);
+    }
+
+    /// Return total events recorded.
+    pub fn total_events(&self) -> usize {
+        self.total
+    }
+
+    /// Return the number of available entries.
+    pub fn available_entries(&self) -> usize {
+        self.total.min(MAX_AUDIT_LOG)
+    }
+
+    /// Retrieve an entry by ring-buffer index.
+    pub fn get_entry(&self, idx: usize) -> Option<&AaAuditEntry> {
+        if idx >= self.available_entries() {
+            return None;
+        }
+        let start = self.total.saturating_sub(MAX_AUDIT_LOG);
+        let real_idx = (start + idx) % MAX_AUDIT_LOG;
+        let entry = &self.entries[real_idx];
+        if entry.in_use { Some(entry) } else { None }
+    }
+}
+
+// ── Glob pattern matching ────────────────────────────────────────
+
+/// Match a path against a glob-style pattern.
+///
+/// Supports `*` (single component), `**` (recursive), and trailing
+/// `/` (directory prefix). Iterative algorithm, no allocation.
+fn aa_glob_match(pattern: &[u8], path: &[u8]) -> bool {
+    // Trailing '/' means directory prefix match.
+    if !pattern.is_empty()
+        && pattern[pattern.len() - 1] == b'/'
+        && path.len() >= pattern.len()
+        && path[..pattern.len()] == *pattern
+    {
+        return true;
+    }
+
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_si = 0usize;
+
+    while si < path.len() {
+        // Check for `**`.
+        if pi + 1 < pattern.len() && pattern[pi] == b'*' && pattern[pi + 1] == b'*' {
+            pi += 2;
+            if pi < pattern.len() && pattern[pi] == b'/' {
+                pi += 1;
+            }
+            if pi >= pattern.len() {
+                return true;
+            }
+            while si < path.len() {
+                if aa_glob_match(&pattern[pi..], &path[si..]) {
+                    return true;
+                }
+                si += 1;
+            }
+            return aa_glob_match(&pattern[pi..], &path[si..]);
+        }
+
+        if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+            continue;
+        }
+
+        if pi < pattern.len() && pattern[pi] == path[si] {
+            pi += 1;
+            si += 1;
+            continue;
+        }
+
+        if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            if path[star_si - 1] == b'/' {
+                return false;
+            }
+            si = star_si;
+            continue;
+        }
+
+        return false;
+    }
+
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi >= pattern.len()
 }

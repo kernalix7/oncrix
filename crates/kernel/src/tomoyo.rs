@@ -58,6 +58,12 @@ const MAX_TRANSITIONS: usize = 128;
 /// Maximum tracked PIDs for domain assignment.
 const MAX_PIDS: usize = 256;
 
+/// Maximum number of audit log entries.
+const MAX_AUDIT_ENTRIES: usize = 256;
+
+/// Maximum description length in an audit entry.
+const AUDIT_DESC_LEN: usize = 128;
+
 // ── TomoyoMode ────────────────────────────────────────────────────
 
 /// Operating mode for a TOMOYO domain.
@@ -185,6 +191,15 @@ impl TomoyoFileRule {
     /// A rule matches if it is active, the path matches the pattern,
     /// and the requested permission bits are a subset of the rule's
     /// permission bitmask.
+    ///
+    /// Pattern matching supports:
+    /// - Exact match: `/usr/bin/foo` matches only `/usr/bin/foo`
+    /// - Wildcard `*`: matches any sequence of characters within a
+    ///   single path component (no `/`).
+    /// - Wildcard `**`: matches any sequence of characters including
+    ///   path separators (recursive glob).
+    /// - Prefix match: a pattern ending in `/` matches any path
+    ///   under that directory.
     fn matches(&self, path: &[u8], perm: TomoyoPermission) -> bool {
         if !self.active {
             return false;
@@ -193,12 +208,7 @@ impl TomoyoFileRule {
             return false;
         }
         let pattern = self.path();
-        // Simple prefix match: the rule's path pattern must be a
-        // prefix of the requested path (or an exact match).
-        if path.len() < pattern.len() {
-            return false;
-        }
-        path[..pattern.len()] == *pattern
+        wildcard_match(pattern, path)
     }
 }
 
@@ -562,6 +572,63 @@ impl TomoyoPolicy {
         }
         None
     }
+
+    /// Find a domain by name.
+    ///
+    /// Returns the index of the first active domain whose name
+    /// matches `name` exactly.
+    pub fn find_domain_by_name(&self, name: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        while i < self.domain_count {
+            let d = &self.domains[i];
+            if d.active
+                && d.name_len as usize == name.len()
+                && d.name[..d.name_len as usize] == *name
+            {
+                return Some(i);
+            }
+            i = i.saturating_add(1);
+        }
+        None
+    }
+
+    /// Remove a domain by index, deactivating it.
+    ///
+    /// Child domains are not automatically removed; callers must
+    /// handle orphaned children.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `idx` is out of range
+    /// or the domain is already inactive.
+    pub fn remove_domain(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.domain_count {
+            return Err(Error::InvalidArgument);
+        }
+        if !self.domains[idx].active {
+            return Err(Error::InvalidArgument);
+        }
+        self.domains[idx].active = false;
+        Ok(())
+    }
+
+    /// Return the children of a domain.
+    ///
+    /// Returns a count and array of child domain indices (up to 32).
+    pub fn get_children(&self, parent_idx: usize) -> ([usize; 32], usize) {
+        let mut children = [0usize; 32];
+        let mut count = 0usize;
+        let mut i = 0;
+        while i < self.domain_count && count < 32 {
+            let d = &self.domains[i];
+            if d.active && d.parent == Some(parent_idx) {
+                children[count] = i;
+                count = count.saturating_add(1);
+            }
+            i = i.saturating_add(1);
+        }
+        (children, count)
+    }
 }
 
 // ── PID-to-domain mapping ─────────────────────────────────────────
@@ -592,13 +659,15 @@ impl PidDomainEntry {
 
 /// Top-level TOMOYO subsystem registry.
 ///
-/// Manages the policy, PID-to-domain assignments, and subsystem
-/// enable/disable state.
+/// Manages the policy, PID-to-domain assignments, audit log, and
+/// subsystem enable/disable state.
 pub struct TomoyoRegistry {
     /// The loaded TOMOYO policy.
     policy: TomoyoPolicy,
     /// PID-to-domain mapping table.
     pid_map: [PidDomainEntry; MAX_PIDS],
+    /// Audit log for denied and notable operations.
+    audit_log: TomoyoAuditLog,
     /// Whether the TOMOYO subsystem is enabled.
     enabled: bool,
 }
@@ -615,6 +684,7 @@ impl TomoyoRegistry {
         Self {
             policy: TomoyoPolicy::new(),
             pid_map: [PidDomainEntry::empty(); MAX_PIDS],
+            audit_log: TomoyoAuditLog::new(),
             enabled: false,
         }
     }
@@ -720,6 +790,10 @@ impl TomoyoRegistry {
     /// assignment, access is permitted. Otherwise, the check is
     /// delegated to the domain's rules via the policy.
     ///
+    /// Denied operations and permissive-mode violations are recorded
+    /// in the audit log. Enforcing-mode denials also produce an audit
+    /// entry before returning `PermissionDenied`.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::PermissionDenied`] if the domain is in
@@ -737,7 +811,19 @@ impl TomoyoRegistry {
             Some(idx) => idx,
             None => return Ok(()),
         };
-        self.policy.check_file_access(domain_idx, path, perm)
+        let result = self.policy.check_file_access(domain_idx, path, perm);
+        if result.is_err() {
+            // Enforcing-mode denial: log the denied access.
+            self.audit_log
+                .record(pid, domain_idx, path, perm, TomoyoAuditResult::Denied);
+        } else if let Some(domain) = self.policy.get_domain(domain_idx) {
+            if domain.mode() == TomoyoMode::Permissive && !domain.check_access(path, perm) {
+                // Permissive-mode violation: access allowed but logged.
+                self.audit_log
+                    .record(pid, domain_idx, path, perm, TomoyoAuditResult::SoftDenied);
+            }
+        }
+        result
     }
 
     /// Handle an exec event for a PID.
@@ -745,6 +831,8 @@ impl TomoyoRegistry {
     /// Checks the transition table and updates the PID's domain
     /// assignment if a matching transition exists. Returns the new
     /// domain index, or `None` if no transition was triggered.
+    ///
+    /// Domain transitions are logged in the audit log.
     ///
     /// # Errors
     ///
@@ -759,9 +847,293 @@ impl TomoyoRegistry {
         };
         if let Some(new_domain) = self.policy.handle_exec_transition(current, exec_path) {
             self.set_domain(pid, new_domain)?;
+            // Log the domain transition.
+            self.audit_log.record(
+                pid,
+                new_domain,
+                exec_path,
+                TomoyoPermission::EXECUTE,
+                TomoyoAuditResult::Transition,
+            );
             Ok(Some(new_domain))
         } else {
             Ok(None)
         }
     }
+
+    /// Return a reference to the audit log.
+    pub fn audit_log(&self) -> &TomoyoAuditLog {
+        &self.audit_log
+    }
+
+    /// Look up a domain by name in the policy.
+    ///
+    /// Returns the domain index if found.
+    pub fn find_domain_by_name(&self, name: &[u8]) -> Option<usize> {
+        self.policy.find_domain_by_name(name)
+    }
+
+    /// Initialise the registry with a root `<kernel>` domain.
+    ///
+    /// The root domain is added in [`TomoyoMode::Enforcing`] mode
+    /// with no parent. This must be called once before using the
+    /// registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the domain could not be added.
+    pub fn init_root_domain(&mut self) -> Result<usize> {
+        self.policy
+            .add_domain(b"<kernel>", TomoyoMode::Enforcing, None)
+    }
+
+    /// Return the depth of a domain in the hierarchy.
+    ///
+    /// The root domain has depth 0.
+    pub fn domain_depth(&self, domain_idx: usize) -> usize {
+        let mut depth = 0usize;
+        let mut idx = domain_idx;
+        while let Some(domain) = self.policy.get_domain(idx) {
+            match domain.parent() {
+                Some(parent) => {
+                    depth = depth.saturating_add(1);
+                    idx = parent;
+                }
+                None => break,
+            }
+        }
+        depth
+    }
+
+    /// Check whether `ancestor_idx` is an ancestor of `domain_idx`
+    /// in the domain hierarchy.
+    pub fn is_ancestor(&self, domain_idx: usize, ancestor_idx: usize) -> bool {
+        let mut idx = domain_idx;
+        while let Some(domain) = self.policy.get_domain(idx) {
+            match domain.parent() {
+                Some(parent) => {
+                    if parent == ancestor_idx {
+                        return true;
+                    }
+                    idx = parent;
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
+// ── TomoyoAuditResult ────────────────────────────────────────────
+
+/// Outcome recorded in a TOMOYO audit log entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TomoyoAuditResult {
+    /// Access was denied (enforcing mode).
+    Denied,
+    /// Access would have been denied but was allowed (permissive mode).
+    SoftDenied,
+    /// A domain transition occurred.
+    Transition,
+}
+
+// ── TomoyoAuditEntry ─────────────────────────────────────────────
+
+/// A single TOMOYO audit log entry.
+#[derive(Debug, Clone, Copy)]
+pub struct TomoyoAuditEntry {
+    /// Process ID that triggered the event.
+    pub pid: u64,
+    /// Domain index at the time of the event.
+    pub domain_idx: usize,
+    /// Path involved in the operation (truncated).
+    pub path: [u8; AUDIT_DESC_LEN],
+    /// Valid length of `path`.
+    pub path_len: usize,
+    /// Permission that was checked.
+    pub permission: TomoyoPermission,
+    /// Outcome of the check.
+    pub result: TomoyoAuditResult,
+    /// Whether this slot is in use.
+    pub in_use: bool,
+}
+
+impl TomoyoAuditEntry {
+    /// Create an empty, inactive audit entry.
+    const fn empty() -> Self {
+        Self {
+            pid: 0,
+            domain_idx: 0,
+            path: [0u8; AUDIT_DESC_LEN],
+            path_len: 0,
+            permission: TomoyoPermission::NONE,
+            result: TomoyoAuditResult::Denied,
+            in_use: false,
+        }
+    }
+}
+
+// ── TomoyoAuditLog ──────────────────────────────────────────────
+
+/// Ring-buffer audit log for TOMOYO security events.
+///
+/// Records denied operations, permissive-mode violations, and
+/// domain transitions. Older entries are overwritten when full.
+pub struct TomoyoAuditLog {
+    /// Audit entry storage.
+    entries: [TomoyoAuditEntry; MAX_AUDIT_ENTRIES],
+    /// Total number of events recorded (may exceed capacity).
+    total: usize,
+}
+
+impl Default for TomoyoAuditLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TomoyoAuditLog {
+    /// Create an empty audit log.
+    pub const fn new() -> Self {
+        Self {
+            entries: [TomoyoAuditEntry::empty(); MAX_AUDIT_ENTRIES],
+            total: 0,
+        }
+    }
+
+    /// Record a new audit event.
+    pub fn record(
+        &mut self,
+        pid: u64,
+        domain_idx: usize,
+        path: &[u8],
+        permission: TomoyoPermission,
+        result: TomoyoAuditResult,
+    ) {
+        let idx = self.total % MAX_AUDIT_ENTRIES;
+        let entry = &mut self.entries[idx];
+        entry.pid = pid;
+        entry.domain_idx = domain_idx;
+        let copy_len = path.len().min(AUDIT_DESC_LEN);
+        entry.path = [0u8; AUDIT_DESC_LEN];
+        entry.path[..copy_len].copy_from_slice(&path[..copy_len]);
+        entry.path_len = copy_len;
+        entry.permission = permission;
+        entry.result = result;
+        entry.in_use = true;
+        self.total = self.total.saturating_add(1);
+    }
+
+    /// Return the total number of events recorded (including
+    /// overwritten entries).
+    pub fn total_events(&self) -> usize {
+        self.total
+    }
+
+    /// Return the number of entries currently available for reading.
+    pub fn available_entries(&self) -> usize {
+        self.total.min(MAX_AUDIT_ENTRIES)
+    }
+
+    /// Retrieve an audit entry by ring-buffer index.
+    ///
+    /// Index 0 is the oldest available entry.
+    pub fn get_entry(&self, idx: usize) -> Option<&TomoyoAuditEntry> {
+        if idx >= self.available_entries() {
+            return None;
+        }
+        let start = self.total.saturating_sub(MAX_AUDIT_ENTRIES);
+        let real_idx = (start + idx) % MAX_AUDIT_ENTRIES;
+        let entry = &self.entries[real_idx];
+        if entry.in_use { Some(entry) } else { None }
+    }
+}
+
+// ── Wildcard pattern matching ────────────────────────────────────
+
+/// Match a path against a pattern supporting wildcards.
+///
+/// Supported patterns:
+/// - Exact match: `pattern == path`
+/// - Trailing `/`: directory prefix match.
+/// - `*`: matches any sequence of non-`/` characters.
+/// - `**`: matches any sequence of characters including `/`.
+///
+/// Uses an iterative algorithm with backtracking bounded by
+/// pattern and path length (no recursion, no allocation).
+fn wildcard_match(pattern: &[u8], path: &[u8]) -> bool {
+    // Trailing '/' means "anything under this directory".
+    if !pattern.is_empty()
+        && pattern[pattern.len() - 1] == b'/'
+        && path.len() >= pattern.len()
+        && path[..pattern.len()] == *pattern
+    {
+        return true;
+    }
+
+    let mut pi = 0usize; // pattern index
+    let mut si = 0usize; // path (subject) index
+    let mut star_pi: Option<usize> = None; // last `*` position in pattern
+    let mut star_si = 0usize; // path position at last `*`
+
+    while si < path.len() {
+        // Check for `**` (recursive glob).
+        if pi + 1 < pattern.len() && pattern[pi] == b'*' && pattern[pi + 1] == b'*' {
+            // `**` matches everything including `/`.
+            // Try advancing pattern past `**`.
+            pi += 2;
+            // Skip trailing `/` after `**` if present.
+            if pi < pattern.len() && pattern[pi] == b'/' {
+                pi += 1;
+            }
+            // If `**` is at end of pattern, match everything.
+            if pi >= pattern.len() {
+                return true;
+            }
+            // Otherwise, try to match the rest of the pattern
+            // against every suffix of the path.
+            while si < path.len() {
+                if wildcard_match(&pattern[pi..], &path[si..]) {
+                    return true;
+                }
+                si += 1;
+            }
+            return wildcard_match(&pattern[pi..], &path[si..]);
+        }
+
+        if pi < pattern.len() && pattern[pi] == b'*' {
+            // Single `*`: matches non-`/` characters.
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+            continue;
+        }
+
+        if pi < pattern.len() && pattern[pi] == path[si] {
+            pi += 1;
+            si += 1;
+            continue;
+        }
+
+        // Mismatch: backtrack to last `*` if possible.
+        if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            // `*` cannot match `/`.
+            if path[star_si - 1] == b'/' {
+                return false;
+            }
+            si = star_si;
+            continue;
+        }
+
+        return false;
+    }
+
+    // Consume trailing `*` or `**` in pattern.
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi >= pattern.len()
 }

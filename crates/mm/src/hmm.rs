@@ -52,6 +52,12 @@ pub const MAX_RANGES_PER_MIRROR: usize = 32;
 /// Maximum number of pages in a single migration request.
 pub const MAX_MIGRATE_PAGES: usize = 256;
 
+/// Maximum number of device-private page tracking entries.
+pub const MAX_DEVICE_PRIVATE_PAGES: usize = 512;
+
+/// Maximum number of pending page-table sync notifications.
+pub const MAX_SYNC_NOTIFICATIONS: usize = 64;
+
 /// Sentinel value representing an invalid device identifier.
 pub const HMM_INVALID_DEVICE: u32 = u32::MAX;
 
@@ -99,6 +105,120 @@ pub enum HmmFaultKind {
     Cpu,
     /// Device-side page fault (system RAM page accessed by device).
     Device,
+}
+
+// -------------------------------------------------------------------
+// HmmPteSyncKind
+// -------------------------------------------------------------------
+
+/// Type of CPU page-table change that must be propagated to the
+/// device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HmmPteSyncKind {
+    /// A new mapping was established (e.g., page fault resolved).
+    #[default]
+    Map,
+    /// An existing mapping was removed (e.g., munmap).
+    Unmap,
+    /// Permissions on an existing mapping changed (e.g., mprotect).
+    PermChange,
+    /// Page was migrated to a different physical location.
+    Migrate,
+}
+
+// -------------------------------------------------------------------
+// HmmPteSyncNotification
+// -------------------------------------------------------------------
+
+/// Notification for a single CPU PTE change that the device driver
+/// must process.
+///
+/// These are queued by the MMU notifier path and consumed by the
+/// device driver when it synchronises its page tables.
+#[derive(Debug, Clone, Copy)]
+pub struct HmmPteSyncNotification {
+    /// Virtual address affected.
+    pub vaddr: u64,
+    /// New physical address (0 for unmaps).
+    pub new_paddr: u64,
+    /// Kind of change.
+    pub kind: HmmPteSyncKind,
+    /// Whether the new mapping is writable (meaningful only for
+    /// `Map` and `PermChange`).
+    pub writable: bool,
+    /// Device ID this notification targets.
+    pub device_id: u32,
+    /// Process ID.
+    pub pid: u32,
+    /// Whether this slot is occupied.
+    pub active: bool,
+}
+
+impl HmmPteSyncNotification {
+    /// An empty, inactive notification slot.
+    const fn empty() -> Self {
+        Self {
+            vaddr: 0,
+            new_paddr: 0,
+            kind: HmmPteSyncKind::Map,
+            writable: false,
+            device_id: HMM_INVALID_DEVICE,
+            pid: 0,
+            active: false,
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// DevicePrivatePage
+// -------------------------------------------------------------------
+
+/// Tracking entry for a page that lives in device-private memory.
+///
+/// The kernel keeps a shadow entry so it can locate the device page
+/// when the CPU attempts to access it (device fault handling).
+#[derive(Debug, Clone, Copy)]
+pub struct DevicePrivatePage {
+    /// Virtual address in the owning process.
+    pub vaddr: u64,
+    /// Device-side physical address.
+    pub device_paddr: u64,
+    /// Device that owns this page.
+    pub device_id: u32,
+    /// Process that owns the virtual mapping.
+    pub pid: u32,
+    /// Generation counter; incremented on each migration so stale
+    /// references can be detected.
+    pub generation: u64,
+    /// Whether this slot is in use.
+    pub active: bool,
+}
+
+impl DevicePrivatePage {
+    /// An empty, inactive slot.
+    const fn empty() -> Self {
+        Self {
+            vaddr: 0,
+            device_paddr: 0,
+            device_id: HMM_INVALID_DEVICE,
+            pid: 0,
+            generation: 0,
+            active: false,
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// HmmBatchMigrateResult
+// -------------------------------------------------------------------
+
+/// Summary of a batch migration operation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HmmBatchMigrateResult {
+    /// Number of pages successfully migrated.
+    pub migrated: u64,
+    /// Number of pages that could not be migrated (pinned, etc.).
+    pub failed: u64,
 }
 
 // -------------------------------------------------------------------
@@ -244,6 +364,57 @@ impl HmmRange {
             .iter()
             .filter(|e| e.kind == HmmPageKind::DevicePrivate)
             .count()
+    }
+
+    /// Count pages currently being migrated within this range.
+    pub fn migrating_pages(&self) -> usize {
+        self.pages[..self.page_count]
+            .iter()
+            .filter(|e| e.kind == HmmPageKind::Migrating)
+            .count()
+    }
+
+    /// Count pages that are not present (demand-paged or swapped).
+    pub fn not_present_pages(&self) -> usize {
+        self.pages[..self.page_count]
+            .iter()
+            .filter(|e| e.kind == HmmPageKind::NotPresent)
+            .count()
+    }
+
+    /// Takes a snapshot of page entries for building a device page
+    /// table.
+    ///
+    /// Copies up to `out.len()` entries into the provided buffer
+    /// and returns the number of entries written.
+    pub fn snapshot(&self, out: &mut [HmmPageEntry]) -> usize {
+        let copy_len = out.len().min(self.page_count);
+        out[..copy_len].copy_from_slice(&self.pages[..copy_len]);
+        copy_len
+    }
+
+    /// Marks the specified range of pages as migrating.
+    ///
+    /// `start_vaddr` and `end_vaddr` must be within this range
+    /// and page-aligned.
+    pub fn mark_migrating(&mut self, start_vaddr: u64, end_vaddr: u64) -> Result<usize> {
+        if start_vaddr < self.start
+            || end_vaddr > self.end
+            || start_vaddr >= end_vaddr
+            || start_vaddr % HMM_PAGE_SIZE != 0
+            || end_vaddr % HMM_PAGE_SIZE != 0
+        {
+            return Err(Error::InvalidArgument);
+        }
+        let first = ((start_vaddr - self.start) / HMM_PAGE_SIZE) as usize;
+        let last = ((end_vaddr - self.start) / HMM_PAGE_SIZE) as usize;
+        let mut count = 0usize;
+        for entry in &mut self.pages[first..last] {
+            entry.kind = HmmPageKind::Migrating;
+            entry.device_mapped = false;
+            count += 1;
+        }
+        Ok(count)
     }
 }
 
@@ -584,7 +755,10 @@ pub struct HmmStats {
 
 /// Global HMM manager.
 ///
-/// Maintains the registry of [`HmmDevice`]s and [`HmmMirror`]s.
+/// Maintains the registry of [`HmmDevice`]s and [`HmmMirror`]s,
+/// device-private page tracking, and PTE synchronisation
+/// notifications.
+///
 /// In a real kernel this would be protected by a spinlock; here we
 /// rely on the caller to provide appropriate synchronisation.
 pub struct HmmManager {
@@ -592,10 +766,20 @@ pub struct HmmManager {
     devices: [HmmDevice; MAX_HMM_DEVICES],
     /// Active per-process mirrors.
     mirrors: [HmmMirror; MAX_HMM_MIRRORS],
+    /// Device-private page tracker.
+    private_pages: [DevicePrivatePage; MAX_DEVICE_PRIVATE_PAGES],
+    /// Number of active device-private page entries.
+    private_page_count: usize,
+    /// PTE synchronisation notification queue.
+    sync_queue: [HmmPteSyncNotification; MAX_SYNC_NOTIFICATIONS],
+    /// Number of pending sync notifications.
+    sync_queue_count: usize,
     /// Next device ID to assign.
     next_device_id: u32,
     /// Next mirror ID to assign.
     next_mirror_id: u32,
+    /// Generation counter for device-private pages.
+    generation: u64,
     /// Aggregate statistics.
     stats: HmmStats,
 }
@@ -632,8 +816,13 @@ impl HmmManager {
                 HmmMirror::inactive(),
                 HmmMirror::inactive(),
             ],
+            private_pages: [DevicePrivatePage::empty(); MAX_DEVICE_PRIVATE_PAGES],
+            private_page_count: 0,
+            sync_queue: [HmmPteSyncNotification::empty(); MAX_SYNC_NOTIFICATIONS],
+            sync_queue_count: 0,
             next_device_id: 0,
             next_mirror_id: 0,
+            generation: 0,
             stats: HmmStats {
                 device_count: 0,
                 mirror_count: 0,
@@ -918,6 +1107,448 @@ impl HmmManager {
             .iter()
             .filter(|m| m.active && m.pid == pid)
             .count()
+    }
+
+    // ---------------------------------------------------------------
+    // Page Table Synchronisation
+    // ---------------------------------------------------------------
+
+    /// Queues a PTE synchronisation notification for device drivers.
+    ///
+    /// Called from the MMU notifier path whenever a CPU PTE changes
+    /// for a range managed by HMM.  The device driver consumes these
+    /// via [`drain_sync_notifications`](Self::drain_sync_notifications).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the notification queue is
+    /// full.
+    pub fn queue_pte_sync(
+        &mut self,
+        vaddr: u64,
+        new_paddr: u64,
+        kind: HmmPteSyncKind,
+        writable: bool,
+        device_id: u32,
+        pid: u32,
+    ) -> Result<()> {
+        if self.sync_queue_count >= MAX_SYNC_NOTIFICATIONS {
+            return Err(Error::OutOfMemory);
+        }
+        self.sync_queue[self.sync_queue_count] = HmmPteSyncNotification {
+            vaddr,
+            new_paddr,
+            kind,
+            writable,
+            device_id,
+            pid,
+            active: true,
+        };
+        self.sync_queue_count += 1;
+        Ok(())
+    }
+
+    /// Enhanced MMU notifier that also queues PTE sync notifications
+    /// for each affected device mirror.
+    ///
+    /// This replaces direct calls to
+    /// [`mmu_notifier_invalidate`](Self::mmu_notifier_invalidate)
+    /// when per-PTE notifications are needed.
+    pub fn mmu_notifier_sync(&mut self, pid: u32, start: u64, end: u64, kind: HmmPteSyncKind) {
+        for i in 0..self.mirrors.len() {
+            if !self.mirrors[i].active || self.mirrors[i].pid != pid {
+                continue;
+            }
+            let device_id = self.mirrors[i].device_id;
+            self.mirrors[i].invalidate_range(start, end);
+            self.stats.invalidations += 1;
+
+            // Queue per-page notifications.
+            let mut vaddr = start;
+            while vaddr < end {
+                let _ = self.queue_pte_sync(vaddr, 0, kind, false, device_id, pid);
+                vaddr += HMM_PAGE_SIZE;
+            }
+        }
+    }
+
+    /// Drains pending sync notifications into the caller's buffer.
+    ///
+    /// Copies up to `out.len()` notifications and removes them from
+    /// the internal queue.  Returns the number of notifications
+    /// copied.
+    pub fn drain_sync_notifications(&mut self, out: &mut [HmmPteSyncNotification]) -> usize {
+        let drain = out.len().min(self.sync_queue_count);
+        out[..drain].copy_from_slice(&self.sync_queue[..drain]);
+        // Shift remaining entries forward.
+        let remaining = self.sync_queue_count - drain;
+        for i in 0..remaining {
+            self.sync_queue[i] = self.sync_queue[drain + i];
+        }
+        for i in remaining..self.sync_queue_count {
+            self.sync_queue[i] = HmmPteSyncNotification::empty();
+        }
+        self.sync_queue_count = remaining;
+        drain
+    }
+
+    /// Returns the number of pending sync notifications.
+    pub fn pending_sync_count(&self) -> usize {
+        self.sync_queue_count
+    }
+
+    // ---------------------------------------------------------------
+    // Device-Private Page Tracking
+    // ---------------------------------------------------------------
+
+    /// Registers a page as living in device-private memory.
+    ///
+    /// Called after a successful `migrate_to_device` to record
+    /// the device-side location so CPU faults can find the page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the tracker is full.
+    pub fn register_private_page(
+        &mut self,
+        vaddr: u64,
+        device_paddr: u64,
+        device_id: u32,
+        pid: u32,
+    ) -> Result<u64> {
+        if self.private_page_count >= MAX_DEVICE_PRIVATE_PAGES {
+            return Err(Error::OutOfMemory);
+        }
+        self.generation += 1;
+        let cur_gen = self.generation;
+        self.private_pages[self.private_page_count] = DevicePrivatePage {
+            vaddr,
+            device_paddr,
+            device_id,
+            pid,
+            generation: cur_gen,
+            active: true,
+        };
+        self.private_page_count += 1;
+        Ok(cur_gen)
+    }
+
+    /// Unregisters a device-private page (e.g., after migrating
+    /// back to system RAM).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if no matching entry exists.
+    pub fn unregister_private_page(&mut self, vaddr: u64, device_id: u32, pid: u32) -> Result<()> {
+        let pos = (0..self.private_page_count)
+            .find(|&i| {
+                let p = &self.private_pages[i];
+                p.active && p.vaddr == vaddr && p.device_id == device_id && p.pid == pid
+            })
+            .ok_or(Error::NotFound)?;
+
+        self.private_page_count -= 1;
+        if pos < self.private_page_count {
+            self.private_pages[pos] = self.private_pages[self.private_page_count];
+        }
+        self.private_pages[self.private_page_count] = DevicePrivatePage::empty();
+        Ok(())
+    }
+
+    /// Looks up a device-private page by virtual address and
+    /// process.
+    ///
+    /// Returns `None` if the page is not in device-private memory.
+    pub fn find_private_page(&self, vaddr: u64, pid: u32) -> Option<&DevicePrivatePage> {
+        self.private_pages[..self.private_page_count]
+            .iter()
+            .find(|p| p.active && p.vaddr == vaddr && p.pid == pid)
+    }
+
+    /// Returns the number of tracked device-private pages.
+    pub fn private_page_count(&self) -> usize {
+        self.private_page_count
+    }
+
+    /// Returns the number of device-private pages for a given
+    /// device.
+    pub fn device_private_page_count(&self, device_id: u32) -> usize {
+        self.private_pages[..self.private_page_count]
+            .iter()
+            .filter(|p| p.active && p.device_id == device_id)
+            .count()
+    }
+
+    // ---------------------------------------------------------------
+    // Convenience Migration Wrappers
+    // ---------------------------------------------------------------
+
+    /// Migrates pages from system RAM to device-private memory.
+    ///
+    /// A convenience wrapper around [`migrate`](Self::migrate) that
+    /// also registers each migrated page in the device-private page
+    /// tracker and queues PTE sync notifications.
+    ///
+    /// Returns the number of pages migrated.
+    pub fn migrate_to_device(
+        &mut self,
+        start: u64,
+        end: u64,
+        device_id: u32,
+        pid: u32,
+    ) -> Result<u64> {
+        let req = HmmMigrateRequest::new(start, end, HmmMigrateDir::ToDevice, device_id, pid)?;
+        let migrated = self.migrate(&req)?;
+
+        // Register each page in the device-private tracker.
+        let dev_slot = self
+            .devices
+            .iter()
+            .position(|d| d.active && d.id == device_id);
+        let mut vaddr = start;
+        while vaddr < end {
+            let device_paddr = if let Some(ds) = dev_slot {
+                // Estimate: base + offset.
+                let offset = self.devices[ds].private_mem_size - self.devices[ds].free_device_mem();
+                self.devices[ds].private_mem_base + offset
+            } else {
+                vaddr // simulated
+            };
+            let _ = self.register_private_page(vaddr, device_paddr, device_id, pid);
+            let _ = self.queue_pte_sync(vaddr, 0, HmmPteSyncKind::Migrate, false, device_id, pid);
+            vaddr += HMM_PAGE_SIZE;
+        }
+        Ok(migrated)
+    }
+
+    /// Migrates pages from device-private memory back to system RAM.
+    ///
+    /// Unregisters each page from the device-private tracker and
+    /// queues PTE sync notifications.
+    ///
+    /// Returns the number of pages migrated.
+    pub fn migrate_from_device(
+        &mut self,
+        start: u64,
+        end: u64,
+        device_id: u32,
+        pid: u32,
+    ) -> Result<u64> {
+        let req = HmmMigrateRequest::new(start, end, HmmMigrateDir::ToCpu, device_id, pid)?;
+        let migrated = self.migrate(&req)?;
+
+        // Unregister each page from the device-private tracker.
+        let mut vaddr = start;
+        while vaddr < end {
+            let _ = self.unregister_private_page(vaddr, device_id, pid);
+            let _ = self.queue_pte_sync(
+                vaddr,
+                vaddr, // simulated CPU paddr
+                HmmPteSyncKind::Migrate,
+                true,
+                device_id,
+                pid,
+            );
+            vaddr += HMM_PAGE_SIZE;
+        }
+        Ok(migrated)
+    }
+
+    // ---------------------------------------------------------------
+    // Device Fault Handling
+    // ---------------------------------------------------------------
+
+    /// Handles a device-side page fault.
+    ///
+    /// When a device accesses a virtual address whose page resides
+    /// in system RAM (not yet migrated to device-private memory),
+    /// the device driver calls this function to migrate the page
+    /// to the device.
+    ///
+    /// If the page is already in device memory, returns
+    /// `HmmFaultResult::Handled`.  If the page is currently being
+    /// migrated, returns `HmmFaultResult::Retry`.
+    pub fn handle_device_fault(
+        &mut self,
+        pid: u32,
+        vaddr: u64,
+        device_id: u32,
+        write: bool,
+    ) -> HmmFaultResult {
+        self.stats.device_faults += 1;
+
+        // If the page is already in device-private memory, no
+        // migration is needed.
+        if self.find_private_page(vaddr, pid).is_some() {
+            return HmmFaultResult::Handled;
+        }
+
+        // Check if any mirror range has this page marked as
+        // Migrating.
+        for mirror in &self.mirrors {
+            if !mirror.active || mirror.pid != pid || mirror.device_id != device_id {
+                continue;
+            }
+            let mut is_migrating = false;
+            mirror.for_each_range(|r| {
+                if vaddr >= r.start && vaddr < r.end {
+                    for entry in r.page_entries() {
+                        if entry.vaddr == vaddr && entry.kind == HmmPageKind::Migrating {
+                            is_migrating = true;
+                        }
+                    }
+                }
+            });
+            if is_migrating {
+                return HmmFaultResult::Retry;
+            }
+        }
+
+        // Attempt to migrate the single page to the device.
+        let page_end = vaddr + HMM_PAGE_SIZE;
+        match self.migrate_to_device(vaddr, page_end, device_id, pid) {
+            Ok(_) => {
+                // Also update the mirror's page state.
+                let _ = self.handle_fault(pid, vaddr, HmmFaultKind::Device, write);
+                HmmFaultResult::Handled
+            }
+            Err(_) => HmmFaultResult::Error,
+        }
+    }
+
+    /// Handles a CPU-side fault on a device-private page.
+    ///
+    /// When the CPU accesses a virtual address whose page has been
+    /// migrated to device-private memory, this function migrates
+    /// the page back to system RAM so the CPU can access it.
+    pub fn handle_cpu_fault(&mut self, pid: u32, vaddr: u64, write: bool) -> HmmFaultResult {
+        self.stats.cpu_faults += 1;
+
+        // Look up the device-private page entry.
+        let entry = self.find_private_page(vaddr, pid);
+        let device_id = match entry {
+            Some(e) => e.device_id,
+            None => {
+                // Page is not in device memory; delegate to normal
+                // fault handling.
+                return self.handle_fault(pid, vaddr, HmmFaultKind::Cpu, write);
+            }
+        };
+
+        // Migrate the page back to CPU.
+        let page_end = vaddr + HMM_PAGE_SIZE;
+        match self.migrate_from_device(vaddr, page_end, device_id, pid) {
+            Ok(_) => {
+                // Update mirror state.
+                let paddr = vaddr; // simulated
+                for mirror in &mut self.mirrors {
+                    if mirror.active && mirror.pid == pid && mirror.device_id == device_id {
+                        let _ = mirror.update_page(vaddr, paddr, HmmPageKind::SystemRam, write);
+                    }
+                }
+                HmmFaultResult::Handled
+            }
+            Err(_) => HmmFaultResult::Error,
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Batch Operations
+    // ---------------------------------------------------------------
+
+    /// Batch-migrates multiple disjoint ranges to a device.
+    ///
+    /// Each entry in `ranges` is `(start, end)`.  Returns aggregate
+    /// results.
+    pub fn batch_migrate_to_device(
+        &mut self,
+        ranges: &[(u64, u64)],
+        device_id: u32,
+        pid: u32,
+    ) -> HmmBatchMigrateResult {
+        let mut result = HmmBatchMigrateResult::default();
+        for &(start, end) in ranges {
+            match self.migrate_to_device(start, end, device_id, pid) {
+                Ok(n) => result.migrated += n,
+                Err(_) => {
+                    let pages = (end.saturating_sub(start)) / HMM_PAGE_SIZE;
+                    result.failed += pages;
+                }
+            }
+        }
+        result
+    }
+
+    /// Batch-migrates multiple disjoint ranges from a device back
+    /// to CPU.
+    pub fn batch_migrate_from_device(
+        &mut self,
+        ranges: &[(u64, u64)],
+        device_id: u32,
+        pid: u32,
+    ) -> HmmBatchMigrateResult {
+        let mut result = HmmBatchMigrateResult::default();
+        for &(start, end) in ranges {
+            match self.migrate_from_device(start, end, device_id, pid) {
+                Ok(n) => result.migrated += n,
+                Err(_) => {
+                    let pages = (end.saturating_sub(start)) / HMM_PAGE_SIZE;
+                    result.failed += pages;
+                }
+            }
+        }
+        result
+    }
+
+    /// Destroys all mirrors and private pages for a device.
+    ///
+    /// Called during device hot-unplug or driver teardown.  Migrates
+    /// all device-private pages back to system RAM first.
+    ///
+    /// Returns the number of mirrors and private pages cleaned up.
+    pub fn teardown_device(&mut self, device_id: u32) -> Result<(usize, usize)> {
+        // Migrate all private pages back.
+        let mut migrated_pages = 0usize;
+        let mut addrs_to_migrate: [(u64, u32); MAX_DEVICE_PRIVATE_PAGES] =
+            [(0, 0); MAX_DEVICE_PRIVATE_PAGES];
+        let mut addr_count = 0usize;
+
+        for i in 0..self.private_page_count {
+            let p = &self.private_pages[i];
+            if p.active && p.device_id == device_id {
+                addrs_to_migrate[addr_count] = (p.vaddr, p.pid);
+                addr_count += 1;
+            }
+        }
+
+        for i in 0..addr_count {
+            let (vaddr, pid) = addrs_to_migrate[i];
+            let page_end = vaddr + HMM_PAGE_SIZE;
+            if self
+                .migrate_from_device(vaddr, page_end, device_id, pid)
+                .is_ok()
+            {
+                migrated_pages += 1;
+            }
+        }
+
+        // Destroy all mirrors for this device.
+        let mut destroyed_mirrors = 0usize;
+        let mut mirror_ids = [0u32; MAX_HMM_MIRRORS];
+        let mut mid_count = 0usize;
+        for mirror in &self.mirrors {
+            if mirror.active && mirror.device_id == device_id {
+                mirror_ids[mid_count] = mirror.id;
+                mid_count += 1;
+            }
+        }
+        for i in 0..mid_count {
+            if self.destroy_mirror(mirror_ids[i]).is_ok() {
+                destroyed_mirrors += 1;
+            }
+        }
+
+        Ok((destroyed_mirrors, migrated_pages))
     }
 }
 

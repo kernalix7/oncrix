@@ -516,3 +516,568 @@ pub struct CgroupStat {
     /// Whether frozen.
     pub frozen: bool,
 }
+
+// ======================================================================
+// Resource controllers
+// ======================================================================
+
+// ── CpuController ────────────────────────────────────────────────
+
+/// CPU bandwidth controller implementing `cpu.max` semantics.
+///
+/// Enforces a quota/period bandwidth limit: the cgroup may consume
+/// at most `quota_us` microseconds of CPU time per `period_us`
+/// microsecond window. When the quota is exhausted the cgroup is
+/// throttled until the next period.
+///
+/// # Interface mapping
+///
+/// | cgroup file   | Field           |
+/// |---------------|-----------------|
+/// | `cpu.max`     | quota / period  |
+/// | `cpu.stat`    | usage / periods / throttled |
+pub struct CpuController {
+    /// Maximum CPU time allowed per period (microseconds).
+    /// A value of 0 means unlimited (no bandwidth cap).
+    quota_us: u64,
+    /// Period length (microseconds). Default 100 000 (100 ms).
+    period_us: u64,
+    /// CPU time consumed in the current period (microseconds).
+    used_us: u64,
+    /// Total number of elapsed periods.
+    nr_periods: u64,
+    /// Number of periods in which the cgroup was throttled.
+    nr_throttled: u64,
+    /// Total throttled time (microseconds).
+    throttled_us: u64,
+    /// Whether the controller is currently enforcing a limit.
+    enabled: bool,
+}
+
+impl CpuController {
+    /// Default period length: 100 ms = 100 000 us.
+    const DEFAULT_PERIOD_US: u64 = 100_000;
+
+    /// Create a new CPU controller with no bandwidth limit.
+    pub const fn new() -> Self {
+        Self {
+            quota_us: 0,
+            period_us: Self::DEFAULT_PERIOD_US,
+            used_us: 0,
+            nr_periods: 0,
+            nr_throttled: 0,
+            throttled_us: 0,
+            enabled: false,
+        }
+    }
+
+    /// Set the bandwidth limit (`cpu.max` equivalent).
+    ///
+    /// `quota_us = 0` disables the limit. `period_us` must be > 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` if `period_us` is zero or if
+    /// `quota_us` exceeds `period_us` (over-provisioned).
+    pub fn set_limit(&mut self, quota_us: u64, period_us: u64) -> Result<()> {
+        if period_us == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if quota_us > 0 && quota_us > period_us {
+            return Err(Error::InvalidArgument);
+        }
+        self.quota_us = quota_us;
+        self.period_us = period_us;
+        self.enabled = quota_us > 0;
+        Ok(())
+    }
+
+    /// Return the current quota and period.
+    pub const fn limit(&self) -> (u64, u64) {
+        (self.quota_us, self.period_us)
+    }
+
+    /// Whether the controller is actively limiting bandwidth.
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Record CPU usage for this period.
+    ///
+    /// `delta_us` is the additional CPU time consumed since the
+    /// last call. Returns `Ok(())` if usage is within budget,
+    /// or `Err(Busy)` if the cgroup should be throttled.
+    pub fn charge(&mut self, delta_us: u64) -> Result<()> {
+        self.used_us = self.used_us.saturating_add(delta_us);
+        if self.enabled && self.used_us >= self.quota_us {
+            self.nr_throttled = self.nr_throttled.saturating_add(1);
+            self.throttled_us = self
+                .throttled_us
+                .saturating_add(self.used_us.saturating_sub(self.quota_us));
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+
+    /// Check whether the cgroup has remaining budget in this
+    /// period without consuming any.
+    pub const fn check_budget(&self) -> bool {
+        !self.enabled || self.used_us < self.quota_us
+    }
+
+    /// Advance to a new period: reset the usage counter and bump
+    /// the period count.
+    pub fn new_period(&mut self) {
+        self.nr_periods = self.nr_periods.saturating_add(1);
+        self.used_us = 0;
+    }
+
+    /// Return the accumulated statistics.
+    pub const fn stats(&self) -> (u64, u64, u64) {
+        (self.nr_periods, self.nr_throttled, self.throttled_us)
+    }
+
+    /// Apply this controller's state to a [`CpuCtrlStats`] struct.
+    pub fn update_stats(&self, dst: &mut CpuCtrlStats) {
+        dst.nr_periods = self.nr_periods;
+        dst.nr_throttled = self.nr_throttled;
+        dst.throttled_ns = self.throttled_us.saturating_mul(1_000);
+    }
+}
+
+impl Default for CpuController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── MemoryController ─────────────────────────────────────────────
+
+/// Memory resource controller implementing `memory.max` semantics.
+///
+/// Enforces a hard memory limit. When usage reaches the limit,
+/// a reclaim cycle is triggered. If reclaim fails, the allocation
+/// is denied and an OOM event is recorded.
+///
+/// | cgroup file     | Field / Method          |
+/// |-----------------|-------------------------|
+/// | `memory.max`    | `limit_bytes`           |
+/// | `memory.high`   | `high_bytes`            |
+/// | `memory.current`| `usage_bytes`           |
+/// | `memory.stat`   | `stats()`               |
+pub struct MemoryController {
+    /// Current memory usage (bytes).
+    usage_bytes: u64,
+    /// Hard limit (bytes). 0 = unlimited.
+    limit_bytes: u64,
+    /// High watermark / soft limit (bytes). 0 = no soft limit.
+    high_bytes: u64,
+    /// Peak usage observed since creation (bytes).
+    peak_bytes: u64,
+    /// Number of OOM events (allocation denied after reclaim
+    /// failure).
+    nr_oom_events: u64,
+    /// Number of times the high watermark was exceeded, triggering
+    /// asynchronous reclaim.
+    nr_high_events: u64,
+    /// Whether the controller is actively limiting.
+    enabled: bool,
+}
+
+impl MemoryController {
+    /// Create a new memory controller with no limit.
+    pub const fn new() -> Self {
+        Self {
+            usage_bytes: 0,
+            limit_bytes: 0,
+            high_bytes: 0,
+            peak_bytes: 0,
+            nr_oom_events: 0,
+            nr_high_events: 0,
+            enabled: false,
+        }
+    }
+
+    /// Set the hard memory limit (`memory.max`).
+    ///
+    /// `limit = 0` disables the hard limit.
+    pub fn set_limit(&mut self, limit: u64) {
+        self.limit_bytes = limit;
+        self.enabled = limit > 0;
+    }
+
+    /// Set the high watermark / soft limit (`memory.high`).
+    pub fn set_high(&mut self, high: u64) {
+        self.high_bytes = high;
+    }
+
+    /// Return the current limits.
+    pub const fn limits(&self) -> (u64, u64) {
+        (self.limit_bytes, self.high_bytes)
+    }
+
+    /// Whether the controller is actively limiting.
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Attempt to charge `size` bytes of memory usage.
+    ///
+    /// Returns `Ok(true)` if the allocation is within the soft
+    /// limit, `Ok(false)` if it exceeds the high watermark
+    /// (caller should trigger async reclaim), or `Err(OutOfMemory)`
+    /// if the hard limit is exceeded (OOM).
+    pub fn charge(&mut self, size: u64) -> Result<bool> {
+        let new_usage = self.usage_bytes.saturating_add(size);
+
+        // Hard limit check.
+        if self.enabled && new_usage > self.limit_bytes {
+            self.nr_oom_events = self.nr_oom_events.saturating_add(1);
+            return Err(Error::OutOfMemory);
+        }
+
+        self.usage_bytes = new_usage;
+        if new_usage > self.peak_bytes {
+            self.peak_bytes = new_usage;
+        }
+
+        // High watermark check.
+        if self.high_bytes > 0 && new_usage > self.high_bytes {
+            self.nr_high_events = self.nr_high_events.saturating_add(1);
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Release `size` bytes of memory usage.
+    pub fn uncharge(&mut self, size: u64) {
+        self.usage_bytes = self.usage_bytes.saturating_sub(size);
+    }
+
+    /// Return the current usage.
+    pub const fn usage(&self) -> u64 {
+        self.usage_bytes
+    }
+
+    /// Return the peak usage.
+    pub const fn peak(&self) -> u64 {
+        self.peak_bytes
+    }
+
+    /// Check whether there is room for `size` bytes without
+    /// hitting the hard limit.
+    pub fn check_limit(&self, size: u64) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        self.usage_bytes.saturating_add(size) <= self.limit_bytes
+    }
+
+    /// Apply this controller's state to a [`MemoryCtrlStats`].
+    pub fn update_stats(&self, dst: &mut MemoryCtrlStats) {
+        dst.usage_bytes = self.usage_bytes;
+        dst.limit_bytes = self.limit_bytes;
+        dst.high_bytes = self.high_bytes;
+        dst.max_usage_bytes = self.peak_bytes;
+        dst.nr_oom_events = self.nr_oom_events;
+    }
+}
+
+impl Default for MemoryController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── IoController ─────────────────────────────────────────────────
+
+/// Maximum number of per-device IO limits.
+const MAX_IO_DEVICES: usize = 16;
+
+/// A per-device BPS/IOPS rate limit entry.
+///
+/// Maps a device (identified by major:minor pair) to read/write
+/// byte-per-second and IO-per-second limits.
+#[derive(Clone, Copy)]
+pub struct IoDeviceLimit {
+    /// Device major number.
+    pub major: u16,
+    /// Device minor number.
+    pub minor: u16,
+    /// Read bytes-per-second limit (0 = unlimited).
+    pub rbps: u64,
+    /// Write bytes-per-second limit (0 = unlimited).
+    pub wbps: u64,
+    /// Read IOPS limit (0 = unlimited).
+    pub riops: u32,
+    /// Write IOPS limit (0 = unlimited).
+    pub wiops: u32,
+    /// Whether this slot is active.
+    active: bool,
+}
+
+impl IoDeviceLimit {
+    /// Create an empty (inactive) device limit entry.
+    pub const fn new() -> Self {
+        Self {
+            major: 0,
+            minor: 0,
+            rbps: 0,
+            wbps: 0,
+            riops: 0,
+            wiops: 0,
+            active: false,
+        }
+    }
+}
+
+impl Default for IoDeviceLimit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-device IO usage counters for a single accounting window.
+#[derive(Clone, Copy)]
+struct IoDeviceUsage {
+    /// Bytes read in the current window.
+    bytes_read: u64,
+    /// Bytes written in the current window.
+    bytes_written: u64,
+    /// Read IOs in the current window.
+    ios_read: u32,
+    /// Write IOs in the current window.
+    ios_written: u32,
+}
+
+impl IoDeviceUsage {
+    const fn new() -> Self {
+        Self {
+            bytes_read: 0,
+            bytes_written: 0,
+            ios_read: 0,
+            ios_written: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.bytes_read = 0;
+        self.bytes_written = 0;
+        self.ios_read = 0;
+        self.ios_written = 0;
+    }
+}
+
+/// IO resource controller implementing `io.max` semantics.
+///
+/// Enforces per-device BPS and IOPS limits. Each device identified
+/// by (major, minor) can have independent read/write rate limits.
+///
+/// | cgroup file | Field / Method         |
+/// |-------------|------------------------|
+/// | `io.max`    | `set_device_limit()`   |
+/// | `io.stat`   | `device_usage()`       |
+pub struct IoController {
+    /// Per-device limit entries.
+    limits: [IoDeviceLimit; MAX_IO_DEVICES],
+    /// Per-device usage counters (indexed same as limits).
+    usage: [IoDeviceUsage; MAX_IO_DEVICES],
+    /// Number of active device limit entries.
+    nr_devices: usize,
+    /// Whether any device has a non-zero limit.
+    enabled: bool,
+}
+
+impl IoController {
+    /// Create a new IO controller with no device limits.
+    pub const fn new() -> Self {
+        Self {
+            limits: [const { IoDeviceLimit::new() }; MAX_IO_DEVICES],
+            usage: [const { IoDeviceUsage::new() }; MAX_IO_DEVICES],
+            nr_devices: 0,
+            enabled: false,
+        }
+    }
+
+    /// Set or update a per-device rate limit (`io.max`).
+    ///
+    /// If a limit already exists for `(major, minor)` it is
+    /// updated in place. Otherwise a new entry is allocated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OutOfMemory` if no free slots remain.
+    pub fn set_device_limit(
+        &mut self,
+        major: u16,
+        minor: u16,
+        rbps: u64,
+        wbps: u64,
+        riops: u32,
+        wiops: u32,
+    ) -> Result<()> {
+        // Check for existing entry.
+        for i in 0..self.nr_devices {
+            if self.limits[i].active
+                && self.limits[i].major == major
+                && self.limits[i].minor == minor
+            {
+                self.limits[i].rbps = rbps;
+                self.limits[i].wbps = wbps;
+                self.limits[i].riops = riops;
+                self.limits[i].wiops = wiops;
+                self.refresh_enabled();
+                return Ok(());
+            }
+        }
+
+        // Allocate new slot.
+        if self.nr_devices >= MAX_IO_DEVICES {
+            return Err(Error::OutOfMemory);
+        }
+        let slot = self.nr_devices;
+        self.limits[slot] = IoDeviceLimit {
+            major,
+            minor,
+            rbps,
+            wbps,
+            riops,
+            wiops,
+            active: true,
+        };
+        self.usage[slot] = IoDeviceUsage::new();
+        self.nr_devices += 1;
+        self.refresh_enabled();
+        Ok(())
+    }
+
+    /// Remove a per-device rate limit.
+    ///
+    /// Returns `NotFound` if no limit exists for the device.
+    pub fn remove_device_limit(&mut self, major: u16, minor: u16) -> Result<()> {
+        let pos = self.find_device(major, minor).ok_or(Error::NotFound)?;
+        // Shift remaining entries down.
+        let mut i = pos;
+        while i + 1 < self.nr_devices {
+            self.limits[i] = self.limits[i + 1];
+            self.usage[i] = self.usage[i + 1];
+            i += 1;
+        }
+        self.nr_devices -= 1;
+        self.refresh_enabled();
+        Ok(())
+    }
+
+    /// Check whether a read IO of `bytes` to device `(major,minor)`
+    /// is within the rate limit.
+    ///
+    /// Returns `Ok(())` if allowed, `Err(Busy)` if throttled.
+    pub fn check_read(&self, major: u16, minor: u16, bytes: u64) -> Result<()> {
+        if let Some(idx) = self.find_device(major, minor) {
+            let lim = &self.limits[idx];
+            let usg = &self.usage[idx];
+            if lim.rbps > 0 && usg.bytes_read.saturating_add(bytes) > lim.rbps {
+                return Err(Error::Busy);
+            }
+            if lim.riops > 0 && usg.ios_read >= lim.riops {
+                return Err(Error::Busy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Check whether a write IO of `bytes` to device
+    /// `(major,minor)` is within the rate limit.
+    ///
+    /// Returns `Ok(())` if allowed, `Err(Busy)` if throttled.
+    pub fn check_write(&self, major: u16, minor: u16, bytes: u64) -> Result<()> {
+        if let Some(idx) = self.find_device(major, minor) {
+            let lim = &self.limits[idx];
+            let usg = &self.usage[idx];
+            if lim.wbps > 0 && usg.bytes_written.saturating_add(bytes) > lim.wbps {
+                return Err(Error::Busy);
+            }
+            if lim.wiops > 0 && usg.ios_written >= lim.wiops {
+                return Err(Error::Busy);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a completed read IO.
+    pub fn charge_read(&mut self, major: u16, minor: u16, bytes: u64) {
+        if let Some(idx) = self.find_device(major, minor) {
+            self.usage[idx].bytes_read = self.usage[idx].bytes_read.saturating_add(bytes);
+            self.usage[idx].ios_read = self.usage[idx].ios_read.saturating_add(1);
+        }
+    }
+
+    /// Record a completed write IO.
+    pub fn charge_write(&mut self, major: u16, minor: u16, bytes: u64) {
+        if let Some(idx) = self.find_device(major, minor) {
+            self.usage[idx].bytes_written = self.usage[idx].bytes_written.saturating_add(bytes);
+            self.usage[idx].ios_written = self.usage[idx].ios_written.saturating_add(1);
+        }
+    }
+
+    /// Reset all per-device usage counters (start of a new
+    /// accounting window).
+    pub fn reset_usage(&mut self) {
+        for usg in &mut self.usage[..self.nr_devices] {
+            usg.reset();
+        }
+    }
+
+    /// Whether the controller has any active rate limits.
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Return the number of devices with active limits.
+    pub const fn device_count(&self) -> usize {
+        self.nr_devices
+    }
+
+    /// Return the limit entry for a device, if configured.
+    pub fn device_limit(&self, major: u16, minor: u16) -> Option<&IoDeviceLimit> {
+        self.find_device(major, minor).map(|idx| &self.limits[idx])
+    }
+
+    /// Apply aggregate IO statistics to an [`IoCtrlStats`].
+    pub fn update_stats(&self, dst: &mut IoCtrlStats) {
+        let mut total_read = 0u64;
+        let mut total_written = 0u64;
+        let mut total_ops = 0u64;
+        for usg in &self.usage[..self.nr_devices] {
+            total_read = total_read.saturating_add(usg.bytes_read);
+            total_written = total_written.saturating_add(usg.bytes_written);
+            total_ops = total_ops
+                .saturating_add(usg.ios_read as u64)
+                .saturating_add(usg.ios_written as u64);
+        }
+        dst.bytes_read = total_read;
+        dst.bytes_written = total_written;
+        dst.io_ops = total_ops;
+    }
+
+    /// Find the index of a device entry by (major, minor).
+    fn find_device(&self, major: u16, minor: u16) -> Option<usize> {
+        self.limits[..self.nr_devices]
+            .iter()
+            .position(|l| l.active && l.major == major && l.minor == minor)
+    }
+
+    /// Recalculate the `enabled` flag based on current limits.
+    fn refresh_enabled(&mut self) {
+        self.enabled = self.limits[..self.nr_devices]
+            .iter()
+            .any(|l| l.active && (l.rbps > 0 || l.wbps > 0 || l.riops > 0 || l.wiops > 0));
+    }
+}
+
+impl Default for IoController {
+    fn default() -> Self {
+        Self::new()
+    }
+}

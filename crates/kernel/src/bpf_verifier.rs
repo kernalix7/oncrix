@@ -32,8 +32,10 @@
 //! `include/linux/bpf_verifier.h`.
 
 use super::bpf::{
-    BPF_ALU, BPF_ALU64, BPF_CALL, BPF_DIV, BPF_EXIT, BPF_JA, BPF_JMP, BPF_JMP32, BPF_K, BPF_LD,
-    BPF_LDX, BPF_MOD, BPF_MOV, BPF_NEG, BPF_ST, BPF_STX, BPF_X, BpfInsn,
+    BPF_ADD, BPF_ALU, BPF_ALU64, BPF_AND, BPF_ARSH, BPF_CALL, BPF_DIV, BPF_EXIT, BPF_JA, BPF_JEQ,
+    BPF_JGE, BPF_JGT, BPF_JMP, BPF_JMP32, BPF_JNE, BPF_JSET, BPF_JSGE, BPF_JSGT, BPF_K, BPF_LD,
+    BPF_LDX, BPF_LSH, BPF_MOD, BPF_MOV, BPF_MUL, BPF_NEG, BPF_OR, BPF_RSH, BPF_ST, BPF_STX,
+    BPF_SUB, BPF_X, BPF_XOR, BpfInsn,
 };
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -58,6 +60,12 @@ const MAX_HELPERS: usize = 32;
 
 /// Maximum depth of the verification work stack.
 const MAX_WORK_STACK: usize = 64;
+
+/// Maximum number of BPF maps that the verifier tracks.
+const MAX_MAPS: usize = 16;
+
+/// Valid memory access widths in bytes (1, 2, 4, 8).
+const VALID_ACCESS_WIDTHS: [u8; 4] = [1, 2, 4, 8];
 
 // ── VerifierError ──────────────────────────────────────────────────
 
@@ -140,6 +148,32 @@ pub enum VerifierError {
         /// The backward target index.
         target: usize,
     },
+    /// Stack depth exceeds the 512-byte limit.
+    StackDepthExceeded {
+        /// Instruction index.
+        insn_idx: usize,
+        /// The stack depth that exceeded the limit.
+        depth: usize,
+    },
+    /// Invalid ALU or JMP sub-operation code.
+    InvalidSubOpcode {
+        /// Instruction index.
+        insn_idx: usize,
+        /// The invalid sub-opcode byte.
+        sub_op: u8,
+    },
+    /// Invalid memory access width (must be 1, 2, 4, or 8).
+    InvalidAccessWidth {
+        /// Instruction index.
+        insn_idx: usize,
+        /// The invalid width.
+        width: u8,
+    },
+    /// Map access out of bounds (offset + size > map value size).
+    MapAccessOutOfBounds {
+        /// Instruction index.
+        insn_idx: usize,
+    },
 }
 
 impl core::fmt::Display for VerifierError {
@@ -186,6 +220,22 @@ impl core::fmt::Display for VerifierError {
             Self::BackwardJump { insn_idx, target } => {
                 write!(f, "backward jump to {} at insn {}", target, insn_idx)
             }
+            Self::StackDepthExceeded { insn_idx, depth } => {
+                write!(f, "stack depth {} exceeds 512 at insn {}", depth, insn_idx)
+            }
+            Self::InvalidSubOpcode { insn_idx, sub_op } => {
+                write!(
+                    f,
+                    "invalid sub-opcode 0x{:02x} at insn {}",
+                    sub_op, insn_idx
+                )
+            }
+            Self::InvalidAccessWidth { insn_idx, width } => {
+                write!(f, "invalid access width {} at insn {}", width, insn_idx)
+            }
+            Self::MapAccessOutOfBounds { insn_idx } => {
+                write!(f, "map access out of bounds at insn {}", insn_idx)
+            }
         }
     }
 }
@@ -212,12 +262,118 @@ pub enum RegType {
     PtrToStack,
 }
 
+// ── MapInfo ──────────────────────────────────────────────────────
+
+/// Metadata for a single BPF map used in bounds checking.
+///
+/// The verifier uses this to validate that memory accesses through
+/// `PtrToMap` registers stay within the map's value size.
+#[derive(Debug, Clone, Copy)]
+pub struct MapInfo {
+    /// Map identifier.
+    pub map_id: u32,
+    /// Key size in bytes.
+    pub key_size: u32,
+    /// Value size in bytes.
+    pub value_size: u32,
+    /// Whether this slot is active.
+    active: bool,
+}
+
+impl MapInfo {
+    /// Create an empty (inactive) map info entry.
+    pub const fn new() -> Self {
+        Self {
+            map_id: 0,
+            key_size: 0,
+            value_size: 0,
+            active: false,
+        }
+    }
+}
+
+impl Default for MapInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Registry of BPF maps available during verification.
+///
+/// Programs reference maps by ID; the verifier looks up the
+/// corresponding key/value sizes to validate memory accesses.
+pub struct MapRegistry {
+    /// Map metadata entries.
+    maps: [MapInfo; MAX_MAPS],
+    /// Number of active entries.
+    len: usize,
+}
+
+impl MapRegistry {
+    /// Create an empty map registry.
+    pub const fn new() -> Self {
+        Self {
+            maps: [const { MapInfo::new() }; MAX_MAPS],
+            len: 0,
+        }
+    }
+
+    /// Register a map. Returns `false` if the registry is full.
+    pub fn add(&mut self, map_id: u32, key_size: u32, value_size: u32) -> bool {
+        if self.len >= MAX_MAPS {
+            return false;
+        }
+        self.maps[self.len] = MapInfo {
+            map_id,
+            key_size,
+            value_size,
+            active: true,
+        };
+        self.len += 1;
+        true
+    }
+
+    /// Look up a map by ID.
+    pub fn lookup(&self, map_id: u32) -> Option<&MapInfo> {
+        self.maps[..self.len]
+            .iter()
+            .find(|m| m.active && m.map_id == map_id)
+    }
+
+    /// Return the number of registered maps.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get map info by index (0-based, within active entries).
+    pub fn get(&self, index: usize) -> Option<&MapInfo> {
+        if index < self.len && self.maps[index].active {
+            Some(&self.maps[index])
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for MapRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── RegState ──────────────────────────────────────────────────────
 
 /// Tracked state of a single register during abstract interpretation.
 ///
 /// For scalar registers, `min_value` and `max_value` bound the
-/// possible range. For pointer registers, the bounds are unused.
+/// possible range. For `PtrToMap` registers, `map_id` identifies
+/// the map and `map_value_size` records its value size for bounds
+/// checking.
 #[derive(Debug, Clone, Copy)]
 pub struct RegState {
     /// Type classification.
@@ -226,6 +382,10 @@ pub struct RegState {
     pub min_value: i64,
     /// Maximum possible value (inclusive, for scalars).
     pub max_value: i64,
+    /// Map ID when `reg_type == PtrToMap` (0 = unknown).
+    pub map_id: u32,
+    /// Map value size in bytes (for bounds checking).
+    pub map_value_size: u32,
 }
 
 impl Default for RegState {
@@ -234,6 +394,8 @@ impl Default for RegState {
             reg_type: RegType::NotInit,
             min_value: i64::MIN,
             max_value: i64::MAX,
+            map_id: 0,
+            map_value_size: 0,
         }
     }
 }
@@ -245,6 +407,8 @@ impl RegState {
             reg_type: RegType::Scalar,
             min_value: i64::MIN,
             max_value: i64::MAX,
+            map_id: 0,
+            map_value_size: 0,
         }
     }
 
@@ -254,6 +418,20 @@ impl RegState {
             reg_type: RegType::Scalar,
             min_value: val,
             max_value: val,
+            map_id: 0,
+            map_value_size: 0,
+        }
+    }
+
+    /// Create a map-value pointer with known bounds.
+    #[allow(dead_code)]
+    const fn ptr_to_map(map_id: u32, value_size: u32) -> Self {
+        Self {
+            reg_type: RegType::PtrToMap,
+            min_value: 0,
+            max_value: 0,
+            map_id,
+            map_value_size: value_size,
         }
     }
 }
@@ -261,10 +439,17 @@ impl RegState {
 // ── VerifierState ─────────────────────────────────────────────────
 
 /// Snapshot of the register file at a single program point.
+///
+/// In addition to per-register type/value tracking, we record the
+/// maximum stack depth observed along the current execution path
+/// so the verifier can enforce the 512-byte stack limit.
 #[derive(Clone, Copy)]
 struct VerifierState {
     /// Per-register tracked state.
     regs: [RegState; NUM_REGS],
+    /// Maximum stack depth (bytes) used along this path.
+    #[allow(dead_code)]
+    stack_depth: usize,
 }
 
 impl Default for VerifierState {
@@ -275,14 +460,21 @@ impl Default for VerifierState {
             reg_type: RegType::PtrToCtx,
             min_value: 0,
             max_value: 0,
+            map_id: 0,
+            map_value_size: 0,
         };
         // R10 = frame pointer (stack).
         regs[REG_FP] = RegState {
             reg_type: RegType::PtrToStack,
             min_value: 0,
             max_value: 0,
+            map_id: 0,
+            map_value_size: 0,
         };
-        Self { regs }
+        Self {
+            regs,
+            stack_depth: 0,
+        }
     }
 }
 
@@ -353,6 +545,125 @@ impl HelperAllowlist {
     }
 }
 
+// ── Opcode validation helpers ─────────────────────────────────────
+
+/// Check whether an ALU sub-operation code is valid.
+///
+/// Valid ALU ops: ADD, SUB, MUL, DIV, OR, AND, LSH, RSH, NEG,
+/// MOD, XOR, MOV, ARSH.
+fn is_valid_alu_op(op: u8) -> bool {
+    matches!(
+        op,
+        BPF_ADD
+            | BPF_SUB
+            | BPF_MUL
+            | BPF_DIV
+            | BPF_OR
+            | BPF_AND
+            | BPF_LSH
+            | BPF_RSH
+            | BPF_NEG
+            | BPF_MOD
+            | BPF_XOR
+            | BPF_MOV
+            | BPF_ARSH
+    )
+}
+
+/// Check whether a JMP sub-operation code is valid.
+///
+/// Valid JMP ops: JA, JEQ, JGT, JGE, JSET, JNE, JSGT, JSGE,
+/// CALL, EXIT.
+fn is_valid_jmp_op(op: u8) -> bool {
+    matches!(
+        op,
+        BPF_JA
+            | BPF_JEQ
+            | BPF_JGT
+            | BPF_JGE
+            | BPF_JSET
+            | BPF_JNE
+            | BPF_JSGT
+            | BPF_JSGE
+            | BPF_CALL
+            | BPF_EXIT
+    )
+}
+
+/// Extract the memory access width from a LD/LDX/ST/STX opcode.
+///
+/// Bits 4:3 encode the size: 0 = 4 bytes (W), 1 = 2 bytes (H),
+/// 2 = 1 byte (B), 3 = 8 bytes (DW).
+fn access_width_from_opcode(opcode: u8) -> u8 {
+    match (opcode >> 3) & 0x03 {
+        0x00 => 4, // BPF_W
+        0x01 => 2, // BPF_H
+        0x02 => 1, // BPF_B
+        0x03 => 8, // BPF_DW
+        _ => 0,    // unreachable, but return invalid
+    }
+}
+
+/// Check whether a memory access width is valid.
+fn is_valid_access_width(width: u8) -> bool {
+    VALID_ACCESS_WIDTHS.contains(&width)
+}
+
+// ── Stack depth analysis ─────────────────────────────────────────
+
+/// Analyse the program for maximum stack depth.
+///
+/// Walks all instructions looking for stores via the frame pointer
+/// (R10) and computes the deepest negative offset seen. BPF stack
+/// addresses are negative offsets from R10, so an access at
+/// offset -8 with width 8 uses stack depth 16.
+///
+/// Returns `Err(StackDepthExceeded)` if the maximum depth exceeds
+/// [`STACK_SIZE`] (512 bytes).
+fn stack_depth_check(prog: &[BpfInsn]) -> Result<(), VerifierError> {
+    let mut max_depth: usize = 0;
+
+    for (i, insn) in prog.iter().enumerate() {
+        let class = insn.class();
+
+        // Check stores via R10 (frame pointer).
+        let is_stack_store = matches!(class, BPF_ST | BPF_STX) && insn.dst_reg() as usize == REG_FP;
+
+        // Check loads via R10.
+        let is_stack_load = class == BPF_LDX && insn.src_reg() as usize == REG_FP;
+
+        if is_stack_store || is_stack_load {
+            let off = insn.off;
+            // Stack offsets must be negative from R10.
+            if off >= 0 {
+                continue;
+            }
+            let width = access_width_from_opcode(insn.opcode);
+            // Depth = |offset| (already negative, so negate).
+            // The accessed region is [off, off + width), so the
+            // deepest byte is at |off|.
+            let depth = (-(off as i64)) as usize;
+            // Also account for the access width (the store may
+            // touch bytes below the offset if the offset is not
+            // aligned to the width, but in BPF the depth is
+            // measured as the absolute value of the most negative
+            // offset used).
+            let _ = width; // width is for access validation only
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            if max_depth > STACK_SIZE {
+                return Err(VerifierError::StackDepthExceeded {
+                    insn_idx: i,
+                    depth: max_depth,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── verify_program ────────────────────────────────────────────────
 
 /// Verify a BPF program for safety.
@@ -386,8 +697,35 @@ pub fn verify_program_with_helpers(
     // Phase 2: control flow graph — reachability and no loops.
     cfg_check(prog)?;
 
-    // Phase 3: register state tracking (abstract interpretation).
+    // Phase 3: stack depth analysis.
+    stack_depth_check(prog)?;
+
+    // Phase 4: register state tracking (abstract interpretation).
     state_track(prog, helpers)?;
+
+    Ok(())
+}
+
+/// Verify a BPF program with maps for bounds checking.
+///
+/// Same as [`verify_program_with_helpers`] but additionally
+/// validates map pointer accesses against known map value sizes.
+pub fn verify_program_with_maps(
+    prog: &[BpfInsn],
+    helpers: &HelperAllowlist,
+    maps: &MapRegistry,
+) -> Result<(), VerifierError> {
+    // Phase 1: structural checks.
+    structural_check(prog)?;
+
+    // Phase 2: control flow graph — reachability and no loops.
+    cfg_check(prog)?;
+
+    // Phase 3: stack depth analysis.
+    stack_depth_check(prog)?;
+
+    // Phase 4: register state tracking with map bounds.
+    state_track_with_maps(prog, helpers, maps)?;
 
     Ok(())
 }
@@ -453,6 +791,30 @@ fn structural_check(prog: &[BpfInsn]) -> Result<(), VerifierError> {
             && insn.imm == 0
         {
             return Err(VerifierError::DivisionByZero { insn_idx: i });
+        }
+
+        // Validate ALU sub-opcode.
+        if matches!(class, BPF_ALU | BPF_ALU64) && !is_valid_alu_op(op) {
+            return Err(VerifierError::InvalidSubOpcode {
+                insn_idx: i,
+                sub_op: op,
+            });
+        }
+
+        // Validate JMP sub-opcode.
+        if matches!(class, BPF_JMP | BPF_JMP32) && !is_valid_jmp_op(op) {
+            return Err(VerifierError::InvalidSubOpcode {
+                insn_idx: i,
+                sub_op: op,
+            });
+        }
+
+        // Validate memory access widths for LD/LDX/ST/STX.
+        if matches!(class, BPF_LDX | BPF_ST | BPF_STX) {
+            let width = access_width_from_opcode(insn.opcode);
+            if !is_valid_access_width(width) {
+                return Err(VerifierError::InvalidAccessWidth { insn_idx: i, width });
+            }
         }
     }
 
@@ -800,6 +1162,65 @@ fn propagate_state(
             *work_top += 1;
         }
     }
+}
+
+// ── Phase 4b: register tracking with map bounds ─────────────────
+
+/// Like [`state_track`] but additionally verifies that map pointer
+/// accesses stay within the declared `value_size` of each map.
+///
+/// After the standard register-state walk, this pass re-scans every
+/// load/store whose source register is a `MapValuePtr` and checks
+/// the offset against the map's value size from `maps`.
+fn state_track_with_maps(
+    prog: &[BpfInsn],
+    helpers: &HelperAllowlist,
+    maps: &MapRegistry,
+) -> Result<(), VerifierError> {
+    // Run the standard state-tracking pass first.
+    state_track(prog, helpers)?;
+
+    // Second pass: validate map value pointer accesses.
+    for (pc, insn) in prog.iter().enumerate() {
+        let class = insn.opcode & 0x07;
+
+        // Only check LDX (0x61) and STX (0x63) classes where the
+        // source or destination register could be a map value ptr.
+        let is_ldx = class == 0x01 && (insn.opcode & 0xE0) == 0x60;
+        let is_stx = class == 0x03 && (insn.opcode & 0xE0) == 0x60;
+        if !is_ldx && !is_stx {
+            continue;
+        }
+
+        // Check offset against all known map value sizes. The
+        // access size depends on the opcode size field (bits 4:3).
+        let size_code = (insn.opcode >> 3) & 0x03;
+        let access_bytes: u32 = match size_code {
+            0 => 4, // W  — 32-bit
+            1 => 2, // H  — 16-bit
+            2 => 1, // B  — 8-bit
+            3 => 8, // DW — 64-bit
+            _ => 4,
+        };
+
+        let offset = insn.off as i32;
+        if offset < 0 {
+            return Err(VerifierError::InvalidMemoryAccess { insn_idx: pc });
+        }
+        let end = (offset as u32).saturating_add(access_bytes);
+
+        // If the access offset exceeds any map's value_size that
+        // could be referenced, reject. Conservative: check all maps.
+        for i in 0..maps.len() {
+            if let Some(map) = maps.get(i) {
+                if end > map.value_size {
+                    return Err(VerifierError::MapAccessOutOfBounds { insn_idx: pc });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── Convenience re-exports ────────────────────────────────────────

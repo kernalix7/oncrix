@@ -45,6 +45,15 @@ const MAX_INTERFACES: usize = 32;
 /// Maximum packet buffer size in bytes.
 const XDP_PACKET_BUF_SIZE: usize = 2048;
 
+/// Maximum number of entries in a DEVMAP (redirect map).
+const DEVMAP_SIZE: usize = 64;
+
+/// Maximum number of logical CPUs for per-CPU statistics.
+const MAX_CPUS: usize = 64;
+
+/// Maximum number of packets in the bulk transmit flush queue.
+const XDP_BULK_QUEUE_SIZE: usize = 16;
+
 // =========================================================================
 // XdpAction
 // =========================================================================
@@ -465,4 +474,457 @@ impl XdpRegistry {
         let hook = self.hooks.get(ifindex).ok_or(Error::InvalidArgument)?;
         Ok(hook.prog_id())
     }
+
+    /// Replace the XDP program on an interface atomically.
+    ///
+    /// Detaches any existing program and attaches the new one in a
+    /// single operation.  Statistics are reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `ifindex` is out of
+    /// range.
+    pub fn replace(&mut self, ifindex: usize, prog: XdpProgram) -> Result<Option<XdpProgram>> {
+        let hook = self.hooks.get_mut(ifindex).ok_or(Error::InvalidArgument)?;
+        let old = hook.prog.take();
+        hook.stats = XdpStats::new();
+        let mut new_prog = prog;
+        new_prog.ifindex = hook.ifindex;
+        hook.prog = Some(new_prog);
+        Ok(old)
+    }
+}
+
+// =========================================================================
+// XdpDevMap — redirect target map
+// =========================================================================
+
+/// A single entry in the DEVMAP specifying a redirect target.
+#[derive(Debug, Clone, Copy)]
+pub struct DevMapEntry {
+    /// Target interface index for redirect.
+    pub ifindex: u32,
+    /// Whether this entry is occupied.
+    pub active: bool,
+}
+
+impl DevMapEntry {
+    /// An empty, inactive entry.
+    const EMPTY: Self = Self {
+        ifindex: 0,
+        active: false,
+    };
+}
+
+/// XDP redirect device map (DEVMAP).
+///
+/// Maps a key (index) to a target interface.  When an XDP program
+/// returns [`XdpAction::Redirect`], the redirect target is looked
+/// up by key in this map to determine the egress interface.
+///
+/// Reference: Linux `include/net/xdp.h` (`struct bpf_dtab_netdev`).
+pub struct XdpDevMap {
+    /// Map entries indexed by key.
+    entries: [DevMapEntry; DEVMAP_SIZE],
+    /// Number of active entries.
+    count: usize,
+}
+
+impl Default for XdpDevMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XdpDevMap {
+    /// Create an empty DEVMAP.
+    pub const fn new() -> Self {
+        Self {
+            entries: [DevMapEntry::EMPTY; DEVMAP_SIZE],
+            count: 0,
+        }
+    }
+
+    /// Return the number of active entries.
+    pub const fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Insert or update a redirect target at the given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `key` is out of range.
+    pub fn insert(&mut self, key: usize, ifindex: u32) -> Result<()> {
+        let entry = self.entries.get_mut(key).ok_or(Error::InvalidArgument)?;
+        if !entry.active {
+            self.count += 1;
+        }
+        entry.ifindex = ifindex;
+        entry.active = true;
+        Ok(())
+    }
+
+    /// Remove a redirect target at the given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `key` is out of range.
+    /// Returns [`Error::NotFound`] if the entry is not active.
+    pub fn remove(&mut self, key: usize) -> Result<()> {
+        let entry = self.entries.get_mut(key).ok_or(Error::InvalidArgument)?;
+        if !entry.active {
+            return Err(Error::NotFound);
+        }
+        entry.active = false;
+        entry.ifindex = 0;
+        self.count = self.count.saturating_sub(1);
+        Ok(())
+    }
+
+    /// Look up the redirect target interface for a key.
+    ///
+    /// Returns `None` if the key is out of range or inactive.
+    pub fn lookup(&self, key: usize) -> Option<u32> {
+        self.entries
+            .get(key)
+            .and_then(|e| if e.active { Some(e.ifindex) } else { None })
+    }
+
+    /// Remove all entries from the map.
+    pub fn flush(&mut self) {
+        for entry in self.entries.iter_mut() {
+            entry.active = false;
+            entry.ifindex = 0;
+        }
+        self.count = 0;
+    }
+}
+
+// =========================================================================
+// XdpPerCpuStats — per-CPU action counters
+// =========================================================================
+
+/// Per-CPU XDP statistics array.
+///
+/// Each logical CPU maintains its own set of action counters so that
+/// the fast path can increment without cross-CPU contention.  The
+/// aggregate view is obtained by summing across all CPUs.
+pub struct XdpPerCpuStats {
+    /// Per-CPU statistics slots.
+    cpus: [XdpStats; MAX_CPUS],
+    /// Number of CPUs actually in use.
+    nr_cpus: usize,
+}
+
+impl Default for XdpPerCpuStats {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl XdpPerCpuStats {
+    /// Create per-CPU statistics for `nr_cpus` processors.
+    ///
+    /// Clamps to [`MAX_CPUS`] if the value exceeds the limit.
+    pub fn new(nr_cpus: usize) -> Self {
+        let capped = if nr_cpus == 0 {
+            1
+        } else {
+            nr_cpus.min(MAX_CPUS)
+        };
+        Self {
+            cpus: [const { XdpStats::new() }; MAX_CPUS],
+            nr_cpus: capped,
+        }
+    }
+
+    /// Record an action on the specified CPU.
+    ///
+    /// If `cpu` is out of range, the action is silently attributed
+    /// to CPU 0.
+    pub fn record(&mut self, cpu: usize, action: XdpAction) {
+        let idx = if cpu < self.nr_cpus { cpu } else { 0 };
+        self.cpus[idx].record(action);
+    }
+
+    /// Return the statistics for a single CPU.
+    ///
+    /// Returns `None` if `cpu` is out of range.
+    pub fn cpu_stats(&self, cpu: usize) -> Option<&XdpStats> {
+        if cpu < self.nr_cpus {
+            Some(&self.cpus[cpu])
+        } else {
+            None
+        }
+    }
+
+    /// Compute the aggregate statistics across all CPUs.
+    pub fn aggregate(&self) -> XdpStats {
+        let mut agg = XdpStats::new();
+        for (i, stats) in self.cpus.iter().enumerate() {
+            if i >= self.nr_cpus {
+                break;
+            }
+            agg.aborted = agg.aborted.wrapping_add(stats.aborted);
+            agg.drop = agg.drop.wrapping_add(stats.drop);
+            agg.pass = agg.pass.wrapping_add(stats.pass);
+            agg.tx = agg.tx.wrapping_add(stats.tx);
+            agg.redirect = agg.redirect.wrapping_add(stats.redirect);
+        }
+        agg
+    }
+
+    /// Reset all per-CPU counters to zero.
+    pub fn reset(&mut self) {
+        for (i, stats) in self.cpus.iter_mut().enumerate() {
+            if i >= self.nr_cpus {
+                break;
+            }
+            *stats = XdpStats::new();
+        }
+    }
+
+    /// Return the number of CPUs tracked.
+    pub const fn nr_cpus(&self) -> usize {
+        self.nr_cpus
+    }
+}
+
+// =========================================================================
+// XdpBulkQueue — deferred packet flush
+// =========================================================================
+
+/// A single queued redirect entry awaiting bulk flush.
+#[derive(Debug, Clone, Copy)]
+pub struct BulkEntry {
+    /// Target interface index.
+    pub ifindex: u32,
+    /// Offset into the XDP buffer where this packet's data starts.
+    pub data_start: usize,
+    /// Offset one past the last byte of packet data.
+    pub data_end: usize,
+    /// Whether this slot is occupied.
+    pub active: bool,
+}
+
+impl BulkEntry {
+    /// An empty entry.
+    const EMPTY: Self = Self {
+        ifindex: 0,
+        data_start: 0,
+        data_end: 0,
+        active: false,
+    };
+}
+
+/// Queue for batching XDP_REDIRECT packets before flushing.
+///
+/// Instead of immediately forwarding each redirected packet, the
+/// XDP fast path enqueues redirect decisions.  At the end of a
+/// receive batch (NAPI poll), [`XdpBulkQueue::flush`] transmits
+/// all queued packets to their target interfaces in one burst.
+///
+/// This reduces per-packet overhead from device TX ring
+/// doorbell writes.
+pub struct XdpBulkQueue {
+    /// Queued redirect entries.
+    queue: [BulkEntry; XDP_BULK_QUEUE_SIZE],
+    /// Number of entries currently queued.
+    count: usize,
+    /// Total packets successfully flushed since creation.
+    total_flushed: u64,
+    /// Total flush operations performed.
+    flush_count: u64,
+}
+
+impl Default for XdpBulkQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XdpBulkQueue {
+    /// Create an empty bulk queue.
+    pub const fn new() -> Self {
+        Self {
+            queue: [BulkEntry::EMPTY; XDP_BULK_QUEUE_SIZE],
+            count: 0,
+            total_flushed: 0,
+            flush_count: 0,
+        }
+    }
+
+    /// Return the number of entries currently queued.
+    pub const fn pending(&self) -> usize {
+        self.count
+    }
+
+    /// Return whether the queue is full.
+    pub const fn is_full(&self) -> bool {
+        self.count >= XDP_BULK_QUEUE_SIZE
+    }
+
+    /// Return total packets flushed since creation.
+    pub const fn total_flushed(&self) -> u64 {
+        self.total_flushed
+    }
+
+    /// Return total flush operations performed.
+    pub const fn flush_count(&self) -> u64 {
+        self.flush_count
+    }
+
+    /// Enqueue a redirect decision for deferred transmission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the queue is full.  The
+    /// caller should flush first, then retry.
+    pub fn enqueue(&mut self, ifindex: u32, data_start: usize, data_end: usize) -> Result<()> {
+        if self.count >= XDP_BULK_QUEUE_SIZE {
+            return Err(Error::OutOfMemory);
+        }
+        self.queue[self.count] = BulkEntry {
+            ifindex,
+            data_start,
+            data_end,
+            active: true,
+        };
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Return a reference to the queued entries pending flush.
+    ///
+    /// The returned slice contains exactly [`Self::pending`] active
+    /// entries.  Callers (e.g. the NIC driver) use this to iterate
+    /// over the redirect targets before or during flush.
+    pub fn entries(&self) -> &[BulkEntry] {
+        &self.queue[..self.count]
+    }
+
+    /// Flush all queued redirect entries.
+    ///
+    /// Returns the number of entries that were flushed.  In a real
+    /// implementation this would invoke the target NIC's
+    /// `ndo_xdp_xmit` for each queued packet; here we simply
+    /// account for the entries and clear the queue.
+    pub fn flush(&mut self) -> usize {
+        let flushed = self.count;
+        for (i, entry) in self.queue.iter_mut().enumerate() {
+            if i >= self.count {
+                break;
+            }
+            entry.active = false;
+        }
+        self.total_flushed = self.total_flushed.wrapping_add(flushed as u64);
+        self.flush_count = self.flush_count.wrapping_add(1);
+        self.count = 0;
+        flushed
+    }
+}
+
+// =========================================================================
+// XdpActionDispatch — run action after XDP program verdict
+// =========================================================================
+
+/// Result of dispatching an XDP action.
+///
+/// After the XDP program returns a verdict, the dispatcher
+/// executes the corresponding action and reports back what
+/// happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdpDispatchResult {
+    /// Packet was dropped (either by XDP_DROP or XDP_ABORTED).
+    Dropped,
+    /// Packet should be passed up to the kernel network stack.
+    PassToStack,
+    /// Packet was reflected back on the ingress interface (XDP_TX).
+    Transmitted,
+    /// Packet was enqueued for redirect to another interface.
+    Redirected {
+        /// Target interface index.
+        target_ifindex: u32,
+    },
+    /// Redirect failed because the DEVMAP lookup returned no target.
+    RedirectFailed,
+}
+
+/// Dispatch an XDP action after a program verdict.
+///
+/// Given the action returned by an XDP program, this function
+/// performs the corresponding operation:
+///
+/// - **Aborted / Drop**: packet is discarded.
+/// - **Pass**: packet continues to the kernel network stack.
+/// - **Tx**: packet is reflected back on the ingress interface.
+/// - **Redirect**: packet is looked up in the `devmap` and
+///   enqueued in the `bulk_queue` for deferred transmission.
+///
+/// # Arguments
+///
+/// * `action` — the verdict from the XDP program.
+/// * `devmap_key` — key to look up in the DEVMAP for redirect
+///   (typically the ingress `ifindex` or a program-set value).
+/// * `devmap` — the DEVMAP containing redirect targets.
+/// * `bulk_queue` — the bulk queue for batching redirects.
+/// * `buff` — the packet buffer (needed for redirect enqueue
+///   offsets).
+pub fn xdp_dispatch_action(
+    action: XdpAction,
+    devmap_key: usize,
+    devmap: &XdpDevMap,
+    bulk_queue: &mut XdpBulkQueue,
+    buff: &XdpBuff,
+) -> XdpDispatchResult {
+    match action {
+        XdpAction::Aborted | XdpAction::Drop => XdpDispatchResult::Dropped,
+        XdpAction::Pass => XdpDispatchResult::PassToStack,
+        XdpAction::Tx => XdpDispatchResult::Transmitted,
+        XdpAction::Redirect => {
+            if let Some(target) = devmap.lookup(devmap_key) {
+                let _ = bulk_queue.enqueue(target, buff.data_start, buff.data_end);
+                XdpDispatchResult::Redirected {
+                    target_ifindex: target,
+                }
+            } else {
+                XdpDispatchResult::RedirectFailed
+            }
+        }
+    }
+}
+
+/// Run the full XDP receive path for a single packet.
+///
+/// Combines hook execution, per-CPU statistics recording, and
+/// action dispatch into one call.  This is the top-level entry
+/// point invoked by the NIC driver's NAPI poll loop.
+///
+/// # Arguments
+///
+/// * `registry` — the system-wide XDP hook registry.
+/// * `ifindex` — interface the packet was received on.
+/// * `cpu` — logical CPU running the NAPI poll.
+/// * `buff` — the packet buffer.
+/// * `devmap` — the DEVMAP for redirect lookups.
+/// * `per_cpu` — per-CPU statistics.
+/// * `bulk_queue` — bulk queue for deferred redirects.
+///
+/// # Returns
+///
+/// The dispatch result indicating what happened to the packet.
+pub fn xdp_receive(
+    registry: &mut XdpRegistry,
+    ifindex: usize,
+    cpu: usize,
+    buff: &XdpBuff,
+    devmap: &XdpDevMap,
+    per_cpu: &mut XdpPerCpuStats,
+    bulk_queue: &mut XdpBulkQueue,
+) -> XdpDispatchResult {
+    let action = registry.process_packet(ifindex, buff);
+    per_cpu.record(cpu, action);
+
+    xdp_dispatch_action(action, ifindex, devmap, bulk_queue, buff)
 }
