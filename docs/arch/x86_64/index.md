@@ -18,21 +18,57 @@ x86_64-specific implementation details.
 
 ## Boot Sequence
 
+ONCRIX boots via the **Xen PVH ELF Note** (type 18) — QEMU's
+`-kernel` loader scans the note to find a 32-bit physical entry
+for uncompressed ELF64 images. Multiboot1 is intentionally
+omitted because QEMU's Multiboot1 loader rejects ELFCLASS64;
+GRUB2 / Multiboot2 is used for ISO images.
+
 ```
-GRUB / Multiboot2
+QEMU -kernel (PVH)  /  GRUB2 (Multiboot2)
     │
     ▼
-_start()                    (kernel/src/main.rs)
+_start32  (boot.S, 32-bit stub at 1 MiB physical)
     │
-    ├─ Phase 1: Serial console (COM1, 115200 8N1)
-    ├─ Phase 2: GDT (5 segments + TSS)
-    ├─ Phase 3: IDT (5 exception handlers)
-    ├─ Phase 4: Kernel heap (256 KiB linked-list)
-    ├─ Phase 5: PIC remap (IRQ 0-15 → vectors 32-47)
-    ├─ Phase 6: PIT timer (100 Hz periodic)
-    ├─ Phase 7: Enable interrupts (sti)
+    ├─ Zero 16 KiB boot page tables
+    ├─ Build PML4[0]→PDPT_low→PD_0_1G    (identity 0..1 GiB)
+    ├─ Build PML4[511]→PDPT_high          (higher-half -2 GiB)
+    ├─ CR4.PAE | EFER.LME | CR0.PG        (enable long mode)
+    └─ ljmp to _start64_trampoline
+    │
+    ▼
+_start64  (higher-half at 0xFFFFFFFF80000000)
+    │
+    ├─ Switch to bootstrap stack (8 MiB)
+    └─ call kernel_main
+    │
+    ▼
+kernel_main  (main.rs)
+    │
+    ├─ Phase 1:  Serial console           (COM1, 115200 8N1)
+    ├─ Phase 2:  GDT                      (5 segments + TSS)
+    ├─ Phase 3:  IDT                      (5 exception handlers)
+    ├─ Phase 4:  Kernel heap              (16 MiB linked-list)
+    ├─ Phase 5:  Scheduler                (idle thread ready)
+    ├─ Phase 6:  SYSCALL/SYSRET           (MSR setup)
+    ├─ Phase 7:  PIC + PIT timer          (~100 Hz, enables IF)
+    ├─ Phase 8:  Root filesystem          (ramfs on /, creates /dev /proc /tmp /sbin)
+    ├─ Phase 9:  IPC channels             (kernel↔console, kernel↔devmgr, kernel↔netd)
+    ├─ Phase 10: Service manager          (PID 0 + PID 1 registration, init boot)
     └─ halt_loop()
 ```
+
+### Memory Layout
+
+| Region | Virtual | Physical |
+|--------|---------|----------|
+| Boot stub (PVH note, 32-bit code, GDT) | `0xFFFFFFFF80100000+` | `0x00100000+` |
+| `.text` / `.rodata` | higher-half | `0x0010X000+` |
+| `.data` / `.bss` (incl. 16 MiB heap, 8 MiB bootstrap stack) | higher-half | after kernel image |
+
+VMA is always higher-half. LMA is set via linker `AT()` so the
+ELF image loads at low physical memory but symbols resolve to
+their higher-half addresses.
 
 ## GDT and TSS
 

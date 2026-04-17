@@ -1,0 +1,17 @@
+# Copyright 2026 ONCRIX Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "oncrix-boot-tests"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
+publish = false
+
+[[bin]]
+name = "boot_test"
+path = "src/main.rs"
+
+[workspace]

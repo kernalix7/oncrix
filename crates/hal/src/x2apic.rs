@@ -485,6 +485,7 @@ impl X2Apic {
     ///
     /// The ISR spans 8 MSRs (ISR0..ISR7) covering vectors 0..255.
     pub fn vector_in_service(&self, vector: u8) -> bool {
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
         let word = (vector / 32) as u32;
         let bit = vector % 32;
         // SAFETY: ISR MSRs are always readable when x2APIC is enabled.

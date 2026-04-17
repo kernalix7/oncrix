@@ -31,6 +31,11 @@
 //! Reference: Intel 64 and IA-32 Architectures Software Developer's Manual,
 //! Volume 3B §17.17 (Time Stamp Counter), §18.7.3 (TSC Deadline).
 
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(unreachable_code, unused_variables, dead_code)
+)]
+
 use oncrix_lib::{Error, Result};
 
 use crate::timer::Timer;

@@ -14,6 +14,8 @@
 //! Reference: Intel 64 and IA-32 Architectures Software Developer's Manual,
 //! Volume 1, Chapter 13 — Managing State Using the XSAVE Feature Set.
 
+#![cfg_attr(not(target_arch = "x86_64"), allow(unused_imports, dead_code))]
+
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,11 @@
 //! Capabilities) objects. This is the classic x86 P-state mechanism
 //! predating the modern HWP/HFI interfaces.
 
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(unreachable_code, unused_variables, dead_code)
+)]
+
 use oncrix_lib::{Error, Result};
 
 /// Maximum number of P-states per CPU.

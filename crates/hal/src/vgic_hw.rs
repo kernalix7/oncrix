@@ -123,9 +123,9 @@ impl VgicHyp {
     pub fn load(&mut self) {
         // SAFETY: Reading ARM GICv3 virtualization system registers.
         unsafe {
-            core::arch::asm!("mrs {}, ICH_HCR_EL2", out(reg) self.hcr, options(nostack, nomem));
-            core::arch::asm!("mrs {}, ICH_VMCR_EL2", out(reg) self.vmcr, options(nostack, nomem));
-            core::arch::asm!("mrs {}, ICH_MISR_EL2", out(reg) self.misr, options(nostack, nomem));
+            core::arch::asm!("mrs {0:x}, ich_hcr_el2", out(reg) self.hcr, options(nostack, nomem));
+            core::arch::asm!("mrs {0:x}, ich_vmcr_el2", out(reg) self.vmcr, options(nostack, nomem));
+            core::arch::asm!("mrs {0:x}, ich_misr_el2", out(reg) self.misr, options(nostack, nomem));
         }
         for i in 0..self.num_lr.min(VGIC_MAX_LR) {
             // LRs are indexed as ICH_LR<n>_EL2; we read LR0 as representative.
@@ -139,8 +139,8 @@ impl VgicHyp {
     pub fn save(&self) {
         // SAFETY: Writing ARM GICv3 virtualization system registers.
         unsafe {
-            core::arch::asm!("msr ICH_HCR_EL2, {}", in(reg) self.hcr, options(nostack, nomem));
-            core::arch::asm!("msr ICH_VMCR_EL2, {}", in(reg) self.vmcr, options(nostack, nomem));
+            core::arch::asm!("msr ich_hcr_el2, {0:x}", in(reg) self.hcr, options(nostack, nomem));
+            core::arch::asm!("msr ich_vmcr_el2, {0:x}", in(reg) self.vmcr, options(nostack, nomem));
         }
     }
 

@@ -20,8 +20,13 @@ use oncrix_process::thread::{Priority, Thread};
 
 use super::{exceptions, interrupts};
 
-/// Kernel heap size (256 KiB).
-const KERNEL_HEAP_SIZE: usize = 256 * 1024;
+/// Kernel heap size (16 MiB).
+///
+/// Sized to accommodate the full `KernelState` allocation: `Ramfs`
+/// alone is ~512 KiB (128 × 4 KiB file buffers), and future subsystem
+/// expansion (service manager, IPC channel backlogs, process table)
+/// is expected to grow the working set further.
+const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
 
 /// Static storage for the kernel heap (BSS, does not bloat the image).
 static mut KERNEL_HEAP: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
@@ -240,7 +245,7 @@ pub unsafe fn init_heap() {
         ALLOCATOR.init(heap_ptr, KERNEL_HEAP_SIZE);
     }
 
-    let _ = serial.write_str("[ONCRIX] Kernel heap initialized (256 KiB)\n");
+    let _ = serial.write_str("[ONCRIX] Kernel heap initialized (16 MiB)\n");
 }
 
 // ── Scheduler ───────────────────────────────────────────────────

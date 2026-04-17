@@ -355,6 +355,7 @@ impl AcpiPmTimer {
 // ── Power Manager ─────────────────────────────────────────────
 
 /// SLP_EN bit position in PM1_CNT register (bit 13).
+#[cfg(target_arch = "x86_64")]
 const SLP_EN_BIT: u16 = 1 << 13;
 
 /// ACPI power manager.

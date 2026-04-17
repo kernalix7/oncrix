@@ -292,9 +292,8 @@ pub extern "C" fn syscall_entry() {
 /// This is called from the assembly stub with RDI pointing to the
 /// `SyscallArgs` struct on the stack.
 ///
-/// IPC syscalls (512–516) are handled directly by the kernel's
-/// [`crate::ipc_dispatch`] module, which has access to the global
-/// [`crate::state::KernelState`]. All other syscalls are forwarded
+/// IPC syscalls (512–516) and early-boot `SYS_WRITE` (fd 1/2) are
+/// handled directly by the kernel. All other syscalls are forwarded
 /// to the `oncrix_syscall` crate.
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::SyscallArgs) -> i64 {
@@ -302,10 +301,27 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
     // SyscallArgs struct on the kernel stack.
     let args = unsafe { &*args };
 
-    // Intercept IPC syscalls — these require direct access to the
-    // kernel state (ChannelRegistry) which the syscall crate cannot
-    // reach.
     match args.number {
+        // SYS_WRITE to stdout/stderr: stream bytes from user buffer to serial.
+        oncrix_syscall::number::SYS_WRITE if args.arg0 <= 2 => {
+            kernel_serial_write(args.arg1, args.arg2)
+        }
+        // SYS_EXIT / SYS_EXIT_GROUP: print a notice and halt the CPU.
+        // In a full kernel this would schedule another process; for the
+        // early-boot smoke test there is nothing else to run.
+        oncrix_syscall::number::SYS_EXIT | 231 => {
+            use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
+            use oncrix_hal::serial::SerialPort;
+            let mut serial = Uart16550::new(COM1);
+            let _ = serial.write_str("[ONCRIX] Userspace exited — halting.\n");
+            // SAFETY: `hlt` halts the CPU until the next interrupt.
+            // No process remains to schedule so spinning on hlt is correct.
+            loop {
+                unsafe { core::arch::asm!("hlt") };
+            }
+        }
+        // Intercept IPC syscalls — these require direct access to the
+        // kernel state (ChannelRegistry) which the syscall crate cannot reach.
         oncrix_syscall::number::SYS_IPC_SEND => {
             crate::ipc_dispatch::kernel_ipc_send(args.arg0, args.arg1)
         }
@@ -323,4 +339,51 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
         }
         _ => oncrix_syscall::dispatch::dispatch(args),
     }
+}
+
+/// Write `count` bytes from user-space address `buf` to the serial console.
+///
+/// Used to back `SYS_WRITE` for fd 0–2 during early-boot userspace testing,
+/// before a full VFS/tty layer is in place.
+///
+/// # Safety contract
+///
+/// The caller (SYSCALL entry path) has already validated that the syscall
+/// came from ring 3. The pointer is accepted without full validation because
+/// in this early-boot phase the only userspace code running is the trusted
+/// `usermode_test_entry` stub whose buffer resides in kernel-mapped BSS.
+/// Full pointer validation (canonical address, user-range check, page
+/// presence) must be added before multi-process userspace is enabled.
+fn kernel_serial_write(buf: u64, count: u64) -> i64 {
+    use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
+    use oncrix_hal::serial::SerialPort;
+
+    // Reject obviously bad pointers (NULL or kernel-space canonical range).
+    if buf == 0 || buf >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let count = count.min(4096) as usize; // cap per-write to 4 KiB
+    if count == 0 {
+        return 0;
+    }
+
+    let mut serial = Uart16550::new(COM1);
+    // SAFETY: `buf` is a non-null, non-kernel-canonical address.
+    // For the current early-boot phase the only caller is the trusted
+    // `usermode_test_entry` whose buffer lives in kernel-mapped BSS.
+    // We read byte-by-byte to avoid creating a slice (which would
+    // require lifetime/alignment proof we cannot provide here).
+    let written = unsafe {
+        let ptr = buf as *const u8;
+        let mut n = 0usize;
+        while n < count {
+            let byte = ptr.add(n).read_volatile();
+            if serial.write_byte(byte).is_err() {
+                break;
+            }
+            n += 1;
+        }
+        n
+    };
+    written as i64
 }

@@ -12,6 +12,8 @@
 //!
 //! Reference: MC146818A RTC Datasheet; IBM PC-AT Technical Reference.
 
+#![cfg_attr(not(target_arch = "x86_64"), allow(unused_imports, dead_code))]
+
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------

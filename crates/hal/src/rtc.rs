@@ -8,6 +8,8 @@
 //! and binary mode detection, and conversion to/from Unix
 //! timestamps.
 
+#![cfg_attr(not(target_arch = "x86_64"), allow(unused_imports, dead_code))]
+
 use oncrix_lib::Result;
 
 // ── CMOS register addresses ────────────────────────────────────

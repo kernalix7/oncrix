@@ -8,6 +8,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Embed the pre-built oncrix-init ELF binary into the kernel image.
+# Requires `build.rs` to have set ONCRIX_INIT_BIN before compilation.
+embed-init = []
+
 [dependencies]
 oncrix-lib.workspace = true
 oncrix-hal.workspace = true

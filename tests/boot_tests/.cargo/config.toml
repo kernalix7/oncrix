@@ -1,0 +1,7 @@
+# Copyright 2026 ONCRIX Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Override build target to host so this std harness isn't built for
+# the kernel's no_std x86_64-unknown-none target.
+[build]
+target = "x86_64-unknown-linux-gnu"

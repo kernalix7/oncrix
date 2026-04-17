@@ -127,6 +127,34 @@ oncrix/
 cargo build --workspace
 ```
 
+### Boot in QEMU
+
+```bash
+bash scripts/run-qemu.sh
+```
+
+Expected output (10-phase boot sequence):
+
+```
+[ONCRIX] Kernel booting...
+[ONCRIX] Serial console initialized (COM1, 115200 8N1)
+[ONCRIX] GDT initialized
+[ONCRIX] IDT initialized (5 exception handlers)
+[ONCRIX] Kernel heap initialized (16 MiB)
+[ONCRIX] Scheduler initialized (idle thread ready)
+[ONCRIX] SYSCALL/SYSRET initialized
+[ONCRIX] PIC initialized, PIT running at ~100 Hz
+[ONCRIX] All early initialization complete.
+[ONCRIX] Mounting root filesystem...
+[ONCRIX] Root filesystem mounted (ramfs on /)
+[ONCRIX] Created /dev /proc /tmp /sbin
+[ONCRIX] Initializing IPC channels...
+[ONCRIX] IPC channels ready (kernel<->console, kernel<->devmgr, kernel<->netd)
+[ONCRIX] Starting service manager...
+[ONCRIX] Service manager boot complete
+[ONCRIX] Entering halt loop.
+```
+
 ### Verify
 
 ```bash
@@ -137,14 +165,15 @@ cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings && cargo b
 
 ### Phase 1: Foundation
 - [x] Project structure and workspace setup (10-crate workspace, CI/CD)
-- [x] Basic bootloader (Multiboot2 header, boot info structures)
+- [x] Boot entry via Xen PVH ELF Note (QEMU `-kernel`) + Multiboot2 header (GRUB)
+- [x] 32-bit → 64-bit long-mode transition (boot.S stub at 1 MiB physical)
 - [x] Serial console output (UART 16550, COM1 115200 8N1)
 - [x] Physical memory manager (bitmap allocator, 128 MiB)
 - [x] Virtual memory (4-level page tables, map/unmap, TLB flush)
-- [x] Kernel heap allocator (linked-list free-list, 256 KiB)
+- [x] Kernel heap allocator (linked-list free-list, 16 MiB)
 - [x] GDT/IDT (5 segments + TSS, 256 vectors, 5 exception handlers)
 - [x] Linker script (higher-half at 0xFFFFFFFF80000000)
-- [x] QEMU integration script
+- [x] QEMU integration script (boots all 10 init phases)
 
 ### Phase 2: Core Kernel
 - [x] 8259 PIC driver (IRQ remap to vectors 32-47)
@@ -180,12 +209,24 @@ cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings && cargo b
 
 ### Phase 5: POSIX Compatibility
 - [x] POSIX syscall numbers (Linux x86_64 ABI)
-- [x] Syscall dispatcher + 22 handler stubs
+- [x] Syscall dispatcher + 200+ handler stubs (io_uring, BPF, perf, prctl, landlock, pidfd)
 - [x] Signal handling (32 signals, mask, pending)
 - [x] File descriptor table (256 fds, dup2)
 - [x] stat/fstat/lseek/pipe/dup2 handlers
-- [ ] execve syscall
+- [x] SYSCALL/SYSRET fast-path entry (MSR setup)
+- [ ] Ring 0 → Ring 3 transition (in progress)
+- [ ] execve syscall end-to-end
 - [ ] Basic shell
+
+### Phase 6: Multi-arch (in progress)
+- [x] x86_64 (primary, boots in QEMU)
+- [ ] aarch64 (HAL boot stub in progress)
+- [ ] riscv64 (HAL boot stub planned)
+
+### Phase 7-9: Userspace, Testing, Docs (in progress)
+- [ ] `crates/userspace/` tree (init, sh, libc shim)
+- [ ] QEMU integration tests in CI
+- [x] Architecture documentation (x86_64 boot flow)
 
 ## Contributing
 

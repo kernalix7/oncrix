@@ -1,0 +1,14 @@
+[package]
+name = "oncrix-ulibc"
+description = "ONCRIX minimal no_std libc shim for userspace programs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "oncrix_ulibc"
+
+[dependencies]

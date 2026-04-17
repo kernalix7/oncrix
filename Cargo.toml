@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "crates/userspace/init", "crates/userspace/sh", "crates/userspace/libc"]
 resolver = "3"
 
 [workspace.package]
@@ -21,3 +21,4 @@ oncrix-ipc = { path = "crates/ipc" }
 oncrix-mm = { path = "crates/mm" }
 oncrix-syscall = { path = "crates/syscall" }
 oncrix-lib = { path = "crates/lib" }
+oncrix-ulibc = { path = "crates/userspace/libc" }

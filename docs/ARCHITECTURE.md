@@ -164,44 +164,84 @@ Monolithic (Linux, FreeBSD)              Microkernel (QNX, ONCRIX)
 
 ## Boot Sequence
 
-The kernel boots through a strict 7-phase initialization sequence. Each phase
+Boot is split into an architecture-specific stub (in `boot.S`) that brings
+the CPU to 64-bit long mode at a higher-half virtual address, followed by
+a 10-phase Rust initialization sequence in `kernel_main`. Each phase
 depends on the previous one completing successfully.
 
+### Architecture Stub (x86_64)
+
 ```
-Phase 1: Serial Console
+QEMU -kernel  ──── scans PVH ELF Note (type 18, "Xen")
+    │             locates _start32 physical entry
+    v
+_start32  (32-bit, loaded at 1 MiB physical via linker AT())
+    │  Zero 16 KiB boot page tables
+    │  Build identity map (PML4[0] → 0..1 GiB, 2 MiB pages)
+    │  Build higher-half (PML4[511] → 0xFFFFFFFF80000000..0..1 GiB)
+    │  CR4.PAE | EFER.LME | CR0.PG  → long mode
+    │  lgdt + ljmp to _start64_trampoline
+    v
+_start64_trampoline  (64-bit, still at low physical)
+    │  Reload data segments with 0x10
+    │  movabs + jmp to higher-half _start64
+    v
+_start64  (higher-half, 0xFFFFFFFF8XXXXXXX)
+    │  Switch to bootstrap stack (8 MiB in .boot.bss)
+    │  call kernel_main
+    v
+```
+
+### Rust Init Phases
+
+```
+Phase 1:  Serial Console
   │  UART 16550 on COM1 (0x3F8), 115200 baud, 8N1
   │  All subsequent output goes here
   v
-Phase 2: GDT + TSS
+Phase 2:  GDT + TSS
   │  5 segments: null, kernel code (0x08), kernel data (0x10),
-  │              user data (0x1B), user code (0x23)
-  │  TSS loaded at selector 0x28 (double-fault stack: 16 KiB)
+  │              user data (0x18), user code (0x20)
+  │  TSS loaded at selector 0x28 (double-fault stack: 16 KiB via IST1)
   v
-Phase 3: IDT
+Phase 3:  IDT
   │  256 interrupt vectors
   │  Exception handlers: #DE (0), #UD (6), #DF (8, IST1), #GP (13), #PF (14)
   v
-Phase 4: Kernel Heap
-  │  LinkedListAllocator, 256 KiB
+Phase 4:  Kernel Heap
+  │  LinkedListAllocator, 16 MiB (sized for KernelState + ramfs)
   │  First-fit allocation with coalescing
   v
-Phase 5: Scheduler
+Phase 5:  Scheduler
   │  Round-robin, 256 thread slots
-  │  Idle + init kernel threads spawned
+  │  Idle kernel thread spawned
   v
-Phase 6: SYSCALL/SYSRET
+Phase 6:  SYSCALL/SYSRET
   │  MSR configuration:
-  │    EFER (0xC000_0080) — set SCE bit
-  │    STAR (0xC000_0081) — kernel CS=0x08, user base=0x10
+  │    EFER  (0xC000_0080) — set SCE bit
+  │    STAR  (0xC000_0081) — kernel CS=0x08, user base=0x10
   │    LSTAR (0xC000_0082) — entry point address
   │    FMASK (0xC000_0084) — mask IF on entry
   v
-Phase 7: PIC + PIT
+Phase 7:  PIC + PIT
   │  8259 PIC: ICW1-4, remap IRQ 0-15 → vectors 32-47
   │  PIT: channel 0, rate generator mode, ~100 Hz (divisor 11932)
-  │  [Optional: APIC timer calibration via PIT channel 2]
+  │  Enables CPU interrupts (sti)
   v
-  Kernel Ready — halt loop or schedule first task
+Phase 8:  Root Filesystem
+  │  Ramfs mounted on / (128 inodes, 4 KiB/file)
+  │  Creates /dev /proc /tmp /sbin
+  v
+Phase 9:  IPC Channels
+  │  Kernel endpoint (id=0) ↔ console (1), devmgr (2), netd (3)
+  │  Backed by ring-buffer channels (16-msg, 64 channels global)
+  v
+Phase 10: Service Manager
+  │  Process table: PID 0 (kernel), PID 1 (init)
+  │  Runs do_init_boot(InitSystem) to enumerate services
+  v
+  Kernel Ready — publishes KernelState via set_global(),
+                 enters halt loop (to be replaced with Ring 3 jump)
 ```
 
 ### Memory Layout (Higher-Half)

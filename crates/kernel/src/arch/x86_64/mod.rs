@@ -6,6 +6,7 @@
 pub mod context;
 pub mod exceptions;
 pub mod init;
+pub mod init_embed;
 pub mod interrupts;
 pub mod kthread;
 pub mod multiboot2;

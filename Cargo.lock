@@ -28,6 +28,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-init"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-ipc"
 version = "0.1.0"
 dependencies = [
@@ -70,6 +77,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-sh"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-syscall"
 version = "0.1.0"
 dependencies = [
@@ -79,6 +93,14 @@ dependencies = [
  "oncrix-process",
  "oncrix-vfs",
 ]
+
+[[package]]
+name = "oncrix-ulibc"
+version = "0.1.0"
+
+[[package]]
+name = "oncrix-userspace"
+version = "0.1.0"
 
 [[package]]
 name = "oncrix-vfs"

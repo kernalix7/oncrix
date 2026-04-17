@@ -9,20 +9,25 @@
 
 use oncrix_lib::{Error, Result};
 
+#[cfg(target_arch = "x86_64")]
 use crate::power::{inl, outl};
 
-// ── PCI I/O ports ─────────────────────────────────────────────
+// ── PCI I/O ports (x86_64 Mechanism 1 only) ───────────────────
 
 /// PCI configuration address port (CONFIG_ADDRESS).
+#[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_ADDR: u16 = 0x0CF8;
 
 /// PCI configuration data port (CONFIG_DATA).
+#[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_DATA: u16 = 0x0CFC;
 
 /// Enable bit (bit 31) for PCI configuration address.
+#[cfg(target_arch = "x86_64")]
 const PCI_ENABLE_BIT: u32 = 1 << 31;
 
 /// Invalid PCI vendor ID indicating no device present.
+#[cfg(target_arch = "x86_64")]
 const PCI_VENDOR_INVALID: u16 = 0xFFFF;
 
 /// Maximum number of devices stored by [`PciDeviceList`].
@@ -61,6 +66,7 @@ impl PciAddress {
 
     /// Build the 32-bit CONFIG_ADDRESS value for a given register
     /// offset (must be 4-byte aligned).
+    #[cfg(target_arch = "x86_64")]
     fn config_address(self, offset: u8) -> u32 {
         PCI_ENABLE_BIT
             | (u32::from(self.bus) << 16)
@@ -261,6 +267,7 @@ impl PciDevice {
 // ── BAR decoding ──────────────────────────────────────────────
 
 /// Offset of the first BAR in the PCI configuration header.
+#[cfg(target_arch = "x86_64")]
 const BAR_OFFSET: u8 = 0x10;
 
 /// Decode all 6 BARs for a Type 0 device.

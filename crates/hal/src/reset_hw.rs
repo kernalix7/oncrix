@@ -15,6 +15,8 @@
 //!
 //! Reference: ACPI Specification 6.5 §4.8.3; Intel 8042 Application Note.
 
+#[cfg(not(target_arch = "x86_64"))]
+use oncrix_lib::Error;
 use oncrix_lib::Result;
 
 // ---------------------------------------------------------------------------

@@ -291,6 +291,7 @@ impl SuspendOps for AcpiSuspend {
             return Err(Error::InvalidArgument);
         }
         // Build PM1a_CNT value: SLP_TYP (bits 12:10) | SLP_EN (bit 13).
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
         let slp_val = ((self.slp_typ_s3 as u16) << 10) | (1 << 13);
 
         // SAFETY: Writing to the ACPI PM1a_CNT port at CPL 0 to initiate
