@@ -63,24 +63,24 @@ static mut USER_LOAD_REGION: UserLoadRegion = UserLoadRegion([0; USER_REGION_SIZ
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Load the embedded `init` ELF into the static user-load region.
+/// Parse the embedded `init` ELF and report it on the serial console.
 ///
-/// Copies each PT_LOAD segment from the embedded ELF data into the static
-/// `USER_LOAD_REGION` buffer and returns the entry-point virtual address.
-///
-/// Returns `None` when:
-/// - The `embed-init` feature is not enabled.
-/// - ELF parsing fails.
-/// - A segment extends beyond `USER_REGION_SIZE`.
+/// Returns `None` unconditionally for now:
+/// - Build-pipeline verification: when `embed-init` is enabled the ELF is
+///   embedded via `include_bytes!(env!("ONCRIX_INIT_BIN"))` and its header
+///   + PT_LOAD segment table is parsed to prove the binary is well-formed.
+/// - Runtime launch is deferred to Phase 10b: jumping to 0x400000 requires
+///   a per-process page table that maps the user VMA with the user-accessible
+///   bit set. Until that lands the caller falls back to `usermode_test_entry`,
+///   whose address is already mapped (it lives in the kernel image).
 ///
 /// # Safety
 ///
-/// Must be called exactly once during single-threaded boot, before any
-/// jump to ring 3.  The `USER_LOAD_REGION` static must not be aliased.
+/// Must be called exactly once during single-threaded boot.
 pub unsafe fn load_init_elf() -> Option<u64> {
     #[cfg(not(feature = "embed-init"))]
     {
-        // Feature not enabled — caller falls back to smoke-test stub.
+        // Feature not enabled — caller uses the smoke-test stub.
         let _ = INIT_ELF;
         None
     }
@@ -90,65 +90,29 @@ pub unsafe fn load_init_elf() -> Option<u64> {
         let data: &[u8] = INIT_ELF;
 
         let mut serial = Uart16550::new(COM1);
-        let _ = serial.write_str("[ONCRIX] Loading embedded init ELF...\n");
+        let _ = serial.write_str("[ONCRIX] Verifying embedded init ELF...\n");
 
         let info = elf::parse_header(data).ok()?;
-        let (segments, seg_count) = elf::load_segments(data).ok()?;
+        let (_segments, seg_count) = elf::load_segments(data).ok()?;
 
+        // Reference the segment staging area so the symbol is not dropped;
+        // the real copy path lands with Phase 10b's process VM.
         // SAFETY: Single-threaded boot; USER_LOAD_REGION is not aliased.
-        // `&raw mut` avoids creating a reference to the `static mut`, per
-        // Rust 2024's `static_mut_refs` lint.
-        let region = unsafe {
+        let _region = unsafe {
             let ptr = (&raw mut USER_LOAD_REGION).cast::<u8>();
             core::slice::from_raw_parts_mut(ptr, USER_REGION_SIZE)
         };
 
-        // Base offset: ELF is linked at USER_BASE (0x400000); our static
-        // region starts at its own address. Compute the delta so we can
-        // map VMA → region offset.
-        let region_base = region.as_ptr() as u64;
+        let _ = serial.write_str("[ONCRIX] init ELF parsed (");
+        let _ = serial.write_str(if seg_count == 1 {
+            "1 segment"
+        } else {
+            "N segments"
+        });
+        let _ = serial.write_str(")\n");
+        let _ = info.entry;
 
-        for seg in &segments[..seg_count] {
-            let file_data = data
-                .get(seg.file_offset as usize..)
-                .and_then(|s| s.get(..seg.file_size as usize))?;
-
-            // Determine where in our static region this segment lands.
-            // The ELF vaddr is the intended VMA (e.g. 0x401000).
-            // We copy directly to USER_LOAD_REGION + (vaddr - region_base)
-            // only if they happen to coincide. For the simple case where
-            // the region IS mapped at the ELF's link address, the offset is 0.
-            //
-            // In this early-boot stub we copy to the raw vaddr, trusting
-            // the kernel identity-maps physical == virtual for this range.
-            if seg.mem_size as usize > USER_REGION_SIZE {
-                let _ = serial.write_str("[ONCRIX] init ELF segment too large\n");
-                return None;
-            }
-
-            // Copy using the region buffer as backing — offset from region base.
-            let vaddr_offset = seg.vaddr.checked_sub(region_base)? as usize;
-            if vaddr_offset + seg.mem_size as usize > USER_REGION_SIZE {
-                // If the vaddr doesn't fall within our static region, fall back
-                // to writing directly to the VMA (assumes identity mapping).
-                // SAFETY: The identity mapping guarantees vaddr is accessible.
-                let dst = unsafe {
-                    core::slice::from_raw_parts_mut(seg.vaddr as *mut u8, seg.mem_size as usize)
-                };
-                dst[..seg.file_size as usize].copy_from_slice(file_data);
-                for b in &mut dst[seg.file_size as usize..] {
-                    *b = 0;
-                }
-            } else {
-                let dst = &mut region[vaddr_offset..vaddr_offset + seg.mem_size as usize];
-                dst[..seg.file_size as usize].copy_from_slice(file_data);
-                for b in &mut dst[seg.file_size as usize..] {
-                    *b = 0;
-                }
-            }
-        }
-
-        let _ = serial.write_str("[ONCRIX] init ELF loaded\n");
-        Some(info.entry)
+        // Falling back to the smoke-test stub until the page-table path exists.
+        None
     }
 }

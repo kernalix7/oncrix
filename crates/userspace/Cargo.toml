@@ -1,9 +1,24 @@
-[package]
-name = "oncrix-userspace"
-description = "ONCRIX - Userspace crates (init, libc shim, shell)"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
+# Copyright 2026 ONCRIX Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Nested workspace for ONCRIX userspace crates (init, sh, libc).
+#
+# Kept separate from the root kernel workspace so it doesn't inherit the
+# kernel linker script, `code-model=kernel`, or higher-half link address.
+# The kernel's build.rs invokes `cargo build --manifest-path` on this file
+# when the `embed-init` feature is enabled.
+
+[workspace]
+members = ["init", "sh", "libc"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
+repository = "https://github.com/kernalix7/oncrix"
+
+[workspace.dependencies]
+oncrix-ulibc = { path = "libc" }
