@@ -46,6 +46,13 @@ static mut TSS: Tss = Tss::new();
 /// Double-fault IST stack (16 KiB).
 static mut DOUBLE_FAULT_STACK: [u8; 16384] = [0; 16384];
 
+/// Ring 0 stack used when the CPU traps from ring 3 to ring 0.
+///
+/// Installed into `TSS.RSP0` by [`init_tss_rsp0`]. Without this any
+/// interrupt or exception taken while at ring 3 would try to push the
+/// iretq frame at RSP=0 and triple-fault.
+static mut RING0_STACK: [u8; 32768] = [0; 32768];
+
 /// Initialize the GDT with kernel/user segments and a TSS.
 ///
 /// # Safety
@@ -85,6 +92,30 @@ pub unsafe fn init_gdt() {
     }
 
     let _ = serial.write_str("[ONCRIX] GDT initialized\n");
+}
+
+/// Install [`RING0_STACK`] as the TSS ring-0 stack (`TSS.RSP0`).
+///
+/// Required before any ring 3 → ring 0 transition (interrupt, exception,
+/// or IRETQ fallback from a non-canonical SYSRET). The SYSCALL fast path
+/// uses its own dedicated kernel stack and is not affected.
+///
+/// # Safety
+///
+/// Must be called after [`init_gdt`] and before enabling interrupts or
+/// transitioning to ring 3.
+pub unsafe fn init_tss_rsp0() {
+    let mut serial = Uart16550::new(COM1);
+
+    // SAFETY: Single-threaded boot; TSS is not concurrently accessed.
+    unsafe {
+        let stack_base = &raw const RING0_STACK as *const u8;
+        let stack_top = stack_base as u64 + 32768;
+        let tss_ptr = &raw mut TSS;
+        (*tss_ptr).privilege_stacks[0] = stack_top;
+    }
+
+    let _ = serial.write_str("[ONCRIX] TSS.RSP0 installed (ring 0 trap stack)\n");
 }
 
 // ── IDT ─────────────────────────────────────────────────────────

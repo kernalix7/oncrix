@@ -189,6 +189,14 @@ pub unsafe fn init_syscall() {
 /// return address, and return via SYSRET (or IRETQ fallback if
 /// the return address is non-canonical).
 ///
+/// # Naked function
+///
+/// This must be `#[naked]` because the CPU jumps here directly from the
+/// `SYSCALL` instruction with user RSP still live. Any compiler-emitted
+/// prologue (e.g., a stack-alignment `push rax`) would silently corrupt
+/// the user stack on every syscall — losing 8 bytes per call and
+/// eventually underflowing into user code.
+///
 /// # Kernel Stack Switch
 ///
 /// The entry stub saves the user RSP to an atomic static and loads
@@ -203,14 +211,15 @@ pub unsafe fn init_syscall() {
 /// does not have the RCX privilege escalation vulnerability.
 /// R11 (RFLAGS) is also sanitized to force IF=1, clear IOPL/NT/TF.
 #[unsafe(no_mangle)]
+#[unsafe(naked)]
 pub extern "C" fn syscall_entry() {
     // SAFETY: This is the SYSCALL entry stub executed at Ring 0.
     // We swap GS base for per-CPU data, switch to a kernel stack,
     // save user registers, call the Rust dispatcher, validate the
     // return address, sanitize RFLAGS, and return via SYSRET or
-    // IRETQ fallback.
-    unsafe {
-        core::arch::asm!(
+    // IRETQ fallback. Naked ensures no compiler prologue runs on the
+    // still-live user stack.
+    core::arch::naked_asm!(
             // Swap GS base: user GS <-> kernel GS.
             "swapgs",
             // Save user RSP into the atomic and switch to kernel
@@ -277,14 +286,12 @@ pub extern "C" fn syscall_entry() {
             "push {user_cs}",   // CS
             "push rcx",         // RIP
             "iretq",
-            dispatch = sym syscall_dispatch_wrapper,
-            saved_user_rsp = sym SYSCALL_SAVED_USER_RSP,
-            kern_stack = sym SYSCALL_KERNEL_STACK,
-            user_ss = const 0x1Bu64,  // USER_DATA = (3 << 3)|3
-            user_cs = const 0x23u64,  // USER_CODE = (4 << 3)|3
-            options(noreturn),
-        );
-    }
+        dispatch = sym syscall_dispatch_wrapper,
+        saved_user_rsp = sym SYSCALL_SAVED_USER_RSP,
+        kern_stack = sym SYSCALL_KERNEL_STACK,
+        user_ss = const 0x1Bu64,  // USER_DATA = (3 << 3)|3
+        user_cs = const 0x23u64,  // USER_CODE = (4 << 3)|3
+    );
 }
 
 /// Wrapper that calls into the syscall dispatcher.

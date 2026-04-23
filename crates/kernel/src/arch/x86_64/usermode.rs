@@ -16,39 +16,47 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// RFLAGS bit 1 is always set.
 const RFLAGS_RESERVED: u64 = 1 << 1;
 
-/// Page-aligned user-space stack wrapper.
+/// Page-aligned fallback user-space stack.
 ///
-/// This is a **single-use, test-only** stack for early Ring 3
-/// transition testing. A real multi-process kernel must
-/// dynamically allocate per-process user stacks in user-space
-/// virtual memory.
+/// Used only by the `usermode_test_entry` smoke-test stub (see
+/// [`fallback_user_stack_top`]). When the embedded `init` path is
+/// active, ring 3 receives a user-mapped stack inside its own VMA
+/// (see `init_embed::user_init_rsp`), not this static.
 #[repr(C, align(4096))]
 struct UserStack([u8; 65536]);
 
-/// User-space stack (64 KiB, page-aligned).
-///
-/// This static is safe (non-mut) because we only hand the
-/// address to user-space via iretq; the kernel itself never
-/// writes through it after boot.
+/// Fallback user-space stack backing [`fallback_user_stack_top`].
 static USER_STACK: UserStack = UserStack([0; 65536]);
+
+/// Top address of the fallback user stack.
+///
+/// The stub path does not install a user-accessible mapping for this
+/// buffer; it only works when ring 3 never actually touches its stack
+/// before issuing a `syscall`. Real user code must pass a stack that
+/// lives in a user-mapped VMA.
+pub fn fallback_user_stack_top() -> u64 {
+    let base = &raw const USER_STACK;
+    base as u64 + 65536
+}
 
 /// Jump to user space.
 ///
 /// Constructs an `iretq` frame on the kernel stack and returns to
-/// the given entry point at Ring 3.
+/// the given entry point at Ring 3 with the supplied RSP.
 ///
 /// # Safety
 ///
-/// - `entry` must point to valid, executable user-space code.
-/// - The user-space stack must be properly mapped and accessible.
+/// - `entry` must point to valid, executable ring-3 code (page must
+///   be present and user-accessible).
+/// - `user_rsp` must point into a writable, user-accessible page.
 /// - GDT must have valid user code/data segments at the expected
-///   selector indices.
-pub unsafe fn jump_to_usermode(entry: u64) {
+///   selector indices and TSS.RSP0 must be initialized so any ring
+///   3 → 0 interrupt can land on a valid kernel stack.
+pub unsafe fn jump_to_usermode(entry: u64, user_rsp: u64) {
     let mut serial = Uart16550::new(COM1);
     let _ = serial.write_str("[ONCRIX] Transitioning to Ring 3...\n");
 
-    let base = &raw const USER_STACK;
-    let user_stack_top = base as u64 + 65536;
+    let user_stack_top = user_rsp;
 
     let user_cs = selector::USER_CODE as u64;
     let user_ss = selector::USER_DATA as u64;

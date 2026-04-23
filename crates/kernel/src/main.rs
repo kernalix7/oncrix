@@ -153,17 +153,32 @@ pub extern "C" fn kernel_main() -> ! {
         // fall back to the hello-world smoke-test stub for incremental builds.
         let _ = serial.write_str("[ONCRIX] Launching userspace (ring 3)...\n");
 
+        // Install TSS.RSP0 so any ring 3 → 0 interrupt lands on a valid
+        // kernel stack. Without this any fault (page fault, timer IRQ,
+        // etc.) from ring 3 would triple-fault.
+        //
+        // SAFETY: GDT has been installed by phase 2; single-threaded boot.
+        unsafe {
+            oncrix_kernel::arch::x86_64::init::init_tss_rsp0();
+        }
+
         // SAFETY: Single-threaded boot. GDT, IDT, and SYSCALL MSRs have been
         // fully initialized in phases 2–6. USER_LOAD_REGION is unaliased.
         let entry = unsafe { oncrix_kernel::arch::x86_64::init_embed::load_init_elf() };
 
-        // SAFETY: Either `entry` is the ELF entry point of the verified init
-        // binary, or we use the trusted `usermode_test_entry` stub.
+        // If the embedded init loaded successfully, launch it with a
+        // user-mapped RSP inside its own VMA. Otherwise fall back to the
+        // in-kernel smoke-test stub (works only because it never touches
+        // the fallback user stack before issuing `syscall`).
         unsafe {
-            let entry_ptr = entry.unwrap_or(
-                oncrix_kernel::arch::x86_64::usermode::usermode_test_entry as *const () as u64,
-            );
-            oncrix_kernel::arch::x86_64::usermode::jump_to_usermode(entry_ptr);
+            let (entry_ptr, user_rsp) = match entry {
+                Some(e) => (e, oncrix_kernel::arch::x86_64::init_embed::user_init_rsp()),
+                None => (
+                    oncrix_kernel::arch::x86_64::usermode::usermode_test_entry as *const () as u64,
+                    oncrix_kernel::arch::x86_64::usermode::fallback_user_stack_top(),
+                ),
+            };
+            oncrix_kernel::arch::x86_64::usermode::jump_to_usermode(entry_ptr, user_rsp);
         }
     }
 

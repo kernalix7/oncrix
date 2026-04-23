@@ -41,8 +41,17 @@ const SH_PATH: &[u8] = b"/bin/sh\0";
 /// Null-terminated shell argv[0].
 const SH_ARG0: &[u8] = b"sh\0";
 
+/// Startup banner written to stderr so early-boot integration tests can
+/// observe that the ELF was actually loaded and executed at ring 3.
+const INIT_BANNER: &[u8] = b"[init] hello from pid 1 (ring 3)\n";
+
 /// Main init loop: spawn sh and reap zombies indefinitely.
 fn init_main() -> ! {
+    // SAFETY: `INIT_BANNER` is valid for its full length.
+    unsafe {
+        let _ = libc::write(2, INIT_BANNER.as_ptr(), INIT_BANNER.len());
+    }
+
     loop {
         let child = libc::fork();
 
