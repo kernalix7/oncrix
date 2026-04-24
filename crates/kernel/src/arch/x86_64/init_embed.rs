@@ -194,6 +194,30 @@ pub const fn user_init_rsp() -> u64 {
     0
 }
 
+/// Return the physical address of the per-process page table for the
+/// init process (`USER_PT`).
+///
+/// Used by the boot path to record `user_pt_phys` on the init thread
+/// so that the scheduler can patch `PD_0_1G[2]` correctly on every
+/// context switch in Phase 10c's single-PT model.
+///
+/// Returns `None` when `embed-init` is disabled.
+#[cfg(feature = "embed-init")]
+pub fn init_user_pt_phys() -> Option<u64> {
+    // SAFETY: Computing the virtual address of a static and converting
+    // to a physical address via the known higher-half offset is safe as
+    // long as the static lives in the kernel load region (which it does —
+    // it's a BSS-allocated `static mut`).
+    let virt = &raw const USER_PT as u64;
+    Some(virt - KERNEL_VIRT_BASE)
+}
+
+/// Placeholder when `embed-init` is disabled.
+#[cfg(not(feature = "embed-init"))]
+pub fn init_user_pt_phys() -> Option<u64> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------

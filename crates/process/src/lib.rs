@@ -16,13 +16,18 @@
 //! - [`thread`] — `Thread` struct, state, and priority
 
 #![no_std]
+#![feature(allocator_api)]
+
+extern crate alloc;
 
 pub mod affinity;
 pub mod clone;
+pub mod context;
 pub mod coredump;
 pub mod cred;
 pub mod fork;
 pub mod group;
+pub mod kstack;
 pub mod namespace;
 pub mod pid;
 pub mod process;

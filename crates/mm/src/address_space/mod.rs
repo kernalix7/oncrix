@@ -6,11 +6,23 @@
 //! Each process has its own address space with a root page table
 //! (PML4). The kernel is mapped in the higher half of every address
 //! space; user code occupies the lower half.
+//!
+//! Submodules:
+//! - [`user`] — concrete per-process user-mode VMA with owned page
+//!   tables and backing frames (fork/exec support).
+//! - [`elf_loader`] — reusable ELF PT_LOAD parser/copier used by
+//!   initial load and execve.
 
 use crate::addr::{PhysAddr, VirtAddr};
 use crate::frame::FrameAllocator;
 use crate::page_table::flags;
 use oncrix_lib::{Error, Result};
+
+pub mod elf_loader;
+pub mod user;
+
+pub use elf_loader::{ElfLoadInfo, load_elf_into};
+pub use user::{USER_PT_PD_INDEX, USER_REGION_SIZE, UserAddressSpace};
 
 /// Start of user-space virtual memory.
 pub const USER_SPACE_START: u64 = 0x0000_0000_0040_0000;

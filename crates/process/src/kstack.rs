@@ -1,0 +1,104 @@
+// Copyright 2026 ONCRIX Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Per-thread kernel stack.
+//!
+//! Each [`Thread`](crate::thread::Thread) owns a heap-allocated
+//! kernel stack that is installed in `TSS.RSP0` whenever the thread
+//! is selected to run (so that any ring 3 → 0 trap — interrupt,
+//! exception, or IRETQ fallback — lands on the correct private
+//! stack). Without per-thread kernel stacks, forking a second
+//! process that traps concurrently with its parent would clobber a
+//! shared stack and triple-fault.
+//!
+//! The buffer is 16 KiB, matching the Linux x86_64 `THREAD_SIZE`
+//! default, and 16-byte aligned so the initial RSP is
+//! ABI-compliant for a `call` instruction.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use oncrix_lib::{Error, Result};
+
+/// Kernel stack size for every thread (16 KiB).
+pub const KSTACK_SIZE: usize = 16 * 1024;
+
+/// 16-byte aligned backing buffer.
+///
+/// The System V AMD64 ABI requires `RSP` to be 16-byte aligned
+/// just before a `call` instruction. Allocating a `[u8; N]`
+/// provides no alignment guarantee stronger than 1, so we wrap
+/// it in a `#[repr(C, align(16))]` struct.
+#[repr(C, align(16))]
+struct KStackBuf([u8; KSTACK_SIZE]);
+
+/// Owning handle for a thread's kernel stack.
+///
+/// Dropping a `KernelStack` frees the 16 KiB buffer. The top of
+/// the stack (highest address, since x86_64 stacks grow down)
+/// is exposed via [`top`](Self::top) for `TSS.RSP0` installation.
+pub struct KernelStack {
+    buf: Box<KStackBuf>,
+}
+
+impl KernelStack {
+    /// Allocate a fresh 16 KiB kernel stack on the kernel heap.
+    ///
+    /// Returns `Err(OutOfMemory)` if the heap is exhausted.
+    pub fn allocate() -> Result<Self> {
+        // `Box::new` aborts on OOM under the default alloc error
+        // handler, which is wrong for a kernel. Use `try_new` so
+        // we can surface the error through the `Result`.
+        let buf = Box::try_new(KStackBuf([0; KSTACK_SIZE])).map_err(|_| Error::OutOfMemory)?;
+        Ok(Self { buf })
+    }
+
+    /// Return the bottom (lowest address) of the stack as a `u64`.
+    pub fn bottom(&self) -> u64 {
+        core::ptr::addr_of!(self.buf.0) as u64
+    }
+
+    /// Return the top of the stack (initial `RSP`).
+    ///
+    /// x86_64 stacks grow downward; `top` is `bottom + KSTACK_SIZE`
+    /// and is 16-byte aligned by construction.
+    pub fn top(&self) -> u64 {
+        self.bottom() + KSTACK_SIZE as u64
+    }
+
+    /// Write a 64-bit word at `offset_from_top` bytes below the
+    /// stack top and return the absolute address that was written.
+    ///
+    /// Used by arch-specific clone code to pre-seed an `iretq`
+    /// frame on a freshly-allocated child stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` if `offset_from_top` is not a
+    /// multiple of 8 or would write outside the stack buffer.
+    pub fn write_u64_from_top(&mut self, offset_from_top: usize, value: u64) -> Result<u64> {
+        if offset_from_top % 8 != 0 || !(8..=KSTACK_SIZE).contains(&offset_from_top) {
+            return Err(Error::InvalidArgument);
+        }
+        let addr = self.top() - offset_from_top as u64;
+        // SAFETY: `addr` lies within `self.buf` because `offset_from_top`
+        // is in `[8, KSTACK_SIZE]`. The buffer is exclusively owned
+        // through `&mut self` and is 16-byte aligned, so an 8-byte
+        // aligned write is valid.
+        unsafe {
+            let ptr = addr as *mut u64;
+            ptr.write(value);
+        }
+        Ok(addr)
+    }
+}
+
+impl core::fmt::Debug for KernelStack {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KernelStack")
+            .field("bottom", &format_args!("{:#x}", self.bottom()))
+            .field("top", &format_args!("{:#x}", self.top()))
+            .field("size", &KSTACK_SIZE)
+            .finish()
+    }
+}

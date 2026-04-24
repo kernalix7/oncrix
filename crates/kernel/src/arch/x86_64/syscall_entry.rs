@@ -15,7 +15,7 @@
 //! - `IA32_FMASK` (0xC000_0084): RFLAGS mask (clear IF on entry)
 //! - `IA32_EFER` (0xC000_0080): enable SCE (SYSCALL Enable) bit
 
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
@@ -59,6 +59,24 @@ static mut SYSCALL_KERNEL_STACK: [u8; 32768] = [0; 32768];
 /// The SYSCALL entry stub stores the user-space RSP here before
 /// switching to the kernel stack, and restores it on exit.
 static SYSCALL_SAVED_USER_RSP: AtomicU64 = AtomicU64::new(0);
+
+/// Saved user RIP during SYSCALL execution.
+///
+/// On `SYSCALL`, the CPU places the user return address (the
+/// instruction after `SYSCALL`) into `RCX`. The entry stub saves
+/// it here immediately so that fork/exec handlers can snapshot the
+/// user instruction pointer without needing a full register frame.
+///
+/// Must be read before calling any Rust code that might clobber `RCX`.
+pub static SYSCALL_SAVED_USER_RIP: AtomicU64 = AtomicU64::new(0);
+
+/// Saved user RFLAGS during SYSCALL execution.
+///
+/// On `SYSCALL`, the CPU places the user RFLAGS into `R11`. The
+/// entry stub saves it here alongside [`SYSCALL_SAVED_USER_RIP`]
+/// so fork/exec can reconstruct the parent's full user register
+/// state without walking a stack frame.
+pub static SYSCALL_SAVED_USER_RFLAGS: AtomicU64 = AtomicU64::new(0);
 
 /// RFLAGS sanitization mask: keeps only safe bits for SYSRETQ.
 ///
@@ -226,7 +244,14 @@ pub extern "C" fn syscall_entry() {
             // stack. This must happen before any push instruction.
             "mov [{saved_user_rsp}], rsp",
             "lea rsp, [{kern_stack} + 32768]",
-            // Save user RCX (RIP) and R11 (RFLAGS).
+            // Save user RCX (return RIP) and R11 (user RFLAGS) into
+            // their per-atomic-static slots so that fork/exec handlers
+            // can snapshot the parent's user register state.
+            // These writes happen BEFORE any Rust call that might
+            // clobber RCX or R11 through the C ABI.
+            "mov [{saved_user_rip}], rcx",
+            "mov [{saved_user_rflags}], r11",
+            // Push RCX and R11 onto the kernel stack for restoration.
             "push rcx",       // user RIP
             "push r11",       // user RFLAGS
             // Save callee-saved registers we will clobber.
@@ -258,9 +283,14 @@ pub extern "C" fn syscall_entry() {
             "pop r12",
             "pop rbp",
             "pop rbx",
-            // Restore user RFLAGS and RIP.
-            "pop r11",        // user RFLAGS
-            "pop rcx",        // user RIP
+            // Restore user RFLAGS and RIP. Read from atomics rather
+            // than from the stack so that exec-style handlers can
+            // redirect return-to-user by updating the atomics.
+            "mov rcx, [{saved_user_rip}]",
+            "mov r11, [{saved_user_rflags}]",
+            // Pop the stacked copies (values now superseded by the
+            // atomic reads above; we just need RSP to move past them).
+            "add rsp, 16",
             // Sanitize R11 (RFLAGS): clear IOPL, NT, TF, and
             // force IF=1 + reserved bit 1=1.
             "and r11, 0x3C7FD7",
@@ -288,6 +318,8 @@ pub extern "C" fn syscall_entry() {
             "iretq",
         dispatch = sym syscall_dispatch_wrapper,
         saved_user_rsp = sym SYSCALL_SAVED_USER_RSP,
+        saved_user_rip = sym SYSCALL_SAVED_USER_RIP,
+        saved_user_rflags = sym SYSCALL_SAVED_USER_RFLAGS,
         kern_stack = sym SYSCALL_KERNEL_STACK,
         user_ss = const 0x1Bu64,  // USER_DATA = (3 << 3)|3
         user_cs = const 0x23u64,  // USER_CODE = (4 << 3)|3
@@ -344,8 +376,65 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
         oncrix_syscall::number::SYS_IPC_CREATE_ENDPOINT => {
             crate::ipc_dispatch::kernel_ipc_create_endpoint()
         }
+        // Process management syscalls — require direct kernel access
+        // (scheduler, process table, saved SYSCALL register state).
+        oncrix_syscall::number::SYS_FORK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path. Interrupts are
+            // logically disabled because FMASK cleared IF on entry.
+            unsafe { crate::fork_dispatch::sys_fork() }
+        }
+        oncrix_syscall::number::SYS_WAIT4 => {
+            // SAFETY: see SYS_FORK above.
+            unsafe { crate::fork_dispatch::sys_wait4(args.arg0, args.arg1, args.arg2, args.arg3) }
+        }
+        oncrix_syscall::number::SYS_EXECVE => {
+            // SAFETY: see SYS_FORK above.
+            unsafe { crate::fork_dispatch::sys_execve(args.arg0, args.arg1, args.arg2) }
+        }
         _ => oncrix_syscall::dispatch::dispatch(args),
     }
+}
+
+// ── Saved-register accessors (for fork / execve handlers) ───────
+
+/// Read the user-mode RIP saved by the SYSCALL entry stub.
+///
+/// Must be called from within the SYSCALL dispatch path (i.e. while
+/// the current CPU is serving a SYSCALL), otherwise the value is
+/// stale from a previous call.
+pub fn saved_user_rip() -> u64 {
+    SYSCALL_SAVED_USER_RIP.load(Ordering::Relaxed)
+}
+
+/// Read the user-mode RFLAGS saved by the SYSCALL entry stub.
+///
+/// Same timing contract as [`saved_user_rip`].
+pub fn saved_user_rflags() -> u64 {
+    SYSCALL_SAVED_USER_RFLAGS.load(Ordering::Relaxed)
+}
+
+/// Read the user-mode RSP saved by the SYSCALL entry stub.
+pub fn saved_user_rsp() -> u64 {
+    SYSCALL_SAVED_USER_RSP.load(Ordering::Relaxed)
+}
+
+/// Overwrite the saved user-mode RIP.
+///
+/// The SYSCALL epilogue restores RCX from [`SYSCALL_SAVED_USER_RIP`],
+/// so writing here redirects the post-syscall return-to-user address.
+/// Used by `execve` to jump to the new program entry point.
+pub fn set_saved_user_rip(rip: u64) {
+    SYSCALL_SAVED_USER_RIP.store(rip, Ordering::Relaxed);
+}
+
+/// Overwrite the saved user-mode RFLAGS.
+pub fn set_saved_user_rflags(rflags: u64) {
+    SYSCALL_SAVED_USER_RFLAGS.store(rflags, Ordering::Relaxed);
+}
+
+/// Overwrite the saved user-mode RSP.
+pub fn set_saved_user_rsp(rsp: u64) {
+    SYSCALL_SAVED_USER_RSP.store(rsp, Ordering::Relaxed);
 }
 
 /// Write `count` bytes from user-space address `buf` to the serial console.

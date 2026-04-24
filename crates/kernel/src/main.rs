@@ -166,6 +166,19 @@ pub extern "C" fn kernel_main() -> ! {
         // fully initialized in phases 2–6. USER_LOAD_REGION is unaliased.
         let entry = unsafe { oncrix_kernel::arch::x86_64::init_embed::load_init_elf() };
 
+        // Wire the init process's per-process page-table physical address into
+        // the current (init) thread so the scheduler glue can patch PD_0_1G[2]
+        // correctly on every context switch (Phase 10c single-PT model).
+        //
+        // SAFETY: Single-threaded boot; current_thread_mut has exclusive access.
+        unsafe {
+            if let Some(pt_phys) = oncrix_kernel::arch::x86_64::init_embed::init_user_pt_phys() {
+                if let Some(thread) = oncrix_kernel::current::current_thread_mut() {
+                    thread.user_pt_phys = Some(pt_phys);
+                }
+            }
+        }
+
         // If the embedded init loaded successfully, launch it with a
         // user-mapped RSP inside its own VMA. Otherwise fall back to the
         // in-kernel smoke-test stub (works only because it never touches

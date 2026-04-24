@@ -3,7 +3,10 @@
 
 //! Thread representation and state management.
 
+use crate::context::{CpuContext, Cr3Frame};
+use crate::kstack::KernelStack;
 use crate::pid::{Pid, Tid};
+use oncrix_lib::Result;
 
 /// Thread execution state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +48,18 @@ impl Priority {
 /// A kernel thread.
 ///
 /// Each thread belongs to exactly one process and maintains its own
-/// execution context (register state, stack pointer, etc.).
+/// execution context (register state, stack pointer, etc.). Phase
+/// 10c adds:
+///
+/// * `cpu_context` — the saved register file consumed/produced by the
+///   scheduler's context-switch routine.
+/// * `kernel_stack` — a private 16 KiB kernel stack that is installed
+///   into `TSS.RSP0` whenever this thread is picked to run, so that
+///   ring 3 → 0 traps land on the thread's own stack (fork-safe).
+///
+/// Both fields are `Option` because the idle thread and the initial
+/// bootstrap thread run on the static boot stack and don't need a
+/// heap-allocated private one.
 #[derive(Debug)]
 pub struct Thread {
     /// Thread identifier.
@@ -56,18 +70,34 @@ pub struct Thread {
     state: ThreadState,
     /// Scheduling priority.
     priority: Priority,
-    /// Stack pointer (saved during context switch).
+    /// Stack pointer (legacy field, still used by the kthread path).
     stack_pointer: u64,
     /// Thread-local storage base address (FS base on x86_64).
-    ///
-    /// Set via `arch_prctl(ARCH_SET_FS, addr)` or `clone(CLONE_SETTLS)`.
-    /// The hardware FS segment base is loaded from this field on
-    /// context switch, enabling `__thread` / TLS access in user space.
     tls_base: u64,
+    /// Saved register context for scheduler-driven switches.
+    cpu_context: CpuContext,
+    /// Private 16 KiB kernel stack (None for static bootstrap threads).
+    kernel_stack: Option<KernelStack>,
+    /// Cached top-of-stack for `TSS.RSP0` installation (avoids re-deref
+    /// on every switch). `0` means "use the global ring-0 stack".
+    kernel_stack_top: u64,
+    /// Physical address of this thread's per-process page table (the PT
+    /// installed at `PD_0_1G[2]` covering VMA 0x400000..0x600000).
+    ///
+    /// `None` for kernel threads that share the boot mapping.
+    /// The scheduler glue patches `PD_0_1G[2]` on every context switch
+    /// so each user thread sees its own private page table.
+    ///
+    /// Stored as a raw `u64` to avoid a crate dependency on `oncrix_mm`.
+    pub user_pt_phys: Option<u64>,
 }
 
 impl Thread {
     /// Create a new thread in the Ready state.
+    ///
+    /// The thread has no kernel stack and an empty CPU context; call
+    /// [`attach_kernel_stack`](Self::attach_kernel_stack) and
+    /// [`set_cpu_context`](Self::set_cpu_context) before scheduling.
     pub const fn new(tid: Tid, pid: Pid, priority: Priority) -> Self {
         Self {
             tid,
@@ -76,6 +106,10 @@ impl Thread {
             priority,
             stack_pointer: 0,
             tls_base: 0,
+            cpu_context: CpuContext::empty(),
+            kernel_stack: None,
+            kernel_stack_top: 0,
+            user_pt_phys: None,
         }
     }
 
@@ -104,12 +138,12 @@ impl Thread {
         self.state = state;
     }
 
-    /// Set the saved stack pointer.
+    /// Set the saved stack pointer (legacy).
     pub fn set_stack_pointer(&mut self, sp: u64) {
         self.stack_pointer = sp;
     }
 
-    /// Get the saved stack pointer.
+    /// Get the saved stack pointer (legacy).
     pub const fn stack_pointer(&self) -> u64 {
         self.stack_pointer
     }
@@ -122,5 +156,67 @@ impl Thread {
     /// Get the TLS base address.
     pub const fn tls_base(&self) -> u64 {
         self.tls_base
+    }
+
+    /// Return a reference to the saved CPU context.
+    pub const fn cpu_context(&self) -> &CpuContext {
+        &self.cpu_context
+    }
+
+    /// Return a mutable reference to the saved CPU context.
+    pub fn cpu_context_mut(&mut self) -> &mut CpuContext {
+        &mut self.cpu_context
+    }
+
+    /// Replace the saved CPU context wholesale.
+    pub fn set_cpu_context(&mut self, ctx: CpuContext) {
+        self.cpu_context = ctx;
+    }
+
+    /// Attach a freshly allocated 16 KiB kernel stack to this thread.
+    ///
+    /// This also caches the stack top for fast `TSS.RSP0` lookups on
+    /// context switch. Replaces any previously attached stack.
+    pub fn attach_kernel_stack(&mut self, stack: KernelStack) {
+        self.kernel_stack_top = stack.top();
+        self.kernel_stack = Some(stack);
+    }
+
+    /// Allocate and attach a kernel stack in one call.
+    ///
+    /// Returns `Err(OutOfMemory)` if the kernel heap is exhausted.
+    pub fn ensure_kernel_stack(&mut self) -> Result<()> {
+        if self.kernel_stack.is_none() {
+            let stack = KernelStack::allocate()?;
+            self.attach_kernel_stack(stack);
+        }
+        Ok(())
+    }
+
+    /// Return the top of this thread's kernel stack, or `0` if the
+    /// thread runs on the global bootstrap stack.
+    pub const fn kernel_stack_top(&self) -> u64 {
+        self.kernel_stack_top
+    }
+
+    /// Return a mutable reference to the kernel stack, if any.
+    ///
+    /// Used by arch-specific clone code to pre-seed the child's
+    /// `iretq` frame.
+    pub fn kernel_stack_mut(&mut self) -> Option<&mut KernelStack> {
+        self.kernel_stack.as_mut()
+    }
+
+    /// Set only the address-space root (`CR3` on x86_64).
+    ///
+    /// Invoked after the memory-management crate clones the parent's
+    /// page tables and returns a `Cr3Frame` for the child.
+    pub fn set_address_space(&mut self, cr3: Cr3Frame) {
+        self.cpu_context.cr3 = cr3;
+    }
+
+    /// Return the thread's address-space root.
+    pub const fn address_space(&self) -> Cr3Frame {
+        self.cpu_context.cr3
     }
 }

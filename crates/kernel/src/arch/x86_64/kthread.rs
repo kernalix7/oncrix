@@ -175,7 +175,7 @@ pub unsafe fn spawn_kthread(
             }
 
             let ctx_ptr = &raw mut KTHREAD_CONTEXTS;
-            (*ctx_ptr)[slot] = CpuContext::new(
+            (*ctx_ptr)[slot] = CpuContext::new_kernel(
                 entry as *const () as u64,
                 // RSP after 7 pushes (ret + 6 regs)
                 stack_top - 56,

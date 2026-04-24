@@ -118,6 +118,57 @@ pub unsafe fn init_tss_rsp0() {
     let _ = serial.write_str("[ONCRIX] TSS.RSP0 installed (ring 0 trap stack)\n");
 }
 
+/// Return the global bootstrap ring-0 stack top.
+///
+/// Used as a fallback when the currently running thread does not
+/// own a private kernel stack (e.g. the idle thread still running
+/// on boot storage). Consumers should prefer the per-thread stack
+/// returned by the scheduler.
+pub fn bootstrap_ring0_stack_top() -> u64 {
+    // SAFETY: Reading the base address of a fixed-size static
+    // array and adding its known size is a pure arithmetic
+    // operation; no dereference happens.
+    let base = &raw const RING0_STACK as *const u8 as u64;
+    base + 32768
+}
+
+/// Update `TSS.RSP0` to `top_of_stack`.
+///
+/// Called on every context switch before returning to a user-mode
+/// thread so that the next ring 3 → 0 trap (interrupt, exception,
+/// or syscall IRETQ fallback) lands on the newly-scheduled thread's
+/// private 16 KiB kernel stack.
+///
+/// Passing `0` is treated as "restore the global bootstrap stack",
+/// which lets idle / early-boot threads share the static buffer.
+///
+/// # Safety
+///
+/// `top_of_stack` must either be `0` or the highest address (+1)
+/// of a currently-live, writable, 16-byte aligned 16 KiB region
+/// owned by the incoming thread. Installing a dangling pointer
+/// will cause the *next* trap to triple-fault.
+///
+/// Must be called with interrupts disabled so the switch does not
+/// race with an IRQ that would observe a half-updated TSS.
+pub unsafe fn switch_tss_rsp0(top_of_stack: u64) {
+    let resolved = if top_of_stack == 0 {
+        bootstrap_ring0_stack_top()
+    } else {
+        top_of_stack
+    };
+    // SAFETY: Writing to a single aligned `u64` field of a
+    // properly-aligned `Tss` via a raw pointer. The TSS is a
+    // `static mut` whose exclusive access is guaranteed by the
+    // "interrupts disabled" contract documented above; the CPU
+    // only reads `RSP0` during a privilege transition, which
+    // will not happen while interrupts are off.
+    unsafe {
+        let tss_ptr = &raw mut TSS;
+        (*tss_ptr).privilege_stacks[0] = resolved;
+    }
+}
+
 // ── IDT ─────────────────────────────────────────────────────────
 
 /// Static IDT.

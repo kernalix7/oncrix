@@ -1,112 +1,55 @@
 // Copyright 2026 ONCRIX Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! x86_64 context switching.
+//! x86_64 low-level context switch.
 //!
-//! Saves and restores callee-saved registers (System V AMD64 ABI)
-//! plus the stack pointer. This is a cooperative-style context switch
-//! invoked by the scheduler; the hardware interrupt handler pushes
-//! the interrupt frame separately.
+//! The CPU register block is defined once in
+//! [`oncrix_process::context::CpuContext`] — this module only provides
+//! the assembly primitive that swaps callee-saved registers and the
+//! kernel stack pointer between two [`CpuContext`] instances.
 
-/// CPU context saved across a context switch.
-///
-/// Only callee-saved registers need to be explicitly saved. The
-/// compiler handles caller-saved registers, and the stack pointer
-/// captures the rest of the execution context.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct CpuContext {
-    /// RBX (callee-saved).
-    pub rbx: u64,
-    /// RBP (frame pointer, callee-saved).
-    pub rbp: u64,
-    /// R12 (callee-saved).
-    pub r12: u64,
-    /// R13 (callee-saved).
-    pub r13: u64,
-    /// R14 (callee-saved).
-    pub r14: u64,
-    /// R15 (callee-saved).
-    pub r15: u64,
-    /// RSP (stack pointer — stored separately during switch).
-    pub rsp: u64,
-    /// RIP (instruction pointer — return address on the stack).
-    pub rip: u64,
-}
-
-impl CpuContext {
-    /// Create a zeroed context.
-    pub const fn empty() -> Self {
-        Self {
-            rbx: 0,
-            rbp: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rsp: 0,
-            rip: 0,
-        }
-    }
-
-    /// Create a context for a new thread.
-    ///
-    /// `entry` is the function pointer to start executing.
-    /// `stack_top` is the top of the thread's kernel stack.
-    pub const fn new(entry: u64, stack_top: u64) -> Self {
-        Self {
-            rbx: 0,
-            rbp: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rsp: stack_top,
-            rip: entry,
-        }
-    }
-}
+pub use oncrix_process::context::CpuContext;
 
 /// Perform a context switch from `old` to `new`.
 ///
-/// Saves callee-saved registers into `old`, then restores them from
-/// `new` and jumps to the new context's return address.
+/// Saves callee-saved registers into `old`'s kernel stack, stores the
+/// current `RSP` at `old.rsp` (offset 48), loads `new.rsp`, pops
+/// callee-saved registers, and returns into the new thread.
+///
+/// Both structs share the same memory layout: `rsp` is at byte offset
+/// 48 in `oncrix_process::context::CpuContext` so the inline assembly
+/// can access it directly by field offset.
 ///
 /// # Safety
 ///
-/// - Both `old` and `new` must point to valid `CpuContext` structs.
-/// - `new` must contain a valid stack pointer and instruction pointer.
+/// - `old` and `new` must point to valid `CpuContext` structs.
+/// - `new.rsp` must reference a kernel stack whose top-of-stack word is
+///   a valid return target (either the previous caller of
+///   `switch_context` or a fork-trampoline seed).
 /// - Must be called with interrupts disabled.
-pub unsafe fn switch_context(old: *mut CpuContext, new: *const CpuContext) {
-    // SAFETY: Inline assembly performs a standard context switch.
-    // The callee-saved registers are pushed onto the old stack,
-    // the stack pointer is saved, then restored from the new context,
-    // and callee-saved registers are popped.
-    unsafe {
-        core::arch::asm!(
-            // Save callee-saved registers of current context.
-            "push rbx",
-            "push rbp",
-            "push r12",
-            "push r13",
-            "push r14",
-            "push r15",
-            // Save current stack pointer into old context.
-            "mov [rdi + 48], rsp",  // old.rsp = current rsp
-            // Load new stack pointer from new context.
-            "mov rsp, [rsi + 48]",  // rsp = new.rsp
-            // Restore callee-saved registers of new context.
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop rbp",
-            "pop rbx",
-            // Return (pops return address from new stack).
-            "ret",
-            in("rdi") old,
-            in("rsi") new,
-            options(noreturn),
-        );
-    }
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context(_old: *mut CpuContext, _new: *const CpuContext) {
+    // SAFETY: Naked function — no prologue runs before the asm. The
+    // callee-saved set is pushed on the *current* (old) kernel stack,
+    // the stack pointer is stored into old.rsp (offset 48), the new
+    // stack pointer is loaded, registers are popped, and `ret`
+    // transfers control to the new thread. All clobbers are covered
+    // by the System V ABI callee-saved save/restore sequence below.
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rdi + 48], rsp",
+        "mov rsp, [rsi + 48]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "ret",
+    );
 }
