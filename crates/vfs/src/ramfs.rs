@@ -99,6 +99,26 @@ impl Ramfs {
         InodeNumber(1)
     }
 
+    /// Return the current size of the inode identified by `ino`, or `None`
+    /// if the inode does not exist.
+    ///
+    /// Used by the VFS kernel API to service `SEEK_END` without exposing
+    /// internal inode-table slot indexing.
+    pub fn inode_size(&self, ino: InodeNumber) -> Option<u64> {
+        let slot = self.slot_of(ino)?;
+        self.inodes[slot].as_ref().map(|i| i.size)
+    }
+
+    /// Return a copy of the [`Inode`] with the given number, or `None` if
+    /// no such inode exists in this filesystem.
+    ///
+    /// Used by the kernel fd-dispatch layer to materialise a full `Inode`
+    /// struct from the number stored in a `FileBackend::RamfsFile` handle.
+    pub fn inode_by_number(&self, ino: InodeNumber) -> Option<Inode> {
+        let slot = self.slot_of(ino)?;
+        self.inodes[slot]
+    }
+
     /// Find the slot index for an inode number.
     fn slot_of(&self, ino: InodeNumber) -> Option<usize> {
         self.inodes

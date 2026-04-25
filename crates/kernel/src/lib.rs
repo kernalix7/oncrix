@@ -44,6 +44,7 @@ pub mod epoll;
 pub mod eventfd;
 pub mod evm;
 pub mod exec;
+pub mod fd_table;
 pub mod fork_dispatch;
 pub mod ftrace;
 pub mod futex;

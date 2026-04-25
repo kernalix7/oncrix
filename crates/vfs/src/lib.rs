@@ -47,6 +47,7 @@ pub mod hugetlbfs;
 pub mod inode;
 pub mod inotify;
 pub mod journal;
+pub mod kernel_api;
 pub mod nfs;
 pub mod notify;
 

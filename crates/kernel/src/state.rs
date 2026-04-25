@@ -17,8 +17,8 @@ use oncrix_process::pid::Pid;
 use oncrix_process::process::Process;
 use oncrix_process::table::ProcessTable;
 use oncrix_vfs::inode::{FileMode, FileType, Inode, InodeOps};
-use oncrix_vfs::ramfs::Ramfs;
-use oncrix_vfs::superblock::{FsType, MountTable, Superblock};
+use oncrix_vfs::kernel_api::KernelVfs;
+use oncrix_vfs::superblock::{FsType, Superblock};
 
 // ── Global kernel state ─────────────────────────────────────────
 
@@ -102,10 +102,12 @@ where
 /// Created once in `kernel_main()` via [`Box::new`] to avoid
 /// stack overflow from the large `Ramfs` buffers.
 pub struct KernelState {
-    /// Root filesystem (ramfs during early boot).
-    pub ramfs: Ramfs,
-    /// Global mount table.
-    pub mount_table: MountTable,
+    /// VFS subsystem: ramfs, mount table, and dentry cache.
+    ///
+    /// Replaces the previously separate `ramfs` and `mount_table`
+    /// fields. Use `state.vfs.ramfs` / `state.vfs.mount_table` for
+    /// direct access or the higher-level `KernelVfs` methods.
+    pub vfs: KernelVfs,
     /// IPC channel registry.
     pub channels: ChannelRegistry,
     /// Global process table.
@@ -119,8 +121,7 @@ impl KernelState {
     /// initial (empty) configuration.
     pub fn new() -> Self {
         Self {
-            ramfs: Ramfs::new(),
-            mount_table: MountTable::new(),
+            vfs: KernelVfs::new(),
             channels: ChannelRegistry::new(),
             process_table: ProcessTable::new(),
             init_system: InitSystem::new(),
@@ -133,16 +134,16 @@ impl KernelState {
     /// Creates a ramfs root and populates it with `/dev`, `/proc`,
     /// `/tmp`, and `/sbin`.
     pub fn init_rootfs(&mut self) -> oncrix_lib::Result<()> {
-        let root_ino = self.ramfs.root_inode();
+        let root_ino = self.vfs.ramfs.root_inode();
         let root_sb = Superblock::new(FsType::Ramfs, root_ino);
-        self.mount_table.mount("/", root_sb)?;
+        self.vfs.mount_table.mount("/", root_sb)?;
 
         // Create standard directory hierarchy under root.
         let root = Inode::new(root_ino, FileType::Directory, FileMode::DIR_DEFAULT);
-        let _ = self.ramfs.mkdir(&root, "dev", FileMode::DIR_DEFAULT);
-        let _ = self.ramfs.mkdir(&root, "proc", FileMode::DIR_DEFAULT);
-        let _ = self.ramfs.mkdir(&root, "tmp", FileMode::DIR_DEFAULT);
-        let _ = self.ramfs.mkdir(&root, "sbin", FileMode::DIR_DEFAULT);
+        let _ = self.vfs.ramfs.mkdir(&root, "dev", FileMode::DIR_DEFAULT);
+        let _ = self.vfs.ramfs.mkdir(&root, "proc", FileMode::DIR_DEFAULT);
+        let _ = self.vfs.ramfs.mkdir(&root, "tmp", FileMode::DIR_DEFAULT);
+        let _ = self.vfs.ramfs.mkdir(&root, "sbin", FileMode::DIR_DEFAULT);
 
         Ok(())
     }

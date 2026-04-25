@@ -179,6 +179,17 @@ pub extern "C" fn kernel_main() -> ! {
             }
         }
 
+        // Phase 12: install standard I/O file descriptors (0=stdin, 1=stdout,
+        // 2=stderr) on the current process's fd table so init's first
+        // `write(2, ...)` syscall is dispatched through the VFS-routed path
+        // (`fd_table::dispatch_write`) instead of the legacy serial bypass.
+        //
+        // SAFETY: Single-threaded boot; CURRENT_FD_TABLE is accessed only
+        // through fd_table helpers from this point on.
+        unsafe {
+            oncrix_kernel::fd_table::install_stdio();
+        }
+
         // If the embedded init loaded successfully, launch it with a
         // user-mapped RSP inside its own VMA. Otherwise fall back to the
         // in-kernel smoke-test stub (works only because it never touches

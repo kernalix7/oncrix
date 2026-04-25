@@ -362,9 +362,20 @@ pub extern "C" fn syscall_entry() {
 /// This is called from the assembly stub with RDI pointing to the
 /// `SyscallArgs` struct on the stack.
 ///
-/// IPC syscalls (512–516) and early-boot `SYS_WRITE` (fd 1/2) are
-/// handled directly by the kernel. All other syscalls are forwarded
+/// VFS syscalls (open/read/write/close/lseek), process management
+/// syscalls (fork/wait4/execve/exit), and IPC syscalls (512–516) are
+/// handled directly by the kernel.  All other syscalls are forwarded
 /// to the `oncrix_syscall` crate.
+///
+/// # Phase 12 VFS routing
+///
+/// `SYS_READ` and `SYS_WRITE` now go through the per-process fd table
+/// ([`crate::fd_table`]) rather than the legacy `kernel_serial_write`
+/// fast path.  fd 0/1/2 are pre-installed as console handles at init
+/// time so stdout/stderr still work.  The legacy `kernel_serial_write`
+/// function is kept as a fallback for pathological early-boot cases
+/// (e.g. before [`crate::fd_table::install_stdio`] has been called)
+/// but is no longer the matched branch for fd 0–2.
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::SyscallArgs) -> i64 {
     // SAFETY: The assembly stub guarantees `args` points to a valid
@@ -372,20 +383,92 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
     let args = unsafe { &*args };
 
     match args.number {
-        // SYS_WRITE to stdout/stderr: stream bytes from user buffer to serial.
-        oncrix_syscall::number::SYS_WRITE if args.arg0 <= 2 => {
-            kernel_serial_write(args.arg1, args.arg2)
+        // ── VFS I/O syscalls ─────────────────────────────────────
+
+        // SYS_READ (0): read from file descriptor into user buffer.
+        // POSIX.1-2024 read(3p).
+        oncrix_syscall::number::SYS_READ => {
+            // SAFETY: Single-CPU SYSCALL dispatch; fd_table is the sole
+            // accessor of CURRENT_FD_TABLE in this context.
+            unsafe {
+                crate::fd_table::dispatch_read(
+                    args.arg0 as usize, // fd
+                    args.arg1,          // buf *
+                    args.arg2,          // count
+                )
+            }
         }
+
+        // SYS_WRITE (1): write from user buffer to file descriptor.
+        // POSIX.1-2024 write(3p).
+        // Phase 12: routes through the fd table for ALL file descriptors
+        // including 0/1/2 (which point at the console handle).  The
+        // legacy `kernel_serial_write` fast path is kept as a fallback
+        // only if the fd table is not yet initialised (i.e. the fd slot
+        // is None — dispatch_write returns -9 EBADF, caught below).
+        oncrix_syscall::number::SYS_WRITE => {
+            // SAFETY: see SYS_READ above.
+            let ret = unsafe {
+                crate::fd_table::dispatch_write(
+                    args.arg0 as usize, // fd
+                    args.arg1,          // buf *
+                    args.arg2,          // count
+                )
+            };
+            // Defensive fallback: if for any reason fd 0/1/2 is not yet
+            // installed (boot ordering bug or future reorganisation),
+            // forward to the legacy serial path so the first diagnostic
+            // line is never silently lost. In normal operation this branch
+            // is unreachable because `install_stdio` runs in `main.rs`
+            // before the init ELF is launched.
+            if ret == -9 && args.arg0 <= 2 {
+                kernel_serial_write(args.arg1, args.arg2)
+            } else {
+                ret
+            }
+        }
+
+        // SYS_OPEN (2): open or create a file and return an fd.
+        // POSIX.1-2024 open(3p).
+        oncrix_syscall::number::SYS_OPEN => {
+            // SAFETY: see SYS_READ above.
+            unsafe { sys_open(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_CLOSE (3): close a file descriptor.
+        // POSIX.1-2024 close(3p).
+        oncrix_syscall::number::SYS_CLOSE => {
+            // SAFETY: see SYS_READ above.
+            unsafe {
+                crate::fd_table::fd_close(args.arg0 as usize)
+                    .map(|_| 0i64)
+                    .unwrap_or(-9)
+            }
+        }
+
+        // SYS_LSEEK (8): reposition the file offset.
+        // POSIX.1-2024 lseek(3p).
+        oncrix_syscall::number::SYS_LSEEK => {
+            // SAFETY: see SYS_READ above.
+            unsafe {
+                crate::fd_table::dispatch_lseek(
+                    args.arg0 as usize, // fd
+                    args.arg1 as i64,   // offset
+                    args.arg2 as i32,   // whence
+                )
+            }
+        }
+
+        // ── Process management syscalls ──────────────────────────
+
         // SYS_EXIT / SYS_EXIT_GROUP: mark process as exited and reschedule.
-        // Phase 11: calls sys_exit which transitions the thread to Exited
-        // and loops on yield_now so it is never rescheduled.
         oncrix_syscall::number::SYS_EXIT | 231 => {
             // SAFETY: Single-CPU SYSCALL dispatch path; interrupts effectively
             // disabled (FMASK cleared IF). sys_exit does not return.
             unsafe { crate::fork_dispatch::sys_exit(args.arg0) }
         }
-        // Intercept IPC syscalls — these require direct access to the
-        // kernel state (ChannelRegistry) which the syscall crate cannot reach.
+
+        // ── IPC syscalls ─────────────────────────────────────────
         oncrix_syscall::number::SYS_IPC_SEND => {
             crate::ipc_dispatch::kernel_ipc_send(args.arg0, args.arg1)
         }
@@ -401,11 +484,10 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
         oncrix_syscall::number::SYS_IPC_CREATE_ENDPOINT => {
             crate::ipc_dispatch::kernel_ipc_create_endpoint()
         }
-        // Process management syscalls — require direct kernel access
-        // (scheduler, process table, saved SYSCALL register state).
+
+        // ── Process creation / management syscalls ───────────────
         oncrix_syscall::number::SYS_FORK => {
-            // SAFETY: Single-CPU SYSCALL dispatch path. Interrupts are
-            // logically disabled because FMASK cleared IF on entry.
+            // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::fork_dispatch::sys_fork() }
         }
         oncrix_syscall::number::SYS_WAIT4 => {
@@ -416,7 +498,88 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
             // SAFETY: see SYS_FORK above.
             unsafe { crate::fork_dispatch::sys_execve(args.arg0, args.arg1, args.arg2) }
         }
+
+        // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
+    }
+}
+
+// ── VFS syscall implementations ──────────────────────────────────
+
+/// Maximum path length accepted from user space for `open(2)`.
+const MAX_OPEN_PATH: usize = 256;
+
+/// Kernel handler for `SYS_OPEN` (Linux number 2).
+///
+/// POSIX.1-2024 `open(3p)` semantics:
+/// - Resolves `pathname_ptr` against the global ramfs root.
+/// - Creates the file if `O_CREAT` is set and the file does not exist.
+/// - Allocates the lowest available fd and installs the handle.
+///
+/// Phase 12 simplifications:
+/// - No permission checks (all files are accessible as uid=0).
+/// - Only absolute paths resolved against the ramfs root.
+/// - No `O_EXCL`, `O_NOCTTY`, `O_DIRECTORY` handling.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
+    // Validate the pathname pointer.
+    if pathname_ptr == 0 || pathname_ptr >= 0xFFFF_8000_0000_0000 {
+        return -22; // EINVAL
+    }
+
+    // Copy the null-terminated path from user space (bounded copy).
+    // Uses the same pattern as `copy_user_string` in fork_dispatch.rs.
+    static mut PATH_BUF: [u8; MAX_OPEN_PATH] = [0u8; MAX_OPEN_PATH];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF is exclusively owned here.
+    #[allow(static_mut_refs)]
+    let path_bytes: &[u8] = unsafe {
+        let buf = &mut PATH_BUF;
+        let base = pathname_ptr as *const u8;
+        let mut i = 0usize;
+        loop {
+            if i >= MAX_OPEN_PATH {
+                return -36; // ENAMETOOLONG
+            }
+            let byte = base.add(i).read_volatile();
+            if byte == 0 {
+                break;
+            }
+            buf[i] = byte;
+            i += 1;
+        }
+        &buf[..i]
+    };
+
+    // Require an absolute path.
+    if path_bytes.is_empty() || path_bytes[0] != b'/' {
+        return -22; // EINVAL
+    }
+
+    // Attempt to open / create the file in the global VFS.
+    let result =
+        crate::state::with_global_mut(|s| s.vfs.open_path(path_bytes, flags as u32, mode as u32));
+
+    match result {
+        Some(Ok(inode)) => {
+            // Build a FileHandle for the ramfs inode.
+            let handle_flags = crate::fd_table::HandleFlags(flags as u32);
+            let handle = crate::fd_table::FileHandle::ramfs_file(&inode, handle_flags);
+
+            // Install in the current fd table.
+            // SAFETY: single-CPU SYSCALL context.
+            match unsafe { crate::fd_table::fd_install(handle) } {
+                Ok(fd) => fd as i64,
+                Err(_) => -24, // EMFILE
+            }
+        }
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::AlreadyExists)) => -17, // EEXIST
+        Some(Err(oncrix_lib::Error::OutOfMemory)) => -12, // ENOMEM
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO — VFS not initialised
     }
 }
 
