@@ -77,11 +77,24 @@ pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
     // the duration of this call because no other code can mutate
     // the scheduler while interrupts are off on the single CPU.
     let incoming_cr3 = unsafe { (*next_ctx).cr3 };
+    // Only reload CR3 if the incoming thread has a DIFFERENT address
+    // space from the one currently installed. Skipping the reload
+    // avoids an unnecessary TLB flush when parent and child share a
+    // PML4 (Phase 11 single-PT fork model), and — importantly — it
+    // sidesteps a stale-TLB hazard where `mov cr3` with the current
+    // value can interact poorly with pending non-global translations
+    // around the replaced `PD_0_1G[2]` huge page.
     if !incoming_cr3.is_none() {
-        // SAFETY: caller contract guarantees the Cr3Frame points
-        // to a valid page table that keeps the kernel higher-half
-        // mapped. See `load_cr3` docs.
-        unsafe { load_cr3(incoming_cr3) };
+        // SAFETY: read_cr3 is a privileged but side-effect-free read;
+        // single-CPU interrupts-off context makes the compare-and-load
+        // race-free.
+        let current = unsafe { read_cr3() };
+        if current.as_u64() != incoming_cr3.as_u64() {
+            // SAFETY: caller contract guarantees the Cr3Frame points
+            // to a valid page table that keeps the kernel higher-half
+            // mapped. See `load_cr3` docs.
+            unsafe { load_cr3(incoming_cr3) };
+        }
     }
 
     // Step 3: perform the callee-saved register swap.

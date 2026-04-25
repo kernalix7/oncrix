@@ -46,10 +46,24 @@ impl KernelStack {
     ///
     /// Returns `Err(OutOfMemory)` if the heap is exhausted.
     pub fn allocate() -> Result<Self> {
-        // `Box::new` aborts on OOM under the default alloc error
-        // handler, which is wrong for a kernel. Use `try_new` so
-        // we can surface the error through the `Result`.
-        let buf = Box::try_new(KStackBuf([0; KSTACK_SIZE])).map_err(|_| Error::OutOfMemory)?;
+        // Allocate uninitialized so the 16 KiB array is NOT materialized
+        // on the caller's kernel stack before being copied into the Box.
+        // `Box::try_new(KStackBuf([0; N]))` forces the compiler to build
+        // the zero buffer on the stack first — which easily overflows the
+        // 32 KiB SYSCALL kernel stack when a fork path layers its own
+        // local frames on top. `try_new_uninit` allocates directly from
+        // the heap and we zero in place afterward.
+        let mut buf: Box<core::mem::MaybeUninit<KStackBuf>> =
+            Box::try_new_uninit().map_err(|_| Error::OutOfMemory)?;
+        // SAFETY: `buf` points at an allocation sized/aligned for
+        // `KStackBuf`. `write_bytes` zeroes exactly that region.
+        unsafe {
+            core::ptr::write_bytes(buf.as_mut_ptr().cast::<u8>(), 0, KSTACK_SIZE);
+        }
+        // SAFETY: All bytes of the allocation were just zeroed; the
+        // all-zero bit pattern is a valid value for `KStackBuf`
+        // (a repr(C, align(16)) wrapper around `[u8; N]`).
+        let buf = unsafe { buf.assume_init() };
         Ok(Self { buf })
     }
 

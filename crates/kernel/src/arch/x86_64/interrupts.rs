@@ -41,13 +41,13 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET));
     }
 
-    // Run the scheduler on each timer tick.
-    // SAFETY: Raw pointer to static mut, accessed only in
-    // interrupt context with IF=0 (interrupt gate).
-    unsafe {
-        let sched_ptr = &raw mut super::init::SCHEDULER;
-        let _ = (*sched_ptr).schedule();
-    }
+    // Phase 11: the round-robin scheduler is driven cooperatively by
+    // explicit `yield_now()` from the syscall layer. Calling
+    // `schedule()` here would rewrite `SCHEDULER.current` behind the
+    // back of any in-flight `prepare_switch`/`switch_context` pair,
+    // which corrupts the "prev" pointer and clobbers the outgoing
+    // thread's saved kernel-stack frame. Preemptive scheduling will
+    // be re-enabled once we track saved IRQ frames per-thread.
 }
 
 /// IRQ 1 — Keyboard interrupt (stub).

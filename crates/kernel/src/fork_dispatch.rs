@@ -1,7 +1,7 @@
 // Copyright 2026 ONCRIX Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kernel-side implementations of `fork(2)`, `wait4(2)`, and `execve(2)`.
+//! Kernel-side implementations of `fork(2)`, `wait4(2)`, `execve(2)`, and `_exit(2)`.
 //!
 //! These syscalls require direct access to scheduler state, the process
 //! table, and the saved SYSCALL register slots — all of which live inside
@@ -9,13 +9,13 @@
 //! [`crate::arch::x86_64::syscall_entry::syscall_dispatch_wrapper`] rather
 //! than delegated to the `oncrix_syscall` crate.
 //!
-//! # Phase 10c scope
+//! # Phase 11 scope
 //!
 //! * `sys_fork` — cooperative single-CPU fork. Shares the boot PML4/PDPT/PD
 //!   with the parent and only carries a distinct `user_pt_phys` pointer; the
 //!   sched-glue patches `PD_0_1G[2]` on every context switch. No mm-subsystem
 //!   frame allocator is wired yet — the child inherits the parent's physical
-//!   PT rather than copying it. True CoW fork is a Phase 11 concern.
+//!   PT rather than copying it. True CoW fork is a Phase 12 concern.
 //!
 //! * `sys_wait4` — blocking wait for a single direct child. Spins on
 //!   `yield_now` until the child transitions to `Exited`. WNOHANG returns 0
@@ -23,13 +23,17 @@
 //!   pointer if non-null.
 //!
 //! * `sys_execve` — path-validated in-kernel exec. Only `"/bin/sh"` is
-//!   recognized; the embedded ELF blob lookup is stubbed for Phase 11.
-//!   If the path is found, `map_elf_segments` overwrites the process VMA
-//!   and the SYSCALL epilogue is redirected to the new entry point.
+//!   recognized. The embedded shell ELF is fetched via `embedded_sh_elf()`,
+//!   loaded into the static user load region via `load_sh_elf()`, and the
+//!   SYSCALL epilogue is redirected to the new entry point.
+//!
+//! * `sys_exit` — marks the current process as `Exited` in the process table
+//!   and transitions the current thread to the `Exited` scheduler state, then
+//!   loops on `yield_now` so it is never rescheduled.
 //!
 //! # POSIX references
 //!
-//! POSIX.1-2024 `fork(3p)`, `wait(3p)`, `waitid(3p)`, `execve(3p)`.
+//! POSIX.1-2024 `fork(3p)`, `wait(3p)`, `waitid(3p)`, `execve(3p)`, `_exit(3p)`.
 //! See `.priv-storage/.TheOpenGroup/susv5-html/functions/`.
 
 use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
@@ -297,26 +301,30 @@ const MAX_PATHNAME: usize = 256;
 /// POSIX.1-2024 `execve(3p)` semantics:
 /// - On success: does not return; the current process image is replaced.
 ///   The SYSCALL epilogue is redirected to the new program entry by
-///   overwriting [`SYSCALL_SAVED_USER_RIP`] / [`SYSCALL_SAVED_USER_RSP`].
+///   overwriting the saved user RIP / RSP / RFLAGS atomics.
 /// - On failure: returns a negative errno; the caller continues normally.
 ///
-/// # Phase 10c implementation
+/// # Phase 11 implementation
 ///
-/// Only the special path `"/bin/sh"` is recognized. The embedded ELF
-/// blob is looked up via [`kernel_embedded_sh`]; if it returns `None`,
-/// `-ENOENT` is returned. If the blob is present,
-/// `UserAddressSpace::map_elf_segments` overwrites the current VMA and
-/// the SYSCALL epilogue jumps to the new entry.
+/// Only `"/bin/sh"` is recognized. The embedded ELF blob is fetched via
+/// [`crate::arch::x86_64::init_embed::embedded_sh_elf`] and loaded into
+/// the static user load region via
+/// [`crate::arch::x86_64::init_embed::load_sh_elf`]. On success the
+/// SYSCALL epilogue redirects to the new entry point.
 ///
-/// # TODO(phase10c-followup)
+/// # Phase 12 TODO
 ///
-/// Wire `kernel_embedded_sh()` to an actual embedded ELF in Phase 11.
-/// Add VFS path resolution for non-embedded binaries in Phase 12.
+/// - True address-space isolation: allocate a fresh frame for the child
+///   via the mm-subsystem rather than clobbering the shared static region.
+/// - VFS path resolution for arbitrary binaries beyond `/bin/sh`.
 ///
 /// # Safety
 ///
-/// Must be called from the SYSCALL dispatch path.
+/// Must be called from the SYSCALL dispatch path with interrupts effectively
+/// disabled (single-CPU SYSCALL context).
 pub unsafe fn sys_execve(pathname_ptr: u64, _argv: u64, _envp: u64) -> i64 {
+    let mut serial = Uart16550::new(COM1);
+
     // Validate the pathname pointer.
     if pathname_ptr == 0 || pathname_ptr >= 0xFFFF_8000_0000_0000 {
         return -22; // EINVAL
@@ -328,39 +336,150 @@ pub unsafe fn sys_execve(pathname_ptr: u64, _argv: u64, _envp: u64) -> i64 {
         None => return -22, // EINVAL — too long or non-ASCII
     };
 
-    // Only "/bin/sh" is recognized in Phase 10c.
+    // Only "/bin/sh" is recognized in Phase 11.
     if path != b"/bin/sh" {
         return -2; // ENOENT
     }
 
-    // Look up the embedded shell ELF.
-    // TODO(phase10c-followup): Phase 11 fills in kernel_embedded_sh().
-    let _elf_bytes = match kernel_embedded_sh() {
+    // Fetch the embedded shell ELF blob.
+    let elf_bytes = match crate::arch::x86_64::init_embed::embedded_sh_elf() {
         Some(bytes) => bytes,
         None => {
-            // Stub not filled in yet — return ENOENT.
+            let _ =
+                serial.write_str("[exec] /bin/sh ELF not embedded (build without embed-init?)\n");
             return -2; // ENOENT
         }
     };
 
-    // Phase 10c stub: the ELF mapping and entry-point redirect are
-    // deferred until kernel_embedded_sh() returns a real blob.
-    // When it does, the implementation should:
-    //   1. Call UserAddressSpace::map_elf_segments(&mut uas, elf_bytes)
-    //      to overwrite the current VMA.
-    //   2. Call set_saved_user_rip(entry_point).
-    //   3. Call set_saved_user_rsp(new_user_stack_top).
-    //   4. Call set_saved_user_rflags(DEFAULT_USER_RFLAGS).
-    //   5. Return 0 — the SYSCALL epilogue will jump to the new RIP.
+    // Load the shell ELF segments into the static user load region,
+    // overwriting the current process image (init).
     //
-    // For now we silence the unused-import warnings by referencing the
-    // setters (which is a no-op call with dummy values in dead code).
-    let _ = set_saved_user_rip;
-    let _ = set_saved_user_rsp;
-    let _ = set_saved_user_rflags;
-    let _ = DEFAULT_USER_RFLAGS;
+    // SAFETY: Single-CPU SYSCALL dispatch path. load_sh_elf requires
+    // exclusive access to USER_LOAD_REGION and must not be called
+    // concurrently — the interrupts-off SYSCALL context guarantees this.
+    let entry = match unsafe { crate::arch::x86_64::init_embed::load_sh_elf(elf_bytes) } {
+        Some(e) => e,
+        None => {
+            let _ = serial.write_str("[exec] /bin/sh ELF parse/load failed\n");
+            return -8; // ENOEXEC
+        }
+    };
 
-    -2 // ENOENT — embedded sh not yet wired
+    // Redirect the SYSCALL epilogue to the new program entry.
+    // USER_INIT_RSP is the top of the static 2 MiB user region — the same
+    // stack address the init ELF started with, now reused for sh.
+    set_saved_user_rip(entry);
+    set_saved_user_rsp(crate::arch::x86_64::init_embed::user_init_rsp());
+    set_saved_user_rflags(DEFAULT_USER_RFLAGS);
+
+    // Flush the entire TLB before returning to user space. `load_sh_elf`
+    // may have written new bytes at physical frames that the CPU had
+    // cached as empty/zero-filled under the previous `init` mapping, and
+    // without invalidating those cached translations the child's first
+    // user-mode access to its .data / .rodata segment would #PF even
+    // though the mapping is valid in the active page table.
+    //
+    // SAFETY: writing CR3 with its own current value is a privileged
+    // but side-effect-free operation that invalidates all non-global
+    // TLB entries. Runs in the single-CPU SYSCALL context with
+    // interrupts disabled.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    // Return 0 — the SYSCALL epilogue will sysretq into sh's _start.
+    0
+}
+
+// ── sys_exit ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_EXIT` (Linux number 60) and
+/// `SYS_EXIT_GROUP` (Linux number 231).
+///
+/// POSIX.1-2024 `_exit(3p)` semantics:
+/// - Marks the current process as exited with `code`.
+/// - Removes the current thread from the scheduler so it is never
+///   rescheduled. Loops on `yield_now` as a safety backstop.
+///
+/// This function does not return to the SYSCALL epilogue in the normal
+/// sense: the thread's state is set to `Exited` before we yield, so the
+/// round-robin scanner will skip it on every future pass.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_exit(code: u64) -> i64 {
+    let mut serial = Uart16550::new(COM1);
+    let exit_code = (code & 0xFF) as i32;
+
+    let _ = serial.write_str("[exit] process exiting with code=");
+    // Write decimal exit code to serial.
+    write_exit_code(&mut serial, exit_code);
+    let _ = serial.write_str("\n");
+
+    // Mark the process as exited in the process table.
+    // SAFETY: Single-CPU SYSCALL context.
+    if let Some(pid) = crate::current::current_pid() {
+        unsafe { exit_process(pid, exit_code) };
+    }
+
+    // Transition the current thread to Exited so the scheduler skips it.
+    // SAFETY: Single-CPU SYSCALL context; no other code touches the scheduler.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+        if let Some(t) = sched.current_mut() {
+            t.set_state(oncrix_process::thread::ThreadState::Exited);
+        }
+    }
+
+    // Yield in a loop — the scheduler will skip Exited threads, so this
+    // thread effectively never runs again. The loop satisfies the compiler
+    // (callers have `-> i64` return, but we never actually reach the
+    // return because yield_now eventually runs another thread, and when
+    // (if) we are re-entered it is still Exited, so we loop forever).
+    //
+    // SAFETY: interrupts-off SYSCALL context; no scheduler borrow held.
+    loop {
+        unsafe {
+            let _ = crate::current::yield_now();
+        }
+        // Spin to avoid a busy loop burning 100 % CPU when there are
+        // no other threads. `pause` is the x86_64 spin-wait hint.
+        // SAFETY: `pause` is a hint instruction with no side effects.
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)) };
+    }
+}
+
+/// Write a decimal i32 to the serial console (no heap).
+fn write_exit_code(serial: &mut Uart16550, mut n: i32) {
+    if n < 0 {
+        let _ = serial.write_byte(b'-');
+        // Avoid overflow: i32::MIN.abs() panics in debug; use wrapping.
+        n = n.wrapping_abs();
+    }
+    if n == 0 {
+        let _ = serial.write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut i = 0usize;
+    let mut v = n as u32;
+    while v > 0 {
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        i += 1;
+    }
+    // Digits are stored in reverse order.
+    while i > 0 {
+        i -= 1;
+        let _ = serial.write_byte(buf[i]);
+    }
 }
 
 /// Copy a null-terminated ASCII string from user space.
@@ -406,17 +525,4 @@ fn copy_user_string(ptr: u64, max_len: usize) -> Option<&'static [u8]> {
     // returning an &'static slice is safe because PATH_BUF is a
     // fixed static and we are the sole accessor.
     Some(unsafe { &PATH_BUF[..i] })
-}
-
-/// Return the embedded `/bin/sh` ELF bytes, or `None` if not yet wired.
-///
-/// # TODO(phase10c-followup)
-///
-/// Phase 11 should replace this stub with:
-/// ```rust
-/// static SH_ELF: &[u8] = include_bytes!(env!("ONCRIX_SH_BIN"));
-/// pub fn kernel_embedded_sh() -> Option<&'static [u8]> { Some(SH_ELF) }
-/// ```
-pub fn kernel_embedded_sh() -> Option<&'static [u8]> {
-    None
 }

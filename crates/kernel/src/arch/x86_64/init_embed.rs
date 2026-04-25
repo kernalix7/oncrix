@@ -59,6 +59,14 @@ static INIT_ELF: &[u8] = include_bytes!(env!("ONCRIX_INIT_BIN"));
 #[cfg(not(feature = "embed-init"))]
 static INIT_ELF: Option<&[u8]> = None;
 
+/// The embedded `/bin/sh` ELF binary.
+///
+/// Built alongside `init` by `build.rs` when `embed-init` is active.
+/// Returned by [`embedded_sh_elf`] so that `sys_execve("/bin/sh", …)`
+/// can overwrite the current process image with it.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SH: &[u8] = include_bytes!(env!("ONCRIX_SH_BIN"));
+
 // ---------------------------------------------------------------------------
 // Static user-space load region (2 MiB, page-aligned)
 // ---------------------------------------------------------------------------
@@ -215,6 +223,78 @@ pub fn init_user_pt_phys() -> Option<u64> {
 /// Placeholder when `embed-init` is disabled.
 #[cfg(not(feature = "embed-init"))]
 pub fn init_user_pt_phys() -> Option<u64> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Shell embedding accessors
+// ---------------------------------------------------------------------------
+
+/// Return the embedded `/bin/sh` ELF bytes.
+///
+/// Returns `Some(&[u8])` when the `embed-init` feature is enabled and
+/// `ONCRIX_SH_BIN` was set by `build.rs`. Returns `None` otherwise.
+#[cfg(feature = "embed-init")]
+pub fn embedded_sh_elf() -> Option<&'static [u8]> {
+    Some(EMBEDDED_SH)
+}
+
+/// Placeholder when `embed-init` is disabled.
+#[cfg(not(feature = "embed-init"))]
+pub fn embedded_sh_elf() -> Option<&'static [u8]> {
+    None
+}
+
+/// Load a shell ELF blob into [`USER_LOAD_REGION`] and return its entry point.
+///
+/// This is the exec-path analogue of [`load_init_elf`]: it overwrites the
+/// current user load region with the segments from `elf_bytes` and returns
+/// the ELF entry point on success, or `None` if parsing fails.
+///
+/// After this call the SYSCALL epilogue should redirect the saved user RIP
+/// to the returned entry and the saved user RSP to [`USER_INIT_RSP`] (via
+/// [`user_init_rsp`]) so that `sysretq` jumps into the new program.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path with interrupts effectively
+/// disabled (single-CPU SYSCALL context). The previous user image is
+/// irrecoverably overwritten.
+#[cfg(feature = "embed-init")]
+pub unsafe fn load_sh_elf(elf_bytes: &[u8]) -> Option<u64> {
+    use crate::elf;
+
+    let mut serial = Uart16550::new(COM1);
+
+    let info = elf::parse_header(elf_bytes).ok()?;
+    let (segments, seg_count) = elf::load_segments(elf_bytes).ok()?;
+
+    // Zero the load region before copying new segments so stale bytes from
+    // the init image do not contaminate the shell's .bss.
+    // SAFETY: USER_LOAD_REGION is a static BSS array; single-CPU SYSCALL
+    // path ensures exclusive access.
+    unsafe {
+        let ptr = (&raw mut USER_LOAD_REGION).cast::<u8>();
+        core::ptr::write_bytes(ptr, 0, USER_REGION_SIZE);
+        copy_segments_into_user_region(elf_bytes, &segments[..seg_count])?;
+    }
+
+    let _ = serial.write_str("[exec] loaded /bin/sh at entry=0x");
+    write_hex(&mut serial, info.entry);
+    let _ = serial.write_str("\n");
+
+    Some(info.entry)
+}
+
+/// Placeholder when `embed-init` is disabled.
+///
+/// # Safety
+///
+/// No-op; always returns `None`. The `unsafe` marker is kept so the
+/// signature matches the `embed-init` variant, allowing call sites to
+/// use the same `unsafe { ... }` block regardless of feature flags.
+#[cfg(not(feature = "embed-init"))]
+pub unsafe fn load_sh_elf(_elf_bytes: &[u8]) -> Option<u64> {
     None
 }
 

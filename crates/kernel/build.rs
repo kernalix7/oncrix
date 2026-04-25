@@ -45,7 +45,10 @@ fn main() {
     // - `CARGO_ENCODED_RUSTFLAGS` is scrubbed because when the parent cargo
     //   is already running a build it sets this variable, and it has higher
     //   precedence than `RUSTFLAGS`.
-    let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+
+    // Build oncrix-init.
+    let status = Command::new(&cargo_bin)
         .args([
             "build",
             "--release",
@@ -64,19 +67,52 @@ fn main() {
         panic!("oncrix-init build failed (exit code: {:?})", status.code());
     }
 
-    // Binary lands in crates/userspace/target/x86_64-unknown-none/release/init.
-    let init_bin = userspace_dir
+    // Build oncrix-sh alongside init so the kernel can embed it.
+    let status_sh = Command::new(&cargo_bin)
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "oncrix-sh",
+            "--target",
+            "x86_64-unknown-none",
+        ])
+        .current_dir(&userspace_dir)
+        .env("RUSTFLAGS", "-C relocation-model=static")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .status()
+        .expect("failed to invoke cargo to build oncrix-sh");
+
+    if !status_sh.success() {
+        panic!("oncrix-sh build failed (exit code: {:?})", status_sh.code());
+    }
+
+    let target_dir = userspace_dir
         .join("target")
         .join("x86_64-unknown-none")
-        .join("release")
-        .join("init");
+        .join("release");
+
+    // Binary lands in crates/userspace/target/x86_64-unknown-none/release/init.
+    let init_bin = target_dir.join("init");
+    // Shell binary lands at .../release/sh.
+    let sh_bin = target_dir.join("sh");
 
     println!("cargo:rustc-env=ONCRIX_INIT_BIN={}", init_bin.display());
     println!("cargo:rerun-if-changed={}", init_bin.display());
+    println!("cargo:rustc-env=ONCRIX_SH_BIN={}", sh_bin.display());
+    println!("cargo:rerun-if-changed={}", sh_bin.display());
     println!(
         "cargo:rerun-if-changed={}",
         userspace_dir
             .join("init")
+            .join("src")
+            .join("main.rs")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        userspace_dir
+            .join("sh")
             .join("src")
             .join("main.rs")
             .display()

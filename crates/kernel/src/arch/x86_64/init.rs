@@ -167,6 +167,13 @@ pub unsafe fn switch_tss_rsp0(top_of_stack: u64) {
         let tss_ptr = &raw mut TSS;
         (*tss_ptr).privilege_stacks[0] = resolved;
     }
+    // Mirror the same value into the SYSCALL-entry atomic so the
+    // `SYSCALL` fast path can switch to the current thread's private
+    // kernel stack instead of sharing a global scratch stack across
+    // all threads (which gets corrupted when a sleeping parent has its
+    // saved `switch_context` frame sitting on the same buffer that
+    // the child's syscall path re-uses).
+    crate::arch::x86_64::syscall_entry::set_current_kstack_top(resolved);
 }
 
 // ── IDT ─────────────────────────────────────────────────────────
@@ -354,6 +361,11 @@ pub unsafe fn init_scheduler() {
         let idle_tid = alloc_tid();
         let idle_thread = Thread::new(idle_tid, Pid::KERNEL, Priority::IDLE);
         let _ = (*sched_ptr).add(idle_thread);
+        // Mark the idle thread as the currently running thread. Without
+        // this, `current_thread()` returns `None` until the first call
+        // to `schedule()` (which in Phase 11 no longer fires from the
+        // timer because we removed the preemptive reschedule path).
+        let _ = (*sched_ptr).schedule();
     }
 
     let _ = serial.write_str("[ONCRIX] Scheduler initialized (idle thread ready)\n");

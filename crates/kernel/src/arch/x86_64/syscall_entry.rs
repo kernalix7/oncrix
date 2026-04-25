@@ -46,13 +46,33 @@ const RFLAGS_NT: u64 = 1 << 14;
 /// spurious #AC exceptions on unaligned kernel accesses.
 const RFLAGS_AC: u64 = 1 << 18;
 
-/// Static kernel stack for the SYSCALL entry path (32 KiB).
+/// Static fallback kernel stack for the SYSCALL entry path (32 KiB).
 ///
-/// Until per-CPU stacks are implemented, SYSCALL must switch off
-/// the untrusted user RSP onto this kernel stack before pushing
-/// any data. This is single-CPU only; SMP requires per-CPU
-/// storage.
+/// Used only before the scheduler installs the first per-thread
+/// kernel stack via `switch_tss_rsp0`. After that, [`CURRENT_KSTACK_TOP`]
+/// holds the live thread's private stack top and SYSCALL entry
+/// switches onto it — necessary so that a sleeping thread's saved
+/// kernel-call frames are not clobbered by another thread's SYSCALL
+/// reusing the same buffer.
 static mut SYSCALL_KERNEL_STACK: [u8; 32768] = [0; 32768];
+
+/// Top (highest address + 1) of the currently running thread's
+/// private kernel stack, mirrored from `TSS.RSP0` by
+/// [`crate::arch::x86_64::init::switch_tss_rsp0`].
+///
+/// `0` means "fall back to the static SYSCALL_KERNEL_STACK top".
+/// The SYSCALL entry asm reads this atomic and — if non-zero —
+/// loads its value into RSP so each thread's syscall work lives
+/// on its own private 16 KiB kstack.
+pub static CURRENT_KSTACK_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Publish the current thread's per-thread kernel-stack top to
+/// [`CURRENT_KSTACK_TOP`].
+///
+/// `0` reverts to the static fallback stack.
+pub fn set_current_kstack_top(top: u64) {
+    CURRENT_KSTACK_TOP.store(top, Ordering::Relaxed);
+}
 
 /// Saved user RSP during SYSCALL execution.
 ///
@@ -243,7 +263,17 @@ pub extern "C" fn syscall_entry() {
             // Save user RSP into the atomic and switch to kernel
             // stack. This must happen before any push instruction.
             "mov [{saved_user_rsp}], rsp",
+            // Prefer the running thread's private kernel stack (as
+            // mirrored by `switch_tss_rsp0` into CURRENT_KSTACK_TOP).
+            // If it is zero (very early boot, before the scheduler has
+            // installed the first thread), fall back to the static
+            // SYSCALL_KERNEL_STACK so that early-boot syscalls still
+            // work.
+            "mov rsp, [{cur_kstack_top}]",
+            "test rsp, rsp",
+            "jnz 3f",
             "lea rsp, [{kern_stack} + 32768]",
+            "3:",
             // Save user RCX (return RIP) and R11 (user RFLAGS) into
             // their per-atomic-static slots so that fork/exec handlers
             // can snapshot the parent's user register state.
@@ -321,6 +351,7 @@ pub extern "C" fn syscall_entry() {
         saved_user_rip = sym SYSCALL_SAVED_USER_RIP,
         saved_user_rflags = sym SYSCALL_SAVED_USER_RFLAGS,
         kern_stack = sym SYSCALL_KERNEL_STACK,
+        cur_kstack_top = sym CURRENT_KSTACK_TOP,
         user_ss = const 0x1Bu64,  // USER_DATA = (3 << 3)|3
         user_cs = const 0x23u64,  // USER_CODE = (4 << 3)|3
     );
@@ -345,19 +376,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
         oncrix_syscall::number::SYS_WRITE if args.arg0 <= 2 => {
             kernel_serial_write(args.arg1, args.arg2)
         }
-        // SYS_EXIT / SYS_EXIT_GROUP: print a notice and halt the CPU.
-        // In a full kernel this would schedule another process; for the
-        // early-boot smoke test there is nothing else to run.
+        // SYS_EXIT / SYS_EXIT_GROUP: mark process as exited and reschedule.
+        // Phase 11: calls sys_exit which transitions the thread to Exited
+        // and loops on yield_now so it is never rescheduled.
         oncrix_syscall::number::SYS_EXIT | 231 => {
-            use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
-            use oncrix_hal::serial::SerialPort;
-            let mut serial = Uart16550::new(COM1);
-            let _ = serial.write_str("[ONCRIX] Userspace exited — halting.\n");
-            // SAFETY: `hlt` halts the CPU until the next interrupt.
-            // No process remains to schedule so spinning on hlt is correct.
-            loop {
-                unsafe { core::arch::asm!("hlt") };
-            }
+            // SAFETY: Single-CPU SYSCALL dispatch path; interrupts effectively
+            // disabled (FMASK cleared IF). sys_exit does not return.
+            unsafe { crate::fork_dispatch::sys_exit(args.arg0) }
         }
         // Intercept IPC syscalls — these require direct access to the
         // kernel state (ChannelRegistry) which the syscall crate cannot reach.

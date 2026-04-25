@@ -21,14 +21,21 @@
 //!   [top-0x18]  RFLAGS = parent's RFLAGS (IF=1, reserved bit 1=1)
 //!   [top-0x20]  CS     = USER_CODE | 3  = 0x23
 //!   [top-0x28]  RIP    = child_rip (user return address)
-//!   [top-0x30]  ret    = address of fork_trampoline (for context
-//!                        switch to pop into)
+//!   [top-0x30]  ret    = address of fork_trampoline (return target
+//!                        of the context-switch `ret`)
+//!   [top-0x38]  rbx    = 0  (consumed by the final `pop rbx`)
+//!   [top-0x40]  rbp    = 0
+//!   [top-0x48]  r12    = 0
+//!   [top-0x50]  r13    = 0
+//!   [top-0x58]  r14    = 0
+//!   [top-0x60]  r15    = 0  (consumed by the first `pop r15`)
 //! ```
 //!
-//! The [`CpuContext`] `rsp` field is set to `top-0x30`. When the
-//! scheduler's context-switch routine executes `ret`, it pops
-//! `fork_trampoline`, which loads `RAX=0` and issues `iretq`
-//! against the remaining 40 bytes — delivering control to ring 3.
+//! The [`CpuContext`] `rsp` field is set to `top-0x60`. The scheduler's
+//! `switch_context` does `pop r15/r14/r13/r12/rbp/rbx; ret`, which
+//! consumes the 6 zero words and then lands on `fork_trampoline`.
+//! The trampoline zeroes `RAX` and issues `iretq` against the
+//! remaining 40 bytes — delivering control to ring 3.
 
 use oncrix_hal::arch::x86_64::gdt::selector;
 use oncrix_lib::{Error, Result};
@@ -48,9 +55,13 @@ const USER_CS: u64 = selector::USER_CODE as u64;
 
 /// Size of the `iretq` frame pushed onto the child stack: 5×u64.
 const IRETQ_FRAME_BYTES: usize = 5 * 8;
-/// Total bytes pre-seeded on the child stack (iretq frame + return
-/// address for the context-switch `ret`).
-const SEED_BYTES: usize = IRETQ_FRAME_BYTES + 8;
+/// Offset (from stack top) of the `fork_trampoline` return address —
+/// this sits directly above the 6 callee-saved register slots.
+const TRAMPOLINE_OFFSET: usize = IRETQ_FRAME_BYTES + 8;
+/// Total bytes pre-seeded on the child stack: iretq frame (40 B) +
+/// trampoline return address (8 B) + 6 callee-saved register slots
+/// (48 B) that `switch_context` pops before `ret`.
+const SEED_BYTES: usize = TRAMPOLINE_OFFSET + 6 * 8;
 
 /// Trampoline executed the first time a freshly-forked child is
 /// dispatched.
@@ -169,15 +180,28 @@ pub fn arch_clone_thread(parent: &Thread, snapshot: &ForkSnapshot) -> Result<Thr
     let ctx_rsp = {
         let stack = child.kernel_stack_mut().ok_or(Error::InvalidArgument)?;
 
-        // Seed (high → low). Each write returns the absolute address
-        // of the word; we only need the lowest one, which is what
-        // RSP must be set to so that `ret` pops `fork_trampoline`.
+        // Seed the iretq frame (high → low).
         let _ss = stack.write_u64_from_top(0x08, USER_SS)?;
         let _rsp = stack.write_u64_from_top(0x10, user_rsp)?;
         let _rfl = stack.write_u64_from_top(0x18, rflags)?;
         let _cs = stack.write_u64_from_top(0x20, USER_CS)?;
         let _rip = stack.write_u64_from_top(0x28, user_rip)?;
-        stack.write_u64_from_top(SEED_BYTES, fork_trampoline as *const () as u64)?
+
+        // Seed the trampoline return address at top-0x30: this is what
+        // the final `ret` inside `switch_context` pops into RIP.
+        let _tr =
+            stack.write_u64_from_top(TRAMPOLINE_OFFSET, fork_trampoline as *const () as u64)?;
+
+        // Seed 6 zero slots for the callee-saved register pops that
+        // `switch_context` does before `ret`. The lowest word's
+        // address (top-0x60) is what the context-switch loads into
+        // RSP when resuming this thread.
+        let _rbx = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x08, 0)?;
+        let _rbp = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x10, 0)?;
+        let _r12 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x18, 0)?;
+        let _r13 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x20, 0)?;
+        let _r14 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x28, 0)?;
+        stack.write_u64_from_top(SEED_BYTES, 0)?
     };
 
     let mut ctx = CpuContext::new_kernel(fork_trampoline as *const () as u64, ctx_rsp);

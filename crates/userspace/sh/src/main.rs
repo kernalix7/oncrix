@@ -72,6 +72,11 @@ fn sh_main() -> ! {
                 let code = parse_i32(rest).unwrap_or(0);
                 libc::exit(code);
             }
+            b"echo" => {
+                // Write the argument slice followed by a newline to stdout.
+                write_all(1, rest);
+                write_all(1, b"\n");
+            }
             b"cd" => {
                 // cd is a built-in — stub: chdir syscall not yet wired.
                 let _ = rest;
