@@ -13,6 +13,7 @@ x86_64-specific implementation details.
 - [Interrupt Controllers](#interrupt-controllers)
 - [Timers](#timers)
 - [Context Switching](#context-switching)
+- [Userspace Bringup (Phases 10b – 12)](userspace-bringup.md) — ring 3 transition, `USER_PT`, `fork`/`wait4`/`execve`, fd table over VFS
 
 ---
 
