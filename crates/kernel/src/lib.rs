@@ -92,6 +92,7 @@ pub mod panic_notifier;
 pub mod perf;
 pub mod pidfd;
 pub mod pidfd_ext;
+pub mod pipe;
 pub mod poll;
 pub mod posix_timer;
 pub mod prctl;

@@ -132,7 +132,7 @@ impl KernelState {
     /// directories.
     ///
     /// Creates a ramfs root and populates it with `/dev`, `/proc`,
-    /// `/tmp`, and `/sbin`.
+    /// `/tmp`, `/sbin`, and `/etc` (which contains `/etc/motd`).
     pub fn init_rootfs(&mut self) -> oncrix_lib::Result<()> {
         let root_ino = self.vfs.ramfs.root_inode();
         let root_sb = Superblock::new(FsType::Ramfs, root_ino);
@@ -144,6 +144,15 @@ impl KernelState {
         let _ = self.vfs.ramfs.mkdir(&root, "proc", FileMode::DIR_DEFAULT);
         let _ = self.vfs.ramfs.mkdir(&root, "tmp", FileMode::DIR_DEFAULT);
         let _ = self.vfs.ramfs.mkdir(&root, "sbin", FileMode::DIR_DEFAULT);
+
+        // /etc and /etc/motd
+        let etc = self.vfs.ramfs.mkdir(&root, "etc", FileMode::DIR_DEFAULT)?;
+        let motd_content = b"Welcome to ONCRIX (Phase 15)\n";
+        let motd = self
+            .vfs
+            .ramfs
+            .create(&etc, "motd", FileMode::FILE_DEFAULT)?;
+        self.vfs.ramfs.write(&motd, 0, motd_content)?;
 
         Ok(())
     }

@@ -104,7 +104,8 @@ pub extern "C" fn kernel_main() -> ! {
         match state.init_rootfs() {
             Ok(()) => {
                 let _ = serial.write_str("[ONCRIX] Root filesystem mounted (ramfs on /)\n");
-                let _ = serial.write_str("[ONCRIX] Created /dev /proc /tmp /sbin\n");
+                let _ = serial.write_str("[ONCRIX] Created /dev /proc /tmp /sbin /etc\n");
+                let _ = serial.write_str("[ONCRIX] Created /etc/motd\n");
             }
             Err(_) => {
                 let _ = serial.write_str("[ONCRIX] WARNING: Root filesystem mount failed\n");

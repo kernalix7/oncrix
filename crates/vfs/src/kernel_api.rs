@@ -18,6 +18,11 @@
 //! - `write(3p)` — sequential write with offset advancement.
 //! - `lseek(3p)` — random-access seek.
 
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::dentry::{Dentry, DentryCache, DentryName};
 use crate::file::OpenFlags;
 use crate::inode::{FileMode, FileType, Inode, InodeNumber, InodeOps};
@@ -195,6 +200,33 @@ impl KernelVfs {
     /// the number stored inside a [`FileBackend::RamfsFile`] handle.
     pub fn lookup_path_by_ino(&self, ino: InodeNumber) -> Option<Inode> {
         self.ramfs.inode_by_number(ino)
+    }
+
+    /// Read the entire contents of the file at `path` into a `Vec<u8>`.
+    ///
+    /// `path` must be absolute (start with `b'/'`). The root path `b"/"`
+    /// alone is rejected with `InvalidArgument` as it is a directory.
+    ///
+    /// Returns `Err(NotFound)` if any path component does not exist, and
+    /// `Err(InvalidArgument)` for empty or non-absolute paths.
+    pub fn read_file_bytes(&self, path: &[u8]) -> Result<Vec<u8>> {
+        if path.is_empty() || path[0] != b'/' {
+            return Err(Error::InvalidArgument);
+        }
+        // Reject bare "/" — it is a directory, not a readable file.
+        if path == b"/" {
+            return Err(Error::InvalidArgument);
+        }
+
+        let inode = self.lookup_path(path)?;
+
+        let size = inode.size as usize;
+        let capacity = size.max(64);
+        let mut buf: Vec<u8> = vec![0u8; capacity];
+
+        let n = self.ramfs.read(&inode, 0, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
     }
 }
 

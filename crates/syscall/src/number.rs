@@ -104,6 +104,8 @@ pub const SYS_LSEEK: SyscallNumber = 8;
 pub const SYS_DUP2: SyscallNumber = 33;
 /// `pipe(pipefd)` — Create a pipe.
 pub const SYS_PIPE: SyscallNumber = 22;
+/// `pipe2(pipefd, flags)` — Create a pipe with flags.
+pub const SYS_PIPE2: SyscallNumber = 293;
 /// `mkdir(pathname, mode)` — Create a directory.
 pub const SYS_MKDIR: SyscallNumber = 83;
 /// `rmdir(pathname)` — Remove a directory.

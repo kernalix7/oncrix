@@ -25,22 +25,29 @@
 //!   recognized. A new [`UserAddressSpace`] is allocated, the embedded shell
 //!   ELF is loaded into it, the calling thread's previous address space is
 //!   released, and the SYSCALL epilogue is redirected to the new entry point.
+//!   argv/envp are read from user space and laid out on the System V AMD64
+//!   initial stack at user VA 0x5FF000.
 //!
-//! * `sys_exit` — marks the current process as `Exited` in the process table
-//!   and transitions the current thread to the `Exited` scheduler state, then
-//!   loops on `yield_now` so it is never rescheduled.
+//! * `sys_exit` — marks the current process as `Exited` in the process table,
+//!   raises SIGCHLD on the parent, transitions the current thread to the
+//!   `Exited` scheduler state, then loops on `yield_now` so it is never
+//!   rescheduled.
+//!
+//! * `sys_kill` — deliver a signal to a target process by PID.
+//!   POSIX.1-2024 `kill(3p)` semantics.
 //!
 //! [`UserAddressSpace`]: oncrix_mm::address_space::UserAddressSpace
 //!
 //! # POSIX references
 //!
-//! POSIX.1-2024 `fork(3p)`, `wait(3p)`, `waitid(3p)`, `execve(3p)`, `_exit(3p)`.
-//! See `.priv-storage/.TheOpenGroup/susv5-html/functions/`.
+//! POSIX.1-2024 `fork(3p)`, `wait(3p)`, `waitid(3p)`, `execve(3p)`, `_exit(3p)`,
+//! `kill(3p)`. See `.priv-storage/.TheOpenGroup/susv5-html/functions/`.
 
 use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
 use oncrix_process::pid::{Pid, alloc_pid};
 use oncrix_process::process::Process;
+use oncrix_process::signal::Signal;
 use oncrix_process::table::{ExitStatus, ProcessEntry, ProcessTable};
 
 use crate::arch::x86_64::clone::ForkSnapshot;
@@ -394,6 +401,12 @@ fn find_zombie_child(table: &ProcessTable, parent: Pid, target: Option<Pid>) -> 
 /// Maximum pathname length accepted from user space.
 const MAX_PATHNAME: usize = 256;
 
+/// Maximum number of argv/envp pointers accepted from user space.
+const MAX_ARGV: usize = 64;
+
+/// Maximum bytes copied per argv/envp string.
+const MAX_ARG_STR: usize = 256;
+
 /// Kernel handler for `SYS_EXECVE`.
 ///
 /// POSIX.1-2024 `execve(3p)` semantics:
@@ -408,8 +421,11 @@ const MAX_PATHNAME: usize = 256;
 /// allocated via [`crate::frame_alloc`], the embedded `/bin/sh` ELF is
 /// loaded into it, the calling thread's previous address space is
 /// `release`d (so its frames return to the global pool), and the new
-/// UAS is installed both on the thread and at `PD_0_1G[2]`. The
-/// SYSCALL epilogue is redirected to the new entry point.
+/// UAS is installed both on the thread and at `PD_0_1G[2]`. argv and
+/// envp are read from user space and written to the System V AMD64
+/// initial stack at the top 4 KiB of the user region (user VA 0x5FF000).
+/// The SYSCALL epilogue is redirected to the new entry point with
+/// RSP = 0x5FF000.
 ///
 /// [`UserAddressSpace`]: oncrix_mm::address_space::UserAddressSpace
 ///
@@ -417,7 +433,7 @@ const MAX_PATHNAME: usize = 256;
 ///
 /// Must be called from the SYSCALL dispatch path with interrupts effectively
 /// disabled (single-CPU SYSCALL context).
-pub unsafe fn sys_execve(pathname_ptr: u64, _argv: u64, _envp: u64) -> i64 {
+pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
     let mut serial = Uart16550::new(COM1);
 
     // Validate the pathname pointer.
@@ -512,15 +528,157 @@ pub unsafe fn sys_execve(pathname_ptr: u64, _argv: u64, _envp: u64) -> i64 {
         }
     };
 
-    // Redirect the SYSCALL epilogue to the new program entry. The new
-    // UAS exposes a fresh 2 MiB user region; the top of that region is
-    // the canonical initial RSP for ring 3.
+    // Build the System V AMD64 initial stack in the top 4 KiB of the user
+    // region (backing slice offset USER_REGION_SIZE-4096..USER_REGION_SIZE,
+    // user VA 0x5FF000..0x600000).
+    //
+    // Layout at user RSP = 0x5FF000 (low → high address):
+    //   [rsp+0]:              argc (u64)
+    //   [rsp+8]:              argv[0] user VA
+    //   ...
+    //   [rsp+8*(argc)]:       argv[argc-1] user VA
+    //   [rsp+8*(argc+1)]:     NULL (u64)
+    //   [rsp+8*(argc+2)]:     envp[0] user VA
+    //   ...
+    //                         NULL (u64)
+    //                         AT_NULL auxv entry: {0, 0}
+    //   string area growing up: argv strings, then envp strings
+    //
+    // SAFETY: We access the new UAS through the kernel's phys_to_virt
+    // mapping. Single-CPU SYSCALL context ensures exclusive access.
+    unsafe {
+        // Collect argv/envp strings into static kernel-side buffers.
+        static mut ARGV_STRS: [[u8; MAX_ARG_STR]; MAX_ARGV] = [[0u8; MAX_ARG_STR]; MAX_ARGV];
+        static mut ARGV_LENS: [usize; MAX_ARGV] = [0usize; MAX_ARGV];
+        static mut ENVP_STRS: [[u8; MAX_ARG_STR]; MAX_ARGV] = [[0u8; MAX_ARG_STR]; MAX_ARGV];
+        static mut ENVP_LENS: [usize; MAX_ARGV] = [0usize; MAX_ARGV];
+
+        #[allow(static_mut_refs)]
+        let argc = collect_user_argv(argv_ptr, &mut ARGV_STRS, &mut ARGV_LENS);
+        #[allow(static_mut_refs)]
+        let nenv = collect_user_argv(envp_ptr, &mut ENVP_STRS, &mut ENVP_LENS);
+
+        if let Some(thread) = crate::current::current_thread_mut() {
+            if let Some(uas) = thread.user_address_space.as_mut() {
+                // SAFETY: exclusive access to the new UAS backing region.
+                let backing = uas.backing_slice_mut();
+                let region_size = backing.len(); // USER_REGION_SIZE = 2 MiB
+                let stack_off = region_size - 4096;
+                let stack = &mut backing[stack_off..];
+
+                // Zero the 4 KiB stack window.
+                for b in stack.iter_mut() {
+                    *b = 0;
+                }
+
+                // User VA corresponding to stack[0].
+                let stack_user_va: u64 = 0x5FF000;
+
+                // Pointer table entries: 1(argc) + argc + 1(NULL) + nenv + 1(NULL) + 2(AT_NULL).
+                let ptr_entries = 1usize + argc + 1 + nenv + 1 + 2;
+                // String area starts after the pointer table.
+                let mut str_off = ptr_entries * 8;
+
+                // Write argc.
+                let argc_bytes = (argc as u64).to_ne_bytes();
+                stack[0..8].copy_from_slice(&argc_bytes);
+
+                // Write argv pointers and strings.
+                for i in 0..argc {
+                    #[allow(static_mut_refs)]
+                    let len = ARGV_LENS[i];
+                    if str_off + len + 1 > 4096 {
+                        break; // overflow guard
+                    }
+                    #[allow(static_mut_refs)]
+                    stack[str_off..str_off + len].copy_from_slice(&ARGV_STRS[i][..len]);
+                    stack[str_off + len] = 0;
+                    let user_va = stack_user_va + str_off as u64;
+                    let va_bytes = user_va.to_ne_bytes();
+                    let slot = (1 + i) * 8;
+                    stack[slot..slot + 8].copy_from_slice(&va_bytes);
+                    str_off += len + 1;
+                }
+                // argv NULL at slot (1 + argc)*8 — already zero.
+
+                // Write envp pointers and strings.
+                let envp_base = (1 + argc + 1) * 8;
+                for j in 0..nenv {
+                    #[allow(static_mut_refs)]
+                    let len = ENVP_LENS[j];
+                    if str_off + len + 1 > 4096 {
+                        break;
+                    }
+                    #[allow(static_mut_refs)]
+                    stack[str_off..str_off + len].copy_from_slice(&ENVP_STRS[j][..len]);
+                    stack[str_off + len] = 0;
+                    let user_va = stack_user_va + str_off as u64;
+                    let va_bytes = user_va.to_ne_bytes();
+                    let slot = envp_base + j * 8;
+                    stack[slot..slot + 8].copy_from_slice(&va_bytes);
+                    str_off += len + 1;
+                }
+                // envp NULL and AT_NULL auxv are already zero.
+            }
+        }
+    }
+
+    // Redirect the SYSCALL epilogue to the new program entry.
+    // RSP = 0x5FF000: argc at [rsp], argv at [rsp+8], envp at [rsp+8*(argc+2)].
+    // 16-byte aligned (0x5FF000 % 16 == 0).
     set_saved_user_rip(entry);
-    set_saved_user_rsp(crate::arch::x86_64::init::USER_INIT_RSP);
+    set_saved_user_rsp(0x5FF000);
     set_saved_user_rflags(DEFAULT_USER_RFLAGS);
 
     // Return 0 — the SYSCALL epilogue will sysretq into sh's _start.
     0
+}
+
+/// Copy up to `MAX_ARGV` char* entries from a user-space argv/envp array.
+///
+/// `ptr_array` is the user VA of a NULL-terminated array of `char *`.
+/// Each pointed-to string is copied (≤ `MAX_ARG_STR` bytes) into
+/// `strs[i][..]` and its length (without null) into `lens[i]`.
+/// Returns the number of entries collected.
+///
+/// # Safety
+///
+/// Called from single-CPU SYSCALL dispatch context. `ptr_array` must be
+/// a user-space address (< 0xFFFF_8000_0000_0000) or 0 (treated as empty).
+unsafe fn collect_user_argv(
+    ptr_array: u64,
+    strs: &mut [[u8; MAX_ARG_STR]; MAX_ARGV],
+    lens: &mut [usize; MAX_ARGV],
+) -> usize {
+    if ptr_array == 0 || ptr_array >= 0xFFFF_8000_0000_0000 {
+        return 0;
+    }
+    let mut count = 0usize;
+    let base = ptr_array as *const u64;
+    while count < MAX_ARGV {
+        // SAFETY: reading one char* from the user-space array.
+        let str_ptr = unsafe { base.add(count).read_volatile() };
+        if str_ptr == 0 {
+            break; // NULL terminator
+        }
+        if str_ptr >= 0xFFFF_8000_0000_0000 {
+            break; // invalid pointer
+        }
+        let s = str_ptr as *const u8;
+        let mut i = 0usize;
+        while i < MAX_ARG_STR {
+            // SAFETY: reading one byte from user space string.
+            let byte = unsafe { s.add(i).read_volatile() };
+            if byte == 0 {
+                break;
+            }
+            strs[count][i] = byte;
+            i += 1;
+        }
+        lens[count] = i;
+        count += 1;
+    }
+    count
 }
 
 /// Write a 64-bit value as `0x`-prefixed hex to the serial console.
@@ -542,6 +700,56 @@ fn write_hex(serial: &mut Uart16550, value: u64) {
     }
 }
 
+// ── sys_kill ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_KILL` (Linux number 62).
+///
+/// POSIX.1-2024 `kill(3p)` semantics (subset):
+/// - `pid > 0` — send signal to the specific process.
+/// - `pid == 0` or `pid < 0` — process groups are not implemented;
+///   returns -ESRCH (-3).
+/// - `sig == 0` — existence check: returns 0 if the process exists,
+///   -ESRCH otherwise. Does NOT raise a signal.
+/// - `sig > 64` — returns -EINVAL (-22).
+///
+/// Signal state is recorded in the process table entry (not the thread).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_kill(pid_arg: u64, sig_arg: u64) -> i64 {
+    // Validate signal number. Accept 0..=64; actual raise only for 1..=32.
+    if sig_arg > 64 {
+        return -22; // EINVAL
+    }
+
+    // Only positive PIDs supported; process groups deferred.
+    let pid_signed = pid_arg as i64;
+    if pid_signed <= 0 {
+        return -3; // ESRCH
+    }
+
+    let target_pid = Pid::new(pid_arg);
+
+    // SAFETY: single-CPU SYSCALL context; exclusive access to PROCESS_TABLE.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let entry = PROCESS_TABLE.get_mut(target_pid);
+        match entry {
+            None => -3, // ESRCH — no such process
+            Some(e) => {
+                if sig_arg == 0 {
+                    // Existence check only.
+                    0
+                } else {
+                    e.signals.pending.raise(Signal(sig_arg as u8));
+                    0
+                }
+            }
+        }
+    }
+}
+
 // ── sys_exit ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_EXIT` (Linux number 60) and
@@ -549,6 +757,7 @@ fn write_hex(serial: &mut Uart16550, value: u64) {
 ///
 /// POSIX.1-2024 `_exit(3p)` semantics:
 /// - Marks the current process as exited with `code`.
+/// - Raises SIGCHLD on the parent process.
 /// - Removes the current thread from the scheduler so it is never
 ///   rescheduled. Loops on `yield_now` as a safety backstop.
 ///
@@ -572,6 +781,19 @@ pub unsafe fn sys_exit(code: u64) -> i64 {
     // SAFETY: Single-CPU SYSCALL context.
     if let Some(pid) = crate::current::current_pid() {
         unsafe { exit_process(pid, exit_code) };
+
+        // Raise SIGCHLD on the parent process so it can wake from wait4.
+        // SAFETY: single-CPU SYSCALL context; exclusive access to PROCESS_TABLE.
+        unsafe {
+            #[allow(static_mut_refs)]
+            if let Some(entry) = PROCESS_TABLE.get(pid) {
+                let parent_pid = entry.parent;
+                #[allow(static_mut_refs)]
+                if let Some(parent_entry) = PROCESS_TABLE.get_mut(parent_pid) {
+                    parent_entry.signals.pending.raise(Signal::SIGCHLD);
+                }
+            }
+        }
     }
 
     // Transition the current thread to Exited so the scheduler skips it.

@@ -357,3 +357,450 @@ impl SocketRegistry {
         self.id_map.iter().filter(|s| s.is_some()).count()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Global socket table
+// ---------------------------------------------------------------------------
+
+/// Global socket registry for the current process.
+///
+/// Phase 18 simplification: a single static registry for the one running
+/// process. SMP / multi-process support is deferred.
+///
+/// # Safety invariant
+///
+/// Accessed exclusively from the SYSCALL dispatch path where the single CPU
+/// is in ring 0 with interrupts effectively disabled (FMASK cleared IF on
+/// SYSCALL entry). No concurrent mutation is possible on single-CPU builds.
+// SAFETY: Single-CPU SYSCALL context only; see module-level note.
+static mut SOCKET_TABLE: SocketRegistry = SocketRegistry::new();
+
+// ---------------------------------------------------------------------------
+// Kernel-facing helpers (called from fd_table dispatch)
+// ---------------------------------------------------------------------------
+
+/// Send `data` through the socket identified by `handle_id`.
+///
+/// Returns the number of bytes written, or an error.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn socket_send(handle_id: u32, data: &[u8]) -> Result<usize> {
+    // SAFETY: Single-CPU SYSCALL context; no aliased access.
+    unsafe {
+        #[allow(static_mut_refs)]
+        SOCKET_TABLE.send(handle_id as usize, data)
+    }
+}
+
+/// Receive bytes from the socket identified by `handle_id` into `buf`.
+///
+/// Returns the number of bytes read, or an error.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn socket_recv(handle_id: u32, buf: &mut [u8]) -> Result<usize> {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        SOCKET_TABLE.recv(handle_id as usize, buf)
+    }
+}
+
+/// Close the socket identified by `handle_id`, releasing its slot.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn socket_close(handle_id: u32) {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let _ = SOCKET_TABLE.close(handle_id as usize);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall handlers
+// ---------------------------------------------------------------------------
+
+/// Maximum path length for a Unix socket path copied from user space.
+const SOCK_PATH_MAX: usize = 108;
+
+/// Copy a null-terminated path from user space.
+///
+/// Returns the length of the copied path (without null terminator) or
+/// `Err(InvalidArgument)` on bad pointer or overlong path.
+///
+/// # Safety
+///
+/// `path_ptr` must point into user-space (checked against canonical boundary).
+unsafe fn copy_socket_path(path_ptr: u64, buf: &mut [u8; SOCK_PATH_MAX]) -> Result<usize> {
+    if path_ptr == 0 || path_ptr >= 0xFFFF_8000_0000_0000 {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: caller guarantees `path_ptr` is below the kernel canonical boundary.
+    unsafe {
+        let base = path_ptr as *const u8;
+        for (i, slot) in buf.iter_mut().enumerate() {
+            let byte = base.add(i).read_volatile();
+            if byte == 0 {
+                return Ok(i);
+            }
+            *slot = byte;
+        }
+    }
+    Err(Error::InvalidArgument) // path too long
+}
+
+/// Kernel handler for `SYS_SOCKET` (Linux number 41).
+///
+/// POSIX.1-2024 `socket(3p)` semantics.
+/// - `domain` — address family (only `AF_UNIX` / 1 supported).
+/// - `sock_type` — `SOCK_STREAM` (1) or `SOCK_DGRAM` (2).
+/// - `protocol` — ignored (must be 0 for Unix sockets).
+///
+/// Returns the new fd number on success, or a negative errno.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_socket(domain: u64, sock_type: u64, _protocol: u64) -> i64 {
+    let domain = match SocketDomain::from_raw(domain as u32) {
+        Ok(d) => d,
+        Err(_) => return -97, // EAFNOSUPPORT
+    };
+    let sock_type = match SockType::from_raw(sock_type as u32 & 0xF) {
+        Ok(t) => t,
+        Err(_) => return -22, // EINVAL
+    };
+
+    // Allocate a socket slot.
+    // SAFETY: Single-CPU SYSCALL context.
+    let handle_id = unsafe {
+        #[allow(static_mut_refs)]
+        match SOCKET_TABLE.create(domain, sock_type) {
+            Ok(id) => id as u32,
+            Err(_) => return -24, // EMFILE
+        }
+    };
+
+    // Install an fd for this socket.
+    let handle = crate::fd_table::FileHandle {
+        backend: crate::fd_table::FileBackend::Socket { handle_id },
+        offset: 0,
+        flags: crate::fd_table::HandleFlags::RDWR,
+    };
+    // SAFETY: Single-CPU SYSCALL context.
+    match unsafe { crate::fd_table::fd_install(handle) } {
+        Ok(fd) => fd as i64,
+        Err(_) => {
+            // Roll back socket allocation.
+            unsafe {
+                #[allow(static_mut_refs)]
+                let _ = SOCKET_TABLE.close(handle_id as usize);
+            }
+            -24 // EMFILE
+        }
+    }
+}
+
+/// Kernel handler for `SYS_BIND` (Linux number 49).
+///
+/// POSIX.1-2024 `bind(3p)` — binds a socket to a local address.
+///
+/// For Phase 18, only `sockaddr_un` (Unix paths) are supported.
+/// The `addr_ptr` must point to a structure whose first two bytes
+/// are the address family (little-endian `u16`) followed by the
+/// null-terminated path.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_bind(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
+    if addr_ptr == 0 || addr_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Read address family (first 2 bytes of sockaddr).
+    // SAFETY: validated above.
+    let family = unsafe { (addr_ptr as *const u16).read_volatile() };
+    if family != 1 {
+        return -97; // EAFNOSUPPORT
+    }
+
+    // Read the Unix path (bytes 2..2+SOCK_PATH_MAX).
+    let mut path_buf = [0u8; SOCK_PATH_MAX];
+    let path_len = unsafe {
+        match copy_socket_path(addr_ptr + 2, &mut path_buf) {
+            Ok(n) => n,
+            Err(_) => return -22, // EINVAL
+        }
+    };
+
+    let addr = match SocketAddr::from_bytes(&path_buf[..path_len]) {
+        Ok(a) => a,
+        Err(_) => return -22,
+    };
+
+    // Resolve fd → handle_id.
+    let handle_id = match get_socket_fd(sockfd) {
+        Some(id) => id,
+        None => return -9, // EBADF
+    };
+
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        match SOCKET_TABLE.bind(handle_id as usize, addr) {
+            Ok(()) => 0,
+            Err(Error::AlreadyExists) => -98, // EADDRINUSE
+            Err(_) => -22,                    // EINVAL
+        }
+    }
+}
+
+/// Kernel handler for `SYS_LISTEN` (Linux number 50).
+///
+/// POSIX.1-2024 `listen(3p)`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_listen(sockfd: u64, backlog: u64) -> i64 {
+    let handle_id = match get_socket_fd(sockfd) {
+        Some(id) => id,
+        None => return -9, // EBADF
+    };
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        match SOCKET_TABLE.listen(handle_id as usize, backlog as u32) {
+            Ok(()) => 0,
+            Err(_) => -22, // EINVAL
+        }
+    }
+}
+
+/// Kernel handler for `SYS_ACCEPT` (Linux number 43).
+///
+/// POSIX.1-2024 `accept(3p)` — accepts a pending connection and returns
+/// a new fd for the connected socket.  The `addr_ptr` and `addrlen_ptr`
+/// arguments are currently ignored (Phase 18; caller may pass NULL).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_accept(sockfd: u64, _addr_ptr: u64, _addrlen_ptr: u64) -> i64 {
+    let handle_id = match get_socket_fd(sockfd) {
+        Some(id) => id,
+        None => return -9, // EBADF
+    };
+
+    // Block until a connection is pending.
+    loop {
+        // SAFETY: Single-CPU SYSCALL context.
+        let result = unsafe {
+            #[allow(static_mut_refs)]
+            SOCKET_TABLE.accept(handle_id as usize)
+        };
+        match result {
+            Ok(new_id) => {
+                // Install an fd for the new connected socket.
+                let new_handle = crate::fd_table::FileHandle {
+                    backend: crate::fd_table::FileBackend::Socket {
+                        handle_id: new_id as u32,
+                    },
+                    offset: 0,
+                    flags: crate::fd_table::HandleFlags::RDWR,
+                };
+                // SAFETY: Single-CPU SYSCALL context.
+                return match unsafe { crate::fd_table::fd_install(new_handle) } {
+                    Ok(fd) => fd as i64,
+                    Err(_) => {
+                        // Roll back new socket.
+                        unsafe {
+                            #[allow(static_mut_refs)]
+                            let _ = SOCKET_TABLE.close(new_id);
+                        }
+                        -24 // EMFILE
+                    }
+                };
+            }
+            Err(Error::WouldBlock) => {
+                // No connection pending — yield and retry.
+                // SAFETY: SYSCALL context.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
+            Err(_) => return -22, // EINVAL
+        }
+    }
+}
+
+/// Kernel handler for `SYS_CONNECT` (Linux number 42).
+///
+/// POSIX.1-2024 `connect(3p)`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_connect(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
+    if addr_ptr == 0 || addr_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Read address family.
+    // SAFETY: validated above.
+    let family = unsafe { (addr_ptr as *const u16).read_volatile() };
+    if family != 1 {
+        return -97; // EAFNOSUPPORT
+    }
+
+    let mut path_buf = [0u8; SOCK_PATH_MAX];
+    let path_len = unsafe {
+        match copy_socket_path(addr_ptr + 2, &mut path_buf) {
+            Ok(n) => n,
+            Err(_) => return -22,
+        }
+    };
+    let addr = match SocketAddr::from_bytes(&path_buf[..path_len]) {
+        Ok(a) => a,
+        Err(_) => return -22,
+    };
+
+    let handle_id = match get_socket_fd(sockfd) {
+        Some(id) => id,
+        None => return -9,
+    };
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        match SOCKET_TABLE.connect(handle_id as usize, addr) {
+            Ok(()) => 0,
+            Err(Error::NotFound) => -111, // ECONNREFUSED
+            Err(_) => -22,
+        }
+    }
+}
+
+/// Kernel handler for `SYS_SENDTO` (Linux number 44).
+///
+/// For connected sockets this is equivalent to `send(2)`.  The
+/// `dest_addr` and `addrlen` arguments are ignored for connected sockets.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_sendto(
+    sockfd: u64,
+    buf_ptr: u64,
+    len: u64,
+    _flags: u64,
+    _dest: u64,
+    _dlen: u64,
+) -> i64 {
+    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let count = (len as usize).min(4096);
+    let handle_id = match get_socket_fd(sockfd) {
+        Some(id) => id,
+        None => return -9,
+    };
+
+    let mut kbuf = [0u8; 4096];
+    // SAFETY: `buf_ptr` validated above; reading `count` bytes.
+    unsafe {
+        let ptr = buf_ptr as *const u8;
+        for (i, b) in kbuf[..count].iter_mut().enumerate() {
+            *b = ptr.add(i).read_volatile();
+        }
+    }
+
+    loop {
+        // SAFETY: Single-CPU SYSCALL context.
+        let result = unsafe {
+            #[allow(static_mut_refs)]
+            SOCKET_TABLE.send(handle_id as usize, &kbuf[..count])
+        };
+        match result {
+            Ok(n) => return n as i64,
+            Err(Error::WouldBlock) => unsafe {
+                let _ = crate::current::yield_now();
+            },
+            Err(_) => return -22,
+        }
+    }
+}
+
+/// Kernel handler for `SYS_RECVFROM` (Linux number 45).
+///
+/// For connected sockets this is equivalent to `recv(2)`.  The
+/// `src_addr` and `addrlen` arguments are ignored.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_recvfrom(
+    sockfd: u64,
+    buf_ptr: u64,
+    len: u64,
+    _flags: u64,
+    _src: u64,
+    _slen: u64,
+) -> i64 {
+    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let count = (len as usize).min(4096);
+    let handle_id = match get_socket_fd(sockfd) {
+        Some(id) => id,
+        None => return -9,
+    };
+
+    let user_ptr = buf_ptr as *mut u8;
+    loop {
+        let mut kbuf = [0u8; 4096];
+        // SAFETY: Single-CPU SYSCALL context.
+        let result = unsafe {
+            #[allow(static_mut_refs)]
+            SOCKET_TABLE.recv(handle_id as usize, &mut kbuf[..count])
+        };
+        match result {
+            Ok(n) if n > 0 => {
+                // SAFETY: `buf_ptr` validated above; writing `n` bytes.
+                unsafe {
+                    for (i, &byte) in kbuf.iter().take(n).enumerate() {
+                        user_ptr.add(i).write_volatile(byte);
+                    }
+                }
+                return n as i64;
+            }
+            Ok(_) | Err(Error::WouldBlock) => unsafe {
+                let _ = crate::current::yield_now();
+            },
+            Err(_) => return -22,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve an fd number to the socket `handle_id` it references.
+///
+/// Returns `None` if the fd is not open or does not back a socket.
+fn get_socket_fd(fd: u64) -> Option<u32> {
+    // SAFETY: Single-CPU SYSCALL context.
+    let handle = unsafe { crate::fd_table::fd_get(fd as usize)? };
+    if let crate::fd_table::FileBackend::Socket { handle_id } = handle.backend {
+        Some(handle_id)
+    } else {
+        None
+    }
+}

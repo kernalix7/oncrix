@@ -43,6 +43,7 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_GETPID: u64 = 39;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -174,6 +175,12 @@ pub unsafe fn open(path: *const u8, flags: i32, mode: u32) -> i64 {
 pub fn close(fd: i32) -> i64 {
     // SAFETY: SYS_CLOSE with a single integer argument is always safe.
     unsafe { syscall1(SYS_CLOSE, fd as u64) }
+}
+
+/// `getpid(2)` — return the PID of the calling process.
+pub fn getpid() -> i64 {
+    // SAFETY: getpid() takes no arguments and is always safe to call.
+    unsafe { syscall1(SYS_GETPID, 0) }
 }
 
 /// `fork(2)` — create a child process.

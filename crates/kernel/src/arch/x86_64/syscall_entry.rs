@@ -541,6 +541,88 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
             if args.arg0 == 0 { 0 } else { -38 } // ENOSYS for non-zero
         }
 
+        // ── Pipe syscalls ────────────────────────────────────────
+
+        // SYS_PIPE2 (293): create a pipe with optional flags.
+        // POSIX.1-2024 pipe(3p) / Linux pipe2(2).
+        // arg0 = fildes[2] (user pointer), arg1 = flags.
+        oncrix_syscall::number::SYS_PIPE2 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::pipe::sys_pipe2(args.arg0, args.arg1) }
+        }
+
+        // ── Socket syscalls ──────────────────────────────────────
+
+        // SYS_SOCKET (41): create a socket.
+        // POSIX.1-2024 socket(3p).
+        oncrix_syscall::number::SYS_SOCKET => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::socket::sys_socket(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_CONNECT (42): connect a socket to an address.
+        // POSIX.1-2024 connect(3p).
+        oncrix_syscall::number::SYS_CONNECT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::socket::sys_connect(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_ACCEPT (43): accept a connection on a listening socket.
+        // POSIX.1-2024 accept(3p).
+        oncrix_syscall::number::SYS_ACCEPT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::socket::sys_accept(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_SENDTO (44): send data through a socket.
+        // POSIX.1-2024 sendmsg(3p) / send(3p).
+        oncrix_syscall::number::SYS_SENDTO => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::socket::sys_sendto(
+                    args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+                )
+            }
+        }
+
+        // SYS_RECVFROM (45): receive data from a socket.
+        // POSIX.1-2024 recvmsg(3p) / recv(3p).
+        oncrix_syscall::number::SYS_RECVFROM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::socket::sys_recvfrom(
+                    args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+                )
+            }
+        }
+
+        // SYS_BIND (49): bind a socket to a local address.
+        // POSIX.1-2024 bind(3p).
+        oncrix_syscall::number::SYS_BIND => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::socket::sys_bind(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_LISTEN (50): mark a socket as listening.
+        // POSIX.1-2024 listen(3p).
+        oncrix_syscall::number::SYS_LISTEN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::socket::sys_listen(args.arg0, args.arg1) }
+        }
+
+        // ── Signal syscalls ──────────────────────────────────────
+
+        // SYS_RT_SIGACTION (13): stub — ENOSYS until signal handler delivery
+        // is implemented. Returning -ENOSYS lets userspace fall back gracefully.
+        oncrix_syscall::number::SYS_RT_SIGACTION => -38, // ENOSYS
+
+        // SYS_KILL (62): send a signal to a process.
+        // POSIX.1-2024 kill(3p).
+        oncrix_syscall::number::SYS_KILL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_kill(args.arg0, args.arg1) }
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
     }

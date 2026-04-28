@@ -85,6 +85,41 @@ fn sh_main() -> ! {
                 // export is a built-in — stub: putenv not yet wired.
                 let _ = rest;
             }
+            b"pwd" => {
+                write_all(1, b"/\n");
+            }
+            b"pid" => {
+                let pid = libc::getpid();
+                let mut tmp = [0u8; 20];
+                let s = fmt_i64(&mut tmp, pid);
+                write_all(1, s);
+                write_all(1, b"\n");
+            }
+            b"cat" => {
+                if rest == b"/etc/motd" {
+                    // SAFETY: c"/etc/motd" is a valid null-terminated C string.
+                    let fd = unsafe { libc::open(c"/etc/motd".as_ptr().cast(), 0, 0) };
+                    if fd >= 0 {
+                        let mut cbuf = [0u8; 256];
+                        loop {
+                            // SAFETY: cbuf is valid writable storage.
+                            let n = unsafe { libc::read(fd as i32, cbuf.as_mut_ptr(), cbuf.len()) };
+                            if n <= 0 {
+                                break;
+                            }
+                            write_all(1, &cbuf[..n as usize]);
+                        }
+                        libc::close(fd as i32);
+                    } else {
+                        write_all(2, b"cat: cannot open /etc/motd\n");
+                    }
+                } else {
+                    write_all(2, b"cat: not found\n");
+                }
+            }
+            b"help" => {
+                write_all(1, b"builtins: exit cd echo pwd pid cat help\n");
+            }
             _ => {
                 run_external(cmd, line);
             }
@@ -172,6 +207,34 @@ fn read_line(buf: &mut [u8]) -> usize {
 // ---------------------------------------------------------------------------
 // String helpers
 // ---------------------------------------------------------------------------
+
+/// Format a signed 64-bit integer into `buf` as ASCII decimal.
+///
+/// Returns the populated slice within `buf`.  `buf` must be at least 20 bytes.
+fn fmt_i64(buf: &mut [u8; 20], mut n: i64) -> &[u8] {
+    let mut pos = buf.len();
+    let negative = n < 0;
+    if n == i64::MIN {
+        // i64::MIN cannot be negated in i64; return literal string.
+        return b"-9223372036854775808";
+    }
+    if negative {
+        n = -n;
+    }
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if negative {
+        pos -= 1;
+        buf[pos] = b'-';
+    }
+    &buf[pos..]
+}
 
 /// Split `s` at the first whitespace, returning (token, remainder).
 fn split_first_token(s: &[u8]) -> (&[u8], &[u8]) {
