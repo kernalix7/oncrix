@@ -60,6 +60,8 @@ pub const SYS_EXECVEAT: SyscallNumber = 322;
 
 // ── Process groups / sessions ──────────────────────────────────
 
+/// `getppid()` — Get parent process ID.
+pub const SYS_GETPPID: SyscallNumber = 110;
 /// `setpgid(pid, pgid)` — Set process group ID.
 pub const SYS_SETPGID: SyscallNumber = 109;
 /// `getpgrp()` — Get process group ID of the calling process.
@@ -254,6 +256,8 @@ pub const SYS_ARCH_PRCTL: SyscallNumber = 158;
 
 // ── Thread ──────────────────────────────────────────────────────
 
+/// `gettid()` — Get thread ID.
+pub const SYS_GETTID: SyscallNumber = 186;
 /// `set_tid_address(tidptr)` — Set pointer for `CLONE_CHILD_CLEARTID`.
 pub const SYS_SET_TID_ADDRESS: SyscallNumber = 218;
 

@@ -513,6 +513,34 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
             unsafe { crate::fork_dispatch::sys_execve(args.arg0, args.arg1, args.arg2) }
         }
 
+        // ── Process identity syscalls ────────────────────────────
+        // SYS_GETPID (39): POSIX.1-2024 getpid(3p) — always succeeds.
+        oncrix_syscall::number::SYS_GETPID => {
+            crate::current::current_thread()
+                .map(|t| t.pid().as_u64() as i64)
+                .unwrap_or(-3) // ESRCH
+        }
+
+        // SYS_GETPPID (110): POSIX.1-2024 getppid(3p).
+        // Looks up the parent PID in the global process table.
+        oncrix_syscall::number::SYS_GETPPID => {
+            // SAFETY: single-CPU SYSCALL dispatch path; no concurrent table access.
+            unsafe { crate::fork_dispatch::sys_getppid() }
+        }
+
+        // SYS_GETTID (186): returns the thread ID of the calling thread.
+        oncrix_syscall::number::SYS_GETTID => {
+            crate::current::current_thread()
+                .map(|t| t.tid().as_u64() as i64)
+                .unwrap_or(-3) // ESRCH
+        }
+
+        // SYS_BRK (12): POSIX.1-2024 brk(3p) / Linux brk(2).
+        // Non-zero arg is ENOSYS; arg==0 returns current break (0 = stub).
+        oncrix_syscall::number::SYS_BRK => {
+            if args.arg0 == 0 { 0 } else { -38 } // ENOSYS for non-zero
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
     }

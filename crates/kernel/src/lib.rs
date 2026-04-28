@@ -30,6 +30,7 @@ pub mod cgroup_io;
 pub mod cgroup_pids;
 pub mod cmdline;
 pub mod cmwq;
+pub mod console;
 pub mod cpu_hotplug;
 pub mod cputime;
 pub mod crypto;

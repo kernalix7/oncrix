@@ -115,6 +115,27 @@ pub struct Thread {
     pub saved_user_rsp: u64,
     /// Saved user-mode `RFLAGS` mirror — see [`saved_user_rip`](Self::saved_user_rip).
     pub saved_user_rflags: u64,
+    /// Saved interrupt-return frame for preemptive scheduling
+    /// (Phase 20 prep).
+    ///
+    /// `None` until the thread has been preempted at least once.
+    /// `Some([rip, cs, rflags, rsp, ss, scratch[0..6]])` carries the
+    /// eleven `u64`s a future naked timer ISR will spill on preemption
+    /// and reload before issuing `iretq` to resume the thread.
+    ///
+    /// Stored as a raw `[u64; 11]` (rather than the typed `IretFrame`)
+    /// because the typed wrapper lives in `oncrix-kernel` and a process
+    /// → kernel dependency would close the cycle `kernel → process →
+    /// kernel`. The kernel-side helpers
+    /// `oncrix_kernel::arch::x86_64::iret_frame::IretFrame::{from_raw,
+    /// into_raw}` round-trip the buffer at zero cost. Slot layout
+    /// matches `IretFrame::SLOTS`: `rip, cs, rflags, rsp, ss,
+    /// saved[0..6]`.
+    ///
+    /// Phase 20 only adds the storage; the activation step (rewriting
+    /// `timer_handler` to use it) ships in a later commit so the new
+    /// preemption datapath can be QEMU-verified in isolation.
+    pub saved_irq_frame_raw: Option<[u64; 11]>,
 }
 
 // SAFETY: `UserAddressSpace` itself is `Send` (raw `PhysAddr`s plus a
@@ -143,6 +164,7 @@ impl Thread {
             saved_user_rip: 0,
             saved_user_rsp: 0,
             saved_user_rflags: 0,
+            saved_irq_frame_raw: None,
         }
     }
 

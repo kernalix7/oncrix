@@ -455,9 +455,46 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
 
     match handle.backend {
         FileBackend::Console => {
-            // Console read: no data available (returns 0 = would block).
-            // POSIX.1-2024 read(3p): returns 0 at EOF / no data.
-            0
+            // POSIX.1-2024 read(3p) on a tty-like device: block until
+            // at least one byte is available, then return that byte
+            // (and any further bytes already buffered up to `count`
+            // or the first `\n`, whichever comes first). The keyboard
+            // IRQ handler is the producer that fills `STDIN_BUF`; we
+            // are the consumer.
+            let user_ptr = buf_ptr as *mut u8;
+            let mut written = 0usize;
+            loop {
+                // SAFETY: single-CPU SYSCALL context; the IRQ handler
+                // runs with IF=0 so we cannot race against the
+                // producer here. `console_pop_byte` upholds the
+                // documented invariant.
+                let next = unsafe { crate::console::console_pop_byte() };
+                match next {
+                    Some(b) => {
+                        // SAFETY: `buf_ptr` validated above. We have
+                        // written `written < count` bytes so far.
+                        unsafe { user_ptr.add(written).write_volatile(b) };
+                        written += 1;
+                        if b == b'\n' || written >= count {
+                            return written as i64;
+                        }
+                    }
+                    None => {
+                        if written > 0 {
+                            // Hand the partial line back so the user
+                            // can act on whatever has arrived so far
+                            // (matches Linux tty behaviour).
+                            return written as i64;
+                        }
+                        // Nothing yet — yield the CPU and retry.
+                        // SAFETY: interrupts-off SYSCALL context;
+                        // yield_now is documented to require it.
+                        unsafe {
+                            let _ = crate::current::yield_now();
+                        }
+                    }
+                }
+            }
         }
         FileBackend::RamfsFile { ino } => {
             let offset = handle.offset;

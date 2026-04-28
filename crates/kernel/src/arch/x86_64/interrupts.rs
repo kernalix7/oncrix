@@ -50,17 +50,44 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // be re-enabled once we track saved IRQ frames per-thread.
 }
 
-/// IRQ 1 — Keyboard interrupt (stub).
+/// IRQ 1 -- PS/2 keyboard interrupt.
+///
+/// Reads the raw scancode, EOIs the PIC, dispatches [`crate::console::translate`]
+/// to decode the event, updates modifier state, and pushes printable ASCII
+/// bytes onto the stdin ring buffer with echo to COM1.
 pub extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
-    // Read scancode to clear the keyboard buffer.
-    // SAFETY: Reading keyboard data port in Ring 0.
-    let _scancode = unsafe { oncrix_hal::arch::x86_64::io::inb(0x60) };
+    // SAFETY: Reading PS/2 data port (0x60) in Ring 0 is standard.
+    let scancode = unsafe { oncrix_hal::arch::x86_64::io::inb(0x60) };
 
-    // Acknowledge IRQ 1 via PIC.
-    // SAFETY: Raw pointer to static mut, single-threaded boot context.
+    // SAFETY: Raw pointer to `static mut PIC`; single-CPU IF=0 context.
     unsafe {
         let pic_ptr = &raw mut PIC;
         let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET + 1));
+    }
+
+    // SAFETY: IRQ 1 context, IF=0, single CPU — matches translate()'s contract.
+    let event = unsafe { crate::console::translate(scancode) };
+
+    // SAFETY: Modifier state update; same IF=0 single-CPU guarantee.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let mods = &mut crate::console::KBD_MODS;
+        match event {
+            crate::console::KbdEvent::ShiftDown => mods.shift = true,
+            crate::console::KbdEvent::ShiftUp => mods.shift = false,
+            crate::console::KbdEvent::CapsToggle => mods.caps = !mods.caps,
+            crate::console::KbdEvent::CtrlDown => mods.ctrl = true,
+            crate::console::KbdEvent::CtrlUp => mods.ctrl = false,
+            crate::console::KbdEvent::Ascii(ascii) => {
+                // SAFETY: IRQ context, IF=0; ring buffer invariant upheld.
+                crate::console::console_push_byte(ascii);
+                if ascii == b'\n' || (0x20..=0x7E).contains(&ascii) {
+                    let mut serial = Uart16550::new(COM1);
+                    let _ = serial.write_byte(ascii);
+                }
+            }
+            crate::console::KbdEvent::Ignore => {}
+        }
     }
 }
 

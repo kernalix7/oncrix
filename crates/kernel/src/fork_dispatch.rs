@@ -85,6 +85,25 @@ pub unsafe fn register_process(entry: ProcessEntry) {
     }
 }
 
+/// Return the parent PID of the calling process.
+///
+/// POSIX.1-2024 `getppid(3p)` — always succeeds; returns 0 if the
+/// calling process is not found in the table (should not happen).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU context).
+pub unsafe fn sys_getppid() -> i64 {
+    // SAFETY: single-CPU SYSCALL context; no concurrent table access.
+    unsafe {
+        #[allow(static_mut_refs)]
+        crate::current::current_pid()
+            .and_then(|pid| PROCESS_TABLE.get(pid))
+            .map(|entry| entry.parent.as_u64() as i64)
+            .unwrap_or(0) // POSIX: parent is PID 1 (init) if not found
+    }
+}
+
 /// Mark a process as exited with the given raw exit code.
 ///
 /// # Safety
