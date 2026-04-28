@@ -21,7 +21,11 @@
 
 use super::clone::load_cr3;
 use super::context::switch_context;
-use super::init::switch_tss_rsp0;
+use super::init::{install_user_pt, switch_tss_rsp0};
+use super::syscall_entry::{
+    saved_user_rflags, saved_user_rip, saved_user_rsp, set_saved_user_rflags, set_saved_user_rip,
+    set_saved_user_rsp,
+};
 use oncrix_process::context::{CpuContext, Cr3Frame};
 use oncrix_process::scheduler::{RoundRobinScheduler, SwitchTargets};
 
@@ -50,6 +54,19 @@ use oncrix_process::scheduler::{RoundRobinScheduler, SwitchTargets};
 /// * The outgoing thread must be reachable again via its own
 ///   `CpuContext::rsp` once the switch completes.
 pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
+    // Snapshot the OUTGOING thread's SYSCALL register mirrors BEFORE
+    // `prepare_switch` flips `current` to the incoming thread. The
+    // global `SYSCALL_SAVED_USER_*` atomics are shared across all
+    // threads; without this save/restore an in-flight blocked syscall
+    // (e.g. parent's `wait4` yielding to the child) would resume to
+    // whatever RIP the child later loaded into the atomic on its own
+    // SYSCALL or `execve` redirect.
+    if let Some(prev_thread) = sched.current_mut() {
+        prev_thread.saved_user_rip = saved_user_rip();
+        prev_thread.saved_user_rsp = saved_user_rsp();
+        prev_thread.saved_user_rflags = saved_user_rflags();
+    }
+
     let Some(targets) = sched.prepare_switch() else {
         return false;
     };
@@ -64,11 +81,42 @@ pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
         return false;
     }
 
+    // Restore the INCOMING thread's saved SYSCALL register mirrors so
+    // its eventual SYSRET pops the right RCX/R11/RSP. A brand-new
+    // child built by `arch_clone_thread` has zeros here; that's fine
+    // because its first ring-3 entry is via `iretq` from the
+    // fork-trampoline, not a SYSRET, and the iretq frame on its
+    // kernel stack carries the user state directly.
+    if let Some(next_thread) = sched.current()
+        && next_thread.saved_user_rip != 0
+    {
+        set_saved_user_rip(next_thread.saved_user_rip);
+        set_saved_user_rsp(next_thread.saved_user_rsp);
+        set_saved_user_rflags(next_thread.saved_user_rflags);
+    }
+
     // Step 1: update the trap stack BEFORE anything can trap.
     // SAFETY: Called with interrupts disabled per function contract.
     unsafe { switch_tss_rsp0(next_kstack_top) };
 
-    // Step 2: if the incoming thread has an address space (user
+    // Step 2a: Phase 13 — patch PD_0_1G[2] to the incoming thread's
+    // per-process page table. Every user thread owns its own
+    // `UserAddressSpace`, so the right PT must be wired before any
+    // ring-3 access happens. Kernel threads carry `None` here and we
+    // leave PD[2] alone.
+    //
+    // `prepare_switch` already promoted the incoming thread to
+    // `current`, so `sched.current()` (re-borrowed via `&*` to drop
+    // the previous mutable borrow scope) refers to the correct slot.
+    let incoming_user_pt = sched.current().and_then(|t| t.user_pt_phys());
+
+    // SAFETY: `install_user_pt` is the documented runtime variant of
+    // the boot-time PD-patch. Interrupts are off per function contract.
+    if let Some(pt_phys) = incoming_user_pt {
+        unsafe { install_user_pt(pt_phys) };
+    }
+
+    // Step 2b: if the incoming thread has an address space (user
     // thread), install it. Kernel threads leave `cr3 == NONE` so
     // we keep the current CR3 across them.
     //
@@ -80,10 +128,8 @@ pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
     // Only reload CR3 if the incoming thread has a DIFFERENT address
     // space from the one currently installed. Skipping the reload
     // avoids an unnecessary TLB flush when parent and child share a
-    // PML4 (Phase 11 single-PT fork model), and — importantly — it
-    // sidesteps a stale-TLB hazard where `mov cr3` with the current
-    // value can interact poorly with pending non-global translations
-    // around the replaced `PD_0_1G[2]` huge page.
+    // PML4 (Phase 13: all processes share the same PML4 — only PD[2]
+    // varies, and `install_user_pt` already flushed the TLB for that).
     if !incoming_cr3.is_none() {
         // SAFETY: read_cr3 is a privileged but side-effect-free read;
         // single-CPU interrupts-off context makes the compare-and-load

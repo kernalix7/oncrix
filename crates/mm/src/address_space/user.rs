@@ -99,6 +99,7 @@ pub type PhysToVirt = fn(PhysAddr) -> *mut u8;
 /// them to the [`FrameAllocator`] via [`UserAddressSpace::release`]
 /// before drop, otherwise the frames leak. This avoids forcing a
 /// global allocator pointer into every [`UserAddressSpace`].
+#[derive(Debug)]
 pub struct UserAddressSpace {
     /// Physical address of this process's 4 KiB page table.
     user_pt_phys: PhysAddr,

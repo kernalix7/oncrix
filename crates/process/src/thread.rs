@@ -7,6 +7,7 @@ use crate::context::{CpuContext, Cr3Frame};
 use crate::kstack::KernelStack;
 use crate::pid::{Pid, Tid};
 use oncrix_lib::Result;
+use oncrix_mm::address_space::UserAddressSpace;
 
 /// Thread execution state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,16 +82,45 @@ pub struct Thread {
     /// Cached top-of-stack for `TSS.RSP0` installation (avoids re-deref
     /// on every switch). `0` means "use the global ring-0 stack".
     kernel_stack_top: u64,
-    /// Physical address of this thread's per-process page table (the PT
-    /// installed at `PD_0_1G[2]` covering VMA 0x400000..0x600000).
+    /// Per-process user-mode address space.
+    ///
+    /// Phase 13 gives every process its own [`UserAddressSpace`] so
+    /// that `fork`/`execve` can diverge from the parent without
+    /// clobbering shared static buffers (which previously triggered an
+    /// `#UD` after `wait4` because the parent's text was overwritten by
+    /// the child's `execve`).
     ///
     /// `None` for kernel threads that share the boot mapping.
     /// The scheduler glue patches `PD_0_1G[2]` on every context switch
-    /// so each user thread sees its own private page table.
+    /// so each user thread sees its own private page table; on `execve`
+    /// the kernel replaces this field with a freshly built address
+    /// space and releases the old one.
     ///
-    /// Stored as a raw `u64` to avoid a crate dependency on `oncrix_mm`.
-    pub user_pt_phys: Option<u64>,
+    /// `UserAddressSpace` is `Send`-but-not-`Sync` (heap-allocated
+    /// frames pointed at by raw indices); the single-CPU SYSCALL
+    /// invariant covers all access patterns we currently need.
+    pub user_address_space: Option<UserAddressSpace>,
+    /// Saved user-mode `RIP` for an in-flight SYSCALL on this thread.
+    ///
+    /// The arch SYSCALL stub mirrors `RCX` (post-syscall user RIP) into
+    /// a global atomic on entry, but that atomic is shared across all
+    /// threads. When the calling thread blocks (e.g. `wait4` yielding)
+    /// and another thread runs its own SYSCALL, the atomic is
+    /// overwritten — so when the original caller resumes and SYSRETs,
+    /// it would jump to the wrong RIP. The scheduler therefore
+    /// snapshots the three SYSCALL registers into these per-thread
+    /// fields on yield and restores them on resume.
+    pub saved_user_rip: u64,
+    /// Saved user-mode `RSP` mirror — see [`saved_user_rip`](Self::saved_user_rip).
+    pub saved_user_rsp: u64,
+    /// Saved user-mode `RFLAGS` mirror — see [`saved_user_rip`](Self::saved_user_rip).
+    pub saved_user_rflags: u64,
 }
+
+// SAFETY: `UserAddressSpace` itself is `Send` (raw `PhysAddr`s plus a
+// fn-pointer). The whole [`Thread`] is moved between scheduler slots
+// during a switch, so we make the wrapper `Send` explicitly.
+unsafe impl Send for Thread {}
 
 impl Thread {
     /// Create a new thread in the Ready state.
@@ -109,8 +139,25 @@ impl Thread {
             cpu_context: CpuContext::empty(),
             kernel_stack: None,
             kernel_stack_top: 0,
-            user_pt_phys: None,
+            user_address_space: None,
+            saved_user_rip: 0,
+            saved_user_rsp: 0,
+            saved_user_rflags: 0,
         }
+    }
+
+    /// Physical address of this thread's per-process user-mode page
+    /// table (the PT installed at `PD_0_1G[2]` covering VMA
+    /// `0x400000..0x600000`).
+    ///
+    /// Returns `None` for kernel threads or any thread without an
+    /// installed [`UserAddressSpace`]. Used by the scheduler glue to
+    /// patch `PD_0_1G[2]` on every context switch, mirroring the legacy
+    /// `user_pt_phys` field this method replaces.
+    pub fn user_pt_phys(&self) -> Option<u64> {
+        self.user_address_space
+            .as_ref()
+            .map(|uas| uas.user_pt_phys().as_u64())
     }
 
     /// Return the thread ID.

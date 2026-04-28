@@ -171,6 +171,15 @@ impl RoundRobinScheduler {
             .find(|t| t.tid() == tid)
     }
 
+    /// Iterate every slot mutably (occupied or empty).
+    ///
+    /// Used by the kernel's wait4 reaper to locate a thread by PID
+    /// (rather than TID) and release its [`UserAddressSpace`] before
+    /// the slot is removed.
+    pub fn threads_iter_mut(&mut self) -> core::slice::IterMut<'_, Option<Thread>> {
+        self.threads.iter_mut()
+    }
+
     /// Return a reference to the currently running thread, if any.
     ///
     /// Consumed by the kernel's `current_thread()` accessor. Single-

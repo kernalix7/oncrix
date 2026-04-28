@@ -148,7 +148,7 @@ pub extern "C" fn kernel_main() -> ! {
             oncrix_kernel::state::set_global(state as *mut oncrix_kernel::state::KernelState);
         }
 
-        // Phase 11: Ring 0 → Ring 3 transition.
+        // Phase 11/13: Ring 0 → Ring 3 transition.
         // Prefer the embedded `init` ELF (built with the `embed-init` feature);
         // fall back to the hello-world smoke-test stub for incremental builds.
         let _ = serial.write_str("[ONCRIX] Launching userspace (ring 3)...\n");
@@ -162,22 +162,46 @@ pub extern "C" fn kernel_main() -> ! {
             oncrix_kernel::arch::x86_64::init::init_tss_rsp0();
         }
 
-        // SAFETY: Single-threaded boot. GDT, IDT, and SYSCALL MSRs have been
-        // fully initialized in phases 2–6. USER_LOAD_REGION is unaliased.
-        let entry = unsafe { oncrix_kernel::arch::x86_64::init_embed::load_init_elf() };
-
-        // Wire the init process's per-process page-table physical address into
-        // the current (init) thread so the scheduler glue can patch PD_0_1G[2]
-        // correctly on every context switch (Phase 10c single-PT model).
+        // Phase 13: bring up the global frame allocator BEFORE we build
+        // the init process's UserAddressSpace.
         //
-        // SAFETY: Single-threaded boot; current_thread_mut has exclusive access.
+        // SAFETY: Single-threaded boot; FRAME_ALLOC is not yet aliased.
         unsafe {
-            if let Some(pt_phys) = oncrix_kernel::arch::x86_64::init_embed::init_user_pt_phys() {
-                if let Some(thread) = oncrix_kernel::current::current_thread_mut() {
-                    thread.user_pt_phys = Some(pt_phys);
-                }
-            }
+            oncrix_kernel::frame_alloc::init();
         }
+
+        // Phase 13: build a per-process UserAddressSpace for `init` and
+        // load the embedded ELF into its private 2 MiB region.
+        //
+        // SAFETY: Single-threaded boot. GDT, IDT, and SYSCALL MSRs have been
+        // fully initialized in phases 2–6. The frame allocator was just
+        // initialised above, and no other code can race against
+        // FRAME_ALLOC or the boot page tables.
+        let entry = unsafe {
+            let init_elf = oncrix_kernel::arch::x86_64::init_embed::embedded_init_elf();
+            init_elf.and_then(|elf_bytes| {
+                let alloc = oncrix_kernel::frame_alloc::frame_alloc();
+                let mut uas = oncrix_mm::address_space::UserAddressSpace::new_empty(
+                    alloc,
+                    oncrix_kernel::frame_alloc::phys_to_virt,
+                )
+                .ok()?;
+                let entry = uas.map_elf_segments(elf_bytes).ok()?;
+
+                // Patch PD_0_1G[2] to point at the init UAS's PT and
+                // flush the TLB so the previous huge-page mapping is
+                // dropped.
+                oncrix_kernel::arch::x86_64::init::install_user_pt(uas.user_pt_phys().as_u64());
+
+                // Stash the address space on the current (init) thread so
+                // every future context switch can route through it.
+                if let Some(thread) = oncrix_kernel::current::current_thread_mut() {
+                    thread.user_address_space = Some(uas);
+                }
+
+                Some(entry)
+            })
+        };
 
         // Phase 12: install standard I/O file descriptors (0=stdin, 1=stdout,
         // 2=stderr) on the current process's fd table so init's first
@@ -196,7 +220,7 @@ pub extern "C" fn kernel_main() -> ! {
         // the fallback user stack before issuing `syscall`).
         unsafe {
             let (entry_ptr, user_rsp) = match entry {
-                Some(e) => (e, oncrix_kernel::arch::x86_64::init_embed::user_init_rsp()),
+                Some(e) => (e, oncrix_kernel::arch::x86_64::init::USER_INIT_RSP),
                 None => (
                     oncrix_kernel::arch::x86_64::usermode::usermode_test_entry as *const () as u64,
                     oncrix_kernel::arch::x86_64::usermode::fallback_user_stack_top(),

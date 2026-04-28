@@ -9,13 +9,12 @@
 //! [`crate::arch::x86_64::syscall_entry::syscall_dispatch_wrapper`] rather
 //! than delegated to the `oncrix_syscall` crate.
 //!
-//! # Phase 11 scope
+//! # Phase 13 scope
 //!
-//! * `sys_fork` — cooperative single-CPU fork. Shares the boot PML4/PDPT/PD
-//!   with the parent and only carries a distinct `user_pt_phys` pointer; the
-//!   sched-glue patches `PD_0_1G[2]` on every context switch. No mm-subsystem
-//!   frame allocator is wired yet — the child inherits the parent's physical
-//!   PT rather than copying it. True CoW fork is a Phase 12 concern.
+//! * `sys_fork` — single-CPU fork backed by per-process [`UserAddressSpace`].
+//!   The child receives a freshly allocated PT + 2 MiB backing region copied
+//!   eagerly from the parent. PML4/PDPT/PD are still shared; only
+//!   `PD_0_1G[2]` differs per process and is patched at context-switch time.
 //!
 //! * `sys_wait4` — blocking wait for a single direct child. Spins on
 //!   `yield_now` until the child transitions to `Exited`. WNOHANG returns 0
@@ -23,13 +22,15 @@
 //!   pointer if non-null.
 //!
 //! * `sys_execve` — path-validated in-kernel exec. Only `"/bin/sh"` is
-//!   recognized. The embedded shell ELF is fetched via `embedded_sh_elf()`,
-//!   loaded into the static user load region via `load_sh_elf()`, and the
-//!   SYSCALL epilogue is redirected to the new entry point.
+//!   recognized. A new [`UserAddressSpace`] is allocated, the embedded shell
+//!   ELF is loaded into it, the calling thread's previous address space is
+//!   released, and the SYSCALL epilogue is redirected to the new entry point.
 //!
 //! * `sys_exit` — marks the current process as `Exited` in the process table
 //!   and transitions the current thread to the `Exited` scheduler state, then
 //!   loops on `yield_now` so it is never rescheduled.
+//!
+//! [`UserAddressSpace`]: oncrix_mm::address_space::UserAddressSpace
 //!
 //! # POSIX references
 //!
@@ -108,12 +109,14 @@ pub unsafe fn exit_process(pid: Pid, code: i32) {
 /// - Parent: returns child PID (> 0) on success, -EAGAIN / -ENOMEM on failure.
 /// - Child: returns 0 (delivered via `fork_trampoline` which zeroes RAX).
 ///
-/// Phase 10c simplification: the child shares the parent's CR3 (PML4/PDPT/PD
-/// are identical). The child carries its own `user_pt_phys` copied from the
-/// parent's `Thread::user_pt_phys`. On every context switch `sched_glue`
-/// patches `PD_0_1G[2]` — in Phase 10c both child and parent point at the
-/// same physical PT page, so there is no actual address-space isolation.
-/// True CoW requires mm-subsystem frame allocation and is deferred.
+/// Phase 13: the child receives a freshly allocated [`UserAddressSpace`]
+/// whose 2 MiB backing region is `memcpy`'d from the parent's. PML4/PDPT/PD
+/// remain shared (only `PD_0_1G[2]` differs per process); the scheduler
+/// glue patches that slot on every context switch. The eager copy
+/// simplifies POSIX semantics — neither parent nor child can corrupt
+/// the other's text/data even after `execve`.
+///
+/// [`UserAddressSpace`]: oncrix_mm::address_space::UserAddressSpace
 ///
 /// # Safety
 ///
@@ -127,20 +130,49 @@ pub unsafe fn sys_fork() -> i64 {
     let user_rsp = saved_user_rsp();
     let user_rflags = saved_user_rflags();
 
-    // Acquire the parent thread's priority and user_pt_phys.
+    // Acquire the parent thread's priority + PID.
     // SAFETY: single-CPU SYSCALL context.
-    let (parent_priority, parent_user_pt_phys, parent_pid) = match crate::current::current_thread()
-    {
-        Some(t) => (t.priority(), t.user_pt_phys, t.pid()),
+    let (parent_priority, parent_pid) = match crate::current::current_thread() {
+        Some(t) => (t.priority(), t.pid()),
         None => return -11, // EAGAIN — no current thread
+    };
+
+    // Phase 13: build the child's UserAddressSpace by eager-copying
+    // the parent's. Single-CPU + interrupts-off serves as the "freeze
+    // parent during copy" guarantee. The PML4 CR3 stays the same
+    // because every process shares PML4/PDPT/PD; only PD[2] differs.
+    //
+    // SAFETY: single-CPU SYSCALL context. The frame allocator and the
+    // parent's UAS are accessed exclusively here.
+    let child_uas = unsafe {
+        // Re-borrow the parent thread to reach its UAS (we dropped the
+        // earlier borrow above).
+        let parent_uas = match crate::current::current_thread() {
+            Some(t) => match &t.user_address_space {
+                Some(uas) => uas,
+                None => {
+                    let _ = serial.write_str("[fork] parent has no UserAddressSpace\n");
+                    return -11; // EAGAIN
+                }
+            },
+            None => return -11,
+        };
+        let alloc = crate::frame_alloc::frame_alloc();
+        match parent_uas.clone_for_fork(alloc) {
+            Ok(uas) => uas,
+            Err(_) => {
+                let _ = serial.write_str("[fork] clone_for_fork OOM\n");
+                return -12; // ENOMEM
+            }
+        }
     };
 
     // Allocate a child PID.
     let child_pid = alloc_pid();
 
-    // Phase 10c: child shares the parent's PML4 CR3. The child's
-    // user_pt_phys field is copied from the parent so the scheduler
-    // can patch PD[2] appropriately when switching to the child.
+    // Child CR3 stays the parent's PML4 root — only PD[2] differs and
+    // that is handled at context-switch time via the child's own
+    // `user_pt_phys()`.
     //
     // SAFETY: read_cr3 is a privileged but side-effect-free read.
     let child_cr3 = unsafe { read_cr3() };
@@ -159,18 +191,27 @@ pub unsafe fn sys_fork() -> i64 {
     let child_tid = unsafe {
         match crate::current::fork_current(snapshot) {
             Ok(tid) => tid,
-            Err(_) => return -12, // ENOMEM
+            Err(_) => {
+                // Roll back the child UAS to avoid leaking frames.
+                let alloc = crate::frame_alloc::frame_alloc();
+                child_uas.release(alloc);
+                return -12; // ENOMEM
+            }
         }
     };
 
-    // Set the child's user_pt_phys to match the parent's so the
-    // scheduler glue can patch PD_0_1G[2] on context switch.
+    // Install the freshly cloned UAS on the child thread.
     // SAFETY: single-CPU SYSCALL context.
     unsafe {
         #[allow(static_mut_refs)]
         let sched = &mut crate::arch::x86_64::init::SCHEDULER;
         if let Some(child_thread) = sched.get_mut(child_tid) {
-            child_thread.user_pt_phys = parent_user_pt_phys;
+            child_thread.user_address_space = Some(child_uas);
+        } else {
+            // Should not happen — fork_current just inserted child_tid.
+            let alloc = crate::frame_alloc::frame_alloc();
+            child_uas.release(alloc);
+            return -12; // ENOMEM
         }
     }
 
@@ -246,11 +287,49 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
                 }
             }
 
-            // Reap the zombie: remove from table.
+            // Reap the zombie: remove from process table, and free
+            // the child thread's per-process UserAddressSpace +
+            // remove the thread from the scheduler so the 96 MiB
+            // frame pool isn't leaked one fork's worth (2 MiB) at a
+            // time.
+            //
             // SAFETY: single-CPU SYSCALL context.
             unsafe {
                 #[allow(static_mut_refs)]
                 PROCESS_TABLE.remove(zombie_pid);
+            }
+            // SAFETY: same as above; SCHEDULER is exclusively owned
+            // here.
+            let zombie_tid = unsafe {
+                #[allow(static_mut_refs)]
+                let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+                // Find the (single) thread whose owning PID matches
+                // the zombie PID. The Phase 13 process model is
+                // single-threaded-per-process, so there is at most
+                // one such thread.
+                let mut tid_opt: Option<oncrix_process::pid::Tid> = None;
+                for slot in sched.threads_iter_mut() {
+                    if let Some(t) = slot
+                        && t.pid() == zombie_pid
+                    {
+                        // Take and release the UAS frames before the
+                        // Thread is dropped.
+                        if let Some(uas) = t.user_address_space.take() {
+                            let alloc = crate::frame_alloc::frame_alloc();
+                            uas.release(alloc);
+                        }
+                        tid_opt = Some(t.tid());
+                        break;
+                    }
+                }
+                tid_opt
+            };
+            if let Some(tid) = zombie_tid {
+                // SAFETY: same single-CPU context.
+                unsafe {
+                    #[allow(static_mut_refs)]
+                    let _ = crate::arch::x86_64::init::SCHEDULER.remove(tid);
+                }
             }
 
             let _ = serial.write_str("[wait4] reaped child\n");
@@ -304,19 +383,16 @@ const MAX_PATHNAME: usize = 256;
 ///   overwriting the saved user RIP / RSP / RFLAGS atomics.
 /// - On failure: returns a negative errno; the caller continues normally.
 ///
-/// # Phase 11 implementation
+/// # Phase 13 implementation
 ///
-/// Only `"/bin/sh"` is recognized. The embedded ELF blob is fetched via
-/// [`crate::arch::x86_64::init_embed::embedded_sh_elf`] and loaded into
-/// the static user load region via
-/// [`crate::arch::x86_64::init_embed::load_sh_elf`]. On success the
-/// SYSCALL epilogue redirects to the new entry point.
+/// Only `"/bin/sh"` is recognized. A fresh [`UserAddressSpace`] is
+/// allocated via [`crate::frame_alloc`], the embedded `/bin/sh` ELF is
+/// loaded into it, the calling thread's previous address space is
+/// `release`d (so its frames return to the global pool), and the new
+/// UAS is installed both on the thread and at `PD_0_1G[2]`. The
+/// SYSCALL epilogue is redirected to the new entry point.
 ///
-/// # Phase 12 TODO
-///
-/// - True address-space isolation: allocate a fresh frame for the child
-///   via the mm-subsystem rather than clobbering the shared static region.
-/// - VFS path resolution for arbitrary binaries beyond `/bin/sh`.
+/// [`UserAddressSpace`]: oncrix_mm::address_space::UserAddressSpace
 ///
 /// # Safety
 ///
@@ -336,7 +412,7 @@ pub unsafe fn sys_execve(pathname_ptr: u64, _argv: u64, _envp: u64) -> i64 {
         None => return -22, // EINVAL — too long or non-ASCII
     };
 
-    // Only "/bin/sh" is recognized in Phase 11.
+    // Only "/bin/sh" is recognized in Phase 13.
     if path != b"/bin/sh" {
         return -2; // ENOENT
     }
@@ -351,49 +427,100 @@ pub unsafe fn sys_execve(pathname_ptr: u64, _argv: u64, _envp: u64) -> i64 {
         }
     };
 
-    // Load the shell ELF segments into the static user load region,
-    // overwriting the current process image (init).
+    // Build a fresh UserAddressSpace and load /bin/sh into it. The new
+    // UAS is independent of the calling thread's old one — that is the
+    // whole point of Phase 13: parent (init) keeps its own frames so
+    // when wait4 resumes it after the child exits, init's text is
+    // still mapped at 0x400000.
     //
-    // SAFETY: Single-CPU SYSCALL dispatch path. load_sh_elf requires
-    // exclusive access to USER_LOAD_REGION and must not be called
-    // concurrently — the interrupts-off SYSCALL context guarantees this.
-    let entry = match unsafe { crate::arch::x86_64::init_embed::load_sh_elf(elf_bytes) } {
-        Some(e) => e,
-        None => {
-            let _ = serial.write_str("[exec] /bin/sh ELF parse/load failed\n");
-            return -8; // ENOEXEC
+    // SAFETY: Single-CPU SYSCALL dispatch path. The frame allocator
+    // and the running thread's UAS are accessed exclusively here. The
+    // new UAS is not yet visible to ring 3 (PD[2] still points at the
+    // calling process's old PT) when `map_elf_segments` runs, so the
+    // backing region is not aliased.
+    let entry = unsafe {
+        let alloc = crate::frame_alloc::frame_alloc();
+        let mut new_uas = match oncrix_mm::address_space::UserAddressSpace::new_empty(
+            alloc,
+            crate::frame_alloc::phys_to_virt,
+        ) {
+            Ok(u) => u,
+            Err(_) => {
+                let _ = serial.write_str("[exec] new_empty OOM\n");
+                return -12; // ENOMEM
+            }
+        };
+        match new_uas.map_elf_segments(elf_bytes) {
+            Ok(e) => {
+                let _ = serial.write_str("[exec] loaded /bin/sh at entry=0x");
+                write_hex(&mut serial, e);
+                let _ = serial.write_str("\n");
+
+                // Take the calling thread's old UAS and replace it with
+                // the new one. The old UAS is then released so its
+                // frames return to the global pool.
+                let old_uas = match crate::current::current_thread_mut() {
+                    Some(t) => t.user_address_space.replace(new_uas),
+                    None => {
+                        // No current thread? Drop the new UAS to avoid
+                        // leaking frames.
+                        new_uas.release(alloc);
+                        return -22; // EINVAL
+                    }
+                };
+
+                // Install the new PT at PD_0_1G[2] (the calling thread
+                // now owns the new UAS, so look it up to get the phys
+                // address). Then release the old UAS.
+                if let Some(thread) = crate::current::current_thread() {
+                    if let Some(uas) = thread.user_address_space.as_ref() {
+                        crate::arch::x86_64::init::install_user_pt(uas.user_pt_phys().as_u64());
+                    }
+                }
+
+                // Free the old address space's frames.
+                if let Some(old) = old_uas {
+                    old.release(alloc);
+                }
+
+                e
+            }
+            Err(_) => {
+                let _ = serial.write_str("[exec] /bin/sh ELF parse/load failed\n");
+                new_uas.release(alloc);
+                return -8; // ENOEXEC
+            }
         }
     };
 
-    // Redirect the SYSCALL epilogue to the new program entry.
-    // USER_INIT_RSP is the top of the static 2 MiB user region — the same
-    // stack address the init ELF started with, now reused for sh.
+    // Redirect the SYSCALL epilogue to the new program entry. The new
+    // UAS exposes a fresh 2 MiB user region; the top of that region is
+    // the canonical initial RSP for ring 3.
     set_saved_user_rip(entry);
-    set_saved_user_rsp(crate::arch::x86_64::init_embed::user_init_rsp());
+    set_saved_user_rsp(crate::arch::x86_64::init::USER_INIT_RSP);
     set_saved_user_rflags(DEFAULT_USER_RFLAGS);
-
-    // Flush the entire TLB before returning to user space. `load_sh_elf`
-    // may have written new bytes at physical frames that the CPU had
-    // cached as empty/zero-filled under the previous `init` mapping, and
-    // without invalidating those cached translations the child's first
-    // user-mode access to its .data / .rodata segment would #PF even
-    // though the mapping is valid in the active page table.
-    //
-    // SAFETY: writing CR3 with its own current value is a privileged
-    // but side-effect-free operation that invalidates all non-global
-    // TLB entries. Runs in the single-CPU SYSCALL context with
-    // interrupts disabled.
-    unsafe {
-        core::arch::asm!(
-            "mov {tmp}, cr3",
-            "mov cr3, {tmp}",
-            tmp = out(reg) _,
-            options(nostack, preserves_flags),
-        );
-    }
 
     // Return 0 — the SYSCALL epilogue will sysretq into sh's _start.
     0
+}
+
+/// Write a 64-bit value as `0x`-prefixed hex to the serial console.
+fn write_hex(serial: &mut Uart16550, value: u64) {
+    let mut buf = [0u8; 16];
+    let mut n = value;
+    for byte in buf.iter_mut().rev() {
+        let digit = (n & 0xF) as u8;
+        *byte = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        n >>= 4;
+    }
+    let start = buf.iter().position(|&b| b != b'0').unwrap_or(15);
+    for &b in &buf[start..] {
+        let _ = serial.write_byte(b);
+    }
 }
 
 // ── sys_exit ─────────────────────────────────────────────────────

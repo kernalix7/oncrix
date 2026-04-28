@@ -303,9 +303,23 @@ pub extern "C" fn syscall_entry() {
             // Call the Rust dispatcher with pointer to SyscallArgs.
             "mov rdi, rsp",   // rdi = &SyscallArgs
             "call {dispatch}",
-            // Result is in RAX (SyscallResult).
-            // Pop SyscallArgs (7 * 8 = 56 bytes).
-            "add rsp, 56",
+            // Result is in RAX (SyscallResult). Pop SyscallArgs in
+            // reverse push order, restoring the user-mode caller-saved
+            // registers (rdi, rsi, rdx, r10, r8, r9) so the user
+            // observes them unchanged across the syscall — required by
+            // the System V AMD64 ABI for arguments and by the Rust
+            // compiler's expectation that RSI/RDI survive across an
+            // inline `syscall` instruction. Without this restore the
+            // user sees garbage in those registers and any subsequent
+            // syscall using them as arguments (e.g. wait4's wstatus
+            // pointer in rsi) traps in user space.
+            "add rsp, 8",     // discard pushed syscall number; rax already holds return value
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop r10",
+            "pop r8",
+            "pop r9",
             // Restore callee-saved registers.
             "pop r15",
             "pop r14",

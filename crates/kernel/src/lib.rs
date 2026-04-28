@@ -46,6 +46,7 @@ pub mod evm;
 pub mod exec;
 pub mod fd_table;
 pub mod fork_dispatch;
+pub mod frame_alloc;
 pub mod ftrace;
 pub mod futex;
 pub mod futex_pi;

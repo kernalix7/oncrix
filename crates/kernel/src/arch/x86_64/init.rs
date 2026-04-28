@@ -337,6 +337,113 @@ pub unsafe fn init_heap() {
     let _ = serial.write_str("[ONCRIX] Kernel heap initialized (16 MiB)\n");
 }
 
+// ── User-mode VMA constants ─────────────────────────────────────
+
+/// User code base virtual address (matches `user.ld`).
+pub const USER_BASE: u64 = 0x0040_0000;
+/// Size of the user-space load region (2 MiB — one PD entry).
+pub const USER_REGION_SIZE: u64 = 2 * 1024 * 1024;
+/// User-space stack top (end of the user region).
+pub const USER_STACK_TOP: u64 = USER_BASE + USER_REGION_SIZE;
+/// Initial user RSP: 16 bytes below the top, 16-byte aligned.
+///
+/// Defined here (rather than inside `init_embed.rs`) so both the boot
+/// path and `sys_execve` can use the same constant after Phase 13's
+/// `UserAddressSpace` migration.
+pub const USER_INIT_RSP: u64 = USER_STACK_TOP - 16;
+
+// ── Per-process page-table install ──────────────────────────────
+
+/// Higher-half kernel virtual base (matches `linker.ld` and `boot.S`).
+const INIT_KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+/// Page-table entry physical-address mask (bits 12..51).
+const INIT_PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// PTE flag: present.
+const INIT_PTE_P: u64 = 1 << 0;
+/// PTE flag: writable.
+const INIT_PTE_W: u64 = 1 << 1;
+/// PTE flag: user-accessible (CPL 3).
+const INIT_PTE_U: u64 = 1 << 2;
+/// `PD_0_1G` entry index covering VMA `0x400000..0x600000`.
+const USER_PT_PD_INDEX: usize = 2;
+
+/// Install a per-process user-mode page table at `PD_0_1G[2]`.
+///
+/// Walks the boot page tables via CR3, sets the user bit on `PML4[0]`
+/// and `PDPT_low[0]` (idempotent — the bit may already be set from
+/// boot), then overwrites `PD_0_1G[2]` to point at `pt_phys` with
+/// `P|W|U` flags. Finishes with a full TLB flush so any stale 2 MiB
+/// huge-page or PT translation for the previous process is dropped.
+///
+/// The PML4/PDPT are shared across every process; only `PD_0_1G[2]`
+/// differs per [`UserAddressSpace`](oncrix_mm::address_space::UserAddressSpace).
+/// This is the runtime variant of the legacy
+/// `init_embed::install_user_mapping` (now removed) — same logic but
+/// parameterised by a caller-supplied physical address rather than a
+/// static `USER_PT`.
+///
+/// # Safety
+///
+/// * `pt_phys` must point at a fully populated 4 KiB page table whose
+///   512 PTEs map `0x400000..0x600000` to the caller's owned frames
+///   with the appropriate user flags. Failing to do so will fault on
+///   the next ring 3 access.
+/// * Must be called either during single-threaded boot or from the
+///   SYSCALL/IRQ-disabled path on the single CPU; the boot page tables
+///   must not be concurrently mutated.
+pub unsafe fn install_user_pt(pt_phys: u64) {
+    // SAFETY: Reading CR3 is privileged but side-effect-free.
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    }
+    let pml4_phys = cr3 & INIT_PTE_ADDR_MASK;
+
+    // SAFETY: Boot page tables live in `.boot.bss` whose physical
+    // frames sit in the higher-half identity map (0..1 GiB).
+    let pml4 = (pml4_phys + INIT_KERNEL_VIRT_BASE) as *mut u64;
+    unsafe {
+        *pml4.add(0) |= INIT_PTE_U;
+    }
+
+    // SAFETY: PML4[0] now has a present mapping to PDPT_low.
+    let pdpt_low_phys = unsafe { *pml4.add(0) } & INIT_PTE_ADDR_MASK;
+    let pdpt_low = (pdpt_low_phys + INIT_KERNEL_VIRT_BASE) as *mut u64;
+    unsafe {
+        *pdpt_low.add(0) |= INIT_PTE_U;
+    }
+
+    // SAFETY: PDPT_low[0] points at PD_0_1G.
+    let pd_phys = unsafe { *pdpt_low.add(0) } & INIT_PTE_ADDR_MASK;
+    let pd = (pd_phys + INIT_KERNEL_VIRT_BASE) as *mut u64;
+
+    // Replace PD[2] with the new PT pointer (P|W|U). PT pointers do
+    // NOT set the PS (page-size) bit — leaving it clear tells the CPU
+    // to walk one more level into the per-process PT.
+    //
+    // SAFETY: pd is a valid higher-half alias of PD_0_1G; index 2 is
+    // the slot covering 0x400000..0x600000.
+    unsafe {
+        *pd.add(USER_PT_PD_INDEX) =
+            (pt_phys & INIT_PTE_ADDR_MASK) | INIT_PTE_P | INIT_PTE_W | INIT_PTE_U;
+    }
+
+    // Full TLB flush via `mov cr3, cr3` to drop any cached translation
+    // for `0x400000..0x600000` from the previously installed PD entry.
+    //
+    // SAFETY: Writing CR3 with its current value is privileged but
+    // side-effect-free; no in-flight memory access depends on a stale
+    // TLB while interrupts are off.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+            options(nomem, nostack),
+        );
+    }
+}
+
 // ── Scheduler ───────────────────────────────────────────────────
 
 /// Global round-robin scheduler.
