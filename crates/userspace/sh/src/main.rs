@@ -39,6 +39,12 @@ pub extern "C" fn _start() -> ! {
 // ---------------------------------------------------------------------------
 
 fn sh_main() -> ! {
+    // Display the message of the day on startup — exercises the
+    // embedded `/bin/cat` binary end-to-end via fork+execve. Best-
+    // effort: failures are silent so a missing/empty motd does not
+    // prevent the prompt from coming up.
+    print_motd();
+
     let mut buf = [0u8; CMD_MAX];
 
     loop {
@@ -251,6 +257,34 @@ fn dispatch_command(line: &[u8]) {
 // ---------------------------------------------------------------------------
 // External command execution
 // ---------------------------------------------------------------------------
+
+/// Display `/etc/motd` by fork+execve("/bin/cat", "/etc/motd").
+///
+/// Best-effort: any failure (fork, execve, file missing) is silent.
+/// On success the child writes motd contents to fd 1 and exits; the
+/// parent waits for it before returning so the next `$ ` prompt does
+/// not interleave with motd output.
+fn print_motd() {
+    let pid = libc::fork();
+    if pid == 0 {
+        // Child: execve("/bin/cat", ["cat", "/etc/motd"], []).
+        let path = b"/bin/cat\0".as_ptr();
+        let arg0 = b"cat\0".as_ptr();
+        let arg1 = b"/etc/motd\0".as_ptr();
+        let argv: [*const u8; 3] = [arg0, arg1, core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        // SAFETY: Both pointer arrays are NUL-terminated; path and
+        // argv strings are static byte slices with explicit `\0`.
+        unsafe { libc::execve(path, argv.as_ptr(), envp.as_ptr()) };
+        // execve only returns on failure — bail silently.
+        libc::exit(0);
+    } else if pid > 0 {
+        // SAFETY: pid is a valid child PID; status pointer is null
+        // (status is discarded — best-effort path).
+        unsafe { libc::waitpid(pid, core::ptr::null_mut(), 0) };
+    }
+    // pid < 0 → fork failed; do nothing.
+}
 
 /// Maximum number of argv slots passed to an external command,
 /// excluding the trailing NULL terminator.

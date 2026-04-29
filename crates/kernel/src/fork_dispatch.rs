@@ -487,7 +487,11 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
         };
         match new_uas.map_elf_segments(elf_bytes) {
             Ok(e) => {
-                let _ = serial.write_str("[exec] loaded /bin/sh at entry=0x");
+                let _ = serial.write_str("[exec] loaded ");
+                for &b in path {
+                    let _ = serial.write_byte(b);
+                }
+                let _ = serial.write_str(" at entry=0x");
                 write_hex(&mut serial, e);
                 let _ = serial.write_str("\n");
 
@@ -521,7 +525,11 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
                 e
             }
             Err(_) => {
-                let _ = serial.write_str("[exec] /bin/sh ELF parse/load failed\n");
+                let _ = serial.write_str("[exec] ELF parse/load failed for ");
+                for &b in path {
+                    let _ = serial.write_byte(b);
+                }
+                let _ = serial.write_str("\n");
                 new_uas.release(alloc);
                 return -8; // ENOEXEC
             }
