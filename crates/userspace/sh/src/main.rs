@@ -170,11 +170,6 @@ fn dispatch_command(line: &[u8]) {
             let code = parse_i32(rest).unwrap_or(0);
             libc::exit(code);
         }
-        b"echo" => {
-            // Write the argument slice followed by a newline to stdout.
-            write_all(1, rest);
-            write_all(1, b"\n");
-        }
         b"cd" => {
             // cd is a built-in — stub: chdir syscall not yet wired.
             let _ = rest;
@@ -192,30 +187,6 @@ fn dispatch_command(line: &[u8]) {
             let s = fmt_i64(&mut tmp, pid);
             write_all(1, s);
             write_all(1, b"\n");
-        }
-        b"cat" => {
-            if rest == b"/etc/motd" {
-                // SAFETY: c"/etc/motd" is a valid null-terminated C string.
-                let fd = unsafe { libc::open(c"/etc/motd".as_ptr().cast(), 0, 0) };
-                if fd >= 0 {
-                    let mut cbuf = [0u8; 256];
-                    loop {
-                        // SAFETY: cbuf is valid writable storage.
-                        let n = unsafe { libc::read(fd as i32, cbuf.as_mut_ptr(), cbuf.len()) };
-                        if n <= 0 {
-                            break;
-                        }
-                        write_all(1, &cbuf[..n as usize]);
-                    }
-                    libc::close(fd as i32);
-                } else {
-                    write_all(2, b"cat: cannot open /etc/motd\n");
-                }
-            } else {
-                // In a pipeline child this exits 127; in the main loop it just returns.
-                write_all(2, b"sh: not found\n");
-                libc::exit(127);
-            }
         }
         b"ls" => {
             let target = if rest.is_empty() { b"/" as &[u8] } else { rest };
@@ -267,11 +238,12 @@ fn dispatch_command(line: &[u8]) {
         b"help" => {
             write_all(
                 1,
-                b"builtins: exit cd echo pwd pid cat ls mkdir touch rm help\n",
+                b"builtins: exit cd export pwd pid ls mkdir touch rm help\n",
             );
+            write_all(1, b"externals: echo cat true false (and more in /bin)\n");
         }
         _ => {
-            run_external(cmd, line);
+            run_external(cmd, rest);
         }
     }
 }
@@ -280,37 +252,77 @@ fn dispatch_command(line: &[u8]) {
 // External command execution
 // ---------------------------------------------------------------------------
 
-/// Fork and exec an external command.
+/// Maximum number of argv slots passed to an external command,
+/// excluding the trailing NULL terminator.
+const ARGV_MAX: usize = 8;
+/// Maximum length of a single argv string (including NUL terminator).
+const ARG_BUF_LEN: usize = 64;
+
+/// Fork and exec an external command resolved against the kernel's
+/// embedded binary set (`/bin/{sh,echo,cat,true,false}` plus their
+/// bare-name aliases).
 ///
-/// `line` is the full raw command line (used as argv[0] for now).
-fn run_external(cmd: &[u8], line: &[u8]) {
-    // Build a stack-allocated null-terminated path buffer.
-    let mut path_buf = [0u8; 256];
-    if cmd.len() >= path_buf.len() {
+/// `cmd` is the command name (becomes both the execve path and
+/// `argv[0]`). `rest` is the remaining whitespace-separated argument
+/// string from the prompt; it is tokenised into `argv[1..]` slots up
+/// to [`ARGV_MAX`] and at most [`ARG_BUF_LEN`] - 1 bytes per slot.
+fn run_external(cmd: &[u8], rest: &[u8]) {
+    if cmd.len() >= ARG_BUF_LEN {
         write_all(2, b"sh: command too long\n");
         return;
     }
-    path_buf[..cmd.len()].copy_from_slice(cmd);
-    // path_buf is already null-terminated because it's zero-initialized.
 
-    let mut argv_buf = [0u8; 256];
-    let len = line.len().min(argv_buf.len() - 1);
-    argv_buf[..len].copy_from_slice(&line[..len]);
+    // Stack-allocated NUL-terminated storage for argv strings.
+    // Each row is one argv slot; the trailing zero byte serves as the
+    // NUL terminator since the array is zero-initialised.
+    let mut arg_storage = [[0u8; ARG_BUF_LEN]; ARGV_MAX];
+    let mut argv: [*const u8; ARGV_MAX + 1] = [core::ptr::null(); ARGV_MAX + 1];
 
-    let argv: [*const u8; 2] = [argv_buf.as_ptr(), core::ptr::null()];
+    // argv[0] = cmd.
+    arg_storage[0][..cmd.len()].copy_from_slice(cmd);
+    argv[0] = arg_storage[0].as_ptr();
+
+    // argv[1..] = whitespace-separated tokens of `rest`.
+    let mut slot = 1usize;
+    let mut i = 0usize;
+    while i < rest.len() && slot < ARGV_MAX {
+        // Skip leading whitespace.
+        while i < rest.len() && (rest[i] == b' ' || rest[i] == b'\t') {
+            i += 1;
+        }
+        if i == rest.len() {
+            break;
+        }
+        let start = i;
+        while i < rest.len() && rest[i] != b' ' && rest[i] != b'\t' {
+            i += 1;
+        }
+        let tok = &rest[start..i];
+        let copy_len = tok.len().min(ARG_BUF_LEN - 1);
+        arg_storage[slot][..copy_len].copy_from_slice(&tok[..copy_len]);
+        argv[slot] = arg_storage[slot].as_ptr();
+        slot += 1;
+    }
+    // argv[slot] remains NULL — POSIX-required terminator.
+
     let envp: [*const u8; 1] = [core::ptr::null()];
 
     let child = libc::fork();
     if child == 0 {
-        // SAFETY: path_buf is null-terminated; argv and envp are valid.
-        let ret = unsafe { libc::execve(path_buf.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-        let _ = ret;
+        // Child: execve into the requested binary. argv[0] is `cmd`
+        // which is also the path — `embedded_lookup` accepts both
+        // `/bin/<name>` and bare `<name>` forms.
+        // SAFETY: arg_storage[0] is NUL-terminated (zero-padded);
+        // argv and envp arrays are NULL-terminated.
+        unsafe { libc::execve(arg_storage[0].as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        // execve only returns on failure.
         write_all(2, b"sh: exec failed\n");
         libc::exit(127);
     } else if child > 0 {
-        // Wait for child.
+        // Parent: wait for the child.
         let mut status: i32 = 0;
-        // SAFETY: status is a valid stack i32.
+        // SAFETY: status is a valid stack i32 owned for the duration
+        // of this call.
         unsafe { libc::waitpid(child, &mut status as *mut i32, 0) };
     } else {
         write_all(2, b"sh: fork failed\n");
