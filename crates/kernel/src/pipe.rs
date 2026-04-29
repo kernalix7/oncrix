@@ -53,6 +53,11 @@ pub const PIPE_BUF: usize = 4096;
 /// the pipe is still open.  When the write end is closed and the buffer
 /// is empty, reads return 0 (EOF).  When the read end is closed, writes
 /// return `-EPIPE` (32).
+///
+/// `write_refs` / `read_refs` count how many fd slots reference each
+/// end (incremented by `dup2` / `fork`, decremented by `close`).  An
+/// end transitions from open to closed only when its refcount hits
+/// zero.
 pub struct PipeRing {
     buf: [u8; PIPE_BUF],
     head: usize,
@@ -63,6 +68,10 @@ pub struct PipeRing {
     pub read_open: bool,
     /// `true` when this slot is in use.
     pub in_use: bool,
+    /// Reference count for write-end fds.
+    pub write_refs: u32,
+    /// Reference count for read-end fds.
+    pub read_refs: u32,
 }
 
 impl Default for PipeRing {
@@ -81,16 +90,20 @@ impl PipeRing {
             write_open: false,
             read_open: false,
             in_use: false,
+            write_refs: 0,
+            read_refs: 0,
         }
     }
 
-    /// Initialize this slot as a live pipe.
+    /// Initialize this slot as a live pipe with a single fd on each end.
     pub fn open(&mut self) {
         self.head = 0;
         self.tail = 0;
         self.write_open = true;
         self.read_open = true;
         self.in_use = true;
+        self.write_refs = 1;
+        self.read_refs = 1;
     }
 
     /// Number of bytes available to read.
@@ -217,9 +230,10 @@ pub unsafe fn pipe_get_mut(ring_id: u32) -> Option<&'static mut PipeRing> {
     }
 }
 
-/// Mark the write end of pipe `ring_id` as closed.
+/// Drop one reference to the write end of pipe `ring_id`.
 ///
-/// If the read end is also closed, the slot is released.
+/// When the refcount reaches zero, the write end is marked closed; if
+/// the read end is also closed, the slot is released entirely.
 ///
 /// # Safety
 ///
@@ -231,17 +245,21 @@ pub unsafe fn pipe_close_write(ring_id: u32) {
         if let Some(slot) = PIPE_TABLE.get_mut(ring_id as usize)
             && slot.in_use
         {
-            slot.write_open = false;
-            if !slot.read_open {
-                slot.in_use = false;
+            slot.write_refs = slot.write_refs.saturating_sub(1);
+            if slot.write_refs == 0 {
+                slot.write_open = false;
+                if !slot.read_open {
+                    slot.in_use = false;
+                }
             }
         }
     }
 }
 
-/// Mark the read end of pipe `ring_id` as closed.
+/// Drop one reference to the read end of pipe `ring_id`.
 ///
-/// If the write end is also closed, the slot is released.
+/// When the refcount reaches zero, the read end is marked closed; if
+/// the write end is also closed, the slot is released entirely.
 ///
 /// # Safety
 ///
@@ -253,10 +271,53 @@ pub unsafe fn pipe_close_read(ring_id: u32) {
         if let Some(slot) = PIPE_TABLE.get_mut(ring_id as usize)
             && slot.in_use
         {
-            slot.read_open = false;
-            if !slot.write_open {
-                slot.in_use = false;
+            slot.read_refs = slot.read_refs.saturating_sub(1);
+            if slot.read_refs == 0 {
+                slot.read_open = false;
+                if !slot.write_open {
+                    slot.in_use = false;
+                }
             }
+        }
+    }
+}
+
+/// Add one reference to the write end of pipe `ring_id`.
+///
+/// Used by `dup`/`dup2`/`fork` when an additional fd starts referencing
+/// the same write end.  No-op if the slot is not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_dup_write(ring_id: u32) {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get_mut(ring_id as usize)
+            && slot.in_use
+        {
+            slot.write_refs = slot.write_refs.saturating_add(1);
+        }
+    }
+}
+
+/// Add one reference to the read end of pipe `ring_id`.
+///
+/// Used by `dup`/`dup2`/`fork` when an additional fd starts referencing
+/// the same read end.  No-op if the slot is not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_dup_read(ring_id: u32) {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get_mut(ring_id as usize)
+            && slot.in_use
+        {
+            slot.read_refs = slot.read_refs.saturating_add(1);
         }
     }
 }

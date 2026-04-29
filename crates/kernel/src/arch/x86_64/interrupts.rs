@@ -22,6 +22,23 @@ use super::init::PIC;
 /// so that higher-priority interrupts are not blocked during
 /// scheduling. The interrupt gate guarantees IF=0 (interrupts
 /// disabled) on entry.
+///
+/// # Phase 20 — preemptive scheduling
+///
+/// When the IRQ fires from ring 3 the CPU loads the per-thread
+/// kernel stack from `TSS.RSP0` and pushes the user iretq frame
+/// onto that stack. We can therefore reuse the cooperative path
+/// (`sched_yield_once`): it merely swaps the kernel `RSP` between
+/// `CpuContext`s, leaving each thread's iretq frame untouched on
+/// its own private kstack. When the outgoing thread is resumed,
+/// `switch_context` returns into this handler's epilogue, which
+/// runs `iretq` against the still-intact frame and resumes user
+/// mode at the preempted `RIP/RSP/RFLAGS`.
+///
+/// Cooperative `yield_now()` callers (syscall layer) run with
+/// `IF=0` (FMASK clears it on `SYSCALL` entry), so an in-flight
+/// `prepare_switch` / `switch_context` pair can never be raced by
+/// this handler.
 pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // Increment the PIT tick counter.
     // SAFETY: Accessed only in interrupt context with IF=0
@@ -41,13 +58,32 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET));
     }
 
-    // Phase 11: the round-robin scheduler is driven cooperatively by
-    // explicit `yield_now()` from the syscall layer. Calling
-    // `schedule()` here would rewrite `SCHEDULER.current` behind the
-    // back of any in-flight `prepare_switch`/`switch_context` pair,
-    // which corrupts the "prev" pointer and clobbers the outgoing
-    // thread's saved kernel-stack frame. Preemptive scheduling will
-    // be re-enabled once we track saved IRQ frames per-thread.
+    // Skip the switch when only the idle thread is runnable —
+    // `prepare_switch` would return `None` anyway, but checking
+    // up front keeps the hot-path branch-predictor friendly and
+    // avoids touching the SYSCALL atomics on every tick.
+    // SAFETY: single-CPU + IF=0 (interrupt gate) guarantees the
+    // scheduler is not concurrently mutated.
+    let should_switch = unsafe {
+        #[allow(static_mut_refs)]
+        let sched = &crate::arch::x86_64::init::SCHEDULER;
+        sched.ready_count() > 0
+    };
+    if !should_switch {
+        return;
+    }
+
+    // SAFETY: IRQ entry guarantees IF=0 (interrupt gate); we hold
+    // no scheduler borrow. `sched_yield_once` is documented to
+    // require both. On return, the previously-current thread has
+    // been re-elected (after some other thread ran) and the iretq
+    // frame still on top of its kernel stack is restored by the
+    // x86-interrupt epilogue.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+        let _ = crate::arch::x86_64::sched_glue::sched_yield_once(sched);
+    }
 }
 
 /// IRQ 1 -- PS/2 keyboard interrupt.

@@ -894,3 +894,29 @@ fn copy_user_string(ptr: u64, max_len: usize) -> Option<&'static [u8]> {
     // fixed static and we are the sole accessor.
     Some(unsafe { &PATH_BUF[..i] })
 }
+
+// ── Crate-private accessor for the global process table ─────────
+
+/// Crate-internal mutable accessor for the global process table.
+///
+/// Lets sibling kernel modules (e.g. [`crate::signal_dispatch`]) read
+/// and mutate per-process state — pending signals, exit status — that
+/// only the fork/wait/exit machinery has historically touched. Keeps
+/// the static itself private so all uses funnel through one auditable
+/// entry point.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path on the single CPU
+/// with interrupts effectively disabled. No two callers may hold the
+/// returned `&mut` simultaneously, and the borrow must be dropped
+/// before any other code path that reaches the table (notably
+/// [`sys_exit`], [`sys_kill`], [`sys_fork`], [`sys_wait4`]).
+pub(crate) unsafe fn process_table_mut() -> &'static mut ProcessTable {
+    // SAFETY: caller upholds the single-borrower invariant documented
+    // above; PROCESS_TABLE has 'static lifetime.
+    unsafe {
+        #[allow(static_mut_refs)]
+        &mut PROCESS_TABLE
+    }
+}

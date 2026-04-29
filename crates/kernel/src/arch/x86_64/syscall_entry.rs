@@ -396,7 +396,7 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
     // SyscallArgs struct on the kernel stack.
     let args = unsafe { &*args };
 
-    match args.number {
+    let result: i64 = match args.number {
         // ── VFS I/O syscalls ─────────────────────────────────────
 
         // SYS_READ (0): read from file descriptor into user buffer.
@@ -610,6 +610,29 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
             unsafe { crate::socket::sys_listen(args.arg0, args.arg1) }
         }
 
+        // ── Filesystem management syscalls ───────────────────────
+
+        // SYS_MKDIR (83): create a directory.
+        // POSIX.1-2024 mkdir(3p).
+        oncrix_syscall::number::SYS_MKDIR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_mkdir(args.arg0, args.arg1) }
+        }
+
+        // SYS_UNLINK (87): remove a filesystem name.
+        // POSIX.1-2024 unlink(3p).
+        oncrix_syscall::number::SYS_UNLINK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_unlink(args.arg0) }
+        }
+
+        // SYS_GETDENTS64 (217): read directory entries.
+        // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
+        oncrix_syscall::number::SYS_GETDENTS64 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_getdents64(args.arg0 as usize, args.arg1, args.arg2) }
+        }
+
         // ── Signal syscalls ──────────────────────────────────────
 
         // SYS_RT_SIGACTION (13): stub — ENOSYS until signal handler delivery
@@ -623,9 +646,30 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
             unsafe { crate::fork_dispatch::sys_kill(args.arg0, args.arg1) }
         }
 
+        // SYS_DUP2 (33): duplicate `oldfd` onto `newfd`, atomically
+        // closing `newfd` if it was already open.
+        // POSIX.1-2024 dup2(3p).
+        oncrix_syscall::number::SYS_DUP2 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::fd_dup2(args.arg0 as usize, args.arg1 as usize) }
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
-    }
+    };
+
+    // SYSCALL epilogue: deliver any pending signals before returning
+    // to user space. This is the canonical "check for signals on
+    // return-to-user" point. Terminate-class signals call sys_exit
+    // and never return; ignore-class signals just clear pending bits.
+    //
+    // SAFETY: single-CPU SYSCALL context with interrupts effectively
+    // disabled (FMASK cleared IF on entry and we have not re-enabled
+    // them in this Rust frame). This is the only context in which
+    // the global PROCESS_TABLE may be mutated without further sync.
+    unsafe { crate::signal_dispatch::deliver_pending_signals() };
+
+    result
 }
 
 // ── VFS syscall implementations ──────────────────────────────────

@@ -7,6 +7,8 @@
 //! a minimal but functional filesystem for the kernel's initial
 //! root before a real filesystem is mounted.
 
+extern crate alloc;
+
 use crate::inode::{FileMode, FileType, Inode, InodeNumber, InodeOps};
 use oncrix_lib::{Error, Result};
 
@@ -64,6 +66,16 @@ impl Default for Ramfs {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A directory listing entry returned by [`Ramfs::list_children`].
+pub struct RamfsDirEntry {
+    /// Entry name.
+    pub name: alloc::string::String,
+    /// Child inode number.
+    pub ino: InodeNumber,
+    /// File type of the child.
+    pub kind: FileType,
 }
 
 impl Ramfs {
@@ -138,6 +150,96 @@ impl Ramfs {
             }
         }
         Err(Error::OutOfMemory)
+    }
+
+    /// Return all child entries of `parent` as a `Vec`.
+    ///
+    /// Returns an empty `Vec` if `parent` is not a directory or has no
+    /// children.  The caller may use this to implement `getdents` /
+    /// `readdir`.
+    pub fn list_children(&self, parent: &Inode) -> alloc::vec::Vec<RamfsDirEntry> {
+        let slot = match self.slot_of(parent.ino) {
+            Some(s) => s,
+            None => return alloc::vec::Vec::new(),
+        };
+        let data = match self.data[slot].as_ref() {
+            Some(d) => d,
+            None => return alloc::vec::Vec::new(),
+        };
+        let RamInodeData::Dir { entries, .. } = data else {
+            return alloc::vec::Vec::new();
+        };
+        let mut out = alloc::vec::Vec::new();
+        for entry in entries.iter().flatten() {
+            let name_bytes = &entry.name[..entry.name_len];
+            let name = match alloc::string::String::from_utf8(name_bytes.to_vec()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let kind = self
+                .slot_of(entry.inode)
+                .and_then(|s| self.inodes[s].as_ref().map(|i| i.file_type))
+                .unwrap_or(FileType::Regular);
+            out.push(RamfsDirEntry {
+                name,
+                ino: entry.inode,
+                kind,
+            });
+        }
+        out
+    }
+
+    /// Remove the entry named `name` from `parent`.
+    ///
+    /// - Returns `NotFound` if the entry does not exist.
+    /// - Returns `InvalidArgument` if the entry is a directory (use rmdir).
+    /// - On success the child inode and its data are freed.
+    pub fn unlink_entry(&mut self, parent: &Inode, name: &str) -> Result<()> {
+        let parent_slot = self.slot_of(parent.ino).ok_or(Error::NotFound)?;
+
+        let child_ino = {
+            let data = self.data[parent_slot].as_ref().ok_or(Error::NotFound)?;
+            if let RamInodeData::Dir { entries, .. } = data {
+                let name_bytes = name.as_bytes();
+                entries
+                    .iter()
+                    .flatten()
+                    .find(|e| &e.name[..e.name_len] == name_bytes)
+                    .map(|e| e.inode)
+                    .ok_or(Error::NotFound)?
+            } else {
+                return Err(Error::InvalidArgument);
+            }
+        };
+
+        // Phase-19 simplification: rm only handles files.
+        if let Some(slot) = self.slot_of(child_ino) {
+            if let Some(inode) = &self.inodes[slot] {
+                if inode.file_type == FileType::Directory {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+        }
+
+        let data = self.data[parent_slot].as_mut().ok_or(Error::NotFound)?;
+        if let RamInodeData::Dir { entries, count } = data {
+            let name_bytes = name.as_bytes();
+            for slot in entries.iter_mut() {
+                if let Some(entry) = slot {
+                    if &entry.name[..entry.name_len] == name_bytes {
+                        let ino = entry.inode;
+                        *slot = None;
+                        *count -= 1;
+                        if let Some(child_slot) = self.slot_of(ino) {
+                            self.inodes[child_slot] = None;
+                            self.data[child_slot] = None;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(Error::NotFound)
     }
 
     /// Add a directory entry to a directory.

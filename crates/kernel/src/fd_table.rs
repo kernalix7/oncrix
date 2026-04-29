@@ -196,6 +196,17 @@ impl KernelFdTable {
         Err(Error::OutOfMemory) // EMFILE
     }
 
+    /// Install `handle` at the explicit slot `fd`, overwriting any
+    /// existing entry.  Used by `dup2` after the caller has closed
+    /// the previous occupant (and propagated backend close).
+    ///
+    /// Returns `Err(InvalidArgument)` if `fd` is out of range.
+    pub fn install_at(&mut self, fd: usize, handle: FileHandle) -> Result<()> {
+        let slot = self.slots.get_mut(fd).ok_or(Error::InvalidArgument)?;
+        *slot = Some(handle);
+        Ok(())
+    }
+
     /// Return a shared reference to the handle at `fd`.
     ///
     /// Returns `None` if `fd` is out of range or not open.
@@ -346,6 +357,81 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Duplicate `oldfd` onto `newfd`, atomically closing `newfd` first
+/// if it was already open.
+///
+/// POSIX.1-2024 `dup2(3p)` semantics:
+/// - If `oldfd` is not open, returns `-EBADF` and leaves `newfd` alone.
+/// - If `oldfd == newfd` and `oldfd` is open, returns `newfd` (no-op).
+/// - Otherwise closes `newfd` if open (propagating backend close), then
+///   copies the handle from `oldfd` and returns `newfd`.
+///
+/// Backend reference counts are bumped for backends that track them
+/// (currently only [`FileBackend::Pipe`]).  Sockets do not yet refcount,
+/// so dup2-then-close patterns on a socket fd will close the underlying
+/// socket — `socketpair` users should not rely on dup2 of a socket end
+/// for the moment.
+///
+/// # Safety
+///
+/// Same as [`fd_install`].
+pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
+    // SAFETY: single-CPU SYSCALL context; sole accessor of the table.
+    let handle = unsafe {
+        #[allow(static_mut_refs)]
+        match CURRENT_FD_TABLE.get(oldfd) {
+            Some(h) => *h,
+            None => return -9, // EBADF
+        }
+    };
+
+    if oldfd == newfd {
+        return newfd as i64;
+    }
+    if newfd >= MAX_FDS {
+        return -9; // EBADF
+    }
+
+    // Close newfd first so backends with destructors release their
+    // resources.  fd_close returns EBADF when newfd was already
+    // empty — which is the no-op case, so the result is ignored.
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if CURRENT_FD_TABLE.get(newfd).is_some() {
+            let _ = fd_close(newfd);
+        }
+    }
+
+    // Bump backend refcounts for the new alias.
+    match handle.backend {
+        FileBackend::Pipe {
+            ring_id,
+            is_write_end,
+        } => {
+            // SAFETY: single-CPU SYSCALL context; pipe table accessed here.
+            unsafe {
+                if is_write_end {
+                    crate::pipe::pipe_dup_write(ring_id);
+                } else {
+                    crate::pipe::pipe_dup_read(ring_id);
+                }
+            }
+        }
+        FileBackend::Console | FileBackend::RamfsFile { .. } | FileBackend::Socket { .. } => {}
+    }
+
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if CURRENT_FD_TABLE.install_at(newfd, handle).is_err() {
+            return -9; // EBADF (out of range — unreachable: bounded above)
+        }
+    }
+
+    newfd as i64
 }
 
 /// Install the standard I/O fds (0/1/2 = console) in the current

@@ -43,11 +43,16 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_DUP2: u64 = 33;
 const SYS_GETPID: u64 = 39;
+const SYS_MKDIR: u64 = 83;
+const SYS_UNLINK: u64 = 87;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
+const SYS_GETDENTS64: u64 = 217;
+const SYS_PIPE2: u64 = 293;
 
 // ---------------------------------------------------------------------------
 // Raw syscall wrappers
@@ -69,6 +74,30 @@ unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
             in("rdi") a0,
             lateout("rax") ret,
             // SYSCALL clobbers rcx and r11 per ABI.
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Issue a 2-argument syscall.
+///
+/// # Safety
+///
+/// The syscall number and arguments must be valid per the ONCRIX ABI.
+unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: `syscall` traps into the kernel. The caller guarantees
+    // the syscall number and arguments are valid.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a0,
+            in("rsi") a1,
+            lateout("rax") ret,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
@@ -241,4 +270,65 @@ pub unsafe fn waitpid(pid: i64, status: *mut i32, options: i32) -> i64 {
             0, // rusage = NULL
         )
     }
+}
+
+/// `mkdir(2)` — create a directory.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn mkdir(path: *const u8, mode: u32) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall2(SYS_MKDIR, path as u64, mode as u64) }
+}
+
+/// `unlink(2)` — delete a name from the filesystem.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn unlink(path: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall1(SYS_UNLINK, path as u64) }
+}
+
+/// `getdents64(2)` — get directory entries.
+///
+/// Returns the number of bytes read into `buf`, 0 at end of directory,
+/// or a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to at least `count` writable bytes.
+pub unsafe fn getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
+    // SAFETY: The caller guarantees `buf` is valid for `count` writable bytes.
+    unsafe { syscall3(SYS_GETDENTS64, fd as u64, buf as u64, count as u64) }
+}
+
+/// `dup2(2)` — duplicate `oldfd` to `newfd`, closing `newfd` first if open.
+///
+/// Returns `newfd` on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Both `oldfd` and `newfd` must be valid file descriptor values (>= 0).
+pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i64 {
+    // SAFETY: The caller guarantees both fd arguments are non-negative integers.
+    unsafe { syscall2(SYS_DUP2, oldfd as u64, newfd as u64) }
+}
+
+/// `pipe2(2)` — create a pipe, writing read and write fds into `fildes[0..2]`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `fildes` must point to at least two writable `i32` slots.
+pub unsafe fn pipe2(fildes: *mut i32, flags: u32) -> i64 {
+    // SAFETY: The caller guarantees `fildes` is valid for two i32 writes.
+    unsafe { syscall2(SYS_PIPE2, fildes as u64, flags as u64) }
 }

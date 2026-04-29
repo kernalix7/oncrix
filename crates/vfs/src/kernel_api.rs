@@ -31,6 +31,16 @@ use crate::ramfs::Ramfs;
 use crate::superblock::MountTable;
 use oncrix_lib::{Error, Result};
 
+/// A directory listing entry returned by [`KernelVfs::list_dir`].
+pub struct DirEntry {
+    /// Entry name.
+    pub name: alloc::string::String,
+    /// File type.
+    pub kind: FileType,
+    /// Inode number.
+    pub ino: u64,
+}
+
 // ── POSIX whence constants ────────────────────────────────────────
 
 /// `lseek` whence: set absolute offset.
@@ -127,17 +137,131 @@ impl KernelVfs {
                 if of.0 & OpenFlags::O_CREAT.0 == 0 {
                     return Err(Error::NotFound);
                 }
-                self.create_file(path, fm)
+                self.create_file_inode(path, fm)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Create a regular file at `path` with optional initial `content`.
+    ///
+    /// Parent directories must already exist.  Suitable for `touch` (pass
+    /// an empty slice) or for writing small files at creation time.
+    ///
+    /// Returns `Err(AlreadyExists)` if the path already names a file.
+    pub fn create_file(&mut self, path: &[u8], content: &[u8]) -> Result<()> {
+        let inode = self.create_file_inode(path, FileMode::FILE_DEFAULT)?;
+        if !content.is_empty() {
+            self.ramfs.write(&inode, 0, content)?;
+        }
+        Ok(())
+    }
+
+    /// Create a directory at `path`.
+    ///
+    /// The parent directory must already exist.
+    ///
+    /// Returns `Err(AlreadyExists)` if the path already exists.
+    pub fn create_dir(&mut self, path: &[u8]) -> Result<()> {
+        let root = self.root_inode();
+        let (components, count) = split_path(path);
+        if count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+
+        let parent = if count == 1 {
+            root
+        } else {
+            let mut cur = root;
+            for component in &components[..count - 1] {
+                let name = core::str::from_utf8(component).map_err(|_| Error::InvalidArgument)?;
+                cur = self.ramfs.lookup(&cur, name)?;
+            }
+            cur
+        };
+
+        let dirname =
+            core::str::from_utf8(components[count - 1]).map_err(|_| Error::InvalidArgument)?;
+        let new_inode = self.ramfs.mkdir(&parent, dirname, FileMode::DIR_DEFAULT)?;
+
+        if let Some(dname) = DentryName::from_name(dirname) {
+            self.dcache
+                .insert(Dentry::new(dname, new_inode.ino, parent.ino));
+        }
+        Ok(())
+    }
+
+    /// Remove the file at `path`.
+    ///
+    /// Returns `Err(InvalidArgument)` if `path` names a directory.
+    /// Returns `Err(NotFound)` if the path does not exist.
+    pub fn unlink_path(&mut self, path: &[u8]) -> Result<()> {
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent_inode = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.unlink_entry(&parent_inode, name)
+    }
+
+    /// List the contents of the directory at `path`.
+    ///
+    /// Returns a `Vec<DirEntry>` with one element per child entry.
+    /// Returns `Err(NotFound)` if the path does not exist.
+    /// Returns `Err(InvalidArgument)` if the path names a regular file.
+    pub fn list_dir(&self, path: &[u8]) -> Result<Vec<DirEntry>> {
+        let inode = self.lookup_path(path)?;
+        if inode.file_type != FileType::Directory {
+            return Err(Error::InvalidArgument);
+        }
+        let children = self.ramfs.list_children(&inode);
+        let mut entries = Vec::with_capacity(children.len());
+        for c in children {
+            entries.push(DirEntry {
+                name: c.name,
+                kind: c.kind,
+                ino: c.ino.0,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Split `path` into the parent directory inode number and the final
+    /// name component as a byte slice borrowed from `path`.
+    ///
+    /// For example `/etc/foo` returns `(ino_of_etc, b"foo")`.
+    /// The root path `/` returns `Err(InvalidArgument)`.
+    pub fn resolve_parent_and_name<'a>(&self, path: &'a [u8]) -> Result<(InodeNumber, &'a [u8])> {
+        if path.is_empty() || path[0] != b'/' {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Find last '/' to split parent path from final component.
+        let last_slash = path
+            .iter()
+            .rposition(|&b| b == b'/')
+            .ok_or(Error::InvalidArgument)?;
+
+        let name = &path[last_slash + 1..];
+        if name.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let parent_path = if last_slash == 0 {
+            b"/" as &[u8]
+        } else {
+            &path[..last_slash]
+        };
+        let parent_inode = self.lookup_path(parent_path)?;
+        Ok((parent_inode.ino, name))
     }
 
     /// Create a regular file at `path`, creating parent components only if
     /// they already exist.
     ///
     /// Returns the new inode on success.
-    fn create_file(&mut self, path: &[u8], mode: FileMode) -> Result<Inode> {
+    fn create_file_inode(&mut self, path: &[u8], mode: FileMode) -> Result<Inode> {
         let root = self.root_inode();
         let (components, count) = split_path(path);
         if count == 0 {
