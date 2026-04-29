@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "oncrix-cat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-echo"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-false"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-init"
 version = "0.1.0"
 dependencies = [
@@ -11,6 +32,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-sh"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-true"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

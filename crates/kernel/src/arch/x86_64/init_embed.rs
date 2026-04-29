@@ -14,10 +14,11 @@
 //! [`crate::arch::x86_64::init::install_user_pt`].
 //!
 //! What remains here is the build-time embedding of the userspace ELF
-//! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN` and
-//! `ONCRIX_SH_BIN`; this module includes the bytes and exposes
-//! [`embedded_init_elf`] / [`embedded_sh_elf`] for the boot path and
-//! `sys_execve` respectively.
+//! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE}_BIN`; this module
+//! includes the bytes and exposes [`embedded_init_elf`] /
+//! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
+//! `sys_execve` to resolve `/bin/<name>` paths against.
 
 // ---------------------------------------------------------------------------
 // Embedded binaries
@@ -37,6 +38,22 @@ static EMBEDDED_INIT: &[u8] = include_bytes!(env!("ONCRIX_INIT_BIN"));
 /// can replace the calling process image with it.
 #[cfg(feature = "embed-init")]
 static EMBEDDED_SH: &[u8] = include_bytes!(env!("ONCRIX_SH_BIN"));
+
+/// The embedded `/bin/echo` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ECHO: &[u8] = include_bytes!(env!("ONCRIX_ECHO_BIN"));
+
+/// The embedded `/bin/cat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CAT: &[u8] = include_bytes!(env!("ONCRIX_CAT_BIN"));
+
+/// The embedded `/bin/true` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TRUE: &[u8] = include_bytes!(env!("ONCRIX_TRUE_BIN"));
+
+/// The embedded `/bin/false` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FALSE: &[u8] = include_bytes!(env!("ONCRIX_FALSE_BIN"));
 
 // ---------------------------------------------------------------------------
 // Public accessors
@@ -69,5 +86,33 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// Placeholder when `embed-init` is disabled — always `None`.
 #[cfg(not(feature = "embed-init"))]
 pub fn embedded_sh_elf() -> Option<&'static [u8]> {
+    None
+}
+
+/// Resolve a POSIX-style path (or bare command name) to an embedded
+/// ELF blob.
+///
+/// Recognised paths: `/bin/sh`, `/bin/echo`, `/bin/cat`, `/bin/true`,
+/// `/bin/false`. Bare names without a leading `/` match the same set
+/// — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
+/// builtin's `argv[0] = "echo"` resolves without prefixing.
+///
+/// Returns `None` for any unknown path, or whenever the `embed-init`
+/// feature is disabled.
+#[cfg(feature = "embed-init")]
+pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
+    match path {
+        b"/bin/sh" | b"sh" => Some(EMBEDDED_SH),
+        b"/bin/echo" | b"echo" => Some(EMBEDDED_ECHO),
+        b"/bin/cat" | b"cat" => Some(EMBEDDED_CAT),
+        b"/bin/true" | b"true" => Some(EMBEDDED_TRUE),
+        b"/bin/false" | b"false" => Some(EMBEDDED_FALSE),
+        _ => None,
+    }
+}
+
+/// Placeholder when `embed-init` is disabled — always `None`.
+#[cfg(not(feature = "embed-init"))]
+pub fn embedded_lookup(_path: &[u8]) -> Option<&'static [u8]> {
     None
 }

@@ -67,24 +67,55 @@ fn main() {
         panic!("oncrix-init build failed (exit code: {:?})", status.code());
     }
 
-    // Build oncrix-sh alongside init so the kernel can embed it.
-    let status_sh = Command::new(&cargo_bin)
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "oncrix-sh",
-            "--target",
-            "x86_64-unknown-none",
-        ])
-        .current_dir(&userspace_dir)
-        .env("RUSTFLAGS", "-C relocation-model=static")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .status()
-        .expect("failed to invoke cargo to build oncrix-sh");
+    // Build all userspace binaries the kernel embeds and exec()s.
+    //
+    // Phase 23 expanded the embedded set from `init` + `/bin/sh` to a
+    // small POSIX coreutils slice (`echo`, `cat`, `true`, `false`).
+    // Each invocation produces an ELF in `target/x86_64-unknown-none/release/`
+    // that the kernel embeds via `include_bytes!` in `init_embed.rs`.
+    let userspace_bins: &[(&str, &str)] = &[
+        ("oncrix-sh", "sh"),
+        ("oncrix-echo", "echo"),
+        ("oncrix-cat", "cat"),
+        ("oncrix-true", "true"),
+        ("oncrix-false", "false"),
+    ];
+    for (pkg, bin_name) in userspace_bins {
+        let status = Command::new(&cargo_bin)
+            .args([
+                "build",
+                "--release",
+                "-p",
+                pkg,
+                "--target",
+                "x86_64-unknown-none",
+            ])
+            .current_dir(&userspace_dir)
+            .env("RUSTFLAGS", "-C relocation-model=static")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .status()
+            .unwrap_or_else(|e| panic!("failed to invoke cargo to build {pkg}: {e}"));
 
-    if !status_sh.success() {
-        panic!("oncrix-sh build failed (exit code: {:?})", status_sh.code());
+        if !status.success() {
+            panic!("{pkg} build failed (exit code: {:?})", status.code());
+        }
+
+        let bin_path = userspace_dir
+            .join("target")
+            .join("x86_64-unknown-none")
+            .join("release")
+            .join(bin_name);
+        let env_key = format!("ONCRIX_{}_BIN", bin_name.to_uppercase());
+        println!("cargo:rustc-env={}={}", env_key, bin_path.display());
+        println!("cargo:rerun-if-changed={}", bin_path.display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            userspace_dir
+                .join(bin_name)
+                .join("src")
+                .join("main.rs")
+                .display()
+        );
     }
 
     let target_dir = userspace_dir
@@ -92,27 +123,13 @@ fn main() {
         .join("x86_64-unknown-none")
         .join("release");
 
-    // Binary lands in crates/userspace/target/x86_64-unknown-none/release/init.
     let init_bin = target_dir.join("init");
-    // Shell binary lands at .../release/sh.
-    let sh_bin = target_dir.join("sh");
-
     println!("cargo:rustc-env=ONCRIX_INIT_BIN={}", init_bin.display());
     println!("cargo:rerun-if-changed={}", init_bin.display());
-    println!("cargo:rustc-env=ONCRIX_SH_BIN={}", sh_bin.display());
-    println!("cargo:rerun-if-changed={}", sh_bin.display());
     println!(
         "cargo:rerun-if-changed={}",
         userspace_dir
             .join("init")
-            .join("src")
-            .join("main.rs")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        userspace_dir
-            .join("sh")
             .join("src")
             .join("main.rs")
             .display()

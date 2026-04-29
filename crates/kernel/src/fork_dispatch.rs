@@ -447,17 +447,17 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
         None => return -22, // EINVAL — too long or non-ASCII
     };
 
-    // Only "/bin/sh" is recognized in Phase 13.
-    if path != b"/bin/sh" {
-        return -2; // ENOENT
-    }
-
-    // Fetch the embedded shell ELF blob.
-    let elf_bytes = match crate::arch::x86_64::init_embed::embedded_sh_elf() {
+    // Resolve `path` against the embedded binary set. Phase 23
+    // recognises `/bin/{sh,echo,cat,true,false}` plus the matching
+    // bare names (a primitive `$PATH=/bin` shortcut).
+    let elf_bytes = match crate::arch::x86_64::init_embed::embedded_lookup(path) {
         Some(bytes) => bytes,
         None => {
-            let _ =
-                serial.write_str("[exec] /bin/sh ELF not embedded (build without embed-init?)\n");
+            let _ = serial.write_str("[exec] path not in embedded set: ");
+            for &b in path {
+                let _ = serial.write_byte(b);
+            }
+            let _ = serial.write_str("\n");
             return -2; // ENOENT
         }
     };
