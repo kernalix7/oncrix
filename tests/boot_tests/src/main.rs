@@ -18,10 +18,17 @@ use std::time::{Duration, Instant};
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Markers that must all appear in serial output for a successful boot.
+///
+/// `[init] hello from pid 1` confirms the embedded init binary actually
+/// reached ring 3 and issued its first `write(2, …)` syscall — i.e.
+/// userspace bringup is intact. This catches regressions that early-
+/// boot-only markers miss (a kernel that boots cleanly but never
+/// crosses the ring 0/3 boundary still trips this assertion).
 const REQUIRED_MARKERS: &[&str] = &[
     "[ONCRIX] Kernel booting",
     "[ONCRIX] Root filesystem mounted",
     "[ONCRIX] Service manager boot complete",
+    "[init] hello from pid 1",
 ];
 
 /// If this string appears the boot is considered failed immediately.
@@ -60,10 +67,22 @@ fn run_x86_64_boot_test() -> BootResult {
 
     let project_dir = std::path::PathBuf::from(&project_dir);
 
-    // Step 1: build the kernel.
-    eprintln!("[boot-test] Building kernel (x86_64-unknown-none)...");
+    // Step 1: build the kernel WITH the embed-init feature so the
+    // ring-3 init binary is included. Without this flag the kernel
+    // falls back to an in-kernel `usermode_test_entry` stub whose
+    // address is in kernel canonical space — useless for catching
+    // userspace regressions.
+    eprintln!("[boot-test] Building kernel (x86_64-unknown-none, --features embed-init)...");
     let build_status = Command::new("cargo")
-        .args(["build", "-p", "oncrix-kernel", "--target", "x86_64-unknown-none"])
+        .args([
+            "build",
+            "-p",
+            "oncrix-kernel",
+            "--target",
+            "x86_64-unknown-none",
+            "--features",
+            "embed-init",
+        ])
         .current_dir(&project_dir)
         .status();
 

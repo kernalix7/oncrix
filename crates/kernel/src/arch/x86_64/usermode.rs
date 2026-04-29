@@ -16,6 +16,26 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// RFLAGS bit 1 is always set.
 const RFLAGS_RESERVED: u64 = 1 << 1;
 
+/// Debug helper: write a u64 as hex to serial.
+fn write_hex(serial: &mut Uart16550, value: u64) {
+    let _ = serial.write_str("0x");
+    let mut buf = [0u8; 16];
+    let mut n = value;
+    for byte in buf.iter_mut().rev() {
+        let digit = (n & 0xF) as u8;
+        *byte = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        n >>= 4;
+    }
+    let start = buf.iter().position(|&b| b != b'0').unwrap_or(15);
+    for &byte in &buf[start..] {
+        let _ = serial.write_byte(byte);
+    }
+}
+
 /// Page-aligned fallback user-space stack.
 ///
 /// Used only by the `usermode_test_entry` smoke-test stub (see
@@ -55,6 +75,11 @@ pub fn fallback_user_stack_top() -> u64 {
 pub unsafe fn jump_to_usermode(entry: u64, user_rsp: u64) {
     let mut serial = Uart16550::new(COM1);
     let _ = serial.write_str("[ONCRIX] Transitioning to Ring 3...\n");
+    let _ = serial.write_str("[debug] entry=");
+    write_hex(&mut serial, entry);
+    let _ = serial.write_str(" rsp=");
+    write_hex(&mut serial, user_rsp);
+    let _ = serial.write_str("\n");
 
     let user_stack_top = user_rsp;
 
