@@ -93,11 +93,28 @@ pub extern "x86-interrupt" fn general_protection_handler(
 }
 
 /// #PF — Page Fault (vector 14), with error code.
+///
+/// Splits on the originating privilege level:
+///
+/// * **Ring 3** (`frame.cs & 0x3 == 0x3`) — the user process tried to
+///   touch an unmapped or improperly-permissioned address. POSIX-1.2024
+///   maps this to `SIGSEGV` on the offending process. We raise the
+///   pending bit on the current pid and invoke
+///   [`crate::signal_dispatch::deliver_pending_signals`], which applies
+///   the kernel-default Terminate action and never returns.
+/// * **Ring 0** (`frame.cs & 0x3 == 0x0`) — the kernel itself faulted.
+///   That's a real bug; print diagnostics and `halt()` so the failure
+///   mode is unambiguous.
+///
+/// # Why call `deliver_pending_signals` from an interrupt handler
+///
+/// `deliver_pending_signals` is documented to require single-CPU +
+/// interrupts-effectively-off; an x86-interrupt handler entered through
+/// an interrupt gate satisfies both (CPU clears `IF` on entry). The
+/// terminate path calls `sys_exit(139)` which `yield_now` loops without
+/// returning, so the iretq epilogue this `extern "x86-interrupt"` fn
+/// would otherwise execute is never reached — that is by design.
 pub extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_code: u64) {
-    serial_print("\n!!! EXCEPTION: Page Fault (#PF) !!!\n");
-    serial_print("  Error code: ");
-    serial_print_hex(error_code);
-    serial_print("\n  CR2 (fault address): ");
     // Read CR2 to get the faulting address.
     let cr2: u64;
     // SAFETY: Reading CR2 is safe in Ring 0 and only reads the
@@ -105,10 +122,52 @@ pub extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, err
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
     }
-    serial_print_hex(cr2);
-    serial_print("\n");
-    print_stack_frame(&frame);
-    halt();
+
+    if frame.cs & 0x3 == 0x3 {
+        // Ring 3 fault: convert to SIGSEGV on the current process.
+        serial_print("[#PF] ring 3 fault → SIGSEGV (cr2=");
+        serial_print_hex(cr2);
+        serial_print(", rip=");
+        serial_print_hex(frame.rip);
+        serial_print(", err=");
+        serial_print_hex(error_code);
+        serial_print(")\n");
+
+        // SAFETY: interrupt-gate entry guarantees IF=0; single-CPU
+        // build means no concurrent access to the process table or
+        // signal state. The borrow is dropped before
+        // `deliver_pending_signals` walks the table.
+        unsafe {
+            if let Some(pid) = crate::current::current_pid()
+                && let Some(entry) = crate::fork_dispatch::process_table_mut().get_mut(pid)
+            {
+                entry
+                    .signals
+                    .pending
+                    .raise(oncrix_process::signal::Signal::SIGSEGV);
+            }
+        }
+
+        // Apply the kernel-default Terminate action — sys_exit(139)
+        // marks the thread Exited and yields forever; never returns.
+        // SAFETY: same single-CPU + IF=0 contract as above.
+        unsafe { crate::signal_dispatch::deliver_pending_signals() };
+
+        // Defensive: should be unreachable. Halt the CPU rather than
+        // try to iretq back into a dead user context.
+        serial_print("[#PF] deliver_pending_signals returned unexpectedly — halting\n");
+        halt();
+    } else {
+        // Ring 0 fault: kernel bug. Diagnose and stop.
+        serial_print("\n!!! EXCEPTION: Page Fault (#PF) !!!\n");
+        serial_print("  Error code: ");
+        serial_print_hex(error_code);
+        serial_print("\n  CR2 (fault address): ");
+        serial_print_hex(cr2);
+        serial_print("\n");
+        print_stack_frame(&frame);
+        halt();
+    }
 }
 
 /// Halt the CPU permanently.
