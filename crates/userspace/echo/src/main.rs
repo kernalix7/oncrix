@@ -20,33 +20,28 @@ use oncrix_ulibc as libc;
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// `_start` must be a *naked* function. The kernel's `sys_execve`
+/// places `argc` at `[RSP]` and `argv` pointers at `[RSP+8..]` on
+/// the System V AMD64 initial stack. A normal Rust prologue would
+/// `sub rsp, N` for locals before our asm could capture those values,
+/// so naked it is.
 #[unsafe(no_mangle)]
+#[unsafe(naked)]
 pub extern "C" fn _start() -> ! {
-    // The kernel lays out the initial stack as:
-    //   [rsp+0]:  argc (u64)
-    //   [rsp+8]:  argv[0] pointer
-    //   ...
-    // We read argc and argv from the stack via inline asm.
-    let (argc, argv): (usize, *const *const u8);
-    // SAFETY: On entry RSP points to the System V AMD64 initial stack
-    // prepared by sys_execve. argc is at [RSP] and argv pointers follow.
-    unsafe {
-        core::arch::asm!(
-            "mov {argc}, [rsp]",
-            "lea {argv}, [rsp + 8]",
-            argc = out(reg) argc,
-            argv = out(reg) argv,
-            options(nostack, readonly),
-        );
-    }
-    echo_main(argc, argv)
+    core::arch::naked_asm!(
+        "mov rdi, [rsp]",
+        "lea rsi, [rsp + 8]",
+        "call {main}",
+        "ud2",
+        main = sym echo_main,
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Echo logic (POSIX.1-2024)
 // ---------------------------------------------------------------------------
 
-fn echo_main(argc: usize, argv: *const *const u8) -> ! {
+extern "C" fn echo_main(argc: usize, argv: *const *const u8) -> ! {
     // argv[0] is the program name; operands start at argv[1].
     let mut first = true;
     for i in 1..argc {

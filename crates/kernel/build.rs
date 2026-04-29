@@ -79,6 +79,9 @@ fn main() {
         ("oncrix-cat", "cat"),
         ("oncrix-true", "true"),
         ("oncrix-false", "false"),
+        ("oncrix-wc", "wc"),
+        ("oncrix-head", "head"),
+        ("oncrix-tail", "tail"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

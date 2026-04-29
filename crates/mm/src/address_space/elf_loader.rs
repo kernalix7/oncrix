@@ -98,12 +98,31 @@ pub struct ElfLoadInfo {
 }
 
 /// Parse `elf_bytes`, validate the ELF64 header, and copy every
-/// PT_LOAD segment into `dst` at offset `p_vaddr - USER_BASE`.
+/// PT_LOAD segment into `dst` rebased to start at [`USER_BASE`].
 ///
 /// `dst` is the per-process backing buffer that will later be mapped
 /// at VMA [`USER_BASE`]..[`USER_BASE`]` + dst.len()`. The caller is
 /// responsible for ensuring `dst` is page-aligned in both its virtual
 /// and physical backing if any page-table mapping uses those frames.
+///
+/// # Image base discovery
+///
+/// rustc's default link script emits a static EXEC at `0x200000`
+/// while ONCRIX's `user.ld` places the image at [`USER_BASE`]
+/// (`0x400000`). Both layouts must run from the kernel's single user
+/// VMA window at [`USER_BASE`]. To support that we treat the lowest
+/// PT_LOAD `p_vaddr` (rounded down to a page boundary) as the
+/// image base and copy each segment at offset
+/// `p_vaddr - image_base`. The returned [`ElfLoadInfo::entry`] and
+/// [`ElfLoadInfo::max_vaddr`] are likewise rebased so they reference
+/// [`USER_BASE`]-relative addresses regardless of how the binary was
+/// linked. The image bytes themselves are copied verbatim, so any
+/// non-relocatable absolute references (a non-PIE EXEC linked at a
+/// base other than [`USER_BASE`]) will reference unmapped VAs at
+/// runtime — those binaries should be relinked with the project's
+/// `user.ld`. The hot path of small statically-linked utilities
+/// (RIP-relative calls + register-based syscalls) does not exercise
+/// such absolutes and runs correctly after rebase.
 ///
 /// # Errors
 ///
@@ -111,9 +130,11 @@ pub struct ElfLoadInfo {
 /// - truncated or malformed ELF header
 /// - wrong ELF class / endianness / machine / type
 /// - program-header table out of bounds
-/// - segment virtual range outside `[USER_BASE, USER_BASE + dst.len())`
+/// - no PT_LOAD segments
+/// - rebased segment span exceeds `dst.len()`
 /// - segment file range outside `elf_bytes`
 /// - `p_filesz > p_memsz`
+/// - entry point falls outside the rebased load image
 /// - more than [`MAX_LOAD_SEGMENTS`] PT_LOAD segments
 ///
 /// On success, `dst` contains the loaded image with `.bss` zero-filled
@@ -153,24 +174,35 @@ pub fn load_elf_into(elf_bytes: &[u8], dst: &mut [u8]) -> Result<ElfLoadInfo> {
         return Err(Error::InvalidArgument);
     }
 
+    // Pass 1: discover the image base (lowest PT_LOAD vaddr, page-aligned
+    // down). This is what the binary "thinks" its load address is; we
+    // rebase everything to USER_BASE below.
+    let mut image_base: Option<u64> = None;
+    let mut load_count = 0usize;
+    for i in 0..ph_count {
+        let phdr = read_phdr(elf_bytes, ph_offset, ph_size, i)?;
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+        load_count += 1;
+        let cand = phdr.p_vaddr & !((PAGE_SIZE_U64) - 1);
+        image_base = Some(match image_base {
+            Some(cur) if cur <= cand => cur,
+            _ => cand,
+        });
+    }
+    if load_count == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let image_base = image_base.ok_or(Error::InvalidArgument)?;
+
     let dst_len = dst.len() as u64;
     let mut loaded = 0usize;
-    let mut max_vaddr = USER_BASE;
+    let mut max_rebased_end = 0u64;
 
+    // Pass 2: copy each PT_LOAD into dst at offset `p_vaddr - image_base`.
     for i in 0..ph_count {
-        let offset = ph_offset
-            .checked_add(i.checked_mul(ph_size).ok_or(Error::InvalidArgument)?)
-            .ok_or(Error::InvalidArgument)?;
-        if offset.checked_add(ph_size).ok_or(Error::InvalidArgument)? > elf_bytes.len() {
-            return Err(Error::InvalidArgument);
-        }
-
-        // SAFETY: Bounds checked above (offset + ph_size <= elf_bytes.len()).
-        // `read_unaligned` handles potentially unaligned input.
-        let phdr = unsafe {
-            core::ptr::read_unaligned(elf_bytes.as_ptr().add(offset) as *const Elf64Phdr)
-        };
-
+        let phdr = read_phdr(elf_bytes, ph_offset, ph_size, i)?;
         if phdr.p_type != PT_LOAD {
             continue;
         }
@@ -181,10 +213,11 @@ pub fn load_elf_into(elf_bytes: &[u8], dst: &mut [u8]) -> Result<ElfLoadInfo> {
             return Err(Error::InvalidArgument);
         }
 
-        // Translate segment VA into the destination buffer offset.
+        // Offset of this segment within the dst buffer (i.e. relative
+        // to `image_base`, which the kernel maps at USER_BASE).
         let seg_off_in_dst = phdr
             .p_vaddr
-            .checked_sub(USER_BASE)
+            .checked_sub(image_base)
             .ok_or(Error::InvalidArgument)?;
         let seg_end_in_dst = seg_off_in_dst
             .checked_add(phdr.p_memsz)
@@ -202,7 +235,6 @@ pub fn load_elf_into(elf_bytes: &[u8], dst: &mut [u8]) -> Result<ElfLoadInfo> {
             return Err(Error::InvalidArgument);
         }
 
-        // Copy file bytes, then zero the bss tail.
         let dst_start = seg_off_in_dst as usize;
         let dst_file_end = dst_start
             .checked_add(file_sz)
@@ -211,7 +243,6 @@ pub fn load_elf_into(elf_bytes: &[u8], dst: &mut [u8]) -> Result<ElfLoadInfo> {
             .checked_add(phdr.p_memsz as usize)
             .ok_or(Error::InvalidArgument)?;
 
-        // Double check against slice bounds (defence in depth).
         if dst_mem_end > dst.len() || dst_file_end > dst.len() {
             return Err(Error::InvalidArgument);
         }
@@ -223,19 +254,50 @@ pub fn load_elf_into(elf_bytes: &[u8], dst: &mut [u8]) -> Result<ElfLoadInfo> {
             }
         }
 
-        let seg_end_va = phdr
-            .p_vaddr
-            .checked_add(phdr.p_memsz)
-            .ok_or(Error::InvalidArgument)?;
-        if seg_end_va > max_vaddr {
-            max_vaddr = seg_end_va;
+        if seg_end_in_dst > max_rebased_end {
+            max_rebased_end = seg_end_in_dst;
         }
         loaded += 1;
     }
 
+    // Rebase the entry point: e_entry is relative to image_base; the
+    // kernel will jump in user mode with the dst buffer mapped at
+    // USER_BASE, so the entry must reference USER_BASE-relative VAs.
+    let entry_off = header
+        .e_entry
+        .checked_sub(image_base)
+        .ok_or(Error::InvalidArgument)?;
+    if entry_off >= max_rebased_end {
+        return Err(Error::InvalidArgument);
+    }
+    let entry = USER_BASE
+        .checked_add(entry_off)
+        .ok_or(Error::InvalidArgument)?;
+    let max_vaddr = USER_BASE
+        .checked_add(max_rebased_end)
+        .ok_or(Error::InvalidArgument)?;
+
     Ok(ElfLoadInfo {
-        entry: header.e_entry,
+        entry,
         load_segment_count: loaded,
         max_vaddr,
     })
+}
+
+/// Page size constant used for image-base alignment. Mirrors
+/// `crate::addr::PAGE_SIZE` but kept local so this module compiles
+/// independently of crate-internal types.
+const PAGE_SIZE_U64: u64 = 4096;
+
+/// Read the i-th program header from `elf_bytes`, bounds-checked.
+fn read_phdr(elf_bytes: &[u8], ph_offset: usize, ph_size: usize, i: usize) -> Result<Elf64Phdr> {
+    let offset = ph_offset
+        .checked_add(i.checked_mul(ph_size).ok_or(Error::InvalidArgument)?)
+        .ok_or(Error::InvalidArgument)?;
+    if offset.checked_add(ph_size).ok_or(Error::InvalidArgument)? > elf_bytes.len() {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: Bounds checked above (offset + ph_size <= elf_bytes.len()).
+    // `read_unaligned` handles potentially unaligned input.
+    Ok(unsafe { core::ptr::read_unaligned(elf_bytes.as_ptr().add(offset) as *const Elf64Phdr) })
 }

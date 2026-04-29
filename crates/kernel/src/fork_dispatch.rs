@@ -462,6 +462,28 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
         }
     };
 
+    // Snapshot argv/envp from the CALLING process's address space
+    // BEFORE the UAS swap below.  After the swap PD_0_1G[2] points at
+    // the new (mostly-zeroed) backing region, and any read through
+    // `argv_ptr` / `envp_ptr` would return garbage — they are user
+    // VAs (e.g. 0x5FFxxx into sh's stack) that resolve to the wrong
+    // physical frame post-swap.
+    //
+    // SAFETY: single-CPU SYSCALL context; the calling process's UAS
+    // is still installed at this point so `read_volatile` through the
+    // user VAs returns the actual argv/envp the caller built.
+    static mut ARGV_STRS: [[u8; MAX_ARG_STR]; MAX_ARGV] = [[0u8; MAX_ARG_STR]; MAX_ARGV];
+    static mut ARGV_LENS: [usize; MAX_ARGV] = [0usize; MAX_ARGV];
+    static mut ENVP_STRS: [[u8; MAX_ARG_STR]; MAX_ARGV] = [[0u8; MAX_ARG_STR]; MAX_ARGV];
+    static mut ENVP_LENS: [usize; MAX_ARGV] = [0usize; MAX_ARGV];
+    let (argc, nenv) = unsafe {
+        #[allow(static_mut_refs)]
+        let a = collect_user_argv(argv_ptr, &mut ARGV_STRS, &mut ARGV_LENS);
+        #[allow(static_mut_refs)]
+        let n = collect_user_argv(envp_ptr, &mut ENVP_STRS, &mut ENVP_LENS);
+        (a, n)
+    };
+
     // Build a fresh UserAddressSpace and load /bin/sh into it. The new
     // UAS is independent of the calling thread's old one — that is the
     // whole point of Phase 13: parent (init) keeps its own frames so
@@ -555,16 +577,10 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
     // SAFETY: We access the new UAS through the kernel's phys_to_virt
     // mapping. Single-CPU SYSCALL context ensures exclusive access.
     unsafe {
-        // Collect argv/envp strings into static kernel-side buffers.
-        static mut ARGV_STRS: [[u8; MAX_ARG_STR]; MAX_ARGV] = [[0u8; MAX_ARG_STR]; MAX_ARGV];
-        static mut ARGV_LENS: [usize; MAX_ARGV] = [0usize; MAX_ARGV];
-        static mut ENVP_STRS: [[u8; MAX_ARG_STR]; MAX_ARGV] = [[0u8; MAX_ARG_STR]; MAX_ARGV];
-        static mut ENVP_LENS: [usize; MAX_ARGV] = [0usize; MAX_ARGV];
-
-        #[allow(static_mut_refs)]
-        let argc = collect_user_argv(argv_ptr, &mut ARGV_STRS, &mut ARGV_LENS);
-        #[allow(static_mut_refs)]
-        let nenv = collect_user_argv(envp_ptr, &mut ENVP_STRS, &mut ENVP_LENS);
+        // argv/envp strings already collected from the OLD UAS above
+        // (before the swap). The static buffers persist between the
+        // pre-swap collection and this stack-build phase; SYSCALL
+        // dispatch is single-CPU so no aliasing.
 
         if let Some(thread) = crate::current::current_thread_mut() {
             if let Some(uas) = thread.user_address_space.as_mut() {

@@ -15,8 +15,8 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE}_BIN`; this module
-//! includes the bytes and exposes [`embedded_init_elf`] /
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL}_BIN`;
+//! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
 
@@ -54,6 +54,18 @@ static EMBEDDED_TRUE: &[u8] = include_bytes!(env!("ONCRIX_TRUE_BIN"));
 /// The embedded `/bin/false` ELF binary.
 #[cfg(feature = "embed-init")]
 static EMBEDDED_FALSE: &[u8] = include_bytes!(env!("ONCRIX_FALSE_BIN"));
+
+/// The embedded `/bin/wc` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WC: &[u8] = include_bytes!(env!("ONCRIX_WC_BIN"));
+
+/// The embedded `/bin/head` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HEAD: &[u8] = include_bytes!(env!("ONCRIX_HEAD_BIN"));
+
+/// The embedded `/bin/tail` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TAIL: &[u8] = include_bytes!(env!("ONCRIX_TAIL_BIN"));
 
 // ---------------------------------------------------------------------------
 // Public accessors
@@ -93,9 +105,10 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// ELF blob.
 ///
 /// Recognised paths: `/bin/sh`, `/bin/echo`, `/bin/cat`, `/bin/true`,
-/// `/bin/false`. Bare names without a leading `/` match the same set
-/// — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
-/// builtin's `argv[0] = "echo"` resolves without prefixing.
+/// `/bin/false`, `/bin/wc`, `/bin/head`, `/bin/tail`. Bare names without a
+/// leading `/` match the same set — a primitive `$PATH=/bin` shortcut so
+/// `sh`'s execve from a builtin's `argv[0] = "echo"` resolves without
+/// prefixing.
 ///
 /// Returns `None` for any unknown path, or whenever the `embed-init`
 /// feature is disabled.
@@ -107,6 +120,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/cat" | b"cat" => Some(EMBEDDED_CAT),
         b"/bin/true" | b"true" => Some(EMBEDDED_TRUE),
         b"/bin/false" | b"false" => Some(EMBEDDED_FALSE),
+        b"/bin/wc" | b"wc" => Some(EMBEDDED_WC),
+        b"/bin/head" | b"head" => Some(EMBEDDED_HEAD),
+        b"/bin/tail" | b"tail" => Some(EMBEDDED_TAIL),
         _ => None,
     }
 }

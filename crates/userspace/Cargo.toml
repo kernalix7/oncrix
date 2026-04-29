@@ -9,7 +9,7 @@
 # when the `embed-init` feature is enabled.
 
 [workspace]
-members = ["init", "sh", "libc", "echo", "cat", "true", "false"]
+members = ["init", "sh", "libc", "echo", "cat", "true", "false", "wc", "head", "tail"]
 resolver = "3"
 
 [workspace.package]

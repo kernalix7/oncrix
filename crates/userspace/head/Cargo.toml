@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-head"
+description = "ONCRIX - /bin/head utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "head"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true

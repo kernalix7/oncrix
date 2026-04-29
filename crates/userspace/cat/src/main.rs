@@ -20,20 +20,25 @@ use oncrix_ulibc as libc;
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// `_start` must be a *naked* function so the Rust prologue does not
+/// allocate a local stack frame before we capture argc/argv. The
+/// kernel's `sys_execve` lays out the System V AMD64 initial stack at
+/// `RSP = 0x5FF000` with `[rsp] = argc` and `[rsp+8..] = argv`.
+/// Rust's normal calling convention would push callee-saved registers
+/// and `sub rsp, N` before our handwritten asm could read `[rsp]`,
+/// shifting the apparent argc to whatever local happens to land there.
 #[unsafe(no_mangle)]
+#[unsafe(naked)]
 pub extern "C" fn _start() -> ! {
-    let (argc, argv): (usize, *const *const u8);
-    // SAFETY: RSP points to the System V AMD64 initial stack from sys_execve.
-    unsafe {
-        core::arch::asm!(
-            "mov {argc}, [rsp]",
-            "lea {argv}, [rsp + 8]",
-            argc = out(reg) argc,
-            argv = out(reg) argv,
-            options(nostack, readonly),
-        );
-    }
-    cat_main(argc, argv)
+    core::arch::naked_asm!(
+        // System V AMD64: rdi = argc, rsi = argv.
+        "mov rdi, [rsp]",
+        "lea rsi, [rsp + 8]",
+        "call {main}",
+        // `cat_main` is divergent; trap if it ever returns.
+        "ud2",
+        main = sym cat_main,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -42,7 +47,7 @@ pub extern "C" fn _start() -> ! {
 
 const CHUNK: usize = 4096;
 
-fn cat_main(argc: usize, argv: *const *const u8) -> ! {
+extern "C" fn cat_main(argc: usize, argv: *const *const u8) -> ! {
     let mut exit_code: i32 = 0;
 
     if argc <= 1 {
