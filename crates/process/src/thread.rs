@@ -136,6 +136,15 @@ pub struct Thread {
     /// `timer_handler` to use it) ships in a later commit so the new
     /// preemption datapath can be QEMU-verified in isolation.
     pub saved_irq_frame_raw: Option<[u64; 11]>,
+    /// Current working directory path bytes (no heap; POSIX §2.7).
+    ///
+    /// Initialised to `b"/"` (root). Inherited unchanged across `fork`
+    /// (child gets a copy of parent's cwd). NOT reset on `execve` per
+    /// POSIX.1-2024.  Updated by `chdir(2)`.
+    pub cwd: [u8; 256],
+    /// Byte length of the valid prefix in `cwd` (excludes the trailing
+    /// null that some helpers write for C-string use).
+    pub cwd_len: u8,
 }
 
 // SAFETY: `UserAddressSpace` itself is `Send` (raw `PhysAddr`s plus a
@@ -150,6 +159,8 @@ impl Thread {
     /// [`attach_kernel_stack`](Self::attach_kernel_stack) and
     /// [`set_cpu_context`](Self::set_cpu_context) before scheduling.
     pub const fn new(tid: Tid, pid: Pid, priority: Priority) -> Self {
+        let mut cwd = [0u8; 256];
+        cwd[0] = b'/';
         Self {
             tid,
             pid,
@@ -165,6 +176,8 @@ impl Thread {
             saved_user_rsp: 0,
             saved_user_rflags: 0,
             saved_irq_frame_raw: None,
+            cwd,
+            cwd_len: 1,
         }
     }
 
@@ -287,5 +300,19 @@ impl Thread {
     /// Return the thread's address-space root.
     pub const fn address_space(&self) -> Cr3Frame {
         self.cpu_context.cr3
+    }
+
+    /// Return the current working directory as a byte slice.
+    pub fn cwd(&self) -> &[u8] {
+        &self.cwd[..self.cwd_len as usize]
+    }
+
+    /// Set the current working directory from a byte slice (max 255 bytes).
+    ///
+    /// Silently truncates paths longer than 255 bytes.
+    pub fn set_cwd(&mut self, path: &[u8]) {
+        let len = path.len().min(255);
+        self.cwd[..len].copy_from_slice(&path[..len]);
+        self.cwd_len = len as u8;
     }
 }

@@ -75,6 +75,48 @@ unsafe fn copy_user_path(user_ptr: u64, buf: &mut [u8; PATH_BUF_LEN]) -> Result<
     Ok(i)
 }
 
+/// Resolve a raw user path slice to an absolute path, writing into `abs_buf`.
+///
+/// If `path` starts with `/`, it is copied directly.  Otherwise the calling
+/// thread's cwd is prepended.  Returns the number of bytes in the absolute
+/// path (excluding any null terminator), or a negative errno on overflow.
+fn resolve_path_abs(path: &[u8], abs_buf: &mut [u8; PATH_BUF_LEN]) -> Result<usize, i64> {
+    if path.is_empty() {
+        return Err(-2); // ENOENT
+    }
+    if path[0] == b'/' {
+        let len = path.len().min(MAX_PATH);
+        abs_buf[..len].copy_from_slice(&path[..len]);
+        abs_buf[len] = 0;
+        return Ok(len);
+    }
+    // Relative: prepend cwd.
+    let (cwd_ptr, cwd_len) = crate::current::current_thread()
+        .map(|t| {
+            let s = t.cwd();
+            (s.as_ptr(), s.len())
+        })
+        .unwrap_or((b"/".as_ptr(), 1));
+    // SAFETY: cwd slice is always within the thread's own cwd buffer.
+    let cwd = unsafe { core::slice::from_raw_parts(cwd_ptr, cwd_len) };
+
+    let copy_cwd = cwd.len().min(MAX_PATH);
+    abs_buf[..copy_cwd].copy_from_slice(&cwd[..copy_cwd]);
+    let mut out = copy_cwd;
+    if out < MAX_PATH && (out == 0 || abs_buf[out - 1] != b'/') {
+        abs_buf[out] = b'/';
+        out += 1;
+    }
+    let copy_path = path.len().min(MAX_PATH - out);
+    abs_buf[out..out + copy_path].copy_from_slice(&path[..copy_path]);
+    out += copy_path;
+    if out > MAX_PATH {
+        return Err(-36); // ENAMETOOLONG
+    }
+    abs_buf[out] = 0;
+    Ok(out)
+}
+
 // ── sys_mkdir ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_MKDIR` (number 83).
@@ -94,7 +136,8 @@ unsafe fn copy_user_path(user_ptr: u64, buf: &mut [u8; PATH_BUF_LEN]) -> Result<
 /// Must be called from the single-CPU SYSCALL dispatch path.
 pub unsafe fn sys_mkdir(pathname_ptr: u64, _mode: u64) -> i64 {
     static mut PATH_BUF: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
-    // SAFETY: single-CPU SYSCALL context; PATH_BUF not concurrently accessed.
+    static mut ABS_BUF: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF/ABS_BUF not concurrently accessed.
     #[allow(static_mut_refs)]
     let path_len = unsafe {
         match copy_user_path(pathname_ptr, &mut PATH_BUF) {
@@ -106,11 +149,18 @@ pub unsafe fn sys_mkdir(pathname_ptr: u64, _mode: u64) -> i64 {
     #[allow(static_mut_refs)]
     let path_bytes: &[u8] = unsafe { &PATH_BUF[..path_len] };
 
-    if path_bytes.is_empty() || path_bytes[0] != b'/' {
-        return -22; // EINVAL — require absolute path
-    }
+    // SAFETY: single-CPU SYSCALL context; ABS_BUF exclusively owned here.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(path_bytes, &mut ABS_BUF) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    #[allow(static_mut_refs)]
+    let abs_path: &[u8] = unsafe { &ABS_BUF[..abs_len] };
 
-    let result = crate::state::with_global_mut(|s| s.vfs.create_dir(path_bytes));
+    let result = crate::state::with_global_mut(|s| s.vfs.create_dir(abs_path));
 
     match result {
         Some(Ok(())) => 0,
@@ -141,7 +191,8 @@ pub unsafe fn sys_mkdir(pathname_ptr: u64, _mode: u64) -> i64 {
 /// Must be called from the single-CPU SYSCALL dispatch path.
 pub unsafe fn sys_unlink(pathname_ptr: u64) -> i64 {
     static mut PATH_BUF2: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
-    // SAFETY: single-CPU SYSCALL context; PATH_BUF2 not concurrently accessed.
+    static mut ABS_BUF2: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF2/ABS_BUF2 not concurrently accessed.
     #[allow(static_mut_refs)]
     let path_len = unsafe {
         match copy_user_path(pathname_ptr, &mut PATH_BUF2) {
@@ -153,11 +204,18 @@ pub unsafe fn sys_unlink(pathname_ptr: u64) -> i64 {
     #[allow(static_mut_refs)]
     let path_bytes: &[u8] = unsafe { &PATH_BUF2[..path_len] };
 
-    if path_bytes.is_empty() || path_bytes[0] != b'/' {
-        return -22; // EINVAL
-    }
+    // SAFETY: single-CPU SYSCALL context; ABS_BUF2 exclusively owned here.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(path_bytes, &mut ABS_BUF2) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    #[allow(static_mut_refs)]
+    let abs_path: &[u8] = unsafe { &ABS_BUF2[..abs_len] };
 
-    let result = crate::state::with_global_mut(|s| s.vfs.unlink_path(path_bytes));
+    let result = crate::state::with_global_mut(|s| s.vfs.unlink_path(abs_path));
 
     match result {
         Some(Ok(())) => 0,

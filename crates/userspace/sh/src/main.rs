@@ -177,15 +177,31 @@ fn dispatch_command(line: &[u8]) {
             libc::exit(code);
         }
         b"cd" => {
-            // cd is a built-in — stub: chdir syscall not yet wired.
-            let _ = rest;
+            let dir = if rest.is_empty() { b"/" as &[u8] } else { rest };
+            let mut path_buf = [0u8; 257];
+            let len = dir.len().min(256);
+            path_buf[..len].copy_from_slice(&dir[..len]);
+            // SAFETY: path_buf is zero-initialized, so it is null-terminated.
+            let ret = unsafe { libc::chdir(path_buf.as_ptr()) };
+            if ret < 0 {
+                write_all(2, b"cd: no such file or directory\n");
+            }
         }
         b"export" => {
             // export is a built-in — stub: putenv not yet wired.
             let _ = rest;
         }
         b"pwd" => {
-            write_all(1, b"/\n");
+            let mut buf = [0u8; 258];
+            // SAFETY: buf is valid for 258 writable bytes.
+            let n = unsafe { libc::getcwd(buf.as_mut_ptr(), 256) };
+            if n > 0 {
+                let len = n as usize - 1;
+                buf[len] = b'\n';
+                write_all(1, &buf[..len + 1]);
+            } else {
+                write_all(1, b"/\n");
+            }
         }
         b"pid" => {
             let pid = libc::getpid();

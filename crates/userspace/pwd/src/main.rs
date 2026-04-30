@@ -4,7 +4,6 @@
 //! ONCRIX `/bin/pwd` — POSIX.1-2024 `pwd` utility.
 //!
 //! Prints the pathname of the current working directory followed by a newline.
-//! Since `chdir` is not yet wired, the kernel root `/` is always the cwd.
 //!
 //! POSIX reference: `.priv-storage/.TheOpenGroup/susv5-html/utilities/pwd.html`
 
@@ -39,8 +38,18 @@ pub extern "C" fn _start() -> ! {
 // ---------------------------------------------------------------------------
 
 extern "C" fn pwd_main(_argc: usize, _argv: *const *const u8) -> ! {
-    // chdir is not yet implemented; root is always the cwd.
-    write_all(1, b"/\n");
+    let mut buf = [0u8; 258]; // 256 path + '\n' + '\0'
+    // SAFETY: buf is valid for 258 writable bytes.
+    let n = unsafe { libc::getcwd(buf.as_mut_ptr(), 256) };
+    if n > 0 {
+        // n includes the null terminator; replace null with '\n'.
+        let len = n as usize - 1;
+        buf[len] = b'\n';
+        write_all(1, &buf[..len + 1]);
+    } else {
+        // Fallback should never happen if kernel cwd is initialised.
+        write_all(1, b"/\n");
+    }
     libc::exit(0)
 }
 

@@ -162,16 +162,16 @@ pub fn arch_clone_thread(parent: &Thread, snapshot: &ForkSnapshot) -> Result<Thr
     if snapshot.child_cr3.is_none() {
         return Err(Error::InvalidArgument);
     }
-    // Parent is not (yet) dereferenced for register copies — the
-    // snapshot carries everything we need. Kept in the signature so
-    // future enhancements (FS/GS base inheritance, FPU state) can
-    // pick it up without a breaking change.
-    let _ = parent;
+    // The parent reference is used for inheriting per-process state
+    // (cwd). Future uses include FS/GS base and FPU state inheritance.
 
     let child_tid = alloc_tid();
     let mut child = Thread::new(child_tid, snapshot.child_pid, snapshot.priority);
     child.ensure_kernel_stack()?;
     child.set_address_space(snapshot.child_cr3);
+
+    // POSIX.1-2024: the child inherits the parent's cwd across fork(2).
+    child.set_cwd(parent.cwd());
 
     let rflags = snapshot.sanitized_rflags();
     let user_rip = snapshot.user_rip;

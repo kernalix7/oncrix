@@ -919,6 +919,174 @@ fn copy_user_string(ptr: u64, max_len: usize) -> Option<&'static [u8]> {
     Some(unsafe { &PATH_BUF[..i] })
 }
 
+// ── sys_chdir / sys_getcwd ────────────────────────────────────────
+
+/// Kernel handler for `SYS_CHDIR` (Linux number 80).
+///
+/// POSIX.1-2024 `chdir(3p)` semantics:
+/// - Resolves `path_ptr` (absolute or relative-to-cwd) against the VFS.
+/// - Verifies the target is a directory.
+/// - Updates the calling thread's `cwd` field.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU context).
+pub unsafe fn sys_chdir(path_ptr: u64) -> i64 {
+    if path_ptr == 0 || path_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Copy path from user space.
+    static mut CHDIR_BUF: [u8; 256] = [0u8; 256];
+    // SAFETY: single-CPU SYSCALL context; exclusive access to CHDIR_BUF.
+    #[allow(static_mut_refs)]
+    let path_bytes: &[u8] = unsafe {
+        let buf = &mut CHDIR_BUF;
+        let base = path_ptr as *const u8;
+        let mut i = 0usize;
+        loop {
+            if i >= 255 {
+                return -36; // ENAMETOOLONG
+            }
+            let byte = base.add(i).read_volatile();
+            if byte == 0 {
+                break;
+            }
+            buf[i] = byte;
+            i += 1;
+        }
+        &buf[..i]
+    };
+
+    if path_bytes.is_empty() {
+        return -2; // ENOENT
+    }
+
+    // Resolve to absolute path.
+    static mut ABS_BUF: [u8; 256] = [0u8; 256];
+    // SAFETY: single-CPU SYSCALL context.
+    #[allow(static_mut_refs)]
+    let abs_path: &[u8] = unsafe {
+        if path_bytes[0] == b'/' {
+            // Already absolute — copy as-is.
+            let len = path_bytes.len().min(255);
+            ABS_BUF[..len].copy_from_slice(&path_bytes[..len]);
+            &ABS_BUF[..len]
+        } else {
+            // Relative — prepend cwd.
+            let cwd = crate::current::current_thread()
+                .map(|t| {
+                    let s = t.cwd();
+                    let l = s.len();
+                    (s.as_ptr(), l)
+                })
+                .unwrap_or((b"/".as_ptr(), 1));
+            let cwd_slice = core::slice::from_raw_parts(cwd.0, cwd.1);
+            // Copy cwd.
+            let copy_cwd = cwd_slice.len().min(255);
+            ABS_BUF[..copy_cwd].copy_from_slice(&cwd_slice[..copy_cwd]);
+            let mut out_len = copy_cwd;
+            // Append '/' separator if cwd doesn't end with '/'.
+            if out_len < 255 && (out_len == 0 || ABS_BUF[out_len - 1] != b'/') {
+                ABS_BUF[out_len] = b'/';
+                out_len += 1;
+            }
+            // Append path.
+            let copy_path = path_bytes.len().min(255 - out_len);
+            ABS_BUF[out_len..out_len + copy_path].copy_from_slice(&path_bytes[..copy_path]);
+            out_len += copy_path;
+            if out_len > 255 {
+                return -36; // ENAMETOOLONG
+            }
+            &ABS_BUF[..out_len]
+        }
+    };
+
+    // Verify target exists and is a directory.
+    let check = crate::state::with_global(|s| {
+        match s.vfs.lookup_path(abs_path) {
+            Ok(inode) => {
+                if inode.file_type == oncrix_vfs::inode::FileType::Directory {
+                    Ok(())
+                } else {
+                    Err(-20i64) // ENOTDIR
+                }
+            }
+            Err(oncrix_lib::Error::NotFound) => Err(-2i64), // ENOENT
+            Err(_) => Err(-22i64),                          // EINVAL
+        }
+    });
+
+    match check {
+        Some(Ok(())) => {}
+        Some(Err(e)) => return e,
+        None => return -5, // EIO
+    }
+
+    // Normalise trailing slash away (keep exactly one '/' for root).
+    let norm_len = {
+        let mut l = abs_path.len();
+        while l > 1 && abs_path[l - 1] == b'/' {
+            l -= 1;
+        }
+        l
+    };
+
+    // Write into the current thread's cwd.
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        if let Some(t) = crate::current::current_thread_mut() {
+            t.set_cwd(&abs_path[..norm_len]);
+        }
+    }
+
+    0
+}
+
+/// Kernel handler for `SYS_GETCWD` (Linux number 79).
+///
+/// POSIX.1-2024 `getcwd(3p)` semantics:
+/// - Copies the current working directory path (null-terminated) into
+///   the user buffer `buf_ptr` of size `size`.
+/// - Returns the number of bytes written (including the null) on success.
+/// - Returns `-ERANGE` if the buffer is too small.
+/// - Returns `-EFAULT` if the buffer pointer is invalid.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU context).
+pub unsafe fn sys_getcwd(buf_ptr: u64, size: u64) -> i64 {
+    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let size = size as usize;
+    if size == 0 {
+        return -22; // EINVAL
+    }
+
+    let (cwd_ptr, cwd_len) = crate::current::current_thread()
+        .map(|t| {
+            let s = t.cwd();
+            (s.as_ptr(), s.len())
+        })
+        .unwrap_or((b"/".as_ptr(), 1));
+
+    // Need cwd_len + 1 for null terminator.
+    if cwd_len + 1 > size {
+        return -34; // ERANGE
+    }
+
+    // Copy cwd + null terminator to user buffer.
+    // SAFETY: buf_ptr validated above; cwd_len is within 255.
+    unsafe {
+        let dst = buf_ptr as *mut u8;
+        core::ptr::copy_nonoverlapping(cwd_ptr, dst, cwd_len);
+        dst.add(cwd_len).write(0);
+    }
+
+    (cwd_len + 1) as i64
+}
+
 // ── Crate-private accessor for the global process table ─────────
 
 /// Crate-internal mutable accessor for the global process table.

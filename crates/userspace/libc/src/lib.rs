@@ -45,6 +45,8 @@ const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_DUP2: u64 = 33;
 const SYS_GETPID: u64 = 39;
+const SYS_GETCWD: u64 = 79;
+const SYS_CHDIR: u64 = 80;
 const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_FORK: u64 = 57;
@@ -331,4 +333,29 @@ pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i64 {
 pub unsafe fn pipe2(fildes: *mut i32, flags: u32) -> i64 {
     // SAFETY: The caller guarantees `fildes` is valid for two i32 writes.
     unsafe { syscall2(SYS_PIPE2, fildes as u64, flags as u64) }
+}
+
+/// `chdir(2)` — change the working directory of the calling process.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn chdir(path: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall1(SYS_CHDIR, path as u64) }
+}
+
+/// `getcwd(3)` — copy the current working directory path into `buf`.
+///
+/// Returns the number of bytes written (including the null terminator)
+/// on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to at least `size` writable bytes.
+pub unsafe fn getcwd(buf: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `buf` is valid for `size` writable bytes.
+    unsafe { syscall2(SYS_GETCWD, buf as u64, size as u64) }
 }

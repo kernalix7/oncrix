@@ -43,6 +43,15 @@ pub const MAX_FDS: usize = 32;
 
 // ── FileBackend ───────────────────────────────────────────────────
 
+/// Selects which synthetic device a [`FileBackend::DevFile`] handle targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevFileKind {
+    /// `/dev/null`: reads return EOF (0 bytes); writes silently succeed.
+    Null,
+    /// `/dev/zero`: reads return all-zero bytes; writes silently succeed.
+    Zero,
+}
+
 /// The backing resource for an open file description.
 ///
 /// Determines how read and write operations are dispatched.
@@ -79,6 +88,15 @@ pub enum FileBackend {
     Socket {
         /// Index into the global socket registry.
         handle_id: u32,
+    },
+
+    /// A synthetic device file (`/dev/null` or `/dev/zero`).
+    ///
+    /// No underlying inode is accessed; reads and writes are handled
+    /// entirely within the fd dispatch layer without touching the ramfs.
+    DevFile {
+        /// Which synthetic device this handle targets.
+        kind: DevFileKind,
     },
 }
 
@@ -144,6 +162,15 @@ impl FileHandle {
     pub const fn ramfs_file(inode: &Inode, flags: HandleFlags) -> Self {
         Self {
             backend: FileBackend::RamfsFile { ino: inode.ino },
+            offset: 0,
+            flags,
+        }
+    }
+
+    /// Create a synthetic device file handle (`/dev/null` or `/dev/zero`).
+    pub const fn dev_file(kind: DevFileKind, flags: HandleFlags) -> Self {
+        Self {
+            backend: FileBackend::DevFile { kind },
             offset: 0,
             flags,
         }
@@ -420,7 +447,10 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
                 }
             }
         }
-        FileBackend::Console | FileBackend::RamfsFile { .. } | FileBackend::Socket { .. } => {}
+        FileBackend::Console
+        | FileBackend::RamfsFile { .. }
+        | FileBackend::Socket { .. }
+        | FileBackend::DevFile { .. } => {}
     }
 
     // SAFETY: single-CPU SYSCALL context.
@@ -630,6 +660,10 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
         }
+        FileBackend::DevFile { .. } => {
+            // /dev/null and /dev/zero both silently discard writes.
+            count as i64
+        }
     }
 }
 
@@ -813,6 +847,20 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
         }
+        FileBackend::DevFile { kind } => match kind {
+            DevFileKind::Null => 0, // EOF — no bytes produced
+            DevFileKind::Zero => {
+                // Fill the user buffer with zero bytes.
+                // SAFETY: `buf_ptr` validated above; writing `count` bytes.
+                unsafe {
+                    let ptr = buf_ptr as *mut u8;
+                    for i in 0..count {
+                        ptr.add(i).write_volatile(0u8);
+                    }
+                }
+                count as i64
+            }
+        },
     }
 }
 
@@ -841,9 +889,10 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
     };
 
     match handle.backend {
-        FileBackend::Console => -29,       // ESPIPE — not seekable
-        FileBackend::Pipe { .. } => -29,   // ESPIPE — pipes not seekable
-        FileBackend::Socket { .. } => -29, // ESPIPE — sockets not seekable
+        FileBackend::Console => -29,        // ESPIPE — not seekable
+        FileBackend::Pipe { .. } => -29,    // ESPIPE — pipes not seekable
+        FileBackend::Socket { .. } => -29,  // ESPIPE — sockets not seekable
+        FileBackend::DevFile { .. } => -29, // ESPIPE — device files not seekable
         FileBackend::RamfsFile { ino } => {
             let current_offset = handle.offset;
 

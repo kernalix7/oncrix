@@ -168,6 +168,31 @@ impl DevFs {
     }
 }
 
+// ── Synthetic device path recognition ────────────────────────────
+
+/// Identifies which synthetic device a path targets, if any.
+///
+/// Returns `Some(DevKind::Null)` for `/dev/null` and
+/// `Some(DevKind::Zero)` for `/dev/zero`; returns `None` for all other
+/// paths.  Called by the kernel `sys_open` handler to short-circuit
+/// normal VFS lookup and install a synthetic fd handle instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevKind {
+    /// `/dev/null` — reads return EOF; writes are silently discarded.
+    Null,
+    /// `/dev/zero` — reads return all-zero bytes; writes are discarded.
+    Zero,
+}
+
+/// Check if `path` names a synthetic device node.
+pub fn classify_dev_path(path: &[u8]) -> Option<DevKind> {
+    match path {
+        b"/dev/null" => Some(DevKind::Null),
+        b"/dev/zero" => Some(DevKind::Zero),
+        _ => None,
+    }
+}
+
 impl InodeOps for DevFs {
     fn lookup(&self, _parent: &Inode, name: &str) -> Result<Inode> {
         self.find_by_name(name)

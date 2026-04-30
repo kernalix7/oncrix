@@ -654,6 +654,22 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
             unsafe { crate::fd_table::fd_dup2(args.arg0 as usize, args.arg1 as usize) }
         }
 
+        // ── Working directory syscalls ────────────────────────────
+
+        // SYS_GETCWD (79): copy current working directory to user buffer.
+        // POSIX.1-2024 getcwd(3p).
+        oncrix_syscall::number::SYS_GETCWD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_getcwd(args.arg0, args.arg1) }
+        }
+
+        // SYS_CHDIR (80): change the process working directory.
+        // POSIX.1-2024 chdir(3p).
+        oncrix_syscall::number::SYS_CHDIR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_chdir(args.arg0) }
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
     };
@@ -677,16 +693,67 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
 /// Maximum path length accepted from user space for `open(2)`.
 const MAX_OPEN_PATH: usize = 256;
 
+/// Resolve a user-supplied path against the calling process's cwd.
+///
+/// If `path` starts with `/`, returns a slice pointing into `abs_buf`
+/// with a copy of `path`.  Otherwise prepends the current thread's cwd
+/// and returns the combined absolute path.  Returns `None` on overflow
+/// or an empty path.
+///
+/// `abs_buf` must be at least `MAX_OPEN_PATH + 1` bytes.
+///
+/// # Safety
+///
+/// `path` must be a valid slice read from user space.
+unsafe fn resolve_to_abs<'b>(
+    path: &[u8],
+    abs_buf: &'b mut [u8; MAX_OPEN_PATH],
+) -> Option<&'b [u8]> {
+    if path.is_empty() {
+        return None;
+    }
+    if path[0] == b'/' {
+        // Already absolute — just copy.
+        let len = path.len().min(MAX_OPEN_PATH - 1);
+        abs_buf[..len].copy_from_slice(&path[..len]);
+        return Some(&abs_buf[..len]);
+    }
+    // Relative: prepend cwd.
+    let (cwd_ptr, cwd_len) = crate::current::current_thread()
+        .map(|t| {
+            let s = t.cwd();
+            (s.as_ptr(), s.len())
+        })
+        .unwrap_or((b"/".as_ptr(), 1));
+    // SAFETY: cwd slice is always within the thread's own cwd buffer.
+    let cwd = unsafe { core::slice::from_raw_parts(cwd_ptr, cwd_len) };
+
+    let copy_cwd = cwd.len().min(MAX_OPEN_PATH - 1);
+    abs_buf[..copy_cwd].copy_from_slice(&cwd[..copy_cwd]);
+    let mut out = copy_cwd;
+    if out < MAX_OPEN_PATH - 1 && (out == 0 || abs_buf[out - 1] != b'/') {
+        abs_buf[out] = b'/';
+        out += 1;
+    }
+    let copy_path = path.len().min(MAX_OPEN_PATH - 1 - out);
+    abs_buf[out..out + copy_path].copy_from_slice(&path[..copy_path]);
+    out += copy_path;
+    if out >= MAX_OPEN_PATH {
+        return None; // ENAMETOOLONG
+    }
+    Some(&abs_buf[..out])
+}
+
 /// Kernel handler for `SYS_OPEN` (Linux number 2).
 ///
 /// POSIX.1-2024 `open(3p)` semantics:
-/// - Resolves `pathname_ptr` against the global ramfs root.
+/// - Resolves `pathname_ptr` against the calling process's cwd (supports
+///   both absolute and relative paths).
 /// - Creates the file if `O_CREAT` is set and the file does not exist.
 /// - Allocates the lowest available fd and installs the handle.
 ///
 /// Phase 12 simplifications:
 /// - No permission checks (all files are accessible as uid=0).
-/// - Only absolute paths resolved against the ramfs root.
 /// - No `O_EXCL`, `O_NOCTTY`, `O_DIRECTORY` handling.
 ///
 /// # Safety
@@ -699,16 +766,16 @@ unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
     }
 
     // Copy the null-terminated path from user space (bounded copy).
-    // Uses the same pattern as `copy_user_string` in fork_dispatch.rs.
     static mut PATH_BUF: [u8; MAX_OPEN_PATH] = [0u8; MAX_OPEN_PATH];
-    // SAFETY: single-CPU SYSCALL context; PATH_BUF is exclusively owned here.
+    static mut ABS_BUF: [u8; MAX_OPEN_PATH] = [0u8; MAX_OPEN_PATH];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF/ABS_BUF exclusively owned here.
     #[allow(static_mut_refs)]
-    let path_bytes: &[u8] = unsafe {
+    let abs_path: &[u8] = unsafe {
         let buf = &mut PATH_BUF;
         let base = pathname_ptr as *const u8;
         let mut i = 0usize;
         loop {
-            if i >= MAX_OPEN_PATH {
+            if i >= MAX_OPEN_PATH - 1 {
                 return -36; // ENAMETOOLONG
             }
             let byte = base.add(i).read_volatile();
@@ -718,17 +785,37 @@ unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
             buf[i] = byte;
             i += 1;
         }
-        &buf[..i]
+        let path_bytes = &buf[..i];
+        match resolve_to_abs(path_bytes, &mut ABS_BUF) {
+            Some(p) => p,
+            None => return -36, // ENAMETOOLONG or empty
+        }
     };
 
-    // Require an absolute path.
-    if path_bytes.is_empty() || path_bytes[0] != b'/' {
+    if abs_path.is_empty() {
         return -22; // EINVAL
+    }
+
+    // Fast path: intercept /dev/null and /dev/zero before touching the ramfs.
+    // These are synthetic devices with no backing inode — reads and writes
+    // are handled entirely in the fd dispatch layer.
+    if let Some(dev_kind) = oncrix_vfs::devfs::classify_dev_path(abs_path) {
+        let fd_kind = match dev_kind {
+            oncrix_vfs::devfs::DevKind::Null => crate::fd_table::DevFileKind::Null,
+            oncrix_vfs::devfs::DevKind::Zero => crate::fd_table::DevFileKind::Zero,
+        };
+        let handle_flags = crate::fd_table::HandleFlags(flags as u32);
+        let handle = crate::fd_table::FileHandle::dev_file(fd_kind, handle_flags);
+        // SAFETY: single-CPU SYSCALL context.
+        return match unsafe { crate::fd_table::fd_install(handle) } {
+            Ok(fd) => fd as i64,
+            Err(_) => -24, // EMFILE
+        };
     }
 
     // Attempt to open / create the file in the global VFS.
     let result =
-        crate::state::with_global_mut(|s| s.vfs.open_path(path_bytes, flags as u32, mode as u32));
+        crate::state::with_global_mut(|s| s.vfs.open_path(abs_path, flags as u32, mode as u32));
 
     match result {
         Some(Ok(inode)) => {

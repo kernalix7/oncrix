@@ -140,7 +140,14 @@ impl KernelState {
 
         // Create standard directory hierarchy under root.
         let root = Inode::new(root_ino, FileType::Directory, FileMode::DIR_DEFAULT);
-        let _ = self.vfs.ramfs.mkdir(&root, "dev", FileMode::DIR_DEFAULT);
+        let dev = self.vfs.ramfs.mkdir(&root, "dev", FileMode::DIR_DEFAULT)?;
+
+        // Populate /dev with synthetic device stubs so `ls /dev` shows them.
+        // The actual I/O is handled by the FileBackend::DevFile fast path in
+        // sys_open — these inodes are never read or written via ramfs.
+        let _ = self.vfs.ramfs.create(&dev, "null", FileMode::FILE_DEFAULT);
+        let _ = self.vfs.ramfs.create(&dev, "zero", FileMode::FILE_DEFAULT);
+
         let _ = self.vfs.ramfs.mkdir(&root, "proc", FileMode::DIR_DEFAULT);
         let _ = self.vfs.ramfs.mkdir(&root, "tmp", FileMode::DIR_DEFAULT);
         let _ = self.vfs.ramfs.mkdir(&root, "sbin", FileMode::DIR_DEFAULT);
