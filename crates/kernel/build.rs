@@ -70,7 +70,8 @@ fn main() {
     // Build all userspace binaries the kernel embeds and exec()s.
     //
     // Phase 23 expanded the embedded set from `init` + `/bin/sh` to a
-    // small POSIX coreutils slice (`echo`, `cat`, `true`, `false`).
+    // small POSIX coreutils slice (`echo`, `cat`, `true`, `false`, `wc`,
+    // `head`, `tail`, `pwd`, `env`, `uname`).
     // Each invocation produces an ELF in `target/x86_64-unknown-none/release/`
     // that the kernel embeds via `include_bytes!` in `init_embed.rs`.
     let userspace_bins: &[(&str, &str)] = &[
@@ -82,6 +83,9 @@ fn main() {
         ("oncrix-wc", "wc"),
         ("oncrix-head", "head"),
         ("oncrix-tail", "tail"),
+        ("oncrix-pwd", "pwd"),
+        ("oncrix-env", "env"),
+        ("oncrix-uname", "uname"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

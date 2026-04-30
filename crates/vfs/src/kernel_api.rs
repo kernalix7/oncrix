@@ -352,6 +352,30 @@ impl KernelVfs {
         buf.truncate(n);
         Ok(buf)
     }
+
+    /// Read a `/proc/<name>` virtual file by name.
+    ///
+    /// Resolves the name against the procfs entry table, generates
+    /// content via [`crate::procfs::ProcFs`], copies at most
+    /// `buf.len()` bytes starting at `offset`, and returns the
+    /// number of bytes copied.
+    ///
+    /// Returns `Err(NotFound)` when no entry matches `name`.
+    pub fn procfs_read(&self, name: &[u8], offset: usize, buf: &mut [u8]) -> Result<usize> {
+        let fs = crate::procfs::ProcFs::new();
+        let name_str = core::str::from_utf8(name).map_err(|_| Error::InvalidArgument)?;
+        let entry = fs.find_by_name(name_str).ok_or(Error::NotFound)?;
+        let generator = entry.generator;
+        let mut tmp = [0u8; 256];
+        let total = fs.generate(generator, &mut tmp)?;
+        if offset >= total {
+            return Ok(0);
+        }
+        let available = total - offset;
+        let to_copy = buf.len().min(available);
+        buf[..to_copy].copy_from_slice(&tmp[offset..offset + to_copy]);
+        Ok(to_copy)
+    }
 }
 
 impl Default for KernelVfs {

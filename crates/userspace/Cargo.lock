@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-env"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-false"
 version = "0.1.0"
 dependencies = [
@@ -32,6 +39,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-init"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pwd"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -61,6 +75,13 @@ dependencies = [
 [[package]]
 name = "oncrix-ulibc"
 version = "0.1.0"
+
+[[package]]
+name = "oncrix-uname"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
 
 [[package]]
 name = "oncrix-wc"
