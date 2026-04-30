@@ -79,6 +79,10 @@ static EMBEDDED_ENV: &[u8] = include_bytes!(env!("ONCRIX_ENV_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_UNAME: &[u8] = include_bytes!(env!("ONCRIX_UNAME_BIN"));
 
+/// The embedded `/bin/ls` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LS: &[u8] = include_bytes!(env!("ONCRIX_LS_BIN"));
+
 // ---------------------------------------------------------------------------
 // Public accessors
 // ---------------------------------------------------------------------------
@@ -138,6 +142,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/pwd" | b"pwd" => Some(EMBEDDED_PWD),
         b"/bin/env" | b"env" => Some(EMBEDDED_ENV),
         b"/bin/uname" | b"uname" => Some(EMBEDDED_UNAME),
+        b"/bin/ls" | b"ls" => Some(EMBEDDED_LS),
         _ => None,
     }
 }

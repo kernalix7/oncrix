@@ -45,6 +45,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-ls"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-pwd"
 version = "0.1.0"
 dependencies = [

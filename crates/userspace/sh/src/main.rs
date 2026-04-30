@@ -194,10 +194,6 @@ fn dispatch_command(line: &[u8]) {
             write_all(1, s);
             write_all(1, b"\n");
         }
-        b"ls" => {
-            let target = if rest.is_empty() { b"/" as &[u8] } else { rest };
-            do_ls(target);
-        }
         b"mkdir" => {
             if rest.is_empty() {
                 write_all(2, b"mkdir: missing operand\n");
@@ -242,11 +238,11 @@ fn dispatch_command(line: &[u8]) {
             }
         }
         b"help" => {
+            write_all(1, b"builtins: exit cd export pwd pid mkdir touch rm help\n");
             write_all(
                 1,
-                b"builtins: exit cd export pwd pid ls mkdir touch rm help\n",
+                b"externals: echo cat ls true false wc head tail env uname (in /bin)\n",
             );
-            write_all(1, b"externals: echo cat true false (and more in /bin)\n");
         }
         _ => {
             run_external(cmd, rest);
@@ -474,67 +470,6 @@ fn parse_i32(s: &[u8]) -> Option<i32> {
         n = n.wrapping_mul(10).wrapping_add((d - b'0') as i32);
     }
     Some(n)
-}
-
-// ---------------------------------------------------------------------------
-// ls helper
-// ---------------------------------------------------------------------------
-
-/// Implements the `ls` builtin.
-///
-/// Opens `target` as a directory, reads directory entries with getdents64,
-/// parses each linux_dirent64 record, and writes the name followed by `\n`.
-fn do_ls(target: &[u8]) {
-    let mut path_buf = [0u8; 257];
-    let len = target.len().min(256);
-    path_buf[..len].copy_from_slice(&target[..len]);
-
-    // Open the directory (O_RDONLY = 0).
-    // SAFETY: path_buf is zero-initialized, so it is null-terminated.
-    let fd = unsafe { libc::open(path_buf.as_ptr(), 0, 0) };
-    if fd < 0 {
-        write_all(2, b"ls: not found\n");
-        return;
-    }
-
-    let mut buf = [0u8; 4096];
-    loop {
-        // SAFETY: buf is a valid 4096-byte writable buffer.
-        let n = unsafe { libc::getdents64(fd as i32, buf.as_mut_ptr(), buf.len()) };
-        if n <= 0 {
-            break;
-        }
-        // Walk the linux_dirent64 records in the returned buffer.
-        // linux_dirent64 layout (as defined in getdents(2)):
-        //   ino:    u64   (offset 0)
-        //   off:    u64   (offset 8)
-        //   reclen: u16   (offset 16)
-        //   type:   u8    (offset 18)
-        //   name:   [u8]  (offset 19, null-terminated)
-        let mut pos = 0usize;
-        while pos < n as usize {
-            if pos + 19 > n as usize {
-                break;
-            }
-            let reclen = u16::from_ne_bytes([buf[pos + 16], buf[pos + 17]]) as usize;
-            if reclen == 0 || pos + reclen > n as usize {
-                break;
-            }
-            // Extract null-terminated name starting at offset 19.
-            let name_start = pos + 19;
-            let name_end = buf[name_start..pos + reclen]
-                .iter()
-                .position(|&b| b == 0)
-                .map(|i| name_start + i)
-                .unwrap_or(pos + reclen);
-            let name = &buf[name_start..name_end];
-            write_all(1, name);
-            write_all(1, b"\n");
-            pos += reclen;
-        }
-    }
-
-    libc::close(fd as i32);
 }
 
 // ---------------------------------------------------------------------------

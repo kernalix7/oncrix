@@ -86,6 +86,7 @@ fn main() {
         ("oncrix-pwd", "pwd"),
         ("oncrix-env", "env"),
         ("oncrix-uname", "uname"),
+        ("oncrix-ls", "ls"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
