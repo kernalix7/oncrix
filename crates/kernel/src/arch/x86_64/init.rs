@@ -366,6 +366,17 @@ const INIT_PTE_W: u64 = 1 << 1;
 const INIT_PTE_U: u64 = 1 << 2;
 /// `PD_0_1G` entry index covering VMA `0x400000..0x600000`.
 const USER_PT_PD_INDEX: usize = 2;
+/// `PD_0_1G` entry index covering VMA `0x600000..0x800000` — anonymous mmap window.
+const USER_MMAP_PT_PD_INDEX: usize = 3;
+/// PTE flag: page-size (2 MiB huge page when set on a PD entry).
+const INIT_PTE_PS: u64 = 1 << 7;
+/// Boot-time kernel-only huge-page entry that originally lived at
+/// `PD_0_1G[3]` covering phys `0x600000..0x800000`. Restored when a
+/// process without an mmap region is scheduled, so the previous
+/// process's mmap pages cannot leak across context switches.
+///
+/// Bits: phys 0x600000 + PRESENT|WRITABLE|PAGE-SIZE (no USER bit).
+const KERNEL_HUGE_PD_SLOT3: u64 = 0x0060_0000 | INIT_PTE_P | INIT_PTE_W | INIT_PTE_PS;
 
 /// Install a per-process user-mode page table at `PD_0_1G[2]`.
 ///
@@ -434,6 +445,68 @@ pub unsafe fn install_user_pt(pt_phys: u64) {
     // SAFETY: Writing CR3 with its current value is privileged but
     // side-effect-free; no in-flight memory access depends on a stale
     // TLB while interrupts are off.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr3",
+            "mov cr3, {tmp}",
+            tmp = out(reg) _,
+            options(nomem, nostack),
+        );
+    }
+}
+
+/// Install a per-process anonymous-mmap page table at `PD_0_1G[3]`.
+///
+/// `pt_phys = Some(phys)` — wires the per-process mmap PT into slot 3
+/// with `PRESENT|WRITABLE|USER` so user VAs `0x600000..0x800000` walk
+/// into this process's anonymous mappings.
+///
+/// `pt_phys = None` — restores the original boot kernel-only huge-page
+/// PDE for slot 3. This is critical for isolation: a process without
+/// any anonymous mmap region must not inherit the previous scheduled
+/// process's PT, otherwise the new process would see (and could write
+/// to) the previous process's mmap pages until its own first
+/// `mmap_anonymous` call.
+///
+/// In both cases the function performs a full TLB flush via the
+/// `mov cr3, cr3` idiom so the change takes effect immediately.
+///
+/// # Safety
+///
+/// Same contract as [`install_user_pt`]: `pt_phys` (when `Some`) must
+/// reference a fully populated 4 KiB page table, and the boot page
+/// tables must not be concurrently mutated. Must be called with
+/// interrupts off on the single CPU.
+pub unsafe fn install_user_mmap_pt(pt_phys: Option<u64>) {
+    // SAFETY: Reading CR3 is privileged but side-effect-free.
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    }
+    let pml4_phys = cr3 & INIT_PTE_ADDR_MASK;
+
+    // SAFETY: PML4 frame lives in the higher-half identity map.
+    let pml4 = (pml4_phys + INIT_KERNEL_VIRT_BASE) as *mut u64;
+    // SAFETY: PML4[0] / PDPT_low[0] are guaranteed user-walkable by the
+    // earlier `install_user_pt` call.
+    let pdpt_low_phys = unsafe { *pml4.add(0) } & INIT_PTE_ADDR_MASK;
+    let pdpt_low = (pdpt_low_phys + INIT_KERNEL_VIRT_BASE) as *mut u64;
+    let pd_phys = unsafe { *pdpt_low.add(0) } & INIT_PTE_ADDR_MASK;
+    let pd = (pd_phys + INIT_KERNEL_VIRT_BASE) as *mut u64;
+
+    let new_entry = match pt_phys {
+        Some(phys) => (phys & INIT_PTE_ADDR_MASK) | INIT_PTE_P | INIT_PTE_W | INIT_PTE_U,
+        None => KERNEL_HUGE_PD_SLOT3,
+    };
+
+    // SAFETY: pd is a valid higher-half alias of PD_0_1G; index 3 is
+    // the slot covering 0x600000..0x800000.
+    unsafe {
+        *pd.add(USER_MMAP_PT_PD_INDEX) = new_entry;
+    }
+
+    // Full TLB flush — same rationale as `install_user_pt`.
+    // SAFETY: see `install_user_pt`.
     unsafe {
         core::arch::asm!(
             "mov {tmp}, cr3",

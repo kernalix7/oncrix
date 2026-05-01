@@ -88,6 +88,7 @@ fn main() {
         ("oncrix-uname", "uname"),
         ("oncrix-ls", "ls"),
         ("oncrix-sigtest", "sigtest"),
+        ("oncrix-mmaptest", "mmaptest"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

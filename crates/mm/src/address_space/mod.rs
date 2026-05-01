@@ -22,7 +22,10 @@ pub mod elf_loader;
 pub mod user;
 
 pub use elf_loader::{ElfLoadInfo, load_elf_into};
-pub use user::{USER_PT_PD_INDEX, USER_REGION_SIZE, UserAddressSpace};
+pub use user::{
+    MMAP_PROT_EXEC, MMAP_PROT_READ, MMAP_PROT_WRITE, USER_MMAP_BASE, USER_MMAP_END,
+    USER_MMAP_PT_PD_INDEX, USER_PT_PD_INDEX, USER_REGION_SIZE, UserAddressSpace,
+};
 
 /// Start of user-space virtual memory.
 pub const USER_SPACE_START: u64 = 0x0000_0000_0040_0000;

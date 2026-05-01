@@ -43,6 +43,7 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_MMAP: u64 = 9;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_DUP2: u64 = 33;
 const SYS_GETPID: u64 = 39;
@@ -132,6 +133,34 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
             in("rdi") a0,
             in("rsi") a1,
             in("rdx") a2,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Issue a 6-argument syscall.
+///
+/// # Safety
+///
+/// The syscall number and arguments must be valid per the ONCRIX ABI.
+unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    let ret: i64;
+    // SAFETY: `syscall` traps into the kernel. The caller guarantees
+    // the syscall number and arguments are valid.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
             lateout("rax") ret,
             lateout("rcx") _,
             lateout("r11") _,
@@ -341,6 +370,59 @@ pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i64 {
 pub unsafe fn pipe2(fildes: *mut i32, flags: u32) -> i64 {
     // SAFETY: The caller guarantees `fildes` is valid for two i32 writes.
     unsafe { syscall2(SYS_PIPE2, fildes as u64, flags as u64) }
+}
+
+// ---------------------------------------------------------------------------
+// mmap protection / flag constants (POSIX values)
+// ---------------------------------------------------------------------------
+
+/// `PROT_READ` — page can be read.
+pub const PROT_READ: u32 = 1;
+/// `PROT_WRITE` — page can be written.
+pub const PROT_WRITE: u32 = 2;
+/// `PROT_EXEC` — page can be executed.
+pub const PROT_EXEC: u32 = 4;
+
+/// `MAP_PRIVATE` — modifications are private to the calling process.
+pub const MAP_PRIVATE: u32 = 0x02;
+/// `MAP_ANONYMOUS` — mapping is not backed by a file.
+pub const MAP_ANONYMOUS: u32 = 0x20;
+
+/// Sentinel returned by [`mmap`] on failure.
+///
+/// Callers should compare the returned pointer against this value
+/// (`(*mut u8) -1`) to detect errors. POSIX uses the same sentinel
+/// (`MAP_FAILED == (void *)-1`).
+pub const MAP_FAILED: *mut u8 = !0_usize as *mut u8;
+
+/// `mmap(2)` — create a new mapping in the virtual address space of the
+/// calling process.
+///
+/// Returns a pointer to the mapped area, or [`MAP_FAILED`] on error.
+///
+/// # Safety
+///
+/// Call sites are required to honour the kernel-imposed restrictions
+/// for the current ONCRIX phase: anonymous + private + `fd == -1`,
+/// `addr == NULL`, `off == 0`. Other combinations return `MAP_FAILED`
+/// with errno encoded as a negative pointer value.
+pub unsafe fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8 {
+    // SAFETY: caller upholds the kernel-side validity contract.
+    let raw = unsafe {
+        syscall6(
+            SYS_MMAP,
+            addr as u64,
+            len as u64,
+            prot as u64,
+            flags as u64,
+            fd as u64,
+            off as u64,
+        )
+    };
+    if raw < 0 {
+        return MAP_FAILED;
+    }
+    raw as u64 as *mut u8
 }
 
 /// `chdir(2)` — change the working directory of the calling process.

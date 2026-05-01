@@ -52,6 +52,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-mmaptest"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-pwd"
 version = "0.1.0"
 dependencies = [

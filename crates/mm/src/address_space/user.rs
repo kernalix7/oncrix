@@ -76,10 +76,30 @@ const ENTRIES_PER_PT: usize = 512;
 /// install the per-process PT at the right PD slot when switching.
 pub const USER_PT_PD_INDEX: usize = 2;
 
+/// Base virtual address of the per-process anonymous mmap window.
+pub const USER_MMAP_BASE: u64 = 0x0060_0000;
+/// End (exclusive) of the per-process anonymous mmap window.
+pub const USER_MMAP_END: u64 = 0x0080_0000;
+/// Index into `PD_0_1G` that covers VMA `0x600000..0x800000`.
+///
+/// `(0x600000 >> 21) & 0x1FF == 3`. Exported so kernel-core can
+/// install the mmap PT at the right PD slot when switching.
+pub const USER_MMAP_PT_PD_INDEX: usize = 3;
+
+/// POSIX `PROT_READ` — page is readable.
+pub const MMAP_PROT_READ: u32 = 1;
+/// POSIX `PROT_WRITE` — page is writable.
+pub const MMAP_PROT_WRITE: u32 = 2;
+/// POSIX `PROT_EXEC` — page is executable.
+pub const MMAP_PROT_EXEC: u32 = 4;
+
 /// PTE flags used for user-accessible data pages.
 const PTE_P: u64 = 1 << 0;
 const PTE_W: u64 = 1 << 1;
 const PTE_U: u64 = 1 << 2;
+/// PTE flag bit 63: NX (no-execute). Treated as a `u64` so the constant
+/// fits without truncation when OR'd into a PTE.
+const PTE_NX: u64 = 1 << 63;
 
 /// Physical-to-virtual translation supplied by the caller.
 ///
@@ -108,6 +128,17 @@ pub struct UserAddressSpace {
     /// Function used to map a physical address back to its higher-half
     /// kernel alias for in-kernel reads/writes.
     phys_to_virt: PhysToVirt,
+    /// Physical address of the per-process anonymous-mmap page table,
+    /// allocated lazily on the first call to [`Self::mmap_anonymous`].
+    /// `None` means the process has never mapped any anonymous memory
+    /// — kernel-core leaves `PD_0_1G[3]` as the boot huge-page entry
+    /// while this process runs.
+    mmap_pt_phys: Option<PhysAddr>,
+    /// Number of 4 KiB pages currently allocated inside the mmap
+    /// window. Anonymous mappings grow upward from [`USER_MMAP_BASE`];
+    /// the next page returned to the user is at
+    /// `USER_MMAP_BASE + mmap_used_pages * PAGE_SIZE`.
+    mmap_used_pages: u32,
 }
 
 impl UserAddressSpace {
@@ -191,6 +222,8 @@ impl UserAddressSpace {
             user_pt_phys,
             region_phys,
             phys_to_virt,
+            mmap_pt_phys: None,
+            mmap_used_pages: 0,
         })
     }
 
@@ -250,13 +283,133 @@ impl UserAddressSpace {
         Ok(info.entry)
     }
 
+    /// Physical address of the per-process anonymous-mmap page table,
+    /// or `None` if the process has not yet called `mmap`.
+    ///
+    /// Kernel-core writes this (OR'd with `PRESENT|WRITABLE|USER`)
+    /// into `PD_0_1G[`[`USER_MMAP_PT_PD_INDEX`]`]` whenever the
+    /// process is scheduled, and restores the boot kernel-only huge
+    /// PDE for slot 3 when the value is `None` so anonymous mmap
+    /// pages cannot leak across processes.
+    pub fn mmap_pt_phys(&self) -> Option<PhysAddr> {
+        self.mmap_pt_phys
+    }
+
+    /// Allocate `len_bytes` of anonymous, zero-filled, ring-3
+    /// memory and return the user virtual address of the first page.
+    ///
+    /// `len_bytes` is rounded up to a multiple of [`PAGE_SIZE`].
+    /// Allocations grow upward from [`USER_MMAP_BASE`]; if the
+    /// request would exceed [`USER_MMAP_END`] the call returns
+    /// [`Error::OutOfMemory`].
+    ///
+    /// On the first successful call this method also allocates the
+    /// per-process mmap page table from `alloc` and stores its
+    /// physical address in [`Self::mmap_pt_phys`]. Subsequent calls
+    /// reuse the same PT.
+    ///
+    /// PTE flags are derived from `prot`:
+    /// - `PRESENT | USER` is always set.
+    /// - `WRITABLE` is set when `prot & MMAP_PROT_WRITE != 0`.
+    /// - `NX` (no-execute) is set when `prot & MMAP_PROT_EXEC == 0`.
+    ///
+    /// # Safety
+    ///
+    /// Mutates physical memory the kernel exposes via `phys_to_virt`.
+    /// Caller must hold the single-CPU + interrupts-off invariant the
+    /// rest of the per-process VM machinery already requires.
+    pub unsafe fn mmap_anonymous<A: FrameAllocator>(
+        &mut self,
+        alloc: &mut A,
+        len_bytes: usize,
+        prot: u32,
+    ) -> Result<u64> {
+        if len_bytes == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let pages = len_bytes.div_ceil(PAGE_SIZE);
+        if pages > u32::MAX as usize {
+            return Err(Error::OutOfMemory);
+        }
+
+        // Bounds check against the 2 MiB mmap window.
+        let start_page = self.mmap_used_pages as u64;
+        let end_page = start_page
+            .checked_add(pages as u64)
+            .ok_or(Error::OutOfMemory)?;
+        let window_pages = (USER_MMAP_END - USER_MMAP_BASE) / PAGE_SIZE as u64;
+        if end_page > window_pages {
+            return Err(Error::OutOfMemory);
+        }
+
+        // Lazily allocate the mmap page table on the first call.
+        if self.mmap_pt_phys.is_none() {
+            let pt_frame = alloc.allocate_frame().ok_or(Error::OutOfMemory)?;
+            // SAFETY: Freshly allocated, page-aligned, unaliased frame.
+            unsafe {
+                core::ptr::write_bytes((self.phys_to_virt)(pt_frame.start_addr()), 0, PAGE_SIZE);
+            }
+            self.mmap_pt_phys = Some(pt_frame.start_addr());
+        }
+        let pt_phys = self.mmap_pt_phys.expect("mmap PT just installed");
+
+        // Allocate `pages` frames; on any failure roll back this call's
+        // newly-allocated frames so the caller sees an atomic ENOMEM.
+        let mut new_frames: [Option<Frame>; 512] = [None; 512];
+        for slot in new_frames.iter_mut().take(pages) {
+            match alloc.allocate_frame() {
+                Some(f) => *slot = Some(f),
+                None => {
+                    for f in new_frames.iter().flatten() {
+                        alloc.deallocate_frame(*f);
+                    }
+                    return Err(Error::OutOfMemory);
+                }
+            }
+        }
+
+        // Compute PTE flags. NX is honoured only when the kernel has
+        // enabled `EFER.NXE`; otherwise setting bit 63 raises a
+        // "reserved bit set" page fault. Boot enables NXE for ONCRIX
+        // (see `init_syscall`), so applying NX here is safe.
+        let mut pte_flags: u64 = PTE_P | PTE_U;
+        if prot & MMAP_PROT_WRITE != 0 {
+            pte_flags |= PTE_W;
+        }
+        if prot & MMAP_PROT_EXEC == 0 {
+            pte_flags |= PTE_NX;
+        }
+
+        // Zero each frame and write the PTE for it.
+        // SAFETY: pt_phys is page-aligned and unaliased except via
+        // phys_to_virt. We write exactly `pages` u64 entries within the
+        // 512-entry table.
+        unsafe {
+            let pt = (self.phys_to_virt)(pt_phys).cast::<u64>();
+            for (i, slot) in new_frames.iter().take(pages).enumerate() {
+                let frame = slot.expect("frame populated above");
+                let frame_phys = frame.start_addr();
+                core::ptr::write_bytes((self.phys_to_virt)(frame_phys), 0, PAGE_SIZE);
+                let pt_index = (start_page as usize) + i;
+                *pt.add(pt_index) = frame_phys.as_u64() | pte_flags;
+            }
+        }
+
+        self.mmap_used_pages += pages as u32;
+        Ok(USER_MMAP_BASE + start_page * PAGE_SIZE as u64)
+    }
+
     /// Duplicate this address space into a new one (eager copy, for
     /// POSIX `fork` semantics).
     ///
     /// Allocates a fresh PT and backing region from `alloc`, then
     /// `memcpy`s the parent's entire 2 MiB into the child. The child's
     /// PT is rewired to point at the child's own frames so no sharing
-    /// remains. On failure the partially-allocated child is released.
+    /// remains. If the parent has any anonymous mmap pages the child
+    /// also receives a freshly allocated mmap PT plus per-page frames
+    /// memcpy'd from the parent, so post-fork the child observes the
+    /// same contents but no shared physical pages. On failure the
+    /// partially-allocated child is released.
     ///
     /// # Safety
     ///
@@ -264,7 +417,7 @@ impl UserAddressSpace {
     /// by ring 3 during the copy. In practice `fork` freezes the
     /// parent across this call.
     pub unsafe fn clone_for_fork<A: FrameAllocator>(&self, alloc: &mut A) -> Result<Self> {
-        let child = Self::new_empty(alloc, self.phys_to_virt)?;
+        let mut child = Self::new_empty(alloc, self.phys_to_virt)?;
         // SAFETY: Both pointers come from `phys_to_virt` on freshly
         // allocated or exclusively-owned frames. Sizes are exactly
         // USER_REGION_SIZE. Caller guarantees the parent region is
@@ -276,6 +429,65 @@ impl UserAddressSpace {
                 USER_REGION_SIZE,
             );
         }
+
+        // Replicate the anonymous mmap region if present.
+        if let Some(parent_pt_phys) = self.mmap_pt_phys {
+            let used = self.mmap_used_pages as usize;
+            // Allocate child mmap PT.
+            let child_pt_frame = match alloc.allocate_frame() {
+                Some(f) => f,
+                None => {
+                    child.release(alloc);
+                    return Err(Error::OutOfMemory);
+                }
+            };
+            // SAFETY: Freshly allocated, page-aligned, unaliased frame.
+            unsafe {
+                core::ptr::write_bytes(
+                    (self.phys_to_virt)(child_pt_frame.start_addr()),
+                    0,
+                    PAGE_SIZE,
+                );
+            }
+            child.mmap_pt_phys = Some(child_pt_frame.start_addr());
+
+            // Copy each in-use mmap page.
+            for page_index in 0..used {
+                // Read parent PTE.
+                // SAFETY: parent_pt_phys is page-aligned and exclusively
+                // accessed via phys_to_virt during this single-CPU call.
+                let parent_pte = unsafe {
+                    let pt = (self.phys_to_virt)(parent_pt_phys).cast::<u64>();
+                    *pt.add(page_index)
+                };
+                if parent_pte & PTE_P == 0 {
+                    continue;
+                }
+                let parent_phys = PhysAddr::new(parent_pte & 0x000F_FFFF_FFFF_F000);
+                let new_frame = match alloc.allocate_frame() {
+                    Some(f) => f,
+                    None => {
+                        child.release(alloc);
+                        return Err(Error::OutOfMemory);
+                    }
+                };
+                // SAFETY: Both pointers refer to exclusively owned 4 KiB
+                // frames. Single-CPU + interrupts-off context prevents
+                // concurrent writes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (self.phys_to_virt)(parent_phys),
+                        (self.phys_to_virt)(new_frame.start_addr()),
+                        PAGE_SIZE,
+                    );
+                    let child_pt = (self.phys_to_virt)(child_pt_frame.start_addr()).cast::<u64>();
+                    let flags_only = parent_pte & !0x000F_FFFF_FFFF_F000;
+                    *child_pt.add(page_index) = new_frame.start_addr().as_u64() | flags_only;
+                }
+            }
+            child.mmap_used_pages = self.mmap_used_pages;
+        }
+
         Ok(child)
     }
 
@@ -284,6 +496,29 @@ impl UserAddressSpace {
     /// Must be called before drop to avoid leaking frames. Callers
     /// typically invoke this from `exit` / the last close path.
     pub fn release<A: FrameAllocator>(self, alloc: &mut A) {
+        // Return mmap-region frames first (if any).
+        if let Some(mmap_pt_phys) = self.mmap_pt_phys {
+            let used = self.mmap_used_pages as usize;
+            // SAFETY: mmap_pt_phys is page-aligned, owned by this UAS,
+            // and accessed exclusively through phys_to_virt.
+            unsafe {
+                let pt = (self.phys_to_virt)(mmap_pt_phys).cast::<u64>();
+                for i in 0..used {
+                    let pte = *pt.add(i);
+                    if pte & PTE_P == 0 {
+                        continue;
+                    }
+                    let phys = PhysAddr::new(pte & 0x000F_FFFF_FFFF_F000);
+                    if let Some(frame) = Frame::from_addr(phys) {
+                        alloc.deallocate_frame(frame);
+                    }
+                }
+            }
+            if let Some(frame) = Frame::from_addr(mmap_pt_phys) {
+                alloc.deallocate_frame(frame);
+            }
+        }
+
         // Return the PT frame.
         if let Some(frame) = Frame::from_addr(self.user_pt_phys) {
             alloc.deallocate_frame(frame);

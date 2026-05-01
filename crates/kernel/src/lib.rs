@@ -82,6 +82,7 @@ pub mod lockdown;
 pub mod log;
 pub mod mac;
 pub mod mmap;
+pub mod mmap_dispatch;
 pub mod net;
 pub mod netfilter;
 pub mod netlink;

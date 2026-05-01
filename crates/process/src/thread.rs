@@ -195,6 +195,21 @@ impl Thread {
             .map(|uas| uas.user_pt_phys().as_u64())
     }
 
+    /// Physical address of this thread's per-process anonymous-mmap
+    /// page table, if any (the PT installed at `PD_0_1G[3]` covering
+    /// VMA `0x600000..0x800000`).
+    ///
+    /// Returns `None` when the thread has no [`UserAddressSpace`] or
+    /// has not yet called `mmap`. Used by the scheduler glue so each
+    /// process's mmap pages are correctly switched in alongside the
+    /// text/stack PT at slot 2.
+    pub fn user_mmap_pt_phys(&self) -> Option<u64> {
+        self.user_address_space
+            .as_ref()
+            .and_then(|uas| uas.mmap_pt_phys())
+            .map(|p| p.as_u64())
+    }
+
     /// Return the thread ID.
     pub const fn tid(&self) -> Tid {
         self.tid

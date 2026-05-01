@@ -21,7 +21,7 @@
 
 use super::clone::load_cr3;
 use super::context::switch_context;
-use super::init::{install_user_pt, switch_tss_rsp0};
+use super::init::{install_user_mmap_pt, install_user_pt, switch_tss_rsp0};
 use super::syscall_entry::{
     saved_user_rflags, saved_user_rip, saved_user_rsp, set_saved_user_rflags, set_saved_user_rip,
     set_saved_user_rsp,
@@ -109,11 +109,19 @@ pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
     // `current`, so `sched.current()` (re-borrowed via `&*` to drop
     // the previous mutable borrow scope) refers to the correct slot.
     let incoming_user_pt = sched.current().and_then(|t| t.user_pt_phys());
+    let incoming_mmap_pt = sched.current().and_then(|t| t.user_mmap_pt_phys());
 
     // SAFETY: `install_user_pt` is the documented runtime variant of
     // the boot-time PD-patch. Interrupts are off per function contract.
     if let Some(pt_phys) = incoming_user_pt {
         unsafe { install_user_pt(pt_phys) };
+        // Install the incoming thread's mmap PT at PD[3]. When the
+        // thread has no anonymous mappings (`None`), restore the boot
+        // kernel-only huge PDE so the previously scheduled process's
+        // mmap pages do not leak into this one.
+        //
+        // SAFETY: same single-CPU + interrupts-off invariant as above.
+        unsafe { install_user_mmap_pt(incoming_mmap_pt) };
     }
 
     // Step 2b: if the incoming thread has an address space (user

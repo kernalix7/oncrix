@@ -31,6 +31,14 @@ const MSR_FMASK: u32 = 0xC000_0084;
 
 /// EFER.SCE (System Call Enable) bit.
 const EFER_SCE: u64 = 1 << 0;
+/// EFER.NXE (No-Execute Enable) bit.
+///
+/// When clear, the CPU treats PTE bit 63 as reserved and raises a
+/// "reserved bit set" #PF (err.bit3=1) on any access through such a
+/// PTE. ONCRIX's anonymous-mmap code sets bit 63 when the caller
+/// omits `PROT_EXEC`, so NXE must be enabled for those mappings to
+/// fault correctly only on instruction fetch.
+const EFER_NXE: u64 = 1 << 11;
 
 /// RFLAGS.IF (Interrupt Flag) bit — masked on SYSCALL entry.
 const RFLAGS_IF: u64 = 1 << 9;
@@ -168,9 +176,12 @@ pub unsafe fn init_syscall() {
     // SYSCALL/SYSRET with segment selectors matching our GDT
     // layout; LSTAR and FMASK are set to valid values.
     unsafe {
-        // Enable SYSCALL/SYSRET in EFER.
+        // Enable SYSCALL/SYSRET and the NX bit in EFER. NXE is required
+        // for `mmap_anonymous` to legally set PTE bit 63 when
+        // `PROT_EXEC` is omitted; without it those PTEs would raise a
+        // reserved-bit page fault on first access.
         let efer = rdmsr(MSR_EFER);
-        wrmsr(MSR_EFER, efer | EFER_SCE);
+        wrmsr(MSR_EFER, efer | EFER_SCE | EFER_NXE);
 
         // STAR: bits 47:32 = kernel CS (0x08), bits 63:48 = user CS base.
         //
@@ -683,6 +694,20 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         oncrix_syscall::number::SYS_CHDIR => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::fork_dispatch::sys_chdir(args.arg0) }
+        }
+
+        // SYS_MMAP (9): map anonymous (or file-backed in future phases)
+        // memory into the calling process's address space. POSIX.1-2024
+        // mmap(3p). The Phase 14 kernel handler only supports
+        // anonymous, private, fd=-1 mappings; everything else returns
+        // -EINVAL.
+        oncrix_syscall::number::SYS_MMAP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::mmap_dispatch::sys_mmap(
+                    args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+                )
+            }
         }
 
         // ── Everything else ──────────────────────────────────────

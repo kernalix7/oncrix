@@ -87,6 +87,10 @@ static EMBEDDED_LS: &[u8] = include_bytes!(env!("ONCRIX_LS_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_SIGTEST: &[u8] = include_bytes!(env!("ONCRIX_SIGTEST_BIN"));
 
+/// The embedded `/bin/mmaptest` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MMAPTEST: &[u8] = include_bytes!(env!("ONCRIX_MMAPTEST_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -186,6 +190,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/uname" | b"uname" => Some(EMBEDDED_UNAME),
         b"/bin/ls" | b"ls" => Some(EMBEDDED_LS),
         b"/bin/sigtest" | b"sigtest" => Some(EMBEDDED_SIGTEST),
+        b"/bin/mmaptest" | b"mmaptest" => Some(EMBEDDED_MMAPTEST),
         _ => None,
     }
 }
