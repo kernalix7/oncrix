@@ -66,6 +66,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-sigtest"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-tail"
 version = "0.1.0"
 dependencies = [

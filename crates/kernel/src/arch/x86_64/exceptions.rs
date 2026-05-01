@@ -151,7 +151,7 @@ pub extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, err
         // Apply the kernel-default Terminate action — sys_exit(139)
         // marks the thread Exited and yields forever; never returns.
         // SAFETY: same single-CPU + IF=0 contract as above.
-        unsafe { crate::signal_dispatch::deliver_pending_signals() };
+        unsafe { crate::signal_dispatch::deliver_pending_signals(core::ptr::null_mut()) };
 
         // Defensive: should be unreachable. Halt the CPU rather than
         // try to iretq back into a dead user context.

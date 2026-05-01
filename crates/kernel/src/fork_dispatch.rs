@@ -587,6 +587,19 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
                 // SAFETY: exclusive access to the new UAS backing region.
                 let backing = uas.backing_slice_mut();
                 let region_size = backing.len(); // USER_REGION_SIZE = 2 MiB
+
+                // Install the per-process `rt_sigreturn` trampoline at
+                // user VA 0x5FE000 (one page below the initial stack)
+                // BEFORE taking the long-lived `stack` borrow below —
+                // both writes target the same `backing` slice and the
+                // borrow checker rejects two `&mut` regions of it being
+                // live at once.
+                let tramp_off = crate::arch::x86_64::init_embed::SIGRETURN_TRAMPOLINE_OFFSET;
+                let tramp = &crate::arch::x86_64::init_embed::SIGRETURN_TRAMPOLINE_BYTES;
+                if tramp_off + tramp.len() <= region_size {
+                    backing[tramp_off..tramp_off + tramp.len()].copy_from_slice(tramp);
+                }
+
                 let stack_off = region_size - 4096;
                 let stack = &mut backing[stack_off..];
 

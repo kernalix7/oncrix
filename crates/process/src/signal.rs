@@ -176,11 +176,24 @@ impl PendingSignals {
     }
 }
 
+// ── sa_flags constants (POSIX.1-2024 sigaction(3p)) ───────────────
+
+/// `SA_NOCLDSTOP` — do not generate `SIGCHLD` when children stop.
+pub const SA_NOCLDSTOP: u64 = 0x0000_0001;
+/// `SA_SIGINFO` — invoke handler with three arguments
+/// (`int signum, siginfo_t *info, void *uctx`) instead of one.
+pub const SA_SIGINFO: u64 = 0x0000_0004;
+/// `SA_RESTART` — automatically restart certain syscalls interrupted
+/// by this signal.
+pub const SA_RESTART: u64 = 0x1000_0000;
+
 /// Per-process signal state.
 #[derive(Debug, Clone, Copy)]
 pub struct SignalState {
     /// Signal actions (indexed by signal number - 1).
     actions: [SignalAction; Signal::MAX as usize],
+    /// `sa_flags` per signal (indexed by signal number - 1).
+    handler_flags: [u64; Signal::MAX as usize],
     /// Currently blocked signals.
     pub mask: SignalMask,
     /// Pending signals.
@@ -198,6 +211,7 @@ impl SignalState {
     pub const fn new() -> Self {
         Self {
             actions: [SignalAction::Default; Signal::MAX as usize],
+            handler_flags: [0u64; Signal::MAX as usize],
             mask: SignalMask::EMPTY,
             pending: PendingSignals::EMPTY,
         }
@@ -211,10 +225,30 @@ impl SignalState {
         self.actions[(sig.0 - 1) as usize]
     }
 
+    /// Get the `sa_flags` for a signal.
+    pub fn get_flags(&self, sig: Signal) -> u64 {
+        if sig.0 == 0 || sig.0 > Signal::MAX {
+            return 0;
+        }
+        self.handler_flags[(sig.0 - 1) as usize]
+    }
+
     /// Set the action for a signal.
     ///
     /// SIGKILL and SIGSTOP cannot be caught or ignored.
     pub fn set_action(&mut self, sig: Signal, action: SignalAction) -> Result<()> {
+        self.set_action_with_flags(sig, action, 0)
+    }
+
+    /// Set the action and `sa_flags` for a signal in one shot.
+    ///
+    /// SIGKILL and SIGSTOP cannot be caught or ignored.
+    pub fn set_action_with_flags(
+        &mut self,
+        sig: Signal,
+        action: SignalAction,
+        flags: u64,
+    ) -> Result<()> {
         if sig == Signal::SIGKILL || sig == Signal::SIGSTOP {
             return Err(Error::InvalidArgument);
         }
@@ -222,6 +256,7 @@ impl SignalState {
             return Err(Error::InvalidArgument);
         }
         self.actions[(sig.0 - 1) as usize] = action;
+        self.handler_flags[(sig.0 - 1) as usize] = flags;
         Ok(())
     }
 

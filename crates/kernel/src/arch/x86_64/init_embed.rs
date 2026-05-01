@@ -83,6 +83,48 @@ static EMBEDDED_UNAME: &[u8] = include_bytes!(env!("ONCRIX_UNAME_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_LS: &[u8] = include_bytes!(env!("ONCRIX_LS_BIN"));
 
+/// The embedded `/bin/sigtest` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SIGTEST: &[u8] = include_bytes!(env!("ONCRIX_SIGTEST_BIN"));
+
+// ---------------------------------------------------------------------------
+// Signal-return trampoline
+// ---------------------------------------------------------------------------
+
+/// User VA at which the per-process `rt_sigreturn` trampoline is mapped.
+///
+/// One page below the System V initial-stack page (0x5FF000), still
+/// inside the per-process 2 MiB region (0x400000..0x600000), so it is
+/// always present in the running process's address space and shares the
+/// same physical backing as the rest of the user mapping.
+pub const SIGRETURN_TRAMPOLINE_VA: u64 = 0x0000_0000_005F_E000;
+
+/// Offset of [`SIGRETURN_TRAMPOLINE_VA`] inside the 2 MiB user backing
+/// region (which starts at user VA 0x400000).
+pub const SIGRETURN_TRAMPOLINE_OFFSET: usize = 0x1FE000;
+
+/// Bytes of the in-process `rt_sigreturn` trampoline.
+///
+/// Disassembly:
+/// ```text
+/// 48 89 e7           mov    %rsp, %rdi         ; frame VA = current RSP
+/// b8 0f 00 00 00     mov    $0xf, %eax         ; SYS_RT_SIGRETURN = 15
+/// 0f 05              syscall
+/// f4                 hlt                       ; defensive
+/// ```
+///
+/// On entry the user stack's top contains the kernel-pushed
+/// `UserSignalFrame` (the handler popped its pretcode return address
+/// via `ret`, so RSP now points at the start of the frame). Passing
+/// RSP into RDI as the syscall argument lets the kernel both validate
+/// the frame's magic word and restore the saved register state.
+pub const SIGRETURN_TRAMPOLINE_BYTES: [u8; 11] = [
+    0x48, 0x89, 0xe7, // mov rsp, rdi
+    0xb8, 0x0f, 0x00, 0x00, 0x00, // mov $0xf, %eax
+    0x0f, 0x05, // syscall
+    0xf4, // hlt
+];
+
 // ---------------------------------------------------------------------------
 // Public accessors
 // ---------------------------------------------------------------------------
@@ -143,6 +185,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/env" | b"env" => Some(EMBEDDED_ENV),
         b"/bin/uname" | b"uname" => Some(EMBEDDED_UNAME),
         b"/bin/ls" | b"ls" => Some(EMBEDDED_LS),
+        b"/bin/sigtest" | b"sigtest" => Some(EMBEDDED_SIGTEST),
         _ => None,
     }
 }

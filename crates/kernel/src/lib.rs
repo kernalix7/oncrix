@@ -117,6 +117,7 @@ pub mod secure_boot;
 pub mod shmem;
 pub mod signal_deliver;
 pub mod signal_dispatch;
+pub mod signal_syscall;
 pub mod signalfd;
 pub mod smack;
 pub mod socket;

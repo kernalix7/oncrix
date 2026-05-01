@@ -78,7 +78,7 @@ pub fn set_current_kstack_top(top: u64) {
 ///
 /// The SYSCALL entry stub stores the user-space RSP here before
 /// switching to the kernel stack, and restores it on exit.
-static SYSCALL_SAVED_USER_RSP: AtomicU64 = AtomicU64::new(0);
+pub static SYSCALL_SAVED_USER_RSP: AtomicU64 = AtomicU64::new(0);
 
 /// Saved user RIP during SYSCALL execution.
 ///
@@ -391,9 +391,12 @@ pub extern "C" fn syscall_entry() {
 /// (e.g. before [`crate::fd_table::install_stdio`] has been called)
 /// but is no longer the matched branch for fd 0–2.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::SyscallArgs) -> i64 {
+extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::SyscallArgs) -> i64 {
     // SAFETY: The assembly stub guarantees `args` points to a valid
-    // SyscallArgs struct on the kernel stack.
+    // SyscallArgs struct on the kernel stack. We retain the raw `*mut`
+    // pointer so the signal-delivery epilogue can plant `arg0` =
+    // signum into the live stack slot before the SYSRET `pop rdi`.
+    let args_ptr: *mut oncrix_syscall::dispatch::SyscallArgs = args;
     let args = unsafe { &*args };
 
     let result: i64 = match args.number {
@@ -635,9 +638,21 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
 
         // ── Signal syscalls ──────────────────────────────────────
 
-        // SYS_RT_SIGACTION (13): stub — ENOSYS until signal handler delivery
-        // is implemented. Returning -ENOSYS lets userspace fall back gracefully.
-        oncrix_syscall::number::SYS_RT_SIGACTION => -38, // ENOSYS
+        // SYS_RT_SIGACTION (13): install a user-space signal handler.
+        // POSIX.1-2024 sigaction(3p).
+        oncrix_syscall::number::SYS_RT_SIGACTION => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::signal_syscall::sys_rt_sigaction(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_RT_SIGRETURN (15): return from a user-mode signal handler.
+        // Reads the kernel-pushed UserSignalFrame at `arg0` and restores
+        // the saved user context for SYSRET.
+        oncrix_syscall::number::SYS_RT_SIGRETURN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; do_sigreturn
+            // validates the frame magic before touching saved-user atomics.
+            unsafe { crate::signal_dispatch::do_sigreturn(args.arg0) }
+        }
 
         // SYS_KILL (62): send a signal to a process.
         // POSIX.1-2024 kill(3p).
@@ -683,7 +698,7 @@ extern "C" fn syscall_dispatch_wrapper(args: *const oncrix_syscall::dispatch::Sy
     // disabled (FMASK cleared IF on entry and we have not re-enabled
     // them in this Rust frame). This is the only context in which
     // the global PROCESS_TABLE may be mutated without further sync.
-    unsafe { crate::signal_dispatch::deliver_pending_signals() };
+    unsafe { crate::signal_dispatch::deliver_pending_signals(args_ptr) };
 
     result
 }

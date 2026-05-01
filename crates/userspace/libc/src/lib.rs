@@ -43,6 +43,7 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_RT_SIGACTION: u64 = 13;
 const SYS_DUP2: u64 = 33;
 const SYS_GETPID: u64 = 39;
 const SYS_GETCWD: u64 = 79;
@@ -55,6 +56,13 @@ const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_PIPE2: u64 = 293;
+
+// ---------------------------------------------------------------------------
+// Signal numbers
+// ---------------------------------------------------------------------------
+
+/// `SIGCHLD` — child process status change.
+pub const SIGCHLD: i32 = 17;
 
 // ---------------------------------------------------------------------------
 // Raw syscall wrappers
@@ -358,4 +366,41 @@ pub unsafe fn chdir(path: *const u8) -> i64 {
 pub unsafe fn getcwd(buf: *mut u8, size: usize) -> i64 {
     // SAFETY: The caller guarantees `buf` is valid for `size` writable bytes.
     unsafe { syscall2(SYS_GETCWD, buf as u64, size as u64) }
+}
+
+// ---------------------------------------------------------------------------
+// Signals
+// ---------------------------------------------------------------------------
+
+/// POSIX `struct sigaction` — kernel ABI mirror.
+///
+/// Field order matches `KernelSigaction` in
+/// `crates/kernel/src/signal_syscall.rs` exactly. Both `act` and
+/// `oldact` arguments to [`sigaction`] are read/written byte-by-byte
+/// by the kernel, so any layout change must be mirrored on both sides.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Sigaction {
+    /// Handler entry point. `0` = `SIG_DFL`, `1` = `SIG_IGN`.
+    pub sa_handler: u64,
+    /// `SA_*` flags.
+    pub sa_flags: u64,
+    /// Restorer trampoline — currently ignored by the kernel (it always
+    /// uses its own in-process trampoline at user VA `0x5FE000`).
+    pub sa_restorer: u64,
+    /// Signal mask while the handler runs.
+    pub sa_mask: u64,
+}
+
+/// `sigaction(2)` — install a per-process disposition for a signal.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `act` and `oldact` must each be either null or a valid pointer to a
+/// [`Sigaction`] struct in the calling process's address space.
+pub unsafe fn sigaction(signum: i32, act: *const Sigaction, oldact: *mut Sigaction) -> i64 {
+    // SAFETY: caller upholds the pointer validity contract.
+    unsafe { syscall3(SYS_RT_SIGACTION, signum as u64, act as u64, oldact as u64) }
 }
