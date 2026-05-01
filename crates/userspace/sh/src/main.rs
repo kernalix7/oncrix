@@ -279,12 +279,11 @@ fn dispatch_command(line: &[u8]) {
 fn print_motd() {
     let pid = libc::fork();
     if pid == 0 {
-        // TEMP HACK: execve mmaptest for batch-14 verification.
-        let path = b"/bin/mmaptest\0".as_ptr();
-        let arg0 = b"mmaptest\0".as_ptr();
+        // Child: execve("/bin/cat", ["cat", "/etc/motd"], []).
+        let path = b"/bin/cat\0".as_ptr();
+        let arg0 = b"cat\0".as_ptr();
         let arg1 = b"/etc/motd\0".as_ptr();
-        let argv: [*const u8; 2] = [arg0, core::ptr::null()];
-        let _ = arg1;
+        let argv: [*const u8; 3] = [arg0, arg1, core::ptr::null()];
         let envp: [*const u8; 1] = [core::ptr::null()];
         // SAFETY: Both pointer arrays are NUL-terminated; path and
         // argv strings are static byte slices with explicit `\0`.
