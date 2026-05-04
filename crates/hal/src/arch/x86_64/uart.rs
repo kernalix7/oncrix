@@ -71,8 +71,10 @@ impl Uart16550 {
             // 8 bits, no parity, one stop bit (8N1), disable DLAB
             outb(self.base + reg::LCR, 0x03);
 
-            // Enable FIFO, clear buffers, 14-byte threshold
-            outb(self.base + reg::FCR, 0xC7);
+            // Enable FIFO, clear both buffers, 1-byte RX trigger level.
+            // A 1-byte trigger fires the RX interrupt on every received byte,
+            // which is required for interactive line-at-a-time input.
+            outb(self.base + reg::FCR, 0x07);
 
             // Enable IRQs, set RTS/DSR
             outb(self.base + reg::MCR, 0x0B);

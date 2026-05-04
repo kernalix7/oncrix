@@ -288,6 +288,14 @@ pub unsafe fn init_pic_and_timer() {
             GateType::Interrupt,
         );
 
+        // IRQ 4 — COM1 UART receive (vector 36).
+        (*idt_ptr).set_handler(
+            PIC_MASTER_OFFSET + 4,
+            handler_addr!(interrupts::uart_handler),
+            selector::KERNEL_CODE,
+            GateType::Interrupt,
+        );
+
         // IRQ 7 — Spurious (vector 39).
         (*idt_ptr).set_handler(
             PIC_MASTER_OFFSET + 7,
@@ -303,12 +311,18 @@ pub unsafe fn init_pic_and_timer() {
         };
         idt::load_idt(&descriptor);
 
-        // Enable IRQ 0 (timer).
+        // Enable IRQ 0 (timer) and IRQ 4 (COM1 UART RX).
         let _ = (*pic_ptr).enable(InterruptVector(PIC_MASTER_OFFSET));
+        let _ = (*pic_ptr).enable(InterruptVector(PIC_MASTER_OFFSET + 4));
 
         // Configure PIT: ~100 Hz (divisor = 1193182 / 100 ≈ 11932).
         let pit_ptr = &raw mut PIT_TIMER;
         let _ = (*pit_ptr).set_periodic(11932);
+
+        // Enable UART RX interrupt (IER bit 0 = Receive Data Available) on COM1.
+        // SAFETY: Writing to COM1 IER (0x3F9) in Ring 0 after the UART has
+        // already been initialized with 8N1; the DLAB bit is clear at this point.
+        oncrix_hal::arch::x86_64::io::outb(0x3F9, 0x01);
 
         // Enable CPU interrupts.
         (*pic_ptr).enable_all();

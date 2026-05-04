@@ -84,6 +84,27 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         let sched = &mut crate::arch::x86_64::init::SCHEDULER;
         let _ = crate::arch::x86_64::sched_glue::sched_yield_once(sched);
     }
+
+    // Poll COM1 UART RX as a fallback: drain all available bytes into
+    // STDIN_BUF even if the IRQ 4 path misses them. This handles QEMU
+    // stdio delivery that does not assert the UART interrupt line.
+    //
+    // SAFETY: IRQ 0 context, IF=0, single CPU — same invariant as the
+    // uart_handler and console_push_byte callers.
+    unsafe {
+        loop {
+            let lsr = oncrix_hal::arch::x86_64::io::inb(0x3FD);
+            if lsr & 0x01 == 0 {
+                break;
+            }
+            let raw = oncrix_hal::arch::x86_64::io::inb(0x3F8);
+            let byte = if raw == 0x0D { 0x0A } else { raw };
+            crate::console::console_push_byte(byte);
+            // Echo back to TX so the user sees what they typed.
+            let mut serial = Uart16550::new(COM1);
+            let _ = serial.write_byte(byte);
+        }
+    }
 }
 
 /// IRQ 1 -- PS/2 keyboard interrupt.
@@ -124,6 +145,39 @@ pub extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
             }
             crate::console::KbdEvent::Ignore => {}
         }
+    }
+}
+
+/// IRQ 4 -- COM1 UART receive interrupt.
+///
+/// Reads all available bytes from the UART RBR while LSR indicates
+/// Data Ready, pushes each byte into STDIN_BUF, echoes it back to
+/// TX, and translates CR (0x0D) to LF (0x0A) so Enter produces a
+/// newline in the shell's read_line loop.
+pub extern "x86-interrupt" fn uart_handler(_frame: InterruptStackFrame) {
+    // SAFETY: Accessing UART I/O ports in Ring 0 with IF=0 (interrupt gate).
+    unsafe {
+        let lsr = oncrix_hal::arch::x86_64::io::inb(0x3FD);
+        if lsr & 0x01 == 0 {
+            // No data ready; send EOI and return.
+            let pic_ptr = &raw mut PIC;
+            let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET + 4));
+            return;
+        }
+        let raw_byte = oncrix_hal::arch::x86_64::io::inb(0x3F8);
+
+        // SAFETY: Raw pointer to `static mut PIC`; single-CPU IF=0 context.
+        let pic_ptr = &raw mut PIC;
+        let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET + 4));
+
+        let byte = if raw_byte == 0x0D { 0x0A } else { raw_byte };
+
+        // SAFETY: IRQ 4 context, IF=0, single CPU — same invariant as console_push_byte.
+        crate::console::console_push_byte(byte);
+
+        // Echo the byte back to UART TX.
+        let mut serial = Uart16550::new(COM1);
+        let _ = serial.write_byte(byte);
     }
 }
 
