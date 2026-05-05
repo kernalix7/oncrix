@@ -724,6 +724,29 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             }
         }
 
+        // ── Time syscalls ─────────────────────────────────────────
+
+        // SYS_TIME (201): seconds since boot. POSIX.1-2024 time(3p)
+        // (deviates: no RTC, so reference is boot not the Epoch).
+        oncrix_syscall::number::SYS_TIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_time(args.arg0) }
+        }
+
+        // SYS_CLOCK_GETTIME (228): write timespec for the requested
+        // clock. POSIX.1-2024 clock_gettime(3p).
+        oncrix_syscall::number::SYS_CLOCK_GETTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_clock_gettime(args.arg0 as u32, args.arg1) }
+        }
+
+        // SYS_NANOSLEEP (35): block for the requested duration via
+        // cooperative yield_now polling. POSIX.1-2024 nanosleep(3p).
+        oncrix_syscall::number::SYS_NANOSLEEP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_nanosleep(args.arg0, args.arg1) }
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
     };

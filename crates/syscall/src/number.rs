@@ -215,6 +215,8 @@ pub const SYS_FUTEX: SyscallNumber = 202;
 pub const SYS_NANOSLEEP: SyscallNumber = 35;
 /// `clock_gettime(clk_id, tp)` — Get clock time.
 pub const SYS_CLOCK_GETTIME: SyscallNumber = 228;
+/// `time(tloc)` — Seconds since the Epoch (or boot, on systems without RTC).
+pub const SYS_TIME: SyscallNumber = 201;
 
 // ── Signal (POSIX) ──────────────────────────────────────────────
 

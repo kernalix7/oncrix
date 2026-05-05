@@ -13,8 +13,27 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use oncrix_ulibc as libc;
+
+/// Exit status of the most recently waited-for child, exposed to the
+/// user via the `$?` special parameter (POSIX.1-2024 §2.5.2).
+///
+/// sh is single-threaded so a relaxed atomic is sufficient — the
+/// atomic wrapper is purely a `static mut`-avoidance convenience.
+static LAST_STATUS: AtomicI32 = AtomicI32::new(0);
+
+/// Decode a `waitpid` raw status word into the conventional exit
+/// code (0..=255) for `$?` reporting.
+///
+/// POSIX `wait(3p)` returns `(exit_code << 8)` for normally
+/// terminated children and `signum` (no high-byte shift) for
+/// signal-killed ones. The kernel currently only emits the former,
+/// so we just take the high byte and downcast.
+fn status_to_exit_code(raw: i32) -> i32 {
+    ((raw as u32 >> 8) & 0xff) as i32
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -70,6 +89,12 @@ fn sh_main() -> ! {
             continue;
         }
 
+        // Substitute `$?` with the most recent child exit status
+        // before tokenisation. The substitution buffer lives on the
+        // stack so we don't need a heap allocator.
+        let mut sub_buf = [0u8; CMD_MAX];
+        let line = substitute_dollar_question(line, &mut sub_buf);
+
         // Check for a pipeline: exactly one `|` splits the line into two segments.
         if let Some(pipe_pos) = find_pipe(line) {
             run_pipeline(&line[..pipe_pos], &line[pipe_pos + 1..]);
@@ -77,6 +102,63 @@ fn sh_main() -> ! {
             dispatch_command(line);
         }
     }
+}
+
+/// Replace every occurrence of the two-byte token `$?` in `src` with
+/// the decimal representation of [`LAST_STATUS`], writing the result
+/// into `dst`. Returns a slice of `dst` covering the substituted
+/// output. If `dst` overflows mid-substitution the remainder of the
+/// input is silently dropped — POSIX leaves over-long lines
+/// implementation-defined.
+fn substitute_dollar_question<'a>(src: &[u8], dst: &'a mut [u8]) -> &'a [u8] {
+    let status = LAST_STATUS.load(Ordering::Relaxed);
+    let mut digits = [0u8; 12];
+    let dlen = i32_to_dec(status, &mut digits);
+
+    let mut i = 0usize;
+    let mut o = 0usize;
+    while i < src.len() && o < dst.len() {
+        if i + 1 < src.len() && src[i] == b'$' && src[i + 1] == b'?' {
+            let copy = dlen.min(dst.len() - o);
+            dst[o..o + copy].copy_from_slice(&digits[..copy]);
+            o += copy;
+            i += 2;
+        } else {
+            dst[o] = src[i];
+            o += 1;
+            i += 1;
+        }
+    }
+    &dst[..o]
+}
+
+/// Format a (possibly negative) `i32` into the start of `buf` as
+/// decimal ASCII; returns the number of bytes written.
+fn i32_to_dec(value: i32, buf: &mut [u8; 12]) -> usize {
+    if value == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let (mut n, neg) = if value < 0 {
+        ((value as i64).unsigned_abs(), true)
+    } else {
+        (value as u64, false)
+    };
+    let mut tmp = [0u8; 12];
+    let mut i = 12usize;
+    while n > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let len = 12 - i;
+    let mut out = 0;
+    if neg {
+        buf[0] = b'-';
+        out = 1;
+    }
+    buf[out..out + len].copy_from_slice(&tmp[i..]);
+    out + len
 }
 
 // ---------------------------------------------------------------------------
@@ -535,11 +617,13 @@ fn run_external(cmd: &[u8], rest: &[u8], redirs: &Redirections) {
         write_all(2, b"sh: exec failed\n");
         libc::exit(127);
     } else if child > 0 {
-        // Parent: wait for the child.
+        // Parent: wait for the child and remember its exit status
+        // for `$?`.
         let mut status: i32 = 0;
         // SAFETY: status is a valid stack i32 owned for the duration
         // of this call.
         unsafe { libc::waitpid(child, &mut status as *mut i32, 0) };
+        LAST_STATUS.store(status_to_exit_code(status), Ordering::Relaxed);
     } else {
         write_all(2, b"sh: fork failed\n");
     }

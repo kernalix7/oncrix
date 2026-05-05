@@ -135,6 +135,7 @@ pub mod tcp;
 pub mod tcp_congestion;
 pub mod tcp_fastopen;
 pub mod termios;
+pub mod time_syscalls;
 pub mod timer;
 pub mod timerfd;
 pub mod tls;

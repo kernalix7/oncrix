@@ -59,6 +59,9 @@ const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_PIPE2: u64 = 293;
+const SYS_NANOSLEEP: u64 = 35;
+const SYS_CLOCK_GETTIME: u64 = 228;
+const SYS_TIME: u64 = 201;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -607,4 +610,69 @@ pub struct Sigaction {
 pub unsafe fn sigaction(signum: i32, act: *const Sigaction, oldact: *mut Sigaction) -> i64 {
     // SAFETY: caller upholds the pointer validity contract.
     unsafe { syscall3(SYS_RT_SIGACTION, signum as u64, act as u64, oldact as u64) }
+}
+
+// ---------------------------------------------------------------------------
+// Time syscalls
+// ---------------------------------------------------------------------------
+
+/// `CLOCK_REALTIME` — system-wide wall clock (currently identical to
+/// `CLOCK_MONOTONIC` on ONCRIX since there is no RTC source).
+pub const CLOCK_REALTIME: i32 = 0;
+/// `CLOCK_MONOTONIC` — monotonic time since boot.
+pub const CLOCK_MONOTONIC: i32 = 1;
+
+/// POSIX `struct timespec` — second + nanosecond pair.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Timespec {
+    /// Whole seconds.
+    pub tv_sec: i64,
+    /// Nanoseconds in `[0, 999_999_999]`.
+    pub tv_nsec: i64,
+}
+
+/// `time(tloc)` — return seconds since boot.
+///
+/// On ONCRIX this is "since boot", not "since the POSIX Epoch" — the
+/// kernel has no RTC source. If `tloc` is non-null the same value is
+/// also written to `*tloc`.
+///
+/// # Safety
+///
+/// `tloc` must be either null or a valid `*mut i64` in the calling
+/// process's address space.
+pub unsafe fn time(tloc: *mut i64) -> i64 {
+    // SAFETY: caller upholds the pointer contract.
+    unsafe { syscall1(SYS_TIME, tloc as u64) }
+}
+
+/// `clock_gettime(clk_id, tp)` — write the current time of `clk_id`
+/// into `*tp`.
+///
+/// Supported clocks: `CLOCK_REALTIME` (0), `CLOCK_MONOTONIC` (1).
+///
+/// # Safety
+///
+/// `tp` must be a valid `*mut Timespec` in the calling process's
+/// address space.
+pub unsafe fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i64 {
+    // SAFETY: caller upholds the pointer contract.
+    unsafe { syscall2(SYS_CLOCK_GETTIME, clk_id as u64, tp as u64) }
+}
+
+/// `nanosleep(req, rem)` — block the calling thread for at least
+/// the duration in `*req`.
+///
+/// Returns 0 on success. ONCRIX has no signal-interrupt mechanism
+/// for sleep yet, so the call always sleeps the full duration and
+/// `*rem` (if non-null) is always written `(0, 0)`.
+///
+/// # Safety
+///
+/// `req` must point to a valid `Timespec`. `rem` must be null or a
+/// valid `*mut Timespec`.
+pub unsafe fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
+    // SAFETY: caller upholds the pointer contracts.
+    unsafe { syscall2(SYS_NANOSLEEP, req as u64, rem as u64) }
 }
