@@ -50,7 +50,7 @@ extern "C" fn sigtest_main(_argc: usize, _argv: *const *const u8) -> ! {
     write_all(2, b"[sigtest] installing SIGCHLD handler\n");
 
     let act = libc::Sigaction {
-        sa_handler: sigchld_handler as u64,
+        sa_handler: sigchld_handler as *const () as u64,
         sa_flags: 0,
         sa_restorer: 0,
         sa_mask: 0,

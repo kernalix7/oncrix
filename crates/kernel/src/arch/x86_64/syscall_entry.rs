@@ -474,6 +474,20 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             }
         }
 
+        // SYS_STAT (4): get file status by pathname.
+        // POSIX.1-2024 stat(3p).
+        oncrix_syscall::number::SYS_STAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_stat(args.arg0, args.arg1) }
+        }
+
+        // SYS_FSTAT (5): get file status by file descriptor.
+        // POSIX.1-2024 fstat(3p).
+        oncrix_syscall::number::SYS_FSTAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_fstat(args.arg0 as i32, args.arg1) }
+        }
+
         // SYS_LSEEK (8): reposition the file offset.
         // POSIX.1-2024 lseek(3p).
         oncrix_syscall::number::SYS_LSEEK => {

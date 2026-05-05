@@ -364,3 +364,198 @@ pub unsafe fn sys_getdents64(fd: usize, buf_ptr: u64, buf_len: u64) -> i64 {
 const fn align8(n: usize) -> usize {
     (n + 7) & !7
 }
+
+// ── Linux-compatible struct stat layout ───────────────────────────
+//
+// This matches the x86-64 Linux `struct stat` layout exactly so that
+// userspace libc can cast the raw bytes to its own mirror struct.
+//
+// Offsets (all little-endian):
+//   0:  st_dev      u64   — device ID (stub: 1)
+//   8:  st_ino      u64   — inode number
+//   16: st_nlink    u64   — hard link count
+//   24: st_mode     u32   — file type + permission bits
+//   28: st_uid      u32   — owner UID
+//   32: st_gid      u32   — owner GID
+//   36: __pad0      u32   — padding
+//   40: st_rdev     u64   — device ID if special file (0)
+//   48: st_size     i64   — file size in bytes
+//   56: st_blksize  i64   — preferred I/O block size (4096)
+//   64: st_blocks   i64   — 512-byte blocks allocated
+//   72: st_atime    u64   — last access time (0)
+//   80: st_atime_ns u64   — nanoseconds
+//   88: st_mtime    u64   — last modification time (0)
+//   96: st_mtime_ns u64   — nanoseconds
+//  104: st_ctime    u64   — last status change time (0)
+//  112: st_ctime_ns u64   — nanoseconds
+//  120: __unused    [3]u64
+// Total: 144 bytes
+
+const STAT_SIZE: usize = 144;
+
+/// Fill a 144-byte Linux `struct stat` from an inode's metadata.
+///
+/// File type bits follow the POSIX definition:
+///   S_IFDIR = 0o040000, S_IFREG = 0o100000.
+///
+/// Permissions come from the inode's `mode` field (lower 12 bits).
+///
+/// # Safety
+///
+/// `buf` must point to at least 144 writable bytes in user space.
+/// The caller must have validated the pointer.
+unsafe fn fill_stat_buf(buf: *mut u8, inode: &oncrix_vfs::inode::Inode) {
+    let mut raw = [0u8; STAT_SIZE];
+
+    // st_dev = 1 (single virtual device)
+    raw[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    // st_ino
+    raw[8..16].copy_from_slice(&inode.ino.0.to_ne_bytes());
+    // st_nlink
+    raw[16..24].copy_from_slice(&(inode.nlink as u64).to_ne_bytes());
+
+    // st_mode: type bits + permission bits
+    let type_bits: u32 = match inode.file_type {
+        oncrix_vfs::inode::FileType::Directory => 0o040000,
+        oncrix_vfs::inode::FileType::Regular => 0o100000,
+        oncrix_vfs::inode::FileType::Symlink => 0o120000,
+        oncrix_vfs::inode::FileType::CharDevice => 0o020000,
+        oncrix_vfs::inode::FileType::BlockDevice => 0o060000,
+        oncrix_vfs::inode::FileType::Fifo => 0o010000,
+        oncrix_vfs::inode::FileType::Socket => 0o140000,
+    };
+    let mode: u32 = type_bits | (inode.mode.0 as u32 & 0o7777);
+    raw[24..28].copy_from_slice(&mode.to_ne_bytes());
+    // st_uid, st_gid
+    raw[28..32].copy_from_slice(&inode.uid.to_ne_bytes());
+    raw[32..36].copy_from_slice(&inode.gid.to_ne_bytes());
+    // st_size
+    raw[48..56].copy_from_slice(&(inode.size as i64).to_ne_bytes());
+    // st_blksize = 4096
+    raw[56..64].copy_from_slice(&4096i64.to_ne_bytes());
+    // st_blocks = (size + 511) / 512
+    let blocks = inode.size.div_ceil(512) as i64;
+    raw[64..72].copy_from_slice(&blocks.to_ne_bytes());
+
+    // SAFETY: caller guarantees `buf` is valid for STAT_SIZE writable bytes.
+    unsafe { buf.copy_from_nonoverlapping(raw.as_ptr(), STAT_SIZE) };
+}
+
+// ── sys_stat ──────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_STAT` (number 4).
+///
+/// POSIX.1-2024 `stat(3p)` — obtain file status by path.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-2` ENOENT — path does not exist.
+/// - `-14` EFAULT — bad user pointer.
+/// - `-36` ENAMETOOLONG — path too long.
+/// - `-22` EINVAL — invalid path.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_stat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
+    // Validate statbuf pointer.
+    if statbuf_ptr == 0 || statbuf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    static mut STAT_PATH_BUF: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut STAT_ABS_BUF: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // SAFETY: single-CPU SYSCALL context; buffers exclusively owned here.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(path_ptr, &mut STAT_PATH_BUF) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    #[allow(static_mut_refs)]
+    let path_bytes: &[u8] = unsafe { &STAT_PATH_BUF[..path_len] };
+
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(path_bytes, &mut STAT_ABS_BUF) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    #[allow(static_mut_refs)]
+    let abs_path: &[u8] = unsafe { &STAT_ABS_BUF[..abs_len] };
+
+    let result = crate::state::with_global(|s| s.vfs.lookup_path(abs_path));
+
+    match result {
+        Some(Ok(inode)) => {
+            // SAFETY: statbuf_ptr validated above; fill_stat_buf writes exactly STAT_SIZE bytes.
+            unsafe { fill_stat_buf(statbuf_ptr as *mut u8, &inode) };
+            0
+        }
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
+// ── sys_fstat ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_FSTAT` (number 5).
+///
+/// POSIX.1-2024 `fstat(3p)` — obtain file status by file descriptor.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-9` EBADF — bad file descriptor.
+/// - `-14` EFAULT — bad statbuf pointer.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_fstat(fd: i32, statbuf_ptr: u64) -> i64 {
+    if statbuf_ptr == 0 || statbuf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // SAFETY: single-CPU SYSCALL context.
+    let handle = unsafe { crate::fd_table::fd_get(fd as usize) };
+    let handle = match handle {
+        Some(h) => h,
+        None => return -9, // EBADF
+    };
+
+    let ino = match handle.backend {
+        crate::fd_table::FileBackend::RamfsFile { ino } => ino,
+        // Console and device files have no inode; return a synthetic stat.
+        crate::fd_table::FileBackend::Console | crate::fd_table::FileBackend::DevFile { .. } => {
+            // Return a zeroed-out stat (mode = char device, size = 0).
+            let mut raw = [0u8; STAT_SIZE];
+            // st_dev = 1, st_ino = 0, st_mode = S_IFCHR | 0o666
+            raw[0..8].copy_from_slice(&1u64.to_ne_bytes());
+            let mode: u32 = 0o020000 | 0o666;
+            raw[24..28].copy_from_slice(&mode.to_ne_bytes());
+            raw[16..24].copy_from_slice(&1u64.to_ne_bytes()); // nlink=1
+            raw[56..64].copy_from_slice(&4096i64.to_ne_bytes()); // blksize
+            // SAFETY: validated above.
+            unsafe { (statbuf_ptr as *mut u8).copy_from_nonoverlapping(raw.as_ptr(), STAT_SIZE) };
+            return 0;
+        }
+        _ => return -9, // EBADF (pipe/socket — not yet supported by fstat)
+    };
+
+    let maybe_inode = crate::state::with_global(|s| s.vfs.ramfs.inode_by_number(ino));
+
+    match maybe_inode.flatten() {
+        Some(inode) => {
+            // SAFETY: statbuf_ptr validated above.
+            unsafe { fill_stat_buf(statbuf_ptr as *mut u8, &inode) };
+            0
+        }
+        None => -9, // EBADF
+    }
+}

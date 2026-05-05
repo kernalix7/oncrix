@@ -169,7 +169,15 @@ fn dispatch_command(line: &[u8]) {
         return;
     }
 
-    let (cmd, rest) = split_first_token(line);
+    // Strip any I/O redirection operators from the line before tokenizing.
+    let mut cmd_buf = [0u8; CMD_MAX];
+    let (stripped, redirs) = parse_redirections(line, &mut cmd_buf);
+    let stripped = trim(stripped);
+    if stripped.is_empty() {
+        return;
+    }
+
+    let (cmd, rest) = split_first_token(stripped);
 
     match cmd {
         b"exit" => {
@@ -231,9 +239,10 @@ fn dispatch_command(line: &[u8]) {
                 let mut path_buf = [0u8; 257];
                 let len = rest.len().min(256);
                 path_buf[..len].copy_from_slice(&rest[..len]);
-                // O_CREAT|O_WRONLY = 0x41
+                // O_CREAT|O_WRONLY
                 // SAFETY: path_buf is zero-initialized, so it is null-terminated.
-                let fd = unsafe { libc::open(path_buf.as_ptr(), 0x41, 0o644) };
+                let fd =
+                    unsafe { libc::open(path_buf.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o644) };
                 if fd >= 0 {
                     libc::close(fd as i32);
                 }
@@ -261,9 +270,150 @@ fn dispatch_command(line: &[u8]) {
             );
         }
         _ => {
-            run_external(cmd, rest);
+            run_external(cmd, rest, &redirs);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// I/O redirection parsing
+// ---------------------------------------------------------------------------
+
+/// Maximum path length for a redirection target filename (including NUL).
+const REDIR_PATH_LEN: usize = 128;
+
+/// Parsed I/O redirections extracted from a command line.
+///
+/// Each direction stores the NUL-terminated filename and whether the
+/// field is active (`has_*`).  Only the rightmost operator wins per
+/// direction, matching POSIX sh behaviour.
+struct Redirections {
+    /// Stdout target (active when `has_out` is true).
+    out_path: [u8; REDIR_PATH_LEN],
+    has_out: bool,
+    /// Append stdout target (active when `has_append` is true; `has_out` is
+    /// also set so the open flags differ only in O_TRUNC vs O_APPEND).
+    append: bool,
+    /// Stdin source (active when `has_in` is true).
+    in_path: [u8; REDIR_PATH_LEN],
+    has_in: bool,
+}
+
+impl Redirections {
+    const fn none() -> Self {
+        Self {
+            out_path: [0u8; REDIR_PATH_LEN],
+            has_out: false,
+            append: false,
+            in_path: [0u8; REDIR_PATH_LEN],
+            has_in: false,
+        }
+    }
+}
+
+/// Scan `line` for unquoted `>>`, `>`, and `<` redirection operators.
+///
+/// Returns the `Redirections` struct plus a heap-free "stripped" command
+/// line written into `cmd_buf` (up to `cmd_buf.len()` bytes; NUL-
+/// terminated).  The returned slice is the printable portion of `cmd_buf`
+/// without the trailing NUL.
+///
+/// Operator precedence: rightmost operator wins per direction (POSIX 2.7).
+/// Whitespace around the operator is allowed (`cmd >file` == `cmd > file`).
+fn parse_redirections<'b>(line: &[u8], cmd_buf: &'b mut [u8; CMD_MAX]) -> (&'b [u8], Redirections) {
+    let mut redirs = Redirections::none();
+    let mut out_len = 0usize;
+    let mut i = 0usize;
+
+    while i < line.len() {
+        // Detect `>>` before `>` so we don't consume the first `>` alone.
+        if i + 1 < line.len() && line[i] == b'>' && line[i + 1] == b'>' {
+            i += 2;
+            // Skip whitespace between operator and filename.
+            while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+                i += 1;
+            }
+            // Collect filename token.
+            let start = i;
+            while i < line.len() && line[i] != b' ' && line[i] != b'\t' {
+                i += 1;
+            }
+            let name = &line[start..i];
+            let copy_len = name.len().min(REDIR_PATH_LEN - 1);
+            redirs.out_path = [0u8; REDIR_PATH_LEN];
+            redirs.out_path[..copy_len].copy_from_slice(&name[..copy_len]);
+            redirs.has_out = true;
+            redirs.append = true;
+            continue;
+        }
+        if line[i] == b'>' {
+            i += 1;
+            while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+                i += 1;
+            }
+            let start = i;
+            while i < line.len() && line[i] != b' ' && line[i] != b'\t' {
+                i += 1;
+            }
+            let name = &line[start..i];
+            let copy_len = name.len().min(REDIR_PATH_LEN - 1);
+            redirs.out_path = [0u8; REDIR_PATH_LEN];
+            redirs.out_path[..copy_len].copy_from_slice(&name[..copy_len]);
+            redirs.has_out = true;
+            redirs.append = false;
+            continue;
+        }
+        if line[i] == b'<' {
+            i += 1;
+            while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+                i += 1;
+            }
+            let start = i;
+            while i < line.len() && line[i] != b' ' && line[i] != b'\t' {
+                i += 1;
+            }
+            let name = &line[start..i];
+            let copy_len = name.len().min(REDIR_PATH_LEN - 1);
+            redirs.in_path = [0u8; REDIR_PATH_LEN];
+            redirs.in_path[..copy_len].copy_from_slice(&name[..copy_len]);
+            redirs.has_in = true;
+            continue;
+        }
+        // Ordinary character — copy to cmd_buf.
+        if out_len < CMD_MAX - 1 {
+            cmd_buf[out_len] = line[i];
+            out_len += 1;
+        }
+        i += 1;
+    }
+    cmd_buf[out_len] = 0;
+    // Trim trailing whitespace from cmd portion.
+    while out_len > 0 && (cmd_buf[out_len - 1] == b' ' || cmd_buf[out_len - 1] == b'\t') {
+        cmd_buf[out_len - 1] = 0;
+        out_len -= 1;
+    }
+    (&cmd_buf[..out_len], redirs)
+}
+
+/// Open a redirection target file and dup2 it onto `target_fd`.
+///
+/// Returns false if any operation fails (the caller should exit the child).
+///
+/// # Safety
+///
+/// Must be called only in the child process after fork, before execve.
+unsafe fn apply_redirection(path: &[u8], open_flags: i32, open_mode: u32, target_fd: i32) -> bool {
+    // path is already NUL-terminated in the fixed-size array; pass its ptr.
+    // SAFETY: caller guarantees path is a NUL-terminated slice from Redirections.
+    let fd = unsafe { libc::open(path.as_ptr(), open_flags, open_mode) };
+    if fd < 0 {
+        write_all(2, b"sh: redirection: cannot open file\n");
+        return false;
+    }
+    // SAFETY: fd >= 0 and target_fd (0 or 1) are valid fds.
+    unsafe { libc::dup2(fd as i32, target_fd) };
+    libc::close(fd as i32);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -280,13 +430,13 @@ fn print_motd() {
     let pid = libc::fork();
     if pid == 0 {
         // Child: execve("/bin/cat", ["cat", "/etc/motd"], []).
-        let path = b"/bin/cat\0".as_ptr();
-        let arg0 = b"cat\0".as_ptr();
-        let arg1 = b"/etc/motd\0".as_ptr();
+        let path = c"/bin/cat".as_ptr().cast::<u8>();
+        let arg0 = c"cat".as_ptr().cast::<u8>();
+        let arg1 = c"/etc/motd".as_ptr().cast::<u8>();
         let argv: [*const u8; 3] = [arg0, arg1, core::ptr::null()];
         let envp: [*const u8; 1] = [core::ptr::null()];
         // SAFETY: Both pointer arrays are NUL-terminated; path and
-        // argv strings are static byte slices with explicit `\0`.
+        // argv strings are static C string literals.
         unsafe { libc::execve(path, argv.as_ptr(), envp.as_ptr()) };
         // execve only returns on failure — bail silently.
         libc::exit(0);
@@ -312,7 +462,9 @@ const ARG_BUF_LEN: usize = 64;
 /// `argv[0]`). `rest` is the remaining whitespace-separated argument
 /// string from the prompt; it is tokenised into `argv[1..]` slots up
 /// to [`ARGV_MAX`] and at most [`ARG_BUF_LEN`] - 1 bytes per slot.
-fn run_external(cmd: &[u8], rest: &[u8]) {
+/// `redirs` carries any I/O redirections parsed from the original line;
+/// they are applied in the child before `execve`.
+fn run_external(cmd: &[u8], rest: &[u8], redirs: &Redirections) {
     if cmd.len() >= ARG_BUF_LEN {
         write_all(2, b"sh: command too long\n");
         return;
@@ -355,9 +507,27 @@ fn run_external(cmd: &[u8], rest: &[u8]) {
 
     let child = libc::fork();
     if child == 0 {
-        // Child: execve into the requested binary. argv[0] is `cmd`
-        // which is also the path — `embedded_lookup` accepts both
-        // `/bin/<name>` and bare `<name>` forms.
+        // Child: apply redirections before execve.
+        if redirs.has_out {
+            let flags = if redirs.append {
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND
+            } else {
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC
+            };
+            // SAFETY: out_path is NUL-terminated (zero-initialized array).
+            if !unsafe { apply_redirection(&redirs.out_path, flags, 0o644, 1) } {
+                libc::exit(1);
+            }
+        }
+        if redirs.has_in {
+            // SAFETY: in_path is NUL-terminated (zero-initialized array).
+            if !unsafe { apply_redirection(&redirs.in_path, libc::O_RDONLY, 0, 0) } {
+                libc::exit(1);
+            }
+        }
+        // execve into the requested binary. argv[0] is `cmd` which is also
+        // the path — `embedded_lookup` accepts both `/bin/<name>` and bare
+        // `<name>` forms.
         // SAFETY: arg_storage[0] is NUL-terminated (zero-padded);
         // argv and envp arrays are NULL-terminated.
         unsafe { libc::execve(arg_storage[0].as_ptr(), argv.as_ptr(), envp.as_ptr()) };

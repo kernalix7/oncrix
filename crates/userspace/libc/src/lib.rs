@@ -43,6 +43,8 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_STAT: u64 = 4;
+const SYS_FSTAT: u64 = 5;
 const SYS_MMAP: u64 = 9;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_DUP2: u64 = 33;
@@ -373,6 +375,23 @@ pub unsafe fn pipe2(fildes: *mut i32, flags: u32) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// open(2) flag constants (Linux/POSIX values)
+// ---------------------------------------------------------------------------
+
+/// `O_RDONLY` — open for reading only.
+pub const O_RDONLY: i32 = 0;
+/// `O_WRONLY` — open for writing only.
+pub const O_WRONLY: i32 = 1;
+/// `O_RDWR` — open for reading and writing.
+pub const O_RDWR: i32 = 2;
+/// `O_CREAT` — create file if it does not exist.
+pub const O_CREAT: i32 = 0o100;
+/// `O_TRUNC` — truncate file to zero length on open.
+pub const O_TRUNC: i32 = 0o1000;
+/// `O_APPEND` — writes always append to end of file.
+pub const O_APPEND: i32 = 0o2000;
+
+// ---------------------------------------------------------------------------
 // mmap protection / flag constants (POSIX values)
 // ---------------------------------------------------------------------------
 
@@ -448,6 +467,109 @@ pub unsafe fn chdir(path: *const u8) -> i64 {
 pub unsafe fn getcwd(buf: *mut u8, size: usize) -> i64 {
     // SAFETY: The caller guarantees `buf` is valid for `size` writable bytes.
     unsafe { syscall2(SYS_GETCWD, buf as u64, size as u64) }
+}
+
+// ---------------------------------------------------------------------------
+// File status (stat/fstat)
+// ---------------------------------------------------------------------------
+
+/// POSIX `struct stat` — kernel ABI mirror (x86-64 Linux layout, 144 bytes).
+///
+/// Field layout matches the kernel's `fill_stat_buf` exactly so that the
+/// kernel can write directly into this struct without any conversion.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Stat {
+    /// Device ID.
+    pub st_dev: u64,
+    /// Inode number.
+    pub st_ino: u64,
+    /// Hard link count.
+    pub st_nlink: u64,
+    /// File mode (type + permission bits).
+    pub st_mode: u32,
+    /// Owner UID.
+    pub st_uid: u32,
+    /// Owner GID.
+    pub st_gid: u32,
+    /// Padding.
+    pub __pad0: u32,
+    /// Device ID (for special files).
+    pub st_rdev: u64,
+    /// File size in bytes.
+    pub st_size: i64,
+    /// Preferred block size for I/O.
+    pub st_blksize: i64,
+    /// Number of 512-byte blocks allocated.
+    pub st_blocks: i64,
+    /// Last access time (seconds).
+    pub st_atime: u64,
+    /// Last access time (nanoseconds).
+    pub st_atime_ns: u64,
+    /// Last modification time (seconds).
+    pub st_mtime: u64,
+    /// Last modification time (nanoseconds).
+    pub st_mtime_ns: u64,
+    /// Last status change time (seconds).
+    pub st_ctime: u64,
+    /// Last status change time (nanoseconds).
+    pub st_ctime_ns: u64,
+    /// Reserved.
+    pub __unused: [u64; 3],
+}
+
+// S_IF* file type constants (POSIX.1-2024 §sys/stat.h)
+
+/// File type mask: isolates the type bits from `st_mode`.
+pub const S_IFMT: u32 = 0o170000;
+/// Regular file.
+pub const S_IFREG: u32 = 0o100000;
+/// Directory.
+pub const S_IFDIR: u32 = 0o040000;
+/// Symbolic link.
+pub const S_IFLNK: u32 = 0o120000;
+/// Character device.
+pub const S_IFCHR: u32 = 0o020000;
+/// Block device.
+pub const S_IFBLK: u32 = 0o060000;
+/// Named pipe (FIFO).
+pub const S_IFIFO: u32 = 0o010000;
+/// Unix domain socket.
+pub const S_IFSOCK: u32 = 0o140000;
+
+/// Returns `true` if `mode` describes a directory.
+pub const fn s_isdir(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFDIR
+}
+
+/// Returns `true` if `mode` describes a regular file.
+pub const fn s_isreg(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFREG
+}
+
+/// `stat(2)` — get file status by pathname.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+/// `buf` must be a valid pointer to a writable [`Stat`].
+pub unsafe fn stat(path: *const u8, buf: *mut Stat) -> i64 {
+    // SAFETY: caller guarantees both pointers are valid.
+    unsafe { syscall2(SYS_STAT, path as u64, buf as u64) }
+}
+
+/// `fstat(2)` — get file status by file descriptor.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must be a valid pointer to a writable [`Stat`].
+pub unsafe fn fstat(fd: i32, buf: *mut Stat) -> i64 {
+    // SAFETY: caller guarantees `buf` is valid.
+    unsafe { syscall2(SYS_FSTAT, fd as u64, buf as u64) }
 }
 
 // ---------------------------------------------------------------------------
