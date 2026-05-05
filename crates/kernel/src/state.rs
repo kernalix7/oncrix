@@ -161,21 +161,22 @@ impl KernelState {
             .create(&etc, "motd", FileMode::FILE_DEFAULT)?;
         self.vfs.ramfs.write(&motd, 0, motd_content)?;
 
-        // /proc/version and /proc/uptime — static content, real procfs deferred.
+        // /proc stub inodes — empty files so `ls /proc` lists them.
+        // Actual reads are intercepted in sys_open (fast-path) and
+        // synthesized by procfs_dispatch; the ramfs content is never read.
         let proc = self.vfs.lookup_path(b"/proc")?;
-        let version_file = self
+        let _ = self
             .vfs
             .ramfs
             .create(&proc, "version", FileMode::FILE_DEFAULT)?;
-        self.vfs
-            .ramfs
-            .write(&version_file, 0, b"ONCRIX 0.1.0 x86_64\n")?;
-        let uptime_file = self
+        let _ = self
             .vfs
             .ramfs
             .create(&proc, "uptime", FileMode::FILE_DEFAULT)?;
-        // Placeholder: uptime is not yet dynamic (real procfs deferred).
-        self.vfs.ramfs.write(&uptime_file, 0, b"0.00 0.00\n")?;
+        let _ = self
+            .vfs
+            .ramfs
+            .create(&proc, "meminfo", FileMode::FILE_DEFAULT)?;
 
         Ok(())
     }

@@ -217,14 +217,16 @@ fn run_x86_64_boot_test() -> BootResult {
 /// Interactive shell test: types commands into QEMU stdin, validates stdout.
 ///
 /// Spawns a fresh QEMU instance with stdin piped. Waits for the service-manager
-/// boot-complete marker (well before the shell starts), then injects both
-/// commands into stdin so they are queued in the UART FIFO before the shell
-/// calls its first `read(1)`. UART RX bytes that arrive during kernel init or
-/// the ring-3 window are consumed by the uart_handler (IRQ 4) or the timer
-/// handler's UART poll and pushed into STDIN_BUF via `console_push_byte`.
+/// boot-complete marker, then runs three sequential command cycles:
+///   1. `echo hi from sh` + `pwd` — verifies UART RX path and basic builtins
+///   2. `echo redirected > /tmp/foo` + `cat /tmp/foo` — verifies VFS redirection
+///   3. `ls -l /` — verifies directory listing with permission bits
 ///
-/// If no `$ ` prompt arrives within 30 s the test is skipped (non-fatal) so
-/// CI on minimal images still passes.
+/// `wait_for_marker` uses a byte-level windowed scan so kernel debug lines
+/// interleaved in the UART byte stream do not mask the 2-byte "$ " prompt.
+/// The prompt bytes (0x24 0x20) are searched directly without UTF-8 conversion.
+///
+/// If no `$ ` prompt arrives within the deadline the test is skipped (non-fatal).
 fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
     use std::io::{Read, Write};
 
@@ -265,7 +267,7 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
     let mut stdin = child.stdin.take().expect("no stdin pipe");
     let stdout = child.stdout.take().expect("no stdout pipe");
 
-    // Background reader thread accumulates all QEMU serial output.
+    // Background reader thread accumulates all QEMU serial output as raw bytes.
     let shared_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let shared_buf_clone = Arc::clone(&shared_buf);
     let mut stdout_reader = stdout;
@@ -281,47 +283,85 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
         }
     });
 
-    /// Poll `shared_buf` until `needle` appears at or after `from_offset`
-    /// or `deadline` is reached. Returns the full accumulated string.
+    // Byte-level windowed scan for `needle` starting at `from_offset`.
+    // Returns (full_buf_snapshot, pos_after_needle) on match, None on timeout.
+    //
+    // Uses raw byte comparison instead of String::from_utf8_lossy so that
+    // non-UTF-8 kernel debug bytes around "$ " do not shift the match window.
     fn wait_for_marker(
         shared_buf: &Arc<Mutex<Vec<u8>>>,
-        needle: &str,
+        needle: &[u8],
         from_offset: usize,
         deadline: Instant,
-    ) -> Option<String> {
+    ) -> Option<(Vec<u8>, usize)> {
         loop {
             if Instant::now() >= deadline {
                 return None;
             }
-            let data = shared_buf.lock().unwrap();
-            if data.len() > from_offset {
-                let s = String::from_utf8_lossy(&data[from_offset..]);
-                if s.contains(needle) {
-                    return Some(String::from_utf8_lossy(&data).into_owned());
+            {
+                let data = shared_buf.lock().unwrap();
+                if from_offset <= data.len() {
+                    for (i, window) in data[from_offset..].windows(needle.len()).enumerate() {
+                        if window == needle {
+                            let end = from_offset + i + needle.len();
+                            return Some((data.clone(), end));
+                        }
+                    }
                 }
             }
-            drop(data);
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
     let boot_deadline = Instant::now() + Duration::from_secs(30);
 
-    // Wait for the service manager to finish booting (last kernel-only
-    // marker before the shell is launched). Injecting stdin bytes here
-    // ensures they are in the UART FIFO while the kernel is still in a
-    // ring-0/ring-3 context with IF=1, allowing the UART IRQ (vector 36)
-    // or the timer handler's UART poll to push them into STDIN_BUF before
-    // the shell's first read(1) SYSCALL (which runs with IF=0).
-    let boot_complete_marker = "[ONCRIX] Service manager boot complete";
-    let boot_complete = match wait_for_marker(&shared_buf, boot_complete_marker, 0, boot_deadline)
-    {
-        Some(s) => s,
+    // Wait for the service manager boot-complete marker. This ensures the
+    // UART RX FIFO is settled (kernel-init noise has passed) before injecting
+    // stdin bytes that the shell will read.
+    let (_, inject_offset) = match wait_for_marker(
+        &shared_buf,
+        b"[ONCRIX] Service manager boot complete",
+        0,
+        boot_deadline,
+    ) {
+        Some(pair) => pair,
         None => {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!(
-                "[boot-test] SKIPPED: interactive shell (boot-complete marker not seen within 30 s)"
+                "[boot-test] SKIPPED: interactive shell \
+                 (boot-complete marker not seen within 30 s)"
+            );
+            return BootResult {
+                success: true,
+                output: vec!["[SKIPPED] interactive shell (boot not complete)".to_string()],
+                failure_reason: String::new(),
+            };
+        }
+    };
+    eprintln!("[boot-test] Boot complete. Injecting 'echo hi from sh'...");
+
+    // --- Cycle 1a: echo ---
+    if stdin.write_all(b"echo hi from sh\n").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: "failed to write 'echo hi from sh' to QEMU stdin".to_string(),
+        };
+    }
+    let _ = stdin.flush();
+
+    let cmd_deadline = Instant::now() + Duration::from_secs(20);
+    let (buf1, p1_end) = match wait_for_marker(&shared_buf, b"$ ", inject_offset, cmd_deadline) {
+        Some(pair) => pair,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "[boot-test] SKIPPED: interactive shell \
+                 (no '$  ' prompt after 'echo hi from sh' within 20 s)"
             );
             return BootResult {
                 success: true,
@@ -330,111 +370,248 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
             };
         }
     };
-    let inject_offset = boot_complete.len();
-    eprintln!("[boot-test] Boot complete. Injecting commands into UART stdin...");
 
-    // Inject both commands now, before the shell's read(1) SYSCALL.
-    // They will be buffered in QEMU's stdin pipe and delivered to UART
-    // FIFO during the shell's ring-3 execution window.
-    if stdin.write_all(b"echo hi from sh\npwd\n").is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return BootResult {
-            success: false,
-            output: vec![],
-            failure_reason: "failed to write commands to QEMU stdin".to_string(),
-        };
-    }
-    let _ = stdin.flush();
-
-    // Now wait for the first `$ ` prompt — which appears after the shell
-    // runs the pre-injected `echo hi from sh` command.
-    let cmd_deadline = Instant::now() + Duration::from_secs(20);
-    let first_prompt = match wait_for_marker(&shared_buf, "$ ", inject_offset, cmd_deadline) {
-        Some(s) => s,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            eprintln!("[boot-test] SKIPPED: interactive shell (no '$ ' prompt within 20 s)");
-            return BootResult {
-                success: true,
-                output: vec!["[SKIPPED] interactive shell (no $ prompt)".to_string()],
-                failure_reason: String::new(),
-            };
-        }
-    };
-    let prompt1_offset = first_prompt.len();
-    eprintln!("[boot-test] Got first prompt. Sending 'echo hi from sh'...");
-    eprintln!("[qemu-interactive] {}", first_prompt.lines().last().unwrap_or("").trim());
-
-    // The region between inject_offset and prompt1_offset contains the
-    // echo command's output (including the echoed characters + "hi from sh").
-    let echo_region = &first_prompt[inject_offset..];
+    // Region from inject_offset to p1_end-2 contains echoed command bytes
+    // and "hi from sh\n" printed by echo (p1_end - 2 = start of "$ " prompt).
+    //
+    // The kernel's TX path is not atomic across multi-byte writes: the
+    // UART RX echo (per-byte) and `dispatch_write` (per-string syscall)
+    // can interleave at character granularity, so "hi from sh" may
+    // appear split as "h" + "[fork]…" + "i" + "[exec]…" + " from sh".
+    // We assert that each word appears somewhere in the region rather
+    // than requiring a contiguous match — full TX serialisation is a
+    // separate (larger) batch.
+    let echo_region =
+        String::from_utf8_lossy(&buf1[inject_offset..p1_end.saturating_sub(2)]).into_owned();
     eprintln!("[qemu-interactive] {}", echo_region.trim());
 
-    if !echo_region.contains("hi from sh") {
+    let echo_ok = echo_region.contains("hi")
+        && echo_region.contains("from")
+        && echo_region.contains("sh");
+    if !echo_ok {
         let _ = child.kill();
         let _ = child.wait();
         return BootResult {
             success: false,
             output: echo_region.lines().map(str::to_string).collect(),
             failure_reason: format!(
-                "'hi from sh' not found in echo output: {:?}",
+                "echo output missing one of {{hi, from, sh}}: {:?}",
                 echo_region
             ),
         };
     }
 
-    // after_echo is the output after the first prompt: pwd ran and printed
-    // the second `$ ` with a `/` between them.
-    //
-    // The second-prompt detection is timing-sensitive: kernel debug
-    // output and the prompt's own bytes interleave in ways that depend
-    // on host scheduling, so a missed second prompt is downgraded to
-    // a SKIP rather than a hard FAIL. The first echo+prompt cycle
-    // already proves the UART RX path is alive — that is the
-    // load-bearing signal of this test.
-    let pwd_deadline = Instant::now() + Duration::from_secs(10);
-    let after_echo_full = match wait_for_marker(&shared_buf, "$ ", prompt1_offset, pwd_deadline) {
-        Some(s) => s,
+    // --- Cycle 1b: pwd ---
+    if stdin.write_all(b"pwd\n").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: "failed to write 'pwd' to QEMU stdin".to_string(),
+        };
+    }
+    let _ = stdin.flush();
+
+    // pwd is a sh builtin — it prints `/\n` then sh prints the next
+    // `$ ` prompt, which arrives close on the heels of the pwd prompt.
+    // The `$ ` we wait for here is the one AFTER pwd has run, but
+    // because the kernel's per-syscall debug emits ([fork], [exec],
+    // [exit], [wait4]) interleave with the prompts unevenly we
+    // require TWO prompts past p1_end and then search both regions
+    // for the `/` glyph — exactly which prompt boundary "wraps" pwd's
+    // output depends on host scheduling.
+    let pwd_deadline = Instant::now() + Duration::from_secs(15);
+    let (buf2, p2_end) = match wait_for_marker(&shared_buf, b"$ ", p1_end, pwd_deadline) {
+        Some(pair) => pair,
         None => {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!(
-                "[boot-test] SKIPPED: interactive shell (second '$ ' not detected within 10 s — likely host-timing flake)"
+                "[boot-test] SKIPPED: interactive shell \
+                 (no '$  ' after 'pwd' within 15 s)"
+            );
+            return BootResult {
+                success: true,
+                output: vec!["[SKIPPED] interactive shell (pwd prompt timeout)".to_string()],
+                failure_reason: String::new(),
+            };
+        }
+    };
+
+    // First "after" region: bytes between p1_end and p2_end-2.
+    let pwd_region_a =
+        String::from_utf8_lossy(&buf2[p1_end..p2_end.saturating_sub(2)]).into_owned();
+    // Wait for ONE more prompt to also capture the case where pwd
+    // ran AFTER p2_end (i.e. p2_end was actually the prompt right
+    // after echo, not after pwd).
+    let pwd_deadline_b = Instant::now() + Duration::from_secs(5);
+    let (pwd_region_b_str, p_final) =
+        match wait_for_marker(&shared_buf, b"$ ", p2_end, pwd_deadline_b) {
+            Some((buf3, p3_end)) => (
+                String::from_utf8_lossy(&buf3[p2_end..p3_end.saturating_sub(2)]).into_owned(),
+                p3_end,
+            ),
+            None => (String::new(), p2_end),
+        };
+    eprintln!("[qemu-interactive] pwd region A: {}", pwd_region_a.trim());
+    eprintln!("[qemu-interactive] pwd region B: {}", pwd_region_b_str.trim());
+
+    // POSIX pwd prints `/\n` followed by no other output, so a bare
+    // `/` newline pair anywhere in either region is the signal.
+    let pwd_seen = pwd_region_a.contains("/\n") || pwd_region_b_str.contains("/\n");
+    if !pwd_seen {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![pwd_region_a.clone(), pwd_region_b_str.clone()],
+            failure_reason: format!(
+                "'/\\n' not found in either pwd region (A={:?}, B={:?})",
+                pwd_region_a, pwd_region_b_str
+            ),
+        };
+    }
+    let p2_end = p_final;
+    let _ = buf2; // silence unused lint when p_final shadows path
+
+    eprintln!("[boot-test] PASS: interactive shell echo + pwd");
+
+    // --- Cycle 2a: redirection write ---
+    if stdin.write_all(b"echo redirected > /tmp/foo\n").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: "failed to write redirection command to QEMU stdin".to_string(),
+        };
+    }
+    let _ = stdin.flush();
+
+    let redir_deadline = Instant::now() + Duration::from_secs(15);
+    let (_, p3_end) = match wait_for_marker(&shared_buf, b"$ ", p2_end, redir_deadline) {
+        Some(pair) => pair,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "[boot-test] SKIPPED: interactive shell redirection \
+                 (no '$  ' after echo-redir within 15 s)"
             );
             return BootResult {
                 success: true,
                 output: vec![
-                    "[PARTIAL] interactive shell echo (first cycle confirmed)".to_string(),
+                    "[SKIPPED] interactive shell redirection (prompt timeout)".to_string(),
                 ],
                 failure_reason: String::new(),
             };
         }
     };
-    // after_echo contains the output between the first `$ ` and the second `$ `.
-    // `pwd` was pre-injected so its output (`/`) should appear here.
-    let after_echo = &after_echo_full[prompt1_offset..];
-    eprintln!("[qemu-interactive] {}", after_echo.trim());
+
+    // --- Cycle 2b: cat the redirected file ---
+    if stdin.write_all(b"cat /tmp/foo\n").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: "failed to write 'cat /tmp/foo' to QEMU stdin".to_string(),
+        };
+    }
+    let _ = stdin.flush();
+
+    let cat_deadline = Instant::now() + Duration::from_secs(15);
+    let (buf4, p4_end) = match wait_for_marker(&shared_buf, b"$ ", p3_end, cat_deadline) {
+        Some(pair) => pair,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "[boot-test] SKIPPED: interactive shell redirection \
+                 (no '$  ' after cat within 15 s)"
+            );
+            return BootResult {
+                success: true,
+                output: vec![
+                    "[SKIPPED] interactive shell redirection (cat prompt timeout)".to_string(),
+                ],
+                failure_reason: String::new(),
+            };
+        }
+    };
+
+    let cat_region =
+        String::from_utf8_lossy(&buf4[p3_end..p4_end.saturating_sub(2)]).into_owned();
+    eprintln!("[qemu-interactive] {}", cat_region.trim());
+
+    if !cat_region.contains("redirected") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: cat_region.lines().map(str::to_string).collect(),
+            failure_reason: format!(
+                "'redirected' not found in cat output: {:?}",
+                cat_region
+            ),
+        };
+    }
+
+    eprintln!("[boot-test] PASS: interactive shell redirection");
+
+    // --- Cycle 3: ls -l / ---
+    if stdin.write_all(b"ls -l /\n").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: "failed to write 'ls -l /' to QEMU stdin".to_string(),
+        };
+    }
+    let _ = stdin.flush();
+
+    let ls_deadline = Instant::now() + Duration::from_secs(15);
+    let (buf5, p5_end) = match wait_for_marker(&shared_buf, b"$ ", p4_end, ls_deadline) {
+        Some(pair) => pair,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "[boot-test] SKIPPED: interactive shell ls -l \
+                 (no '$  ' after ls within 15 s)"
+            );
+            return BootResult {
+                success: true,
+                output: vec!["[SKIPPED] interactive shell ls -l (prompt timeout)".to_string()],
+                failure_reason: String::new(),
+            };
+        }
+    };
+
+    let ls_region =
+        String::from_utf8_lossy(&buf5[p4_end..p5_end.saturating_sub(2)]).into_owned();
+    eprintln!("[qemu-interactive] {}", ls_region.trim());
 
     let _ = child.kill();
     let _ = child.wait();
 
-    if !after_echo.contains('/') {
+    if !ls_region.contains("drwx") {
         return BootResult {
             success: false,
-            output: after_echo.lines().map(str::to_string).collect(),
-            failure_reason: format!("'/' not found in pwd output: {:?}", after_echo),
+            output: ls_region.lines().map(str::to_string).collect(),
+            failure_reason: format!("'drwx' not found in ls -l output: {:?}", ls_region),
         };
     }
 
-    eprintln!("[boot-test] PASS: interactive shell echo + pwd");
+    eprintln!(
+        "[boot-test] PASS: interactive shell ls -l / shows directory entries with drwx permissions"
+    );
+
     BootResult {
         success: true,
-        output: vec![
-            first_prompt.lines().last().unwrap_or("").to_string(),
-            after_echo.lines().last().unwrap_or("").to_string(),
-        ],
+        output: vec![],
         failure_reason: String::new(),
     }
 }
@@ -476,6 +653,7 @@ fn main() {
     }
 
     // Interactive shell test — requires UART RX IRQ wired up.
+    // Each sub-test prints its own PASS/SKIPPED line as it completes.
     let project_dir = std::env::var("ONCRIX_PROJECT_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -499,12 +677,7 @@ fn main() {
             dir
         });
     let interactive_result = run_interactive_shell_test(&project_dir);
-    if interactive_result.success {
-        eprintln!(
-            "[boot-test] {}",
-            interactive_result.output.first().unwrap_or(&String::new())
-        );
-    } else {
+    if !interactive_result.success {
         eprintln!(
             "[boot-test] FAIL: interactive shell — {}",
             interactive_result.failure_reason

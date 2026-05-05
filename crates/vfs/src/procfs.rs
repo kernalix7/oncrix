@@ -16,6 +16,38 @@
 use crate::inode::{FileMode, FileType, Inode, InodeNumber, InodeOps};
 use oncrix_lib::{Error, Result};
 
+// ── ProcKind — synthetic /proc file identifiers ───────────────────
+
+/// Identifies which synthetic `/proc` file a path targets.
+///
+/// Mirrors the `DevKind` pattern from `devfs`: `classify_proc_path`
+/// inspects the path and returns `Some(ProcKind)` for the files that
+/// are intercepted in `sys_open`.  All other `/proc` paths fall
+/// through to the normal VFS lookup (ramfs stub inodes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcKind {
+    /// `/proc/uptime` — seconds elapsed since boot.
+    Uptime,
+    /// `/proc/version` — kernel version string.
+    Version,
+    /// `/proc/meminfo` — memory statistics.
+    Meminfo,
+}
+
+/// Check if `path` names a synthetic procfs entry that should be
+/// intercepted by the `sys_open` fast path.
+///
+/// Returns `None` for any path not listed above, including per-PID
+/// paths (those go through the normal VFS lookup).
+pub fn classify_proc_path(path: &[u8]) -> Option<ProcKind> {
+    match path {
+        b"/proc/uptime" => Some(ProcKind::Uptime),
+        b"/proc/version" => Some(ProcKind::Version),
+        b"/proc/meminfo" => Some(ProcKind::Meminfo),
+        _ => None,
+    }
+}
+
 /// Maximum number of top-level procfs entries.
 const MAX_PROC_ENTRIES: usize = 64;
 

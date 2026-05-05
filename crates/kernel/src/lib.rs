@@ -100,6 +100,7 @@ pub mod posix_timer;
 pub mod prctl;
 pub mod printk;
 pub mod printk_ratelimit;
+pub mod procfs_dispatch;
 pub mod quic;
 pub mod random;
 pub mod rcu;

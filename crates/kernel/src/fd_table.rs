@@ -52,6 +52,22 @@ pub enum DevFileKind {
     Zero,
 }
 
+/// Selects which synthetic `/proc` file a [`FileBackend::ProcFile`] handle targets.
+///
+/// A `u8` repr is used so the enum fits in the same `FileBackend` word without
+/// pulling the `oncrix_vfs::procfs::ProcKind` type directly into this module's
+/// public ABI (mirrors the `DevFileKind` pattern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProcFileKind {
+    /// `/proc/uptime`
+    Uptime = 0,
+    /// `/proc/version`
+    Version = 1,
+    /// `/proc/meminfo`
+    Meminfo = 2,
+}
+
 /// The backing resource for an open file description.
 ///
 /// Determines how read and write operations are dispatched.
@@ -97,6 +113,15 @@ pub enum FileBackend {
     DevFile {
         /// Which synthetic device this handle targets.
         kind: DevFileKind,
+    },
+
+    /// A synthetic procfs file (`/proc/uptime`, `/proc/version`, etc.).
+    ///
+    /// Content is generated on every read by `procfs_dispatch::proc_synthesize`.
+    /// Writes return `-EROFS` (-30); lseek returns `-ESPIPE` (-29).
+    ProcFile {
+        /// Which `/proc` entry this handle targets.
+        kind: ProcFileKind,
     },
 }
 
@@ -171,6 +196,15 @@ impl FileHandle {
     pub const fn dev_file(kind: DevFileKind, flags: HandleFlags) -> Self {
         Self {
             backend: FileBackend::DevFile { kind },
+            offset: 0,
+            flags,
+        }
+    }
+
+    /// Create a synthetic procfs file handle.
+    pub const fn proc_file(kind: ProcFileKind, flags: HandleFlags) -> Self {
+        Self {
+            backend: FileBackend::ProcFile { kind },
             offset: 0,
             flags,
         }
@@ -450,7 +484,8 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
         FileBackend::Console
         | FileBackend::RamfsFile { .. }
         | FileBackend::Socket { .. }
-        | FileBackend::DevFile { .. } => {}
+        | FileBackend::DevFile { .. }
+        | FileBackend::ProcFile { .. } => {}
     }
 
     // SAFETY: single-CPU SYSCALL context.
@@ -664,6 +699,7 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             // /dev/null and /dev/zero both silently discard writes.
             count as i64
         }
+        FileBackend::ProcFile { .. } => -30, // EROFS — proc files are read-only
     }
 }
 
@@ -735,11 +771,33 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                             // (matches Linux tty behaviour).
                             return written as i64;
                         }
-                        // Nothing yet — yield the CPU and retry.
-                        // SAFETY: interrupts-off SYSCALL context;
-                        // yield_now is documented to require it.
+                        // Nothing yet — wait for the next interrupt.
+                        //
+                        // SYSCALL entry clears IF (FMASK), so neither
+                        // the timer nor the UART RX IRQ can fire while
+                        // we busy-spin here. Without enabling them, the
+                        // STDIN_BUF producer (uart_handler / timer-tick
+                        // poll) would never run and this loop would
+                        // wedge forever — that's exactly the bug that
+                        // made interactive `pwd` (or any input-driven
+                        // command after the first) silently hang.
+                        //
+                        // The `sti; hlt; cli` triplet halts the CPU
+                        // until the next interrupt (≤10 ms on the
+                        // 100 Hz PIT), which gives the UART poll
+                        // fallback in `timer_handler` a chance to
+                        // drain QEMU stdin into STDIN_BUF. After
+                        // `hlt` returns we immediately re-disable
+                        // interrupts so the rest of the loop body
+                        // re-enters the syscall's IF=0 contract.
+                        //
+                        // SAFETY: We hold no live borrows of any
+                        // single-CPU-protected data — the only state
+                        // we touch in this branch is STDIN_BUF, and
+                        // the IRQ handlers that mutate it
+                        // save/restore their own context.
                         unsafe {
-                            let _ = crate::current::yield_now();
+                            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                         }
                     }
                 }
@@ -861,6 +919,40 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 count as i64
             }
         },
+        FileBackend::ProcFile { kind } => {
+            // Synthesize content into a kernel buffer, then copy to user.
+            let vfs_kind = match kind {
+                ProcFileKind::Uptime => oncrix_vfs::procfs::ProcKind::Uptime,
+                ProcFileKind::Version => oncrix_vfs::procfs::ProcKind::Version,
+                ProcFileKind::Meminfo => oncrix_vfs::procfs::ProcKind::Meminfo,
+            };
+            let offset = handle.offset as usize;
+            let mut kbuf = [0u8; 256];
+            // SAFETY: SYSCALL dispatch path; proc_synthesize reads PIT_TIMER
+            // under the same single-CPU interrupt-disabled contract.
+            let total = unsafe { crate::procfs_dispatch::proc_synthesize(vfs_kind, &mut kbuf) };
+            if offset >= total {
+                return 0; // EOF
+            }
+            let available = total - offset;
+            let n = available.min(count);
+            // SAFETY: `buf_ptr` validated above; writing `n` bytes.
+            unsafe {
+                let ptr = buf_ptr as *mut u8;
+                for (i, &byte) in kbuf[offset..offset + n].iter().enumerate() {
+                    ptr.add(i).write_volatile(byte);
+                }
+            }
+            // Advance the offset.
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe {
+                #[allow(static_mut_refs)]
+                if let Some(h) = CURRENT_FD_TABLE.get_mut(fd) {
+                    h.offset = (offset + n) as u64;
+                }
+            }
+            n as i64
+        }
     }
 }
 
@@ -889,10 +981,11 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
     };
 
     match handle.backend {
-        FileBackend::Console => -29,        // ESPIPE — not seekable
-        FileBackend::Pipe { .. } => -29,    // ESPIPE — pipes not seekable
-        FileBackend::Socket { .. } => -29,  // ESPIPE — sockets not seekable
-        FileBackend::DevFile { .. } => -29, // ESPIPE — device files not seekable
+        FileBackend::Console => -29,         // ESPIPE — not seekable
+        FileBackend::Pipe { .. } => -29,     // ESPIPE — pipes not seekable
+        FileBackend::Socket { .. } => -29,   // ESPIPE — sockets not seekable
+        FileBackend::DevFile { .. } => -29,  // ESPIPE — device files not seekable
+        FileBackend::ProcFile { .. } => -29, // ESPIPE — proc files not seekable
         FileBackend::RamfsFile { ino } => {
             let current_offset = handle.offset;
 

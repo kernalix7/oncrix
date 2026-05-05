@@ -890,6 +890,24 @@ unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
         };
     }
 
+    // Fast path: intercept /proc/uptime, /proc/version, /proc/meminfo.
+    // Reads are synthesized by procfs_dispatch; the ramfs stub inode exists
+    // only so that `ls /proc` lists the entries via getdents64.
+    if let Some(proc_kind) = oncrix_vfs::procfs::classify_proc_path(abs_path) {
+        let fd_kind = match proc_kind {
+            oncrix_vfs::procfs::ProcKind::Uptime => crate::fd_table::ProcFileKind::Uptime,
+            oncrix_vfs::procfs::ProcKind::Version => crate::fd_table::ProcFileKind::Version,
+            oncrix_vfs::procfs::ProcKind::Meminfo => crate::fd_table::ProcFileKind::Meminfo,
+        };
+        let handle_flags = crate::fd_table::HandleFlags(flags as u32);
+        let handle = crate::fd_table::FileHandle::proc_file(fd_kind, handle_flags);
+        // SAFETY: single-CPU SYSCALL context.
+        return match unsafe { crate::fd_table::fd_install(handle) } {
+            Ok(fd) => fd as i64,
+            Err(_) => -24, // EMFILE
+        };
+    }
+
     // Attempt to open / create the file in the global VFS.
     let result =
         crate::state::with_global_mut(|s| s.vfs.open_path(abs_path, flags as u32, mode as u32));
