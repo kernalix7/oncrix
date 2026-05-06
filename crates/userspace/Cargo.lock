@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-clear"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-echo"
 version = "0.1.0"
 dependencies = [
@@ -113,6 +120,20 @@ dependencies = [
 
 [[package]]
 name = "oncrix-wc"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-whoami"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-yes"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

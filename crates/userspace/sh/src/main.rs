@@ -25,14 +25,18 @@ use oncrix_ulibc as libc;
 static LAST_STATUS: AtomicI32 = AtomicI32::new(0);
 
 /// Decode a `waitpid` raw status word into the conventional exit
-/// code (0..=255) for `$?` reporting.
+/// code (0..=255) for `$?` reporting (POSIX.1-2024 §2.5.2).
 ///
-/// POSIX `wait(3p)` returns `(exit_code << 8)` for normally
-/// terminated children and `signum` (no high-byte shift) for
-/// signal-killed ones. The kernel currently only emits the former,
-/// so we just take the high byte and downcast.
+/// - Normal exit  → `wexitstatus(status)` (bits 15..8 of the wait word).
+/// - Signal kill  → `128 + signum` (POSIX-equivalent sh convention).
 fn status_to_exit_code(raw: i32) -> i32 {
-    ((raw as u32 >> 8) & 0xff) as i32
+    if libc::wifexited(raw) {
+        libc::wexitstatus(raw)
+    } else if libc::wifsignaled(raw) {
+        128 + libc::wtermsig(raw)
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------

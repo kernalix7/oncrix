@@ -155,6 +155,30 @@ pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
     // SAFETY: Both pointers are valid CpuContext instances owned
     // by threads in the scheduler, as documented on
     // `switch_context`.
+    {
+        use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
+        use oncrix_hal::serial::SerialPort;
+        let mut serial = Uart16550::new(COM1);
+        let next_rsp = unsafe { (*next_ctx).rsp };
+        let _ = serial.write_str("[sched] switching to rsp=0x");
+        // print hex
+        let mut buf = [0u8; 16];
+        let mut n = next_rsp;
+        for byte in buf.iter_mut().rev() {
+            let digit = (n & 0xF) as u8;
+            *byte = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            };
+            n >>= 4;
+        }
+        let start = buf.iter().position(|&b| b != b'0').unwrap_or(15);
+        for &b in &buf[start..] {
+            let _ = serial.write_byte(b);
+        }
+        let _ = serial.write_str("\n");
+    }
     unsafe {
         switch_context(prev_ctx, next_ctx);
     }

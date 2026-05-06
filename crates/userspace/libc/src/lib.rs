@@ -661,6 +661,35 @@ pub unsafe fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i64 {
     unsafe { syscall2(SYS_CLOCK_GETTIME, clk_id as u64, tp as u64) }
 }
 
+// ---------------------------------------------------------------------------
+// Wait status decoding (POSIX §sys/wait.h)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the child terminated normally (not via a signal).
+pub const fn wifexited(status: i32) -> bool {
+    (status & 0x7f) == 0
+}
+
+/// Extract the exit code from a normally-terminated child status.
+///
+/// Only meaningful when [`wifexited`] returns `true`.
+pub const fn wexitstatus(status: i32) -> i32 {
+    (status >> 8) & 0xff
+}
+
+/// Returns `true` if the child was terminated by a signal.
+pub const fn wifsignaled(status: i32) -> bool {
+    let term = status & 0x7f;
+    term != 0 && ((term + 1) >> 1) > 0
+}
+
+/// Extract the signal number that terminated the child.
+///
+/// Only meaningful when [`wifsignaled`] returns `true`.
+pub const fn wtermsig(status: i32) -> i32 {
+    status & 0x7f
+}
+
 /// `nanosleep(req, rem)` — block the calling thread for at least
 /// the duration in `*req`.
 ///

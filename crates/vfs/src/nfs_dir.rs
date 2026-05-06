@@ -352,6 +352,7 @@ pub fn dir_listing(cache: &NfsDirCache) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn test_readdir_and_lookup() {

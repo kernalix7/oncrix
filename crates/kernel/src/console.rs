@@ -3,6 +3,12 @@
 
 //! Console stdin ring buffer.
 //!
+//! ## Overflow accounting
+//!
+//! [`OVERFLOW_COUNT`] counts cumulative ring-full drops. The timer
+//! handler reads it and prints a log line when the count crosses the
+//! next debounce threshold (16 / 64 / 256 / 1024).
+//!
 //! A small fixed-size ASCII ring buffer that bridges the keyboard IRQ
 //! producer (single-CPU, IF=0) and the SYSCALL `read(2)` consumer.
 //!
@@ -26,6 +32,26 @@
 //! bytes; line termination on `'\n'` is enforced by
 //! [`crate::fd_table::dispatch_read`] when servicing
 //! [`crate::fd_table::FileBackend::Console`].
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+// ── Overflow counter ──────────────────────────────────────────────
+
+/// Cumulative count of bytes dropped because [`STDIN_BUF`] was full.
+///
+/// Written by the IRQ producer paths (UART / keyboard handlers) and read
+/// by [`timer_handler`] for periodic logging. `Relaxed` ordering is
+/// sufficient: the counter is only used for diagnostic logging, never for
+/// synchronisation.
+pub static OVERFLOW_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Last overflow count threshold that was logged.
+///
+/// [`timer_handler`] compares `OVERFLOW_COUNT` against this to debounce
+/// log output. Accessed only from timer IRQ context (IF=0, single CPU),
+/// so a plain `static mut` suffices.
+// SAFETY: Written and read exclusively from IRQ 0 context (IF=0, single CPU).
+pub static mut LAST_LOGGED_OVERFLOW: u32 = 0;
 
 // ── Keyboard modifier state ───────────────────────────────────────
 
@@ -220,11 +246,11 @@ pub unsafe fn translate(scancode: u8) -> KbdEvent {
 
 /// Capacity of the stdin ring buffer in bytes.
 ///
-/// 256 is plenty for the longest interactive line a user can type
-/// before issuing `read(2)` (which drains the buffer). Sized to a
-/// power of two so that any future masking-based index arithmetic
+/// 4096 bytes absorbs a full QEMU stdio burst during long IF=0 windows
+/// (ELF load in `sys_execve`, frame allocator under contention). Sized
+/// to a power of two so that any future masking-based index arithmetic
 /// stays trivial; current implementation uses modulo for clarity.
-pub const STDIN_RING_CAPACITY: usize = 256;
+pub const STDIN_RING_CAPACITY: usize = 4096;
 
 // ── ConsoleRing ───────────────────────────────────────────────────
 
@@ -260,15 +286,21 @@ impl ConsoleRing {
     }
 
     /// Push `b` at the head. On overflow the oldest byte is dropped.
-    fn push(&mut self, b: u8) {
-        if self.count == STDIN_RING_CAPACITY {
+    ///
+    /// Returns `true` when the buffer was full and a byte was discarded.
+    fn push(&mut self, b: u8) -> bool {
+        let overflowed = if self.count == STDIN_RING_CAPACITY {
             // Buffer full — advance tail (drop oldest) before overwriting.
             self.tail = (self.tail + 1) % STDIN_RING_CAPACITY;
             self.count -= 1;
-        }
+            true
+        } else {
+            false
+        };
         self.buf[self.head] = b;
         self.head = (self.head + 1) % STDIN_RING_CAPACITY;
         self.count += 1;
+        overflowed
     }
 
     /// Pop the oldest buffered byte, if any.
@@ -324,9 +356,12 @@ pub static mut STDIN_BUF: ConsoleRing = ConsoleRing::new();
 /// satisfies this).
 pub unsafe fn console_push_byte(b: u8) {
     // SAFETY: see the module-level note.
-    unsafe {
+    let overflowed = unsafe {
         #[allow(static_mut_refs)]
-        STDIN_BUF.push(b);
+        STDIN_BUF.push(b)
+    };
+    if overflowed {
+        OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
 

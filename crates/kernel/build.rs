@@ -90,6 +90,9 @@ fn main() {
         ("oncrix-sigtest", "sigtest"),
         ("oncrix-mmaptest", "mmaptest"),
         ("oncrix-sleep", "sleep"),
+        ("oncrix-yes", "yes"),
+        ("oncrix-clear", "clear"),
+        ("oncrix-whoami", "whoami"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
