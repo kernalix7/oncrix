@@ -916,7 +916,7 @@ unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
         Some(Ok(inode)) => {
             // Build a FileHandle for the ramfs inode.
             let handle_flags = crate::fd_table::HandleFlags(flags as u32);
-            let handle = crate::fd_table::FileHandle::ramfs_file(&inode, handle_flags);
+            let handle = crate::fd_table::FileHandle::ramfs_file(inode.ino, handle_flags);
 
             // Install in the current fd table.
             // SAFETY: single-CPU SYSCALL context.

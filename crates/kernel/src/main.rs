@@ -204,13 +204,11 @@ pub extern "C" fn kernel_main() -> ! {
             })
         };
 
-        // Phase 12: install standard I/O file descriptors (0=stdin, 1=stdout,
-        // 2=stderr) on the current process's fd table so init's first
-        // `write(2, ...)` syscall is dispatched through the VFS-routed path
-        // (`fd_table::dispatch_write`) instead of the legacy serial bypass.
+        // Install standard I/O file descriptors (0=stdin, 1=stdout, 2=stderr)
+        // on the init thread's per-thread fd table. Each forked child inherits
+        // a deep copy; dup2 in the child affects only the child's own table.
         //
-        // SAFETY: Single-threaded boot; CURRENT_FD_TABLE is accessed only
-        // through fd_table helpers from this point on.
+        // SAFETY: single-threaded boot; the init thread is current at this point.
         unsafe {
             oncrix_kernel::fd_table::install_stdio();
         }

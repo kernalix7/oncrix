@@ -4,6 +4,7 @@
 //! Thread representation and state management.
 
 use crate::context::{CpuContext, Cr3Frame};
+use crate::fd_table::KernelFdTable;
 use crate::kstack::KernelStack;
 use crate::pid::{Pid, Tid};
 use oncrix_lib::Result;
@@ -145,6 +146,13 @@ pub struct Thread {
     /// Byte length of the valid prefix in `cwd` (excludes the trailing
     /// null that some helpers write for C-string use).
     pub cwd_len: u8,
+    /// Per-thread open file descriptor table.
+    ///
+    /// POSIX.1-2024: each thread (process) owns an independent copy of
+    /// the fd table. `fork(2)` produces a deep copy with pipe refcounts
+    /// bumped for each inherited pipe fd. `execve(2)` clears non-`O_CLOEXEC`
+    /// fds (deferred; O_CLOEXEC support ships in a later batch).
+    pub fd_table: KernelFdTable,
 }
 
 // SAFETY: `UserAddressSpace` itself is `Send` (raw `PhysAddr`s plus a
@@ -178,6 +186,7 @@ impl Thread {
             saved_irq_frame_raw: None,
             cwd,
             cwd_len: 1,
+            fd_table: KernelFdTable::new(),
         }
     }
 

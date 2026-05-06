@@ -25,6 +25,7 @@ pub mod clone;
 pub mod context;
 pub mod coredump;
 pub mod cred;
+pub mod fd_table;
 pub mod fork;
 pub mod group;
 pub mod kstack;

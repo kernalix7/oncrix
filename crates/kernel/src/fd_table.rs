@@ -3,23 +3,19 @@
 
 //! Per-process file descriptor table for the ONCRIX kernel.
 //!
-//! This module defines [`FileHandle`] — a lightweight per-fd record holding
-//! the backend type, current offset, and open flags — and [`KernelFdTable`]
-//! — a fixed-size array mapping fd numbers to open handles.
+//! The data types ([`FileBackend`], [`FileHandle`], [`KernelFdTable`]) live in
+//! `oncrix_process::fd_table` and are re-exported here so callers do not need
+//! to import from two crates.  The I/O dispatch functions and the syscall-level
+//! helpers (`fd_install`, `fd_get`, `fd_close`, `fd_dup2`) live here because
+//! they call into VFS, pipe, and socket subsystems.
 //!
-//! A global static [`CURRENT_FD_TABLE`] is used for the single running
-//! process (Phase 12 simplification; a real kernel attaches one per-thread).
-//! Access is safe because all SYSCALL dispatch runs on a single CPU with
-//! interrupts effectively disabled (FMASK cleared IF on SYSCALL entry).
+//! # Per-thread fd ownership
 //!
-//! # File backends
-//!
-//! [`FileBackend`] distinguishes between the backends available:
-//!
-//! - [`FileBackend::Console`] — reads return 0, writes forward to COM1 serial.
-//! - [`FileBackend::RamfsFile`] — backed by a VFS inode in the global ramfs.
-//! - [`FileBackend::Pipe`] — one end of an anonymous pipe ring buffer.
-//! - [`FileBackend::Socket`] — a Unix-domain socket handle.
+//! Every [`oncrix_process::thread::Thread`] owns its `fd_table` field.
+//! All helpers below retrieve the current thread via
+//! [`crate::current::current_thread_mut`] and operate on its fd table.
+//! For the very early-boot window before a thread exists, writes to fd 1/2
+//! fall through to the COM1 serial fallback.
 //!
 //! # POSIX.1-2024 references
 //!
@@ -27,300 +23,22 @@
 //! - `close(3p)` — fd de-allocation.
 //! - `lseek(3p)` — `SEEK_SET`/`SEEK_CUR`/`SEEK_END` semantics.
 //! - `pipe(3p)` — pipe creation and read/write semantics.
-//! - `socket(3p)` — socket creation and I/O.
+//! - `dup2(3p)` — duplicate an fd.
+//! - `fork(3p)` — "the child inherits copies of the parent's set of
+//!   open file descriptors".
 
 use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
 use oncrix_lib::{Error, Result};
-use oncrix_vfs::inode::{Inode, InodeNumber};
 
-// ── Constants ─────────────────────────────────────────────────────
+// Re-export the data types from oncrix_process so callers only import from here.
+pub use oncrix_process::fd_table::{
+    DevFileKind, FileBackend, FileHandle, HandleFlags, KernelFdTable, MAX_FDS, ProcFileKind,
+};
 
-/// Maximum number of open file descriptors per process (POSIX OPEN_MAX).
-///
-/// Conservatively small for Phase 12; Linux defaults to 1024.
-pub const MAX_FDS: usize = 32;
+// ── Current-thread fd table helpers ───────────────────────────────
 
-// ── FileBackend ───────────────────────────────────────────────────
-
-/// Selects which synthetic device a [`FileBackend::DevFile`] handle targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DevFileKind {
-    /// `/dev/null`: reads return EOF (0 bytes); writes silently succeed.
-    Null,
-    /// `/dev/zero`: reads return all-zero bytes; writes silently succeed.
-    Zero,
-}
-
-/// Selects which synthetic `/proc` file a [`FileBackend::ProcFile`] handle targets.
-///
-/// A `u8` repr is used so the enum fits in the same `FileBackend` word without
-/// pulling the `oncrix_vfs::procfs::ProcKind` type directly into this module's
-/// public ABI (mirrors the `DevFileKind` pattern).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ProcFileKind {
-    /// `/proc/uptime`
-    Uptime = 0,
-    /// `/proc/version`
-    Version = 1,
-    /// `/proc/meminfo`
-    Meminfo = 2,
-}
-
-/// The backing resource for an open file description.
-///
-/// Determines how read and write operations are dispatched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileBackend {
-    /// The kernel console — backed by COM1 serial output.
-    ///
-    /// Reads block until a byte is available from the keyboard ring buffer.
-    /// Writes forward bytes to the UART via the existing serial path.
-    Console,
-
-    /// A regular file (or directory) in the ramfs.
-    ///
-    /// The inode number is stable for the lifetime of the file.
-    RamfsFile {
-        /// Inode number in the global ramfs.
-        ino: InodeNumber,
-    },
-
-    /// One end of an anonymous pipe.
-    ///
-    /// The `ring_id` indexes into `pipe::PIPE_TABLE`; `is_write_end`
-    /// distinguishes the write end (producer) from the read end (consumer).
-    Pipe {
-        /// Index into the global pipe ring table.
-        ring_id: u32,
-        /// `true` for the write end; `false` for the read end.
-        is_write_end: bool,
-    },
-
-    /// A Unix-domain socket handle.
-    ///
-    /// The `handle_id` indexes into `socket::SOCKET_TABLE`.
-    Socket {
-        /// Index into the global socket registry.
-        handle_id: u32,
-    },
-
-    /// A synthetic device file (`/dev/null` or `/dev/zero`).
-    ///
-    /// No underlying inode is accessed; reads and writes are handled
-    /// entirely within the fd dispatch layer without touching the ramfs.
-    DevFile {
-        /// Which synthetic device this handle targets.
-        kind: DevFileKind,
-    },
-
-    /// A synthetic procfs file (`/proc/uptime`, `/proc/version`, etc.).
-    ///
-    /// Content is generated on every read by `procfs_dispatch::proc_synthesize`.
-    /// Writes return `-EROFS` (-30); lseek returns `-ESPIPE` (-29).
-    ProcFile {
-        /// Which `/proc` entry this handle targets.
-        kind: ProcFileKind,
-    },
-}
-
-// ── Open flags ────────────────────────────────────────────────────
-
-/// Per-fd status flags stored alongside each open file description.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandleFlags(pub u32);
-
-impl HandleFlags {
-    /// No flags.
-    pub const RDONLY: Self = Self(0);
-    /// Write-only.
-    pub const WRONLY: Self = Self(1);
-    /// Read-write.
-    pub const RDWR: Self = Self(2);
-    /// Append mode: writes always go to EOF.
-    pub const APPEND: Self = Self(0o2000);
-
-    /// Return `true` if writing is allowed (O_WRONLY or O_RDWR).
-    pub const fn is_writable(self) -> bool {
-        (self.0 & 0b11) != 0
-    }
-
-    /// Return `true` if reading is allowed (not O_WRONLY).
-    pub const fn is_readable(self) -> bool {
-        (self.0 & 0b11) != 1
-    }
-
-    /// Return `true` if O_APPEND is set.
-    pub const fn is_append(self) -> bool {
-        (self.0 & 0o2000) != 0
-    }
-}
-
-// ── FileHandle ────────────────────────────────────────────────────
-
-/// An open file description.
-///
-/// Tracks the backing resource, current byte offset, and open flags.
-/// Offset is meaningful only for `RamfsFile`; console/pipe/socket ignore it.
-#[derive(Debug, Clone, Copy)]
-pub struct FileHandle {
-    /// What backs this file description.
-    pub backend: FileBackend,
-    /// Current seek offset (bytes from file start).
-    pub offset: u64,
-    /// Open mode flags.
-    pub flags: HandleFlags,
-}
-
-impl FileHandle {
-    /// Create a console handle (used for fd 0, 1, 2).
-    pub const fn console() -> Self {
-        Self {
-            backend: FileBackend::Console,
-            offset: 0,
-            flags: HandleFlags::RDWR,
-        }
-    }
-
-    /// Create a ramfs file handle.
-    pub const fn ramfs_file(inode: &Inode, flags: HandleFlags) -> Self {
-        Self {
-            backend: FileBackend::RamfsFile { ino: inode.ino },
-            offset: 0,
-            flags,
-        }
-    }
-
-    /// Create a synthetic device file handle (`/dev/null` or `/dev/zero`).
-    pub const fn dev_file(kind: DevFileKind, flags: HandleFlags) -> Self {
-        Self {
-            backend: FileBackend::DevFile { kind },
-            offset: 0,
-            flags,
-        }
-    }
-
-    /// Create a synthetic procfs file handle.
-    pub const fn proc_file(kind: ProcFileKind, flags: HandleFlags) -> Self {
-        Self {
-            backend: FileBackend::ProcFile { kind },
-            offset: 0,
-            flags,
-        }
-    }
-}
-
-// ── KernelFdTable ─────────────────────────────────────────────────
-
-/// Per-process file descriptor table.
-///
-/// Fixed-size array of [`MAX_FDS`] slots. Slot index == fd number.
-/// The lowest free slot is allocated on each `install` call
-/// (POSIX lowest-available-fd rule).
-pub struct KernelFdTable {
-    /// Open file description slots.
-    slots: [Option<FileHandle>; MAX_FDS],
-}
-
-impl KernelFdTable {
-    /// Create an empty fd table.
-    pub const fn new() -> Self {
-        const NONE: Option<FileHandle> = None;
-        Self {
-            slots: [NONE; MAX_FDS],
-        }
-    }
-
-    /// Install standard I/O file descriptors (0=stdin, 1=stdout, 2=stderr)
-    /// all pointing at the console backend.
-    ///
-    /// Called once for the init process and once for each child created
-    /// by fork (the child inherits the console fds).
-    pub fn install_stdio(&mut self) {
-        self.slots[0] = Some(FileHandle::console());
-        self.slots[1] = Some(FileHandle::console());
-        self.slots[2] = Some(FileHandle::console());
-    }
-
-    /// Allocate the lowest available fd for `handle`.
-    ///
-    /// Returns `Err(OutOfMemory)` if the table is full (all
-    /// [`MAX_FDS`] slots are occupied — maps to `EMFILE`).
-    pub fn install(&mut self, handle: FileHandle) -> Result<usize> {
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(handle);
-                return Ok(i);
-            }
-        }
-        Err(Error::OutOfMemory) // EMFILE
-    }
-
-    /// Install `handle` at the explicit slot `fd`, overwriting any
-    /// existing entry.  Used by `dup2` after the caller has closed
-    /// the previous occupant (and propagated backend close).
-    ///
-    /// Returns `Err(InvalidArgument)` if `fd` is out of range.
-    pub fn install_at(&mut self, fd: usize, handle: FileHandle) -> Result<()> {
-        let slot = self.slots.get_mut(fd).ok_or(Error::InvalidArgument)?;
-        *slot = Some(handle);
-        Ok(())
-    }
-
-    /// Return a shared reference to the handle at `fd`.
-    ///
-    /// Returns `None` if `fd` is out of range or not open.
-    pub fn get(&self, fd: usize) -> Option<&FileHandle> {
-        self.slots.get(fd).and_then(|s| s.as_ref())
-    }
-
-    /// Return a mutable reference to the handle at `fd`.
-    ///
-    /// Returns `None` if `fd` is out of range or not open.
-    pub fn get_mut(&mut self, fd: usize) -> Option<&mut FileHandle> {
-        self.slots.get_mut(fd).and_then(|s| s.as_mut())
-    }
-
-    /// Close fd `fd`, releasing its slot.
-    ///
-    /// Returns `Err(InvalidArgument)` if the fd is not open (`EBADF`).
-    pub fn close(&mut self, fd: usize) -> Result<()> {
-        let slot = self.slots.get_mut(fd).ok_or(Error::InvalidArgument)?;
-        if slot.is_none() {
-            return Err(Error::InvalidArgument); // EBADF
-        }
-        *slot = None;
-        Ok(())
-    }
-}
-
-impl Default for KernelFdTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Global fd table (single-process Phase 12) ─────────────────────
-
-/// Global fd table for the current process.
-///
-/// Phase 12 simplification: a single process runs at a time, so a
-/// single static table is sufficient. SMP / multi-process support
-/// will require a per-thread pointer (stored in Thread or a per-CPU
-/// variable) and a proper refcount; that upgrade is deferred.
-///
-/// # Safety invariant
-///
-/// Accessed exclusively from the SYSCALL dispatch path where the
-/// single CPU is in ring 0 with interrupts logically disabled
-/// (FMASK cleared IF on SYSCALL entry). No concurrent mutation
-/// is possible on single-CPU builds.
-// SAFETY: see module-level note. Accessed only from single-CPU
-// interrupt-disabled SYSCALL context.
-static mut CURRENT_FD_TABLE: KernelFdTable = KernelFdTable::new();
-
-/// Install a [`FileHandle`] in the current process's fd table,
+/// Install a [`FileHandle`] in the current thread's fd table,
 /// returning the assigned fd number.
 ///
 /// # Safety
@@ -328,15 +46,16 @@ static mut CURRENT_FD_TABLE: KernelFdTable = KernelFdTable::new();
 /// Must be called from the SYSCALL dispatch path (single-CPU,
 /// interrupts effectively disabled).
 pub unsafe fn fd_install(handle: FileHandle) -> Result<usize> {
-    // SAFETY: single-CPU SYSCALL context; no aliased access.
+    // SAFETY: single-CPU SYSCALL context; caller guarantees no concurrent access.
     unsafe {
-        #[allow(static_mut_refs)]
-        CURRENT_FD_TABLE.install(handle)
+        match crate::current::current_thread_mut() {
+            Some(t) => t.fd_table.install(handle),
+            None => Err(Error::NotFound),
+        }
     }
 }
 
-/// Retrieve a shared reference to the handle for `fd` in the current
-/// process's fd table.
+/// Retrieve a copy of the handle for `fd` in the current thread's fd table.
 ///
 /// Returns `None` if `fd` is not open or out of range.
 ///
@@ -344,15 +63,11 @@ pub unsafe fn fd_install(handle: FileHandle) -> Result<usize> {
 ///
 /// Same as [`fd_install`].
 pub unsafe fn fd_get(fd: usize) -> Option<FileHandle> {
-    // SAFETY: single-CPU SYSCALL context.
-    unsafe {
-        #[allow(static_mut_refs)]
-        CURRENT_FD_TABLE.get(fd).copied()
-    }
+    crate::current::current_thread().and_then(|t| t.fd_table.get(fd))
 }
 
 /// Retrieve a mutable reference to the handle for `fd` in the current
-/// process's fd table.
+/// thread's fd table.
 ///
 /// Returns `None` if `fd` is not open or out of range.
 ///
@@ -362,18 +77,20 @@ pub unsafe fn fd_get(fd: usize) -> Option<FileHandle> {
 pub unsafe fn fd_get_mut(fd: usize) -> Option<&'static mut FileHandle> {
     // SAFETY: single-CPU SYSCALL context; sole accessor.
     unsafe {
-        #[allow(static_mut_refs)]
-        CURRENT_FD_TABLE.get_mut(fd)
+        crate::current::current_thread_mut()
+            .and_then(|t| t.fd_table.get_mut(fd))
+            // SAFETY: the returned reference borrows the thread's fd_table.
+            // The 'static lifetime is an approximation valid within the
+            // single-CPU SYSCALL dispatch window where no other code can
+            // evict or modify the current thread.
+            .map(|h| &mut *(h as *mut FileHandle))
     }
 }
 
-/// Close `fd` in the current process's fd table.
+/// Close `fd` in the current thread's fd table.
 ///
-/// In addition to releasing the fd slot, propagates close semantics to
-/// the underlying backend:
-/// - [`FileBackend::Pipe`] — marks the appropriate pipe end as closed,
-///   potentially freeing the ring slot when both ends are shut.
-/// - [`FileBackend::Socket`] — closes the socket and releases its slot.
+/// Also propagates close semantics to the underlying backend
+/// (pipe refcount / socket release).
 ///
 /// Returns `Err(InvalidArgument)` (EBADF) if the fd is not open.
 ///
@@ -381,26 +98,21 @@ pub unsafe fn fd_get_mut(fd: usize) -> Option<&'static mut FileHandle> {
 ///
 /// Same as [`fd_install`].
 pub unsafe fn fd_close(fd: usize) -> Result<()> {
-    // Snapshot the backend before releasing the slot.
+    // Snapshot and remove in one step.
     // SAFETY: single-CPU SYSCALL context.
-    let backend = unsafe {
-        #[allow(static_mut_refs)]
-        CURRENT_FD_TABLE.get(fd).map(|h| h.backend)
+    let handle = unsafe {
+        match crate::current::current_thread_mut() {
+            Some(t) => t.fd_table.close(fd)?,
+            None => return Err(Error::NotFound),
+        }
     };
 
-    // Release the fd slot.
-    // SAFETY: single-CPU SYSCALL context.
-    unsafe {
-        #[allow(static_mut_refs)]
-        CURRENT_FD_TABLE.close(fd)?;
-    }
-
     // Propagate close to the backend resource.
-    match backend {
-        Some(FileBackend::Pipe {
+    match handle.backend {
+        FileBackend::Pipe {
             ring_id,
             is_write_end,
-        }) => {
+        } => {
             // SAFETY: single-CPU SYSCALL context; pipe table exclusively owned here.
             unsafe {
                 if is_write_end {
@@ -410,7 +122,7 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
                 }
             }
         }
-        Some(FileBackend::Socket { handle_id }) => {
+        FileBackend::Socket { handle_id } => {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { crate::socket::socket_close(handle_id) }
         }
@@ -420,8 +132,7 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
     Ok(())
 }
 
-/// Duplicate `oldfd` onto `newfd`, atomically closing `newfd` first
-/// if it was already open.
+/// Duplicate `oldfd` onto `newfd`, atomically closing `newfd` first if open.
 ///
 /// POSIX.1-2024 `dup2(3p)` semantics:
 /// - If `oldfd` is not open, returns `-EBADF` and leaves `newfd` alone.
@@ -429,21 +140,14 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
 /// - Otherwise closes `newfd` if open (propagating backend close), then
 ///   copies the handle from `oldfd` and returns `newfd`.
 ///
-/// Backend reference counts are bumped for backends that track them
-/// (currently only [`FileBackend::Pipe`]).  Sockets do not yet refcount,
-/// so dup2-then-close patterns on a socket fd will close the underlying
-/// socket — `socketpair` users should not rely on dup2 of a socket end
-/// for the moment.
-///
 /// # Safety
 ///
 /// Same as [`fd_install`].
 pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
-    // SAFETY: single-CPU SYSCALL context; sole accessor of the table.
+    // SAFETY: single-CPU SYSCALL context.
     let handle = unsafe {
-        #[allow(static_mut_refs)]
-        match CURRENT_FD_TABLE.get(oldfd) {
-            Some(h) => *h,
+        match fd_get(oldfd) {
+            Some(h) => h,
             None => return -9, // EBADF
         }
     };
@@ -455,15 +159,12 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
         return -9; // EBADF
     }
 
-    // Close newfd first so backends with destructors release their
-    // resources.  fd_close returns EBADF when newfd was already
-    // empty — which is the no-op case, so the result is ignored.
-    // SAFETY: single-CPU SYSCALL context.
-    unsafe {
-        #[allow(static_mut_refs)]
-        if CURRENT_FD_TABLE.get(newfd).is_some() {
-            let _ = fd_close(newfd);
-        }
+    // Close newfd first (if open) so backends release resources.
+    let newfd_open = crate::current::current_thread()
+        .and_then(|t| t.fd_table.get(newfd))
+        .is_some();
+    if newfd_open {
+        let _ = unsafe { fd_close(newfd) };
     }
 
     // Bump backend refcounts for the new alias.
@@ -472,7 +173,7 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
             ring_id,
             is_write_end,
         } => {
-            // SAFETY: single-CPU SYSCALL context; pipe table accessed here.
+            // SAFETY: single-CPU SYSCALL context.
             unsafe {
                 if is_write_end {
                     crate::pipe::pipe_dup_write(ring_id);
@@ -489,21 +190,21 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
     }
 
     // SAFETY: single-CPU SYSCALL context.
-    unsafe {
-        #[allow(static_mut_refs)]
-        if CURRENT_FD_TABLE.install_at(newfd, handle).is_err() {
-            return -9; // EBADF (out of range — unreachable: bounded above)
+    let result = unsafe {
+        match crate::current::current_thread_mut() {
+            Some(t) => t.fd_table.install_at(newfd, handle),
+            None => return -9,
         }
-    }
+    };
 
-    newfd as i64
+    match result {
+        Ok(()) => newfd as i64,
+        Err(_) => -9, // EBADF (out of range — unreachable: bounded above)
+    }
 }
 
 /// Install the standard I/O fds (0/1/2 = console) in the current
-/// process's fd table.
-///
-/// Must be called during init-process setup and (for Phase 12 single
-/// shared table) is effectively idempotent.
+/// thread's fd table.
 ///
 /// # Safety
 ///
@@ -511,8 +212,9 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
 pub unsafe fn install_stdio() {
     // SAFETY: single-CPU SYSCALL context.
     unsafe {
-        #[allow(static_mut_refs)]
-        CURRENT_FD_TABLE.install_stdio();
+        if let Some(t) = crate::current::current_thread_mut() {
+            t.fd_table.install_stdio();
+        }
     }
 }
 
@@ -520,29 +222,15 @@ pub unsafe fn install_stdio() {
 
 /// Write `count` bytes from the user-space buffer `buf_ptr` to fd `fd`.
 ///
-/// Dispatches to the appropriate backend:
-/// - [`FileBackend::Console`] — forwards bytes to COM1 serial.
-/// - [`FileBackend::RamfsFile`] — writes to the ramfs inode at the
-///   current offset, advancing the offset afterwards.
-/// - [`FileBackend::Pipe`] — pushes bytes into the pipe ring buffer.
-/// - [`FileBackend::Socket`] — sends bytes through the socket.
-///
-/// Returns the number of bytes written (>= 0) or a negative errno:
-/// - `-9` (`EBADF`) — fd is not open.
-/// - `-14` (`EFAULT`) — `buf_ptr` is NULL or in kernel space.
-/// - `-22` (`EINVAL`) — backend returned an error.
-/// - `-32` (`EPIPE`) — pipe read end is closed.
-///
 /// # Safety
 ///
 /// Must be called from the SYSCALL dispatch path. `buf_ptr` must be
 /// a non-null user-space address readable for at least `count` bytes.
 pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
-    // Basic user-space pointer validation.
     if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
     }
-    let count = count.min(4096) as usize; // cap at 4 KiB per write
+    let count = count.min(4096) as usize;
     if count == 0 {
         return 0;
     }
@@ -557,9 +245,8 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
 
     match handle.backend {
         FileBackend::Console => {
-            // Forward bytes to COM1 serial, byte-by-byte.
             let mut serial = Uart16550::new(COM1);
-            // SAFETY: `buf_ptr` is a non-null user-space address validated above.
+            // SAFETY: `buf_ptr` validated above.
             let written = unsafe {
                 let ptr = buf_ptr as *const u8;
                 let mut n = 0usize;
@@ -575,9 +262,8 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             written as i64
         }
         FileBackend::RamfsFile { ino } => {
-            // Copy bytes into a kernel buffer, then write to ramfs.
             let mut kbuf = [0u8; 4096];
-            // SAFETY: `buf_ptr` validated above; reading `count` bytes.
+            // SAFETY: `buf_ptr` validated above.
             unsafe {
                 let ptr = buf_ptr as *const u8;
                 for (i, b) in kbuf[..count].iter_mut().enumerate() {
@@ -585,27 +271,24 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
 
-            // Retrieve the current offset and write.
-            let (offset, new_offset) = unsafe {
-                #[allow(static_mut_refs)]
-                match CURRENT_FD_TABLE.get_mut(fd) {
-                    Some(h) => {
-                        let off = if h.flags.is_append() {
-                            // O_APPEND: look up inode size via the global VFS.
-                            crate::state::with_global(|s| s.vfs.inode_size(ino))
-                                .flatten()
-                                .unwrap_or(0)
-                        } else {
-                            h.offset
-                        };
-                        (off, off)
-                    }
-                    None => return -9, // EBADF
+            let offset = unsafe {
+                match crate::current::current_thread_mut() {
+                    Some(t) => match t.fd_table.get_mut(fd) {
+                        Some(h) => {
+                            if h.flags.is_append() {
+                                crate::state::with_global(|s| s.vfs.inode_size(ino))
+                                    .flatten()
+                                    .unwrap_or(0)
+                            } else {
+                                h.offset
+                            }
+                        }
+                        None => return -9,
+                    },
+                    None => return -9,
                 }
             };
-            let _ = new_offset;
 
-            // Perform the VFS write via the global kernel state.
             let written = crate::state::with_global_mut(|s| {
                 let inode_val = match s.vfs.lookup_path_by_ino(ino) {
                     Some(i) => i,
@@ -619,9 +302,10 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                     // Advance the offset.
                     // SAFETY: single-CPU SYSCALL context.
                     unsafe {
-                        #[allow(static_mut_refs)]
-                        if let Some(h) = CURRENT_FD_TABLE.get_mut(fd) {
-                            h.offset = offset + n as u64;
+                        if let Some(t) = crate::current::current_thread_mut() {
+                            if let Some(h) = t.fd_table.get_mut(fd) {
+                                h.offset = offset + n as u64;
+                            }
                         }
                     }
                     n as i64
@@ -637,16 +321,14 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             if !is_write_end {
                 return -9; // EBADF — cannot write to read end
             }
-            // Copy user bytes into kernel buffer, then push into ring.
             let mut kbuf = [0u8; 4096];
-            // SAFETY: `buf_ptr` validated above; reading `count` bytes.
+            // SAFETY: `buf_ptr` validated above.
             unsafe {
                 let ptr = buf_ptr as *const u8;
                 for (i, b) in kbuf[..count].iter_mut().enumerate() {
                     *b = ptr.add(i).read_volatile();
                 }
             }
-            // Blocking write: spin-yield until all bytes are pushed or read end is closed.
             let mut written = 0usize;
             loop {
                 // SAFETY: Single-CPU SYSCALL context.
@@ -663,7 +345,6 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 if written >= count {
                     return written as i64;
                 }
-                // Buffer temporarily full — yield and retry.
                 // SAFETY: SYSCALL context; yield_now is documented for this.
                 unsafe {
                     let _ = crate::current::yield_now();
@@ -671,9 +352,8 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             }
         }
         FileBackend::Socket { handle_id } => {
-            // Copy user bytes into kernel buffer, then send via socket.
             let mut kbuf = [0u8; 4096];
-            // SAFETY: `buf_ptr` validated above; reading `count` bytes.
+            // SAFETY: `buf_ptr` validated above.
             unsafe {
                 let ptr = buf_ptr as *const u8;
                 for (i, b) in kbuf[..count].iter_mut().enumerate() {
@@ -685,43 +365,25 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 let result = unsafe { crate::socket::socket_send(handle_id, &kbuf[..count]) };
                 match result {
                     Ok(n) => return n as i64,
-                    Err(oncrix_lib::Error::WouldBlock) => {
-                        // Peer buffer full — yield and retry.
-                        unsafe {
-                            let _ = crate::current::yield_now();
-                        }
-                    }
+                    Err(oncrix_lib::Error::WouldBlock) => unsafe {
+                        let _ = crate::current::yield_now();
+                    },
                     Err(_) => return -22, // EINVAL
                 }
             }
         }
-        FileBackend::DevFile { .. } => {
-            // /dev/null and /dev/zero both silently discard writes.
-            count as i64
-        }
-        FileBackend::ProcFile { .. } => -30, // EROFS — proc files are read-only
+        FileBackend::DevFile { .. } => count as i64, // /dev/null and /dev/zero discard writes
+        FileBackend::ProcFile { .. } => -30,         // EROFS — proc files are read-only
     }
 }
 
 /// Read up to `count` bytes from fd `fd` into user-space buffer `buf_ptr`.
-///
-/// Dispatches to the appropriate backend:
-/// - [`FileBackend::Console`] — blocks until at least one byte is available.
-/// - [`FileBackend::RamfsFile`] — reads from the ramfs inode at the
-///   current offset, advancing the offset afterwards.
-/// - [`FileBackend::Pipe`] — pops bytes from the pipe ring buffer.
-/// - [`FileBackend::Socket`] — receives bytes from the socket.
-///
-/// Returns the number of bytes read (0 = EOF) or a negative errno:
-/// - `-9` (`EBADF`) — fd is not open.
-/// - `-14` (`EFAULT`) — `buf_ptr` is NULL or in kernel space.
 ///
 /// # Safety
 ///
 /// Must be called from the SYSCALL dispatch path. `buf_ptr` must be
 /// a non-null user-space address writable for at least `count` bytes.
 pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
-    // Basic user-space pointer validation.
     if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
     }
@@ -740,24 +402,14 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
 
     match handle.backend {
         FileBackend::Console => {
-            // POSIX.1-2024 read(3p) on a tty-like device: block until
-            // at least one byte is available, then return that byte
-            // (and any further bytes already buffered up to `count`
-            // or the first `\n`, whichever comes first). The keyboard
-            // IRQ handler is the producer that fills `STDIN_BUF`; we
-            // are the consumer.
             let user_ptr = buf_ptr as *mut u8;
             let mut written = 0usize;
             loop {
-                // SAFETY: single-CPU SYSCALL context; the IRQ handler
-                // runs with IF=0 so we cannot race against the
-                // producer here. `console_pop_byte` upholds the
-                // documented invariant.
+                // SAFETY: single-CPU SYSCALL context.
                 let next = unsafe { crate::console::console_pop_byte() };
                 match next {
                     Some(b) => {
-                        // SAFETY: `buf_ptr` validated above. We have
-                        // written `written < count` bytes so far.
+                        // SAFETY: `buf_ptr` validated above.
                         unsafe { user_ptr.add(written).write_volatile(b) };
                         written += 1;
                         if b == b'\n' || written >= count {
@@ -766,36 +418,10 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                     }
                     None => {
                         if written > 0 {
-                            // Hand the partial line back so the user
-                            // can act on whatever has arrived so far
-                            // (matches Linux tty behaviour).
                             return written as i64;
                         }
-                        // Nothing yet — wait for the next interrupt.
-                        //
-                        // SYSCALL entry clears IF (FMASK), so neither
-                        // the timer nor the UART RX IRQ can fire while
-                        // we busy-spin here. Without enabling them, the
-                        // STDIN_BUF producer (uart_handler / timer-tick
-                        // poll) would never run and this loop would
-                        // wedge forever — that's exactly the bug that
-                        // made interactive `pwd` (or any input-driven
-                        // command after the first) silently hang.
-                        //
-                        // The `sti; hlt; cli` triplet halts the CPU
-                        // until the next interrupt (≤10 ms on the
-                        // 100 Hz PIT), which gives the UART poll
-                        // fallback in `timer_handler` a chance to
-                        // drain QEMU stdin into STDIN_BUF. After
-                        // `hlt` returns we immediately re-disable
-                        // interrupts so the rest of the loop body
-                        // re-enters the syscall's IF=0 contract.
-                        //
-                        // SAFETY: We hold no live borrows of any
-                        // single-CPU-protected data — the only state
-                        // we touch in this branch is STDIN_BUF, and
-                        // the IRQ handlers that mutate it
-                        // save/restore their own context.
+                        // SAFETY: We hold no live borrows of any single-CPU-protected
+                        // data in this branch. The IRQ handlers save/restore context.
                         unsafe {
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                         }
@@ -807,7 +433,6 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             let offset = handle.offset;
             let mut kbuf = [0u8; 4096];
 
-            // Read from ramfs.
             let result = crate::state::with_global(|s| {
                 let inode_val = match s.vfs.lookup_path_by_ino(ino) {
                     Some(i) => i,
@@ -818,8 +443,7 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
 
             match result {
                 Some(Ok(n)) => {
-                    // Copy kernel buffer to user space.
-                    // SAFETY: `buf_ptr` validated above; writing `n` bytes.
+                    // SAFETY: `buf_ptr` validated above.
                     unsafe {
                         let ptr = buf_ptr as *mut u8;
                         for (i, byte) in kbuf.iter().take(n).enumerate() {
@@ -829,9 +453,10 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                     // Advance the offset.
                     // SAFETY: single-CPU SYSCALL context.
                     unsafe {
-                        #[allow(static_mut_refs)]
-                        if let Some(h) = CURRENT_FD_TABLE.get_mut(fd) {
-                            h.offset = offset + n as u64;
+                        if let Some(t) = crate::current::current_thread_mut() {
+                            if let Some(h) = t.fd_table.get_mut(fd) {
+                                h.offset = offset + n as u64;
+                            }
                         }
                     }
                     n as i64
@@ -859,7 +484,7 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 let mut kbuf = [0u8; 4096];
                 let n = ring.pop(&mut kbuf[..count]);
                 if n > 0 {
-                    // SAFETY: `buf_ptr` validated above; writing `n` bytes.
+                    // SAFETY: `buf_ptr` validated above.
                     unsafe {
                         let ptr = user_ptr;
                         for (i, &byte) in kbuf.iter().take(n).enumerate() {
@@ -868,12 +493,10 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                     }
                     return n as i64;
                 }
-                // Buffer empty — check if write end is closed (EOF).
                 if !ring.write_open {
                     return 0; // POSIX EOF
                 }
-                // No data yet — yield and retry.
-                // SAFETY: SYSCALL context; yield_now documented for this.
+                // SAFETY: SYSCALL context.
                 unsafe {
                     let _ = crate::current::yield_now();
                 }
@@ -887,7 +510,7 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 let result = unsafe { crate::socket::socket_recv(handle_id, &mut kbuf[..count]) };
                 match result {
                     Ok(n) if n > 0 => {
-                        // SAFETY: `buf_ptr` validated above; writing `n` bytes.
+                        // SAFETY: `buf_ptr` validated above.
                         unsafe {
                             for (i, &byte) in kbuf.iter().take(n).enumerate() {
                                 user_ptr.add(i).write_volatile(byte);
@@ -895,21 +518,17 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                         }
                         return n as i64;
                     }
-                    Ok(_) | Err(oncrix_lib::Error::WouldBlock) => {
-                        // No data available — yield and retry.
-                        unsafe {
-                            let _ = crate::current::yield_now();
-                        }
-                    }
+                    Ok(_) | Err(oncrix_lib::Error::WouldBlock) => unsafe {
+                        let _ = crate::current::yield_now();
+                    },
                     Err(_) => return -22, // EINVAL
                 }
             }
         }
         FileBackend::DevFile { kind } => match kind {
-            DevFileKind::Null => 0, // EOF — no bytes produced
+            DevFileKind::Null => 0,
             DevFileKind::Zero => {
-                // Fill the user buffer with zero bytes.
-                // SAFETY: `buf_ptr` validated above; writing `count` bytes.
+                // SAFETY: `buf_ptr` validated above.
                 unsafe {
                     let ptr = buf_ptr as *mut u8;
                     for i in 0..count {
@@ -920,7 +539,6 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             }
         },
         FileBackend::ProcFile { kind } => {
-            // Synthesize content into a kernel buffer, then copy to user.
             let vfs_kind = match kind {
                 ProcFileKind::Uptime => oncrix_vfs::procfs::ProcKind::Uptime,
                 ProcFileKind::Version => oncrix_vfs::procfs::ProcKind::Version,
@@ -928,15 +546,14 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             };
             let offset = handle.offset as usize;
             let mut kbuf = [0u8; 256];
-            // SAFETY: SYSCALL dispatch path; proc_synthesize reads PIT_TIMER
-            // under the same single-CPU interrupt-disabled contract.
+            // SAFETY: SYSCALL dispatch path.
             let total = unsafe { crate::procfs_dispatch::proc_synthesize(vfs_kind, &mut kbuf) };
             if offset >= total {
                 return 0; // EOF
             }
             let available = total - offset;
             let n = available.min(count);
-            // SAFETY: `buf_ptr` validated above; writing `n` bytes.
+            // SAFETY: `buf_ptr` validated above.
             unsafe {
                 let ptr = buf_ptr as *mut u8;
                 for (i, &byte) in kbuf[offset..offset + n].iter().enumerate() {
@@ -946,9 +563,10 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             // Advance the offset.
             // SAFETY: single-CPU SYSCALL context.
             unsafe {
-                #[allow(static_mut_refs)]
-                if let Some(h) = CURRENT_FD_TABLE.get_mut(fd) {
-                    h.offset = (offset + n) as u64;
+                if let Some(t) = crate::current::current_thread_mut() {
+                    if let Some(h) = t.fd_table.get_mut(fd) {
+                        h.offset = (offset + n) as u64;
+                    }
                 }
             }
             n as i64
@@ -963,11 +581,6 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
 /// - `1` (`SEEK_CUR`) — add `off` to current offset.
 /// - `2` (`SEEK_END`) — set offset to file size + `off`.
 ///
-/// Returns the new offset on success, or a negative errno:
-/// - `-9` (`EBADF`) — fd is not open.
-/// - `-29` (`ESPIPE`) — fd is not seekable (console, pipe, or socket).
-/// - `-22` (`EINVAL`) — invalid whence or offset would be negative.
-///
 /// # Safety
 ///
 /// Must be called from the SYSCALL dispatch path.
@@ -981,11 +594,11 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
     };
 
     match handle.backend {
-        FileBackend::Console => -29,         // ESPIPE — not seekable
-        FileBackend::Pipe { .. } => -29,     // ESPIPE — pipes not seekable
-        FileBackend::Socket { .. } => -29,   // ESPIPE — sockets not seekable
-        FileBackend::DevFile { .. } => -29,  // ESPIPE — device files not seekable
-        FileBackend::ProcFile { .. } => -29, // ESPIPE — proc files not seekable
+        FileBackend::Console => -29,         // ESPIPE
+        FileBackend::Pipe { .. } => -29,     // ESPIPE
+        FileBackend::Socket { .. } => -29,   // ESPIPE
+        FileBackend::DevFile { .. } => -29,  // ESPIPE
+        FileBackend::ProcFile { .. } => -29, // ESPIPE
         FileBackend::RamfsFile { ino } => {
             let current_offset = handle.offset;
 
@@ -1012,15 +625,16 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
             };
 
             if new_offset < 0 {
-                return -22; // EINVAL — result would be negative
+                return -22; // EINVAL
             }
 
             // Update the handle's offset.
             // SAFETY: single-CPU SYSCALL context.
             unsafe {
-                #[allow(static_mut_refs)]
-                if let Some(h) = CURRENT_FD_TABLE.get_mut(fd) {
-                    h.offset = new_offset as u64;
+                if let Some(t) = crate::current::current_thread_mut() {
+                    if let Some(h) = t.fd_table.get_mut(fd) {
+                        h.offset = new_offset as u64;
+                    }
                 }
             }
             new_offset

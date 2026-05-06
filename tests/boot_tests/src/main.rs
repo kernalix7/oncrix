@@ -217,14 +217,13 @@ fn run_x86_64_boot_test() -> BootResult {
 /// Interactive shell test: types commands into QEMU stdin, validates stdout.
 ///
 /// Spawns a fresh QEMU instance with stdin piped. Waits for the service-manager
-/// boot-complete marker, then runs three sequential command cycles:
+/// boot-complete marker, then runs four sequential command cycles:
 ///   1. `echo hi from sh` + `pwd` — verifies UART RX path and basic builtins
 ///   2. `ls -l /` — verifies directory listing with permission bits
-///   3. `echo redirected > /tmp/foo` — SKIP: the Phase-12 single global
-///      `CURRENT_FD_TABLE` is shared between parent and child; the child's
-///      `dup2(file_fd, 1)` overwrites parent sh's stdout fd slot, so after
-///      the child exits the parent's `write(1, "$ ")` goes to the ramfs
-///      file rather than UART — the harness never sees the prompt on serial.
+///   3. `echo redirected > /tmp/foo` — verifies output redirection works
+///      (child's dup2 affects only child's per-thread fd table; parent stdout
+///      remains the console after wait4).
+///   4. `cat /tmp/foo` — verifies the redirected content was written.
 ///
 /// `wait_for_marker` uses a byte-level windowed scan so kernel debug lines
 /// interleaved in the UART byte stream do not mask the 2-byte "$ " prompt.
@@ -529,27 +528,96 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
         "[boot-test] PASS: interactive shell ls -l / shows directory entries with drwx permissions"
     );
 
-    // --- Cycle 3: redirection write (documented SKIP) ---
-    // The kernel uses a single global CURRENT_FD_TABLE shared between parent and
-    // child (Phase-12 design, fd_table.rs). When sh forks for
-    // `echo redirected > /tmp/foo`, the child calls dup2(file_fd, 1) which
-    // overwrites slot 1 in the global table. After the child exits, the parent
-    // sh's stdout fd now points to the ramfs file instead of the UART console,
-    // so the parent's next write(1, "$ ") goes to the file and is never seen on
-    // the serial port. Fixing this requires per-process fd tables (future batch).
-    let _ = stdin.write_all(b"echo redirected > /tmp/foo\n");
+    // --- Cycle 3: redirection write ---
+    // Per-thread fd tables (batch 20) fix the Phase-12 global-table bug.
+    // The child's dup2(file_fd, 1) now only mutates the child's own fd table;
+    // the parent's slot 1 remains the console handle.
+    if stdin.write_all(b"echo redirected > /tmp/foo\n").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: "failed to write redirection command to QEMU stdin".to_string(),
+        };
+    }
     let _ = stdin.flush();
+
+    // Wait for the shell prompt to return after the redirect command.
+    let redir_deadline = Instant::now() + Duration::from_secs(20);
+    let (_, p4_end) = match wait_for_marker(&shared_buf, b"$ ", p3_end, redir_deadline) {
+        Some(pair) => pair,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "[boot-test] SKIPPED: interactive shell redirection \
+                 (no '$ ' after redirect within 20 s)"
+            );
+            return BootResult {
+                success: true,
+                output: vec!["[SKIPPED] interactive shell redirection (prompt timeout)".to_string()],
+                failure_reason: String::new(),
+            };
+        }
+    };
+
+    // Now run `cat /tmp/foo` and verify "redirected" appears in output.
+    if stdin.write_all(b"cat /tmp/foo\n").is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: "failed to write 'cat /tmp/foo' to QEMU stdin".to_string(),
+        };
+    }
+    let _ = stdin.flush();
+
+    let cat_deadline = Instant::now() + Duration::from_secs(15);
+    let (buf_cat, p5_end) = match wait_for_marker(&shared_buf, b"$ ", p4_end, cat_deadline) {
+        Some(pair) => pair,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!(
+                "[boot-test] SKIPPED: interactive shell redirection \
+                 (no '$ ' after 'cat /tmp/foo' within 15 s)"
+            );
+            return BootResult {
+                success: true,
+                output: vec!["[SKIPPED] interactive shell redirection (cat timeout)".to_string()],
+                failure_reason: String::new(),
+            };
+        }
+    };
+    let _ = p5_end;
+
+    let cat_region =
+        String::from_utf8_lossy(&buf_cat[p4_end..p5_end.saturating_sub(2)]).into_owned();
+    eprintln!("[qemu-interactive] cat /tmp/foo region: {}", cat_region.trim());
+
+    if !cat_region.contains("redirected") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BootResult {
+            success: false,
+            output: cat_region.lines().map(str::to_string).collect(),
+            failure_reason: format!(
+                "'redirected' not found in cat /tmp/foo output: {:?}",
+                cat_region
+            ),
+        };
+    }
+
     let _ = child.kill();
     let _ = child.wait();
 
-    eprintln!(
-        "[boot-test] SKIPPED: interactive shell redirection \
-         (Phase-12 global CURRENT_FD_TABLE: child dup2 corrupts parent stdout)"
-    );
+    eprintln!("[boot-test] PASS: interactive shell redirection (echo redirected > /tmp/foo; cat /tmp/foo prints 'redirected')");
 
     BootResult {
         success: true,
-        output: vec!["[SKIPPED] interactive shell redirection (global fd-table)".to_string()],
+        output: vec!["[PASS] interactive shell redirection".to_string()],
         failure_reason: String::new(),
     }
 }

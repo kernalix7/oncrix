@@ -64,9 +64,11 @@ dependencies = [
 name = "oncrix-process"
 version = "0.1.0"
 dependencies = [
+ "oncrix-hal",
  "oncrix-ipc",
  "oncrix-lib",
  "oncrix-mm",
+ "oncrix-vfs",
 ]
 
 [[package]]
