@@ -97,33 +97,53 @@ fn sh_main() -> ! {
     }
 }
 
-/// Split `line` on `;` and execute each segment in order, updating
-/// `LAST_STATUS` between segments so that `$?` sees the prior command's
-/// exit code.
-fn run_semicolon_list(line: &[u8]) {
-    let mut start = 0usize;
-    loop {
-        // Find the next `;` that is not inside a pipeline.
-        let end = {
-            let mut pos = start;
-            let mut found = None;
-            while pos < line.len() {
-                if line[pos] == b';' {
-                    found = Some(pos);
-                    break;
-                }
-                pos += 1;
-            }
-            found
-        };
+/// Operator that joins two adjacent commands in a list.
+///
+/// POSIX.1-2024 §2.9.3 defines an "AND-OR list" using `&&` (only run
+/// the next command if the previous one returned 0) and `||` (only
+/// run the next command if the previous one returned non-zero). `;`
+/// is unconditional sequencing.
+#[derive(Debug, Clone, Copy)]
+enum ListOp {
+    /// `;` — always run the next segment.
+    Semi,
+    /// `&&` — run only when previous exit status == 0.
+    And,
+    /// `||` — run only when previous exit status != 0.
+    Or,
+}
 
-        let segment = match end {
-            Some(semi) => &line[start..semi],
+/// Split `line` on `;`, `&&`, and `||` (in left-to-right scan order)
+/// and execute each segment honouring AND-OR short-circuit semantics.
+///
+/// `LAST_STATUS` is updated by each child's waitpid so that `$?` and
+/// the `&&` / `||` decision both see the same value.
+fn run_semicolon_list(line: &[u8]) {
+    // Operator we used to JOIN this segment to the previous one — the
+    // first segment is unconditional.
+    let mut op = ListOp::Semi;
+    let mut start = 0usize;
+
+    loop {
+        // Find the next `;`, `&&`, or `||` at top-level.
+        let (end, next_op) = find_next_list_op(&line[start..]);
+
+        let abs_end = end.map(|e| start + e);
+        let segment = match abs_end {
+            Some(e) => &line[start..e],
             None => &line[start..],
         };
 
+        // Decide whether to RUN this segment based on the join op +
+        // the prior LAST_STATUS.
+        let should_run = match op {
+            ListOp::Semi => true,
+            ListOp::And => LAST_STATUS.load(Ordering::Relaxed) == 0,
+            ListOp::Or => LAST_STATUS.load(Ordering::Relaxed) != 0,
+        };
+
         let segment = trim(segment);
-        if !segment.is_empty() {
+        if should_run && !segment.is_empty() {
             // Substitute variables in this segment before dispatching.
             let mut sub_buf = [0u8; CMD_MAX];
             let segment = substitute_vars(segment, &mut sub_buf);
@@ -136,11 +156,44 @@ fn run_semicolon_list(line: &[u8]) {
             }
         }
 
-        match end {
-            Some(semi) => start = semi + 1,
+        match abs_end {
+            Some(e) => {
+                let advance = match next_op {
+                    ListOp::Semi => 1,
+                    ListOp::And | ListOp::Or => 2,
+                };
+                start = e + advance;
+                op = next_op;
+            }
             None => break,
         }
     }
+}
+
+/// Scan `line` from index 0 and return the position + kind of the
+/// first top-level list operator, or `(None, _)` if no operator
+/// appears in the segment.
+///
+/// "Top-level" here is unsophisticated — it does not honour quoting
+/// or escapes (sh has no quoting yet); a future POSIX-compliance
+/// batch will need a real tokeniser. The returned tuple's second
+/// element is meaningless when the first is `None`; callers must
+/// not consult it in that case.
+fn find_next_list_op(line: &[u8]) -> (Option<usize>, ListOp) {
+    let mut i = 0usize;
+    while i < line.len() {
+        if i + 1 < line.len() && line[i] == b'&' && line[i + 1] == b'&' {
+            return (Some(i), ListOp::And);
+        }
+        if i + 1 < line.len() && line[i] == b'|' && line[i + 1] == b'|' {
+            return (Some(i), ListOp::Or);
+        }
+        if line[i] == b';' {
+            return (Some(i), ListOp::Semi);
+        }
+        i += 1;
+    }
+    (None, ListOp::Semi)
 }
 
 /// Replace `$?`, `$NAME`, and `${NAME}` in `src`, writing into `dst`.
