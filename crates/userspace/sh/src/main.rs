@@ -89,47 +89,165 @@ fn sh_main() -> ! {
             continue;
         }
 
-        // Substitute `$?` with the most recent child exit status
-        // before tokenisation. The substitution buffer lives on the
-        // stack so we don't need a heap allocator.
-        let mut sub_buf = [0u8; CMD_MAX];
-        let line = substitute_dollar_question(line, &mut sub_buf);
+        // Split on `;` (top-level only — no quoting awareness yet) and
+        // run each segment in order.  Variable substitution is performed
+        // per-segment so that `$?` reflects the exit status of the
+        // immediately preceding command on the same line.
+        run_semicolon_list(line);
+    }
+}
 
-        // Check for a pipeline: exactly one `|` splits the line into two segments.
-        if let Some(pipe_pos) = find_pipe(line) {
-            run_pipeline(&line[..pipe_pos], &line[pipe_pos + 1..]);
-        } else {
-            dispatch_command(line);
+/// Split `line` on `;` and execute each segment in order, updating
+/// `LAST_STATUS` between segments so that `$?` sees the prior command's
+/// exit code.
+fn run_semicolon_list(line: &[u8]) {
+    let mut start = 0usize;
+    loop {
+        // Find the next `;` that is not inside a pipeline.
+        let end = {
+            let mut pos = start;
+            let mut found = None;
+            while pos < line.len() {
+                if line[pos] == b';' {
+                    found = Some(pos);
+                    break;
+                }
+                pos += 1;
+            }
+            found
+        };
+
+        let segment = match end {
+            Some(semi) => &line[start..semi],
+            None => &line[start..],
+        };
+
+        let segment = trim(segment);
+        if !segment.is_empty() {
+            // Substitute variables in this segment before dispatching.
+            let mut sub_buf = [0u8; CMD_MAX];
+            let segment = substitute_vars(segment, &mut sub_buf);
+
+            // Check for a pipeline: exactly one `|` splits into two segments.
+            if let Some(pipe_pos) = find_pipe(segment) {
+                run_pipeline(&segment[..pipe_pos], &segment[pipe_pos + 1..]);
+            } else {
+                dispatch_command(segment);
+            }
+        }
+
+        match end {
+            Some(semi) => start = semi + 1,
+            None => break,
         }
     }
 }
 
-/// Replace every occurrence of the two-byte token `$?` in `src` with
-/// the decimal representation of [`LAST_STATUS`], writing the result
-/// into `dst`. Returns a slice of `dst` covering the substituted
-/// output. If `dst` overflows mid-substitution the remainder of the
-/// input is silently dropped — POSIX leaves over-long lines
-/// implementation-defined.
-fn substitute_dollar_question<'a>(src: &[u8], dst: &'a mut [u8]) -> &'a [u8] {
-    let status = LAST_STATUS.load(Ordering::Relaxed);
-    let mut digits = [0u8; 12];
-    let dlen = i32_to_dec(status, &mut digits);
-
+/// Replace `$?`, `$NAME`, and `${NAME}` in `src`, writing into `dst`.
+///
+/// - `$?` → decimal exit status of last child (POSIX §2.5.2).
+/// - `$NAME` / `${NAME}` → value from the process environment via
+///   `getenv`; expands to empty string when the variable is unset.
+/// - NAME must match `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// Over-long output is silently truncated — POSIX leaves over-long
+/// lines implementation-defined.
+fn substitute_vars<'a>(src: &[u8], dst: &'a mut [u8]) -> &'a [u8] {
     let mut i = 0usize;
     let mut o = 0usize;
+
     while i < src.len() && o < dst.len() {
-        if i + 1 < src.len() && src[i] == b'$' && src[i + 1] == b'?' {
+        if src[i] != b'$' {
+            dst[o] = src[i];
+            o += 1;
+            i += 1;
+            continue;
+        }
+
+        // src[i] == b'$'
+        let after_dollar = i + 1;
+        if after_dollar >= src.len() {
+            // Lone `$` at end of input — pass through literally.
+            dst[o] = src[i];
+            o += 1;
+            i += 1;
+            continue;
+        }
+
+        let next = src[after_dollar];
+
+        if next == b'?' {
+            // $? — last exit status.
+            let status = LAST_STATUS.load(Ordering::Relaxed);
+            let mut digits = [0u8; 12];
+            let dlen = i32_to_dec(status, &mut digits);
             let copy = dlen.min(dst.len() - o);
             dst[o..o + copy].copy_from_slice(&digits[..copy]);
             o += copy;
             i += 2;
+            continue;
+        }
+
+        // Determine whether this is `${NAME}` or `$NAME`.
+        let (name, advance) = if next == b'{' {
+            // `${NAME}` form — scan for closing `}`.
+            let name_start = after_dollar + 1;
+            let mut end = name_start;
+            while end < src.len() && src[end] != b'}' {
+                end += 1;
+            }
+            let name = &src[name_start..end];
+            let advance = if end < src.len() {
+                // consume up to and including the `}`
+                end + 1
+            } else {
+                end
+            };
+            (name, advance)
+        } else if is_name_start(next) {
+            // `$NAME` form — scan identifier characters.
+            let name_start = after_dollar;
+            let mut end = name_start;
+            while end < src.len() && is_name_char(src[end]) {
+                end += 1;
+            }
+            (&src[name_start..end], end)
         } else {
-            dst[o] = src[i];
+            // Not a recognised expansion — pass `$` through literally.
+            dst[o] = b'$';
             o += 1;
             i += 1;
+            continue;
+        };
+
+        // Look up `name` in the environment.
+        if !name.is_empty() {
+            o += getenv_into(name, &mut dst[o..]);
         }
+        i = advance;
     }
     &dst[..o]
+}
+
+/// Return true if `b` is a valid first character of a POSIX NAME (`[A-Za-z_]`).
+#[inline]
+fn is_name_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+/// Return true if `b` is a valid continuation character of a POSIX NAME.
+#[inline]
+fn is_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Write the value of environment variable `name` into `out`, returning
+/// the number of bytes written.  Returns 0 for unset variables.
+///
+/// The kernel currently passes an empty envp, so all variables are unset.
+/// This function is the extension point for a future environ scan.
+fn getenv_into(_name: &[u8], _out: &mut [u8]) -> usize {
+    0
 }
 
 /// Format a (possibly negative) `i32` into the start of `buf` as
