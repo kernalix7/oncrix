@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -119,6 +119,14 @@ static EMBEDDED_BASENAME: &[u8] = include_bytes!(env!("ONCRIX_BASENAME_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_DIRNAME: &[u8] = include_bytes!(env!("ONCRIX_DIRNAME_BIN"));
 
+/// The embedded `/bin/seq` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SEQ: &[u8] = include_bytes!(env!("ONCRIX_SEQ_BIN"));
+
+/// The embedded `/bin/test` ELF binary (also resolvable as `[`).
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TEST: &[u8] = include_bytes!(env!("ONCRIX_TEST_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -197,7 +205,8 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// Recognised paths: `/bin/sh`, `/bin/echo`, `/bin/cat`, `/bin/true`,
 /// `/bin/false`, `/bin/wc`, `/bin/head`, `/bin/tail`, `/bin/pwd`,
 /// `/bin/env`, `/bin/uname`, `/bin/yes`, `/bin/clear`, `/bin/whoami`,
-/// `/bin/kill`, `/bin/basename`, `/bin/dirname`.
+/// `/bin/kill`, `/bin/basename`, `/bin/dirname`, `/bin/seq`,
+/// `/bin/test` (also `/bin/[`).
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -228,6 +237,8 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/kill" | b"kill" => Some(EMBEDDED_KILL),
         b"/bin/basename" | b"basename" => Some(EMBEDDED_BASENAME),
         b"/bin/dirname" | b"dirname" => Some(EMBEDDED_DIRNAME),
+        b"/bin/seq" | b"seq" => Some(EMBEDDED_SEQ),
+        b"/bin/test" | b"test" | b"/bin/[" | b"[" => Some(EMBEDDED_TEST),
         _ => None,
     }
 }

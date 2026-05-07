@@ -94,6 +94,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-seq"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-sh"
 version = "0.1.0"
 dependencies = [
@@ -116,6 +123,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-tail"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-test"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
