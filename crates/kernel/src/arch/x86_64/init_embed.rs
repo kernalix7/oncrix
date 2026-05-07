@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -107,6 +107,18 @@ static EMBEDDED_CLEAR: &[u8] = include_bytes!(env!("ONCRIX_CLEAR_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_WHOAMI: &[u8] = include_bytes!(env!("ONCRIX_WHOAMI_BIN"));
 
+/// The embedded `/bin/kill` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_KILL: &[u8] = include_bytes!(env!("ONCRIX_KILL_BIN"));
+
+/// The embedded `/bin/basename` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BASENAME: &[u8] = include_bytes!(env!("ONCRIX_BASENAME_BIN"));
+
+/// The embedded `/bin/dirname` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_DIRNAME: &[u8] = include_bytes!(env!("ONCRIX_DIRNAME_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -184,7 +196,8 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 ///
 /// Recognised paths: `/bin/sh`, `/bin/echo`, `/bin/cat`, `/bin/true`,
 /// `/bin/false`, `/bin/wc`, `/bin/head`, `/bin/tail`, `/bin/pwd`,
-/// `/bin/env`, `/bin/uname`, `/bin/yes`, `/bin/clear`, `/bin/whoami`.
+/// `/bin/env`, `/bin/uname`, `/bin/yes`, `/bin/clear`, `/bin/whoami`,
+/// `/bin/kill`, `/bin/basename`, `/bin/dirname`.
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -212,6 +225,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/yes" | b"yes" => Some(EMBEDDED_YES),
         b"/bin/clear" | b"clear" => Some(EMBEDDED_CLEAR),
         b"/bin/whoami" | b"whoami" => Some(EMBEDDED_WHOAMI),
+        b"/bin/kill" | b"kill" => Some(EMBEDDED_KILL),
+        b"/bin/basename" | b"basename" => Some(EMBEDDED_BASENAME),
+        b"/bin/dirname" | b"dirname" => Some(EMBEDDED_DIRNAME),
         _ => None,
     }
 }

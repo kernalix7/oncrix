@@ -57,6 +57,7 @@ const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
+const SYS_KILL: u64 = 62;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_PIPE2: u64 = 293;
 const SYS_NANOSLEEP: u64 = 35;
@@ -67,6 +68,16 @@ const SYS_TIME: u64 = 201;
 // Signal numbers
 // ---------------------------------------------------------------------------
 
+/// `SIGHUP` — hangup detected on controlling terminal.
+pub const SIGHUP: i32 = 1;
+/// `SIGINT` — interrupt from keyboard (Ctrl-C).
+pub const SIGINT: i32 = 2;
+/// `SIGQUIT` — quit from keyboard (Ctrl-\).
+pub const SIGQUIT: i32 = 3;
+/// `SIGKILL` — sure kill, cannot be caught or ignored.
+pub const SIGKILL: i32 = 9;
+/// `SIGTERM` — termination request.
+pub const SIGTERM: i32 = 15;
 /// `SIGCHLD` — child process status change.
 pub const SIGCHLD: i32 = 17;
 
@@ -314,6 +325,18 @@ pub unsafe fn waitpid(pid: i64, status: *mut i32, options: i32) -> i64 {
             0, // rusage = NULL
         )
     }
+}
+
+/// `kill(2)` — send a signal to a process.
+///
+/// Returns 0 on success, or a negative errno value:
+/// - `-3` (`ESRCH`) — no such process.
+/// - `-22` (`EINVAL`) — invalid signal number.
+///
+/// `sig == 0` performs an existence check without delivering a signal.
+pub fn kill(pid: i64, sig: i32) -> i64 {
+    // SAFETY: SYS_KILL takes scalar arguments only; no pointers.
+    unsafe { syscall2(SYS_KILL, pid as u64, sig as u64) }
 }
 
 /// `mkdir(2)` — create a directory.

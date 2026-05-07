@@ -159,24 +159,39 @@ pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
         use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
         use oncrix_hal::serial::SerialPort;
         let mut serial = Uart16550::new(COM1);
+
+        fn print_hex(serial: &mut impl SerialPort, val: u64) {
+            let mut buf = [b'0'; 16];
+            let mut v = val;
+            for byte in buf.iter_mut().rev() {
+                let digit = (v & 0xF) as u8;
+                *byte = if digit < 10 {
+                    b'0' + digit
+                } else {
+                    b'a' + digit - 10
+                };
+                v >>= 4;
+            }
+            let start = buf.iter().position(|&b| b != b'0').unwrap_or(15);
+            for &b in &buf[start..] {
+                let _ = serial.write_byte(b);
+            }
+        }
+
+        // SAFETY: next_ctx was just validated non-null above.
         let next_rsp = unsafe { (*next_ctx).rsp };
-        let _ = serial.write_str("[sched] switching to rsp=0x");
-        // print hex
-        let mut buf = [0u8; 16];
-        let mut n = next_rsp;
-        for byte in buf.iter_mut().rev() {
-            let digit = (n & 0xF) as u8;
-            *byte = if digit < 10 {
-                b'0' + digit
-            } else {
-                b'a' + digit - 10
-            };
-            n >>= 4;
-        }
-        let start = buf.iter().position(|&b| b != b'0').unwrap_or(15);
-        for &b in &buf[start..] {
-            let _ = serial.write_byte(b);
-        }
+        // SAFETY: next_rsp+48 is the return-address slot that switch_context
+        // will `ret` to; reading it here lets us detect pre-corruption.
+        let ret_addr = unsafe { *((next_rsp + 48) as *const u64) };
+
+        let _ = serial.write_str("[sched] prevctx=0x");
+        print_hex(&mut serial, prev_ctx as u64);
+        let _ = serial.write_str(" nextctx=0x");
+        print_hex(&mut serial, next_ctx as u64);
+        let _ = serial.write_str(" rsp=0x");
+        print_hex(&mut serial, next_rsp);
+        let _ = serial.write_str(" retaddr=0x");
+        print_hex(&mut serial, ret_addr);
         let _ = serial.write_str("\n");
     }
     unsafe {
