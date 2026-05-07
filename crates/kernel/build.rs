@@ -98,6 +98,9 @@ fn main() {
         ("oncrix-dirname", "dirname"),
         ("oncrix-seq", "seq"),
         ("oncrix-test", "test"),
+        ("oncrix-tee", "tee"),
+        ("oncrix-tr", "tr"),
+        ("oncrix-cut", "cut"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

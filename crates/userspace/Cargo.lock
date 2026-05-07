@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-cut"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-dirname"
 version = "0.1.0"
 dependencies = [
@@ -129,7 +136,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-tee"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-test"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tr"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
