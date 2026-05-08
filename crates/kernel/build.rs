@@ -101,6 +101,9 @@ fn main() {
         ("oncrix-tee", "tee"),
         ("oncrix-tr", "tr"),
         ("oncrix-cut", "cut"),
+        ("oncrix-uniq", "uniq"),
+        ("oncrix-grep", "grep"),
+        ("oncrix-printf", "printf"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

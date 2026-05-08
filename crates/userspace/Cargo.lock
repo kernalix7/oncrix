@@ -59,6 +59,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-grep"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-head"
 version = "0.1.0"
 dependencies = [
@@ -88,6 +95,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-mmaptest"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-printf"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -169,6 +183,13 @@ version = "0.1.0"
 
 [[package]]
 name = "oncrix-uname"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-uniq"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

@@ -1,0 +1,19 @@
+# Copyright 2026 ONCRIX Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "oncrix-grep"
+description = "ONCRIX - /bin/grep utility (fixed-string subset)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "grep"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true
