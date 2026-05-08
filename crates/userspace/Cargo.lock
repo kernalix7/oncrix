@@ -52,6 +52,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-expr"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-false"
 version = "0.1.0"
 dependencies = [
@@ -101,6 +108,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-od"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-printf"
 version = "0.1.0"
 dependencies = [
@@ -137,6 +151,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-sleep"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sort"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

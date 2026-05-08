@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -151,6 +151,18 @@ static EMBEDDED_GREP: &[u8] = include_bytes!(env!("ONCRIX_GREP_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_PRINTF: &[u8] = include_bytes!(env!("ONCRIX_PRINTF_BIN"));
 
+/// The embedded `/bin/sort` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SORT: &[u8] = include_bytes!(env!("ONCRIX_SORT_BIN"));
+
+/// The embedded `/bin/od` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_OD: &[u8] = include_bytes!(env!("ONCRIX_OD_BIN"));
+
+/// The embedded `/bin/expr` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_EXPR: &[u8] = include_bytes!(env!("ONCRIX_EXPR_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -231,7 +243,8 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// `/bin/env`, `/bin/uname`, `/bin/yes`, `/bin/clear`, `/bin/whoami`,
 /// `/bin/kill`, `/bin/basename`, `/bin/dirname`, `/bin/seq`,
 /// `/bin/test` (also `/bin/[`), `/bin/tee`, `/bin/tr`, `/bin/cut`,
-/// `/bin/uniq`, `/bin/grep`, `/bin/printf`.
+/// `/bin/uniq`, `/bin/grep`, `/bin/printf`, `/bin/sort`, `/bin/od`,
+/// `/bin/expr`.
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -270,6 +283,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/uniq" | b"uniq" => Some(EMBEDDED_UNIQ),
         b"/bin/grep" | b"grep" => Some(EMBEDDED_GREP),
         b"/bin/printf" | b"printf" => Some(EMBEDDED_PRINTF),
+        b"/bin/sort" | b"sort" => Some(EMBEDDED_SORT),
+        b"/bin/od" | b"od" => Some(EMBEDDED_OD),
+        b"/bin/expr" | b"expr" => Some(EMBEDDED_EXPR),
         _ => None,
     }
 }
