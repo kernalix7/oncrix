@@ -107,6 +107,9 @@ fn main() {
         ("oncrix-sort", "sort"),
         ("oncrix-od", "od"),
         ("oncrix-expr", "expr"),
+        ("oncrix-touch", "touch"),
+        ("oncrix-cp", "cp"),
+        ("oncrix-rm", "rm"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
