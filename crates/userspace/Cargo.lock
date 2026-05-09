@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-cmp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-cp"
 version = "0.1.0"
 dependencies = [
@@ -32,6 +39,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-cut"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-date"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -102,6 +116,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-ls"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mkdir"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

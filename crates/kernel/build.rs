@@ -110,6 +110,9 @@ fn main() {
         ("oncrix-touch", "touch"),
         ("oncrix-cp", "cp"),
         ("oncrix-rm", "rm"),
+        ("oncrix-mkdir", "mkdir"),
+        ("oncrix-cmp", "cmp"),
+        ("oncrix-date", "date"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

@@ -189,13 +189,7 @@ fn copy_one(src: *const u8, dst: *const u8) -> bool {
     }
 
     // SAFETY: caller guarantees `dst` is null-terminated.
-    let out_fd = unsafe {
-        libc::open(
-            dst,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            0o644,
-        )
-    };
+    let out_fd = unsafe { libc::open(dst, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644) };
     if out_fd < 0 {
         libc::close(in_fd as i32);
         write_all(2, b"cp: cannot open destination\n");
