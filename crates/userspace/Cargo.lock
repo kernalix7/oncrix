@@ -31,6 +31,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-comm"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-cp"
 version = "0.1.0"
 dependencies = [
@@ -136,7 +143,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-nl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-od"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-paste"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

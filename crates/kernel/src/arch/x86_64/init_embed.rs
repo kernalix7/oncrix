@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -187,6 +187,18 @@ static EMBEDDED_CMP: &[u8] = include_bytes!(env!("ONCRIX_CMP_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_DATE: &[u8] = include_bytes!(env!("ONCRIX_DATE_BIN"));
 
+/// The embedded `/bin/comm` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_COMM: &[u8] = include_bytes!(env!("ONCRIX_COMM_BIN"));
+
+/// The embedded `/bin/paste` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PASTE: &[u8] = include_bytes!(env!("ONCRIX_PASTE_BIN"));
+
+/// The embedded `/bin/nl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NL: &[u8] = include_bytes!(env!("ONCRIX_NL_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -269,7 +281,7 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// `/bin/test` (also `/bin/[`), `/bin/tee`, `/bin/tr`, `/bin/cut`,
 /// `/bin/uniq`, `/bin/grep`, `/bin/printf`, `/bin/sort`, `/bin/od`,
 /// `/bin/expr`, `/bin/touch`, `/bin/cp`, `/bin/rm`, `/bin/mkdir`,
-/// `/bin/cmp`, `/bin/date`.
+/// `/bin/cmp`, `/bin/date`, `/bin/comm`, `/bin/paste`, `/bin/nl`.
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -317,6 +329,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/mkdir" | b"mkdir" => Some(EMBEDDED_MKDIR),
         b"/bin/cmp" | b"cmp" => Some(EMBEDDED_CMP),
         b"/bin/date" | b"date" => Some(EMBEDDED_DATE),
+        b"/bin/comm" | b"comm" => Some(EMBEDDED_COMM),
+        b"/bin/paste" | b"paste" => Some(EMBEDDED_PASTE),
+        b"/bin/nl" | b"nl" => Some(EMBEDDED_NL),
         _ => None,
     }
 }

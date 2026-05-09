@@ -113,6 +113,9 @@ fn main() {
         ("oncrix-mkdir", "mkdir"),
         ("oncrix-cmp", "cmp"),
         ("oncrix-date", "date"),
+        ("oncrix-comm", "comm"),
+        ("oncrix-paste", "paste"),
+        ("oncrix-nl", "nl"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
