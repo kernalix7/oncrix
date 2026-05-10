@@ -178,6 +178,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-rev"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-rm"
 version = "0.1.0"
 dependencies = [
@@ -214,6 +221,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-sort"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tac"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -288,6 +302,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-whoami"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-xargs"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

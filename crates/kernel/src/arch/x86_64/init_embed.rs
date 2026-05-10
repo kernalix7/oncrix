@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -199,6 +199,18 @@ static EMBEDDED_PASTE: &[u8] = include_bytes!(env!("ONCRIX_PASTE_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_NL: &[u8] = include_bytes!(env!("ONCRIX_NL_BIN"));
 
+/// The embedded `/bin/rev` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_REV: &[u8] = include_bytes!(env!("ONCRIX_REV_BIN"));
+
+/// The embedded `/bin/tac` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TAC: &[u8] = include_bytes!(env!("ONCRIX_TAC_BIN"));
+
+/// The embedded `/bin/xargs` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_XARGS: &[u8] = include_bytes!(env!("ONCRIX_XARGS_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -281,7 +293,8 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// `/bin/test` (also `/bin/[`), `/bin/tee`, `/bin/tr`, `/bin/cut`,
 /// `/bin/uniq`, `/bin/grep`, `/bin/printf`, `/bin/sort`, `/bin/od`,
 /// `/bin/expr`, `/bin/touch`, `/bin/cp`, `/bin/rm`, `/bin/mkdir`,
-/// `/bin/cmp`, `/bin/date`, `/bin/comm`, `/bin/paste`, `/bin/nl`.
+/// `/bin/cmp`, `/bin/date`, `/bin/comm`, `/bin/paste`, `/bin/nl`,
+/// `/bin/rev`, `/bin/tac`, `/bin/xargs`.
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -332,6 +345,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/comm" | b"comm" => Some(EMBEDDED_COMM),
         b"/bin/paste" | b"paste" => Some(EMBEDDED_PASTE),
         b"/bin/nl" | b"nl" => Some(EMBEDDED_NL),
+        b"/bin/rev" | b"rev" => Some(EMBEDDED_REV),
+        b"/bin/tac" | b"tac" => Some(EMBEDDED_TAC),
+        b"/bin/xargs" | b"xargs" => Some(EMBEDDED_XARGS),
         _ => None,
     }
 }
