@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS,CKSUM,FOLD,REALPATH,CAL,STAT,WHICH}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS,CKSUM,FOLD,REALPATH,CAL,STAT,WHICH,SUM,UPTIME,FACTOR}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -235,6 +235,18 @@ static EMBEDDED_STAT: &[u8] = include_bytes!(env!("ONCRIX_STAT_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_WHICH: &[u8] = include_bytes!(env!("ONCRIX_WHICH_BIN"));
 
+/// The embedded `/bin/sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SUM: &[u8] = include_bytes!(env!("ONCRIX_SUM_BIN"));
+
+/// The embedded `/bin/uptime` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_UPTIME: &[u8] = include_bytes!(env!("ONCRIX_UPTIME_BIN"));
+
+/// The embedded `/bin/factor` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FACTOR: &[u8] = include_bytes!(env!("ONCRIX_FACTOR_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -319,7 +331,8 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// `/bin/expr`, `/bin/touch`, `/bin/cp`, `/bin/rm`, `/bin/mkdir`,
 /// `/bin/cmp`, `/bin/date`, `/bin/comm`, `/bin/paste`, `/bin/nl`,
 /// `/bin/rev`, `/bin/tac`, `/bin/xargs`, `/bin/cksum`, `/bin/fold`,
-/// `/bin/realpath`, `/bin/cal`, `/bin/stat`, `/bin/which`.
+/// `/bin/realpath`, `/bin/cal`, `/bin/stat`, `/bin/which`, `/bin/sum`,
+/// `/bin/uptime`, `/bin/factor`.
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -379,6 +392,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/cal" | b"cal" => Some(EMBEDDED_CAL),
         b"/bin/stat" | b"stat" => Some(EMBEDDED_STAT),
         b"/bin/which" | b"which" => Some(EMBEDDED_WHICH),
+        b"/bin/sum" | b"sum" => Some(EMBEDDED_SUM),
+        b"/bin/uptime" | b"uptime" => Some(EMBEDDED_UPTIME),
+        b"/bin/factor" | b"factor" => Some(EMBEDDED_FACTOR),
         _ => None,
     }
 }

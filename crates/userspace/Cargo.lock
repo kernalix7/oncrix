@@ -101,6 +101,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-factor"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-false"
 version = "0.1.0"
 dependencies = [
@@ -262,6 +269,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-tac"
 version = "0.1.0"
 dependencies = [
@@ -323,6 +337,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-uniq"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-uptime"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

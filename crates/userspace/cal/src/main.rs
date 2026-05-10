@@ -337,11 +337,19 @@ fn print_year(out: &mut OutBuf, year: i32, monday_first: bool) {
 }
 
 fn prev_month(year: i32, month: u32) -> (i32, u32) {
-    if month == 1 { (year - 1, 12) } else { (year, month - 1) }
+    if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    }
 }
 
 fn next_month(year: i32, month: u32) -> (i32, u32) {
-    if month == 12 { (year + 1, 1) } else { (year, month + 1) }
+    if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    }
 }
 
 /// Emit a single fixed-width grid line, trimmed of trailing spaces.
@@ -386,11 +394,7 @@ fn emit_blocks_row(out: &mut OutBuf, blocks: &[MonthBlock; 3]) {
     // own month ran out of days, so column alignment never drifts. After
     // all three columns finish, we strip trailing spaces from the joined
     // line for a clean right edge.
-    let max_rows = blocks
-        .iter()
-        .map(|b| b.used_rows)
-        .max()
-        .unwrap_or(0);
+    let max_rows = blocks.iter().map(|b| b.used_rows).max().unwrap_or(0);
     let blank: [u8; GRID_W] = [b' '; GRID_W];
     for r in 0..max_rows {
         // Build the row in a small stack buffer so trailing spaces can
@@ -527,9 +531,7 @@ fn write_err(msg: &[u8]) {
 }
 
 fn usage() {
-    write_err(
-        b"usage: cal [-m] [-3] [[MONTH] YEAR]\n",
-    );
+    write_err(b"usage: cal [-m] [-3] [[MONTH] YEAR]\n");
 }
 
 #[panic_handler]

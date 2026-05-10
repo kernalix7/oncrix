@@ -125,6 +125,9 @@ fn main() {
         ("oncrix-cal", "cal"),
         ("oncrix-stat", "stat"),
         ("oncrix-which", "which"),
+        ("oncrix-sum", "sum"),
+        ("oncrix-uptime", "uptime"),
+        ("oncrix-factor", "factor"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
