@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-cksum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-clear"
 version = "0.1.0"
 dependencies = [
@@ -88,6 +95,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-false"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-fold"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -172,6 +186,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-pwd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-realpath"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

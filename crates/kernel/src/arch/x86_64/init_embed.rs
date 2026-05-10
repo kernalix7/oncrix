@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS,CKSUM,FOLD,REALPATH}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -211,6 +211,18 @@ static EMBEDDED_TAC: &[u8] = include_bytes!(env!("ONCRIX_TAC_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_XARGS: &[u8] = include_bytes!(env!("ONCRIX_XARGS_BIN"));
 
+/// The embedded `/bin/cksum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CKSUM: &[u8] = include_bytes!(env!("ONCRIX_CKSUM_BIN"));
+
+/// The embedded `/bin/fold` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FOLD: &[u8] = include_bytes!(env!("ONCRIX_FOLD_BIN"));
+
+/// The embedded `/bin/realpath` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_REALPATH: &[u8] = include_bytes!(env!("ONCRIX_REALPATH_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -294,7 +306,8 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// `/bin/uniq`, `/bin/grep`, `/bin/printf`, `/bin/sort`, `/bin/od`,
 /// `/bin/expr`, `/bin/touch`, `/bin/cp`, `/bin/rm`, `/bin/mkdir`,
 /// `/bin/cmp`, `/bin/date`, `/bin/comm`, `/bin/paste`, `/bin/nl`,
-/// `/bin/rev`, `/bin/tac`, `/bin/xargs`.
+/// `/bin/rev`, `/bin/tac`, `/bin/xargs`, `/bin/cksum`, `/bin/fold`,
+/// `/bin/realpath`.
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -348,6 +361,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/rev" | b"rev" => Some(EMBEDDED_REV),
         b"/bin/tac" | b"tac" => Some(EMBEDDED_TAC),
         b"/bin/xargs" | b"xargs" => Some(EMBEDDED_XARGS),
+        b"/bin/cksum" | b"cksum" => Some(EMBEDDED_CKSUM),
+        b"/bin/fold" | b"fold" => Some(EMBEDDED_FOLD),
+        b"/bin/realpath" | b"realpath" => Some(EMBEDDED_REALPATH),
         _ => None,
     }
 }

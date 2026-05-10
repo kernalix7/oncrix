@@ -119,6 +119,9 @@ fn main() {
         ("oncrix-rev", "rev"),
         ("oncrix-tac", "tac"),
         ("oncrix-xargs", "xargs"),
+        ("oncrix-cksum", "cksum"),
+        ("oncrix-fold", "fold"),
+        ("oncrix-realpath", "realpath"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
