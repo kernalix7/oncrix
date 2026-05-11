@@ -157,6 +157,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-id"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-init"
 version = "0.1.0"
 dependencies = [
@@ -276,7 +283,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-sha224sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-sha256sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sha384sum"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

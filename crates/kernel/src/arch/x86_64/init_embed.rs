@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS,CKSUM,FOLD,REALPATH,CAL,STAT,WHICH,SUM,UPTIME,FACTOR,EXPAND,UNEXPAND,SPLIT,BASE64,MD5SUM,SHA256SUM,SHA1SUM,SHA512SUM,BASE32}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS,CKSUM,FOLD,REALPATH,CAL,STAT,WHICH,SUM,UPTIME,FACTOR,EXPAND,UNEXPAND,SPLIT,BASE64,MD5SUM,SHA256SUM,SHA1SUM,SHA512SUM,BASE32,SHA224SUM,SHA384SUM,ID}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -283,6 +283,18 @@ static EMBEDDED_SHA512SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA512SUM_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_BASE32: &[u8] = include_bytes!(env!("ONCRIX_BASE32_BIN"));
 
+/// The embedded `/bin/sha224sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHA224SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA224SUM_BIN"));
+
+/// The embedded `/bin/sha384sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHA384SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA384SUM_BIN"));
+
+/// The embedded `/bin/id` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ID: &[u8] = include_bytes!(env!("ONCRIX_ID_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -370,7 +382,8 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 /// `/bin/realpath`, `/bin/cal`, `/bin/stat`, `/bin/which`, `/bin/sum`,
 /// `/bin/uptime`, `/bin/factor`, `/bin/expand`, `/bin/unexpand`,
 /// `/bin/split`, `/bin/base64`, `/bin/md5sum`, `/bin/sha256sum`,
-/// `/bin/sha1sum`, `/bin/sha512sum`, `/bin/base32`.
+/// `/bin/sha1sum`, `/bin/sha512sum`, `/bin/base32`, `/bin/sha224sum`,
+/// `/bin/sha384sum`, `/bin/id`.
 /// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
@@ -442,6 +455,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/sha1sum" | b"sha1sum" => Some(EMBEDDED_SHA1SUM),
         b"/bin/sha512sum" | b"sha512sum" => Some(EMBEDDED_SHA512SUM),
         b"/bin/base32" | b"base32" => Some(EMBEDDED_BASE32),
+        b"/bin/sha224sum" | b"sha224sum" => Some(EMBEDDED_SHA224SUM),
+        b"/bin/sha384sum" | b"sha384sum" => Some(EMBEDDED_SHA384SUM),
+        b"/bin/id" | b"id" => Some(EMBEDDED_ID),
         _ => None,
     }
 }

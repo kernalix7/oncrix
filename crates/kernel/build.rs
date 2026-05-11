@@ -137,6 +137,9 @@ fn main() {
         ("oncrix-sha1sum", "sha1sum"),
         ("oncrix-sha512sum", "sha512sum"),
         ("oncrix-base32", "base32"),
+        ("oncrix-sha224sum", "sha224sum"),
+        ("oncrix-sha384sum", "sha384sum"),
+        ("oncrix-id", "id"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-sha224sum"
+description = "ONCRIX - /bin/sha224sum utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sha224sum"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true
