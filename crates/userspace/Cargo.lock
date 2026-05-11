@@ -87,6 +87,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-dd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-dirname"
 version = "0.1.0"
 dependencies = [
@@ -151,6 +158,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-head"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-hostname"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -396,6 +410,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-true"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tty"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

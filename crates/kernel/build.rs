@@ -140,6 +140,9 @@ fn main() {
         ("oncrix-sha224sum", "sha224sum"),
         ("oncrix-sha384sum", "sha384sum"),
         ("oncrix-id", "id"),
+        ("oncrix-dd", "dd"),
+        ("oncrix-hostname", "hostname"),
+        ("oncrix-tty", "tty"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
