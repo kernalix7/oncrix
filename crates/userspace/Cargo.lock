@@ -143,7 +143,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-file"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-fold"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-free"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -354,6 +368,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-stat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-strings"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

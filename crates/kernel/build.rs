@@ -143,6 +143,9 @@ fn main() {
         ("oncrix-dd", "dd"),
         ("oncrix-hostname", "hostname"),
         ("oncrix-tty", "tty"),
+        ("oncrix-strings", "strings"),
+        ("oncrix-file", "file"),
+        ("oncrix-free", "free"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
