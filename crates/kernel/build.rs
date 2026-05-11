@@ -131,6 +131,9 @@ fn main() {
         ("oncrix-expand", "expand"),
         ("oncrix-unexpand", "unexpand"),
         ("oncrix-split", "split"),
+        ("oncrix-base64", "base64"),
+        ("oncrix-md5sum", "md5sum"),
+        ("oncrix-sha256sum", "sha256sum"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
