@@ -94,6 +94,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-expand"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-expr"
 version = "0.1.0"
 dependencies = [
@@ -262,6 +269,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-split"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-stat"
 version = "0.1.0"
 dependencies = [
@@ -330,6 +344,13 @@ version = "0.1.0"
 
 [[package]]
 name = "oncrix-uname"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-unexpand"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

@@ -128,6 +128,9 @@ fn main() {
         ("oncrix-sum", "sum"),
         ("oncrix-uptime", "uptime"),
         ("oncrix-factor", "factor"),
+        ("oncrix-expand", "expand"),
+        ("oncrix-unexpand", "unexpand"),
+        ("oncrix-split", "split"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
