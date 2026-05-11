@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "oncrix-base32"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-base64"
 version = "0.1.0"
 dependencies = [
@@ -262,7 +269,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-sha1sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-sha256sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sha512sum"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
