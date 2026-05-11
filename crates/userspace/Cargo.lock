@@ -199,7 +199,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-install"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-kill"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-logname"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -410,6 +424,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-test"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-timeout"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
