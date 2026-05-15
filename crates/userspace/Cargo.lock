@@ -164,7 +164,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-getent"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-grep"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-groups"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -491,6 +505,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-uptime"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-users"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

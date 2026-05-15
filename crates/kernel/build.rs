@@ -149,6 +149,9 @@ fn main() {
         ("oncrix-install", "install"),
         ("oncrix-timeout", "timeout"),
         ("oncrix-logname", "logname"),
+        ("oncrix-groups", "groups"),
+        ("oncrix-users", "users"),
+        ("oncrix-getent", "getent"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

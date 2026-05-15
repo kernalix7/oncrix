@@ -331,6 +331,18 @@ static EMBEDDED_TIMEOUT: &[u8] = include_bytes!(env!("ONCRIX_TIMEOUT_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_LOGNAME: &[u8] = include_bytes!(env!("ONCRIX_LOGNAME_BIN"));
 
+/// The embedded `/bin/groups` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPS: &[u8] = include_bytes!(env!("ONCRIX_GROUPS_BIN"));
+
+/// The embedded `/bin/users` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERS: &[u8] = include_bytes!(env!("ONCRIX_USERS_BIN"));
+
+/// The embedded `/bin/getent` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GETENT: &[u8] = include_bytes!(env!("ONCRIX_GETENT_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -505,6 +517,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/install" | b"install" => Some(EMBEDDED_INSTALL),
         b"/bin/timeout" | b"timeout" => Some(EMBEDDED_TIMEOUT),
         b"/bin/logname" | b"logname" => Some(EMBEDDED_LOGNAME),
+        b"/bin/groups" | b"groups" => Some(EMBEDDED_GROUPS),
+        b"/bin/users" | b"users" => Some(EMBEDDED_USERS),
+        b"/bin/getent" | b"getent" => Some(EMBEDDED_GETENT),
         _ => None,
     }
 }
