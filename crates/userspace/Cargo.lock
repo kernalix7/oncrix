@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-arp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-base32"
 version = "0.1.0"
 dependencies = [
@@ -326,6 +333,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-install"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ip"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -704,6 +718,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-split"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ss"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

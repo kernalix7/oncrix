@@ -571,6 +571,18 @@ static EMBEDDED_ROUTE: &[u8] = include_bytes!(env!("ONCRIX_ROUTE_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_NETSTAT: &[u8] = include_bytes!(env!("ONCRIX_NETSTAT_BIN"));
 
+/// The embedded `/bin/arp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ARP: &[u8] = include_bytes!(env!("ONCRIX_ARP_BIN"));
+
+/// The embedded `/bin/ss` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SS: &[u8] = include_bytes!(env!("ONCRIX_SS_BIN"));
+
+/// The embedded `/bin/ip` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IP: &[u8] = include_bytes!(env!("ONCRIX_IP_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -805,6 +817,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/ifconfig" | b"ifconfig" => Some(EMBEDDED_IFCONFIG),
         b"/bin/route" | b"route" => Some(EMBEDDED_ROUTE),
         b"/bin/netstat" | b"netstat" => Some(EMBEDDED_NETSTAT),
+        b"/bin/arp" | b"arp" => Some(EMBEDDED_ARP),
+        b"/bin/ss" | b"ss" => Some(EMBEDDED_SS),
+        b"/bin/ip" | b"ip" => Some(EMBEDDED_IP),
         _ => None,
     }
 }
