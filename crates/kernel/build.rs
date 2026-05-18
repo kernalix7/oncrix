@@ -164,6 +164,9 @@ fn main() {
         ("oncrix-df", "df"),
         ("oncrix-lscpu", "lscpu"),
         ("oncrix-hostid", "hostid"),
+        ("oncrix-who", "who"),
+        ("oncrix-last", "last"),
+        ("oncrix-lsipc", "lsipc"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

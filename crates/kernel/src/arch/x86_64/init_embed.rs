@@ -391,6 +391,18 @@ static EMBEDDED_LSCPU: &[u8] = include_bytes!(env!("ONCRIX_LSCPU_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_HOSTID: &[u8] = include_bytes!(env!("ONCRIX_HOSTID_BIN"));
 
+/// The embedded `/bin/who` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHO: &[u8] = include_bytes!(env!("ONCRIX_WHO_BIN"));
+
+/// The embedded `/bin/last` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LAST: &[u8] = include_bytes!(env!("ONCRIX_LAST_BIN"));
+
+/// The embedded `/bin/lsipc` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSIPC: &[u8] = include_bytes!(env!("ONCRIX_LSIPC_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -580,6 +592,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/df" | b"df" => Some(EMBEDDED_DF),
         b"/bin/lscpu" | b"lscpu" => Some(EMBEDDED_LSCPU),
         b"/bin/hostid" | b"hostid" => Some(EMBEDDED_HOSTID),
+        b"/bin/who" | b"who" => Some(EMBEDDED_WHO),
+        b"/bin/last" | b"last" => Some(EMBEDDED_LAST),
+        b"/bin/lsipc" | b"lsipc" => Some(EMBEDDED_LSIPC),
         _ => None,
     }
 }

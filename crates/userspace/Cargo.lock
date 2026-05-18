@@ -248,6 +248,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-last"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-logname"
 version = "0.1.0"
 dependencies = [
@@ -263,6 +270,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-lscpu"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsipc"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -610,6 +624,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-which"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-who"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
