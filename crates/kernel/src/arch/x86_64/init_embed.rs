@@ -487,6 +487,18 @@ static EMBEDDED_USERDEL: &[u8] = include_bytes!(env!("ONCRIX_USERDEL_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_USERMOD: &[u8] = include_bytes!(env!("ONCRIX_USERMOD_BIN"));
 
+/// The embedded `/bin/groupadd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPADD: &[u8] = include_bytes!(env!("ONCRIX_GROUPADD_BIN"));
+
+/// The embedded `/bin/groupdel` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPDEL: &[u8] = include_bytes!(env!("ONCRIX_GROUPDEL_BIN"));
+
+/// The embedded `/bin/groupmod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPMOD: &[u8] = include_bytes!(env!("ONCRIX_GROUPMOD_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -700,6 +712,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/useradd" | b"useradd" => Some(EMBEDDED_USERADD),
         b"/bin/userdel" | b"userdel" => Some(EMBEDDED_USERDEL),
         b"/bin/usermod" | b"usermod" => Some(EMBEDDED_USERMOD),
+        b"/bin/groupadd" | b"groupadd" => Some(EMBEDDED_GROUPADD),
+        b"/bin/groupdel" | b"groupdel" => Some(EMBEDDED_GROUPDEL),
+        b"/bin/groupmod" | b"groupmod" => Some(EMBEDDED_GROUPMOD),
         _ => None,
     }
 }

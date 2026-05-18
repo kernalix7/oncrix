@@ -188,6 +188,9 @@ fn main() {
         ("oncrix-useradd", "useradd"),
         ("oncrix-userdel", "userdel"),
         ("oncrix-usermod", "usermod"),
+        ("oncrix-groupadd", "groupadd"),
+        ("oncrix-groupdel", "groupdel"),
+        ("oncrix-groupmod", "groupmod"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

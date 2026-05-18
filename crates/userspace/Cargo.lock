@@ -206,6 +206,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-groupadd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-groupdel"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-groupmod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-groups"
 version = "0.1.0"
 dependencies = [
