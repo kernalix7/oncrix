@@ -191,6 +191,9 @@ fn main() {
         ("oncrix-groupadd", "groupadd"),
         ("oncrix-groupdel", "groupdel"),
         ("oncrix-groupmod", "groupmod"),
+        ("oncrix-tput", "tput"),
+        ("oncrix-reset", "reset"),
+        ("oncrix-tabs", "tabs"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

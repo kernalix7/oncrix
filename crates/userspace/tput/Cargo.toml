@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-tput"
+description = "ONCRIX - /bin/tput utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tput"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true

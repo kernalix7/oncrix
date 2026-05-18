@@ -499,6 +499,18 @@ static EMBEDDED_GROUPDEL: &[u8] = include_bytes!(env!("ONCRIX_GROUPDEL_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_GROUPMOD: &[u8] = include_bytes!(env!("ONCRIX_GROUPMOD_BIN"));
 
+/// The embedded `/bin/tput` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TPUT: &[u8] = include_bytes!(env!("ONCRIX_TPUT_BIN"));
+
+/// The embedded `/bin/reset` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_RESET: &[u8] = include_bytes!(env!("ONCRIX_RESET_BIN"));
+
+/// The embedded `/bin/tabs` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TABS: &[u8] = include_bytes!(env!("ONCRIX_TABS_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -715,6 +727,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/groupadd" | b"groupadd" => Some(EMBEDDED_GROUPADD),
         b"/bin/groupdel" | b"groupdel" => Some(EMBEDDED_GROUPDEL),
         b"/bin/groupmod" | b"groupmod" => Some(EMBEDDED_GROUPMOD),
+        b"/bin/tput" | b"tput" => Some(EMBEDDED_TPUT),
+        b"/bin/reset" | b"reset" => Some(EMBEDDED_RESET),
+        b"/bin/tabs" | b"tabs" => Some(EMBEDDED_TABS),
         _ => None,
     }
 }

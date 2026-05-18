@@ -521,6 +521,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-reset"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-rev"
 version = "0.1.0"
 dependencies = [
@@ -640,6 +647,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-tabs"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-tac"
 version = "0.1.0"
 dependencies = [
@@ -683,6 +697,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-touch"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tput"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
