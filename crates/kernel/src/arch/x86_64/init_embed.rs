@@ -379,6 +379,18 @@ static EMBEDDED_LSMOD: &[u8] = include_bytes!(env!("ONCRIX_LSMOD_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_NICE: &[u8] = include_bytes!(env!("ONCRIX_NICE_BIN"));
 
+/// The embedded `/bin/df` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_DF: &[u8] = include_bytes!(env!("ONCRIX_DF_BIN"));
+
+/// The embedded `/bin/lscpu` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSCPU: &[u8] = include_bytes!(env!("ONCRIX_LSCPU_BIN"));
+
+/// The embedded `/bin/hostid` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HOSTID: &[u8] = include_bytes!(env!("ONCRIX_HOSTID_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -565,6 +577,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/mountpoint" | b"mountpoint" => Some(EMBEDDED_MOUNTPOINT),
         b"/bin/lsmod" | b"lsmod" => Some(EMBEDDED_LSMOD),
         b"/bin/nice" | b"nice" => Some(EMBEDDED_NICE),
+        b"/bin/df" | b"df" => Some(EMBEDDED_DF),
+        b"/bin/lscpu" | b"lscpu" => Some(EMBEDDED_LSCPU),
+        b"/bin/hostid" | b"hostid" => Some(EMBEDDED_HOSTID),
         _ => None,
     }
 }

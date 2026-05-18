@@ -101,6 +101,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-df"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-dirname"
 version = "0.1.0"
 dependencies = [
@@ -199,6 +206,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-hostid"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-hostname"
 version = "0.1.0"
 dependencies = [
@@ -242,6 +256,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-ls"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lscpu"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

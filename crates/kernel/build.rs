@@ -161,6 +161,9 @@ fn main() {
         ("oncrix-mountpoint", "mountpoint"),
         ("oncrix-lsmod", "lsmod"),
         ("oncrix-nice", "nice"),
+        ("oncrix-df", "df"),
+        ("oncrix-lscpu", "lscpu"),
+        ("oncrix-hostid", "hostid"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
