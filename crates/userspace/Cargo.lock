@@ -640,6 +640,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-pmap"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-printenv"
 version = "0.1.0"
 dependencies = [
@@ -648,6 +655,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-printf"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ps"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -872,6 +886,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-timeout"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-top"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

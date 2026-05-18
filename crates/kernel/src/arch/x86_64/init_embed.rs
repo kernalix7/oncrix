@@ -631,6 +631,18 @@ static EMBEDDED_PKILL: &[u8] = include_bytes!(env!("ONCRIX_PKILL_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_KILLALL: &[u8] = include_bytes!(env!("ONCRIX_KILLALL_BIN"));
 
+/// The embedded `/bin/ps` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PS: &[u8] = include_bytes!(env!("ONCRIX_PS_BIN"));
+
+/// The embedded `/bin/top` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TOP: &[u8] = include_bytes!(env!("ONCRIX_TOP_BIN"));
+
+/// The embedded `/bin/pmap` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PMAP: &[u8] = include_bytes!(env!("ONCRIX_PMAP_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -880,6 +892,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/pgrep" | b"pgrep" => Some(EMBEDDED_PGREP),
         b"/bin/pkill" | b"pkill" => Some(EMBEDDED_PKILL),
         b"/bin/killall" | b"killall" => Some(EMBEDDED_KILLALL),
+        b"/bin/ps" | b"ps" => Some(EMBEDDED_PS),
+        b"/bin/top" | b"top" => Some(EMBEDDED_TOP),
+        b"/bin/pmap" | b"pmap" => Some(EMBEDDED_PMAP),
         _ => None,
     }
 }

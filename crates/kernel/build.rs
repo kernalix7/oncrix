@@ -224,6 +224,9 @@ fn main() {
         ("oncrix-pgrep", "pgrep"),
         ("oncrix-pkill", "pkill"),
         ("oncrix-killall", "killall"),
+        ("oncrix-ps", "ps"),
+        ("oncrix-top", "top"),
+        ("oncrix-pmap", "pmap"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
