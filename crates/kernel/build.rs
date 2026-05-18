@@ -185,6 +185,9 @@ fn main() {
         ("oncrix-hostnamectl", "hostnamectl"),
         ("oncrix-timedatectl", "timedatectl"),
         ("oncrix-localectl", "localectl"),
+        ("oncrix-useradd", "useradd"),
+        ("oncrix-userdel", "userdel"),
+        ("oncrix-usermod", "usermod"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

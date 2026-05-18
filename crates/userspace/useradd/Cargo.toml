@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-useradd"
+description = "ONCRIX - /bin/useradd utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "useradd"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true

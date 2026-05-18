@@ -728,6 +728,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-useradd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-userdel"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-usermod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-users"
 version = "0.1.0"
 dependencies = [

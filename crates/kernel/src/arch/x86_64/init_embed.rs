@@ -475,6 +475,18 @@ static EMBEDDED_TIMEDATECTL: &[u8] = include_bytes!(env!("ONCRIX_TIMEDATECTL_BIN
 #[cfg(feature = "embed-init")]
 static EMBEDDED_LOCALECTL: &[u8] = include_bytes!(env!("ONCRIX_LOCALECTL_BIN"));
 
+/// The embedded `/bin/useradd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERADD: &[u8] = include_bytes!(env!("ONCRIX_USERADD_BIN"));
+
+/// The embedded `/bin/userdel` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERDEL: &[u8] = include_bytes!(env!("ONCRIX_USERDEL_BIN"));
+
+/// The embedded `/bin/usermod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERMOD: &[u8] = include_bytes!(env!("ONCRIX_USERMOD_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -685,6 +697,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/hostnamectl" | b"hostnamectl" => Some(EMBEDDED_HOSTNAMECTL),
         b"/bin/timedatectl" | b"timedatectl" => Some(EMBEDDED_TIMEDATECTL),
         b"/bin/localectl" | b"localectl" => Some(EMBEDDED_LOCALECTL),
+        b"/bin/useradd" | b"useradd" => Some(EMBEDDED_USERADD),
+        b"/bin/userdel" | b"userdel" => Some(EMBEDDED_USERDEL),
+        b"/bin/usermod" | b"usermod" => Some(EMBEDDED_USERMOD),
         _ => None,
     }
 }
