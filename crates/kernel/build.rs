@@ -182,6 +182,9 @@ fn main() {
         ("oncrix-blkid", "blkid"),
         ("oncrix-lsblk", "lsblk"),
         ("oncrix-swapon", "swapon"),
+        ("oncrix-hostnamectl", "hostnamectl"),
+        ("oncrix-timedatectl", "timedatectl"),
+        ("oncrix-localectl", "localectl"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

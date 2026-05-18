@@ -234,6 +234,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-hostnamectl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-id"
 version = "0.1.0"
 dependencies = [
@@ -291,6 +298,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-locale"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-localectl"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -627,6 +641,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-test"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-timedatectl"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

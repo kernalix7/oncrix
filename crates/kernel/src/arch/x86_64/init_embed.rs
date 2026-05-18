@@ -463,6 +463,18 @@ static EMBEDDED_LSBLK: &[u8] = include_bytes!(env!("ONCRIX_LSBLK_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_SWAPON: &[u8] = include_bytes!(env!("ONCRIX_SWAPON_BIN"));
 
+/// The embedded `/bin/hostnamectl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HOSTNAMECTL: &[u8] = include_bytes!(env!("ONCRIX_HOSTNAMECTL_BIN"));
+
+/// The embedded `/bin/timedatectl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TIMEDATECTL: &[u8] = include_bytes!(env!("ONCRIX_TIMEDATECTL_BIN"));
+
+/// The embedded `/bin/localectl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LOCALECTL: &[u8] = include_bytes!(env!("ONCRIX_LOCALECTL_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -670,6 +682,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/blkid" | b"blkid" => Some(EMBEDDED_BLKID),
         b"/bin/lsblk" | b"lsblk" => Some(EMBEDDED_LSBLK),
         b"/bin/swapon" | b"swapon" => Some(EMBEDDED_SWAPON),
+        b"/bin/hostnamectl" | b"hostnamectl" => Some(EMBEDDED_HOSTNAMECTL),
+        b"/bin/timedatectl" | b"timedatectl" => Some(EMBEDDED_TIMEDATECTL),
+        b"/bin/localectl" | b"localectl" => Some(EMBEDDED_LOCALECTL),
         _ => None,
     }
 }
