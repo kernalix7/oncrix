@@ -311,6 +311,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-ifconfig"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-init"
 version = "0.1.0"
 dependencies = [
@@ -500,6 +507,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-netstat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-nice"
 version = "0.1.0"
 dependencies = [
@@ -606,6 +620,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-rm"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-route"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

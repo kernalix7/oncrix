@@ -206,6 +206,9 @@ fn main() {
         ("oncrix-ln", "ln"),
         ("oncrix-mv", "mv"),
         ("oncrix-mkfifo", "mkfifo"),
+        ("oncrix-ifconfig", "ifconfig"),
+        ("oncrix-route", "route"),
+        ("oncrix-netstat", "netstat"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

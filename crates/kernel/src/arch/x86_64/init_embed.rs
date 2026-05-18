@@ -559,6 +559,18 @@ static EMBEDDED_MV: &[u8] = include_bytes!(env!("ONCRIX_MV_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_MKFIFO: &[u8] = include_bytes!(env!("ONCRIX_MKFIFO_BIN"));
 
+/// The embedded `/bin/ifconfig` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IFCONFIG: &[u8] = include_bytes!(env!("ONCRIX_IFCONFIG_BIN"));
+
+/// The embedded `/bin/route` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ROUTE: &[u8] = include_bytes!(env!("ONCRIX_ROUTE_BIN"));
+
+/// The embedded `/bin/netstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NETSTAT: &[u8] = include_bytes!(env!("ONCRIX_NETSTAT_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -790,6 +802,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/ln" | b"ln" => Some(EMBEDDED_LN),
         b"/bin/mv" | b"mv" => Some(EMBEDDED_MV),
         b"/bin/mkfifo" | b"mkfifo" => Some(EMBEDDED_MKFIFO),
+        b"/bin/ifconfig" | b"ifconfig" => Some(EMBEDDED_IFCONFIG),
+        b"/bin/route" | b"route" => Some(EMBEDDED_ROUTE),
+        b"/bin/netstat" | b"netstat" => Some(EMBEDDED_NETSTAT),
         _ => None,
     }
 }
