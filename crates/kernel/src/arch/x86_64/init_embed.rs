@@ -427,6 +427,18 @@ static EMBEDDED_LDCONFIG: &[u8] = include_bytes!(env!("ONCRIX_LDCONFIG_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_VMSTAT: &[u8] = include_bytes!(env!("ONCRIX_VMSTAT_BIN"));
 
+/// The embedded `/bin/passwd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PASSWD: &[u8] = include_bytes!(env!("ONCRIX_PASSWD_BIN"));
+
+/// The embedded `/bin/chsh` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHSH: &[u8] = include_bytes!(env!("ONCRIX_CHSH_BIN"));
+
+/// The embedded `/bin/ulimit` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ULIMIT: &[u8] = include_bytes!(env!("ONCRIX_ULIMIT_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -625,6 +637,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/ldd" | b"ldd" => Some(EMBEDDED_LDD),
         b"/bin/ldconfig" | b"ldconfig" => Some(EMBEDDED_LDCONFIG),
         b"/bin/vmstat" | b"vmstat" => Some(EMBEDDED_VMSTAT),
+        b"/bin/passwd" | b"passwd" => Some(EMBEDDED_PASSWD),
+        b"/bin/chsh" | b"chsh" => Some(EMBEDDED_CHSH),
+        b"/bin/ulimit" | b"ulimit" => Some(EMBEDDED_ULIMIT),
         _ => None,
     }
 }

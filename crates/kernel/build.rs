@@ -173,6 +173,9 @@ fn main() {
         ("oncrix-ldd", "ldd"),
         ("oncrix-ldconfig", "ldconfig"),
         ("oncrix-vmstat", "vmstat"),
+        ("oncrix-passwd", "passwd"),
+        ("oncrix-chsh", "chsh"),
+        ("oncrix-ulimit", "ulimit"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

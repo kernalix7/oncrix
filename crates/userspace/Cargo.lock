@@ -45,6 +45,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-chsh"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-cksum"
 version = "0.1.0"
 dependencies = [
@@ -388,6 +395,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-passwd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-paste"
 version = "0.1.0"
 dependencies = [
@@ -614,6 +628,13 @@ dependencies = [
 [[package]]
 name = "oncrix-ulibc"
 version = "0.1.0"
+
+[[package]]
+name = "oncrix-ulimit"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
 
 [[package]]
 name = "oncrix-uname"
