@@ -80,6 +80,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-chacl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-chattr"
 version = "0.1.0"
 dependencies = [
@@ -340,6 +347,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-hostnamectl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-iconv"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -760,6 +774,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-seq"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-setfacl"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

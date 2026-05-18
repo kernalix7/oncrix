@@ -679,6 +679,18 @@ static EMBEDDED_IONICE: &[u8] = include_bytes!(env!("ONCRIX_IONICE_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_WATCH: &[u8] = include_bytes!(env!("ONCRIX_WATCH_BIN"));
 
+/// The embedded `/bin/setfacl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SETFACL: &[u8] = include_bytes!(env!("ONCRIX_SETFACL_BIN"));
+
+/// The embedded `/bin/chacl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHACL: &[u8] = include_bytes!(env!("ONCRIX_CHACL_BIN"));
+
+/// The embedded `/bin/iconv` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ICONV: &[u8] = include_bytes!(env!("ONCRIX_ICONV_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -940,6 +952,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/taskset" | b"taskset" => Some(EMBEDDED_TASKSET),
         b"/bin/ionice" | b"ionice" => Some(EMBEDDED_IONICE),
         b"/bin/watch" | b"watch" => Some(EMBEDDED_WATCH),
+        b"/bin/setfacl" | b"setfacl" => Some(EMBEDDED_SETFACL),
+        b"/bin/chacl" | b"chacl" => Some(EMBEDDED_CHACL),
+        b"/bin/iconv" | b"iconv" => Some(EMBEDDED_ICONV),
         _ => None,
     }
 }

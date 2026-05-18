@@ -236,6 +236,9 @@ fn main() {
         ("oncrix-taskset", "taskset"),
         ("oncrix-ionice", "ionice"),
         ("oncrix-watch", "watch"),
+        ("oncrix-setfacl", "setfacl"),
+        ("oncrix-chacl", "chacl"),
+        ("oncrix-iconv", "iconv"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
