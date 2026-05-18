@@ -547,6 +547,18 @@ static EMBEDDED_CHOWN: &[u8] = include_bytes!(env!("ONCRIX_CHOWN_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_CHGRP: &[u8] = include_bytes!(env!("ONCRIX_CHGRP_BIN"));
 
+/// The embedded `/bin/ln` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LN: &[u8] = include_bytes!(env!("ONCRIX_LN_BIN"));
+
+/// The embedded `/bin/mv` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MV: &[u8] = include_bytes!(env!("ONCRIX_MV_BIN"));
+
+/// The embedded `/bin/mkfifo` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MKFIFO: &[u8] = include_bytes!(env!("ONCRIX_MKFIFO_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -775,6 +787,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/chmod" | b"chmod" => Some(EMBEDDED_CHMOD),
         b"/bin/chown" | b"chown" => Some(EMBEDDED_CHOWN),
         b"/bin/chgrp" | b"chgrp" => Some(EMBEDDED_CHGRP),
+        b"/bin/ln" | b"ln" => Some(EMBEDDED_LN),
+        b"/bin/mv" | b"mv" => Some(EMBEDDED_MV),
+        b"/bin/mkfifo" | b"mkfifo" => Some(EMBEDDED_MKFIFO),
         _ => None,
     }
 }

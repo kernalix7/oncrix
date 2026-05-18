@@ -360,6 +360,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-ln"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-locale"
 version = "0.1.0"
 dependencies = [
@@ -458,6 +465,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-mkfifo"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-mmaptest"
 version = "0.1.0"
 dependencies = [
@@ -473,6 +487,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-mountpoint"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mv"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

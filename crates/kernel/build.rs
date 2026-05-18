@@ -203,6 +203,9 @@ fn main() {
         ("oncrix-chmod", "chmod"),
         ("oncrix-chown", "chown"),
         ("oncrix-chgrp", "chgrp"),
+        ("oncrix-ln", "ln"),
+        ("oncrix-mv", "mv"),
+        ("oncrix-mkfifo", "mkfifo"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
