@@ -227,6 +227,9 @@ fn main() {
         ("oncrix-ps", "ps"),
         ("oncrix-top", "top"),
         ("oncrix-pmap", "pmap"),
+        ("oncrix-iostat", "iostat"),
+        ("oncrix-mpstat", "mpstat"),
+        ("oncrix-pidstat", "pidstat"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

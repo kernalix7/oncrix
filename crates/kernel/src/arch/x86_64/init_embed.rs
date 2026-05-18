@@ -643,6 +643,18 @@ static EMBEDDED_TOP: &[u8] = include_bytes!(env!("ONCRIX_TOP_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_PMAP: &[u8] = include_bytes!(env!("ONCRIX_PMAP_BIN"));
 
+/// The embedded `/bin/iostat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IOSTAT: &[u8] = include_bytes!(env!("ONCRIX_IOSTAT_BIN"));
+
+/// The embedded `/bin/mpstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MPSTAT: &[u8] = include_bytes!(env!("ONCRIX_MPSTAT_BIN"));
+
+/// The embedded `/bin/pidstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PIDSTAT: &[u8] = include_bytes!(env!("ONCRIX_PIDSTAT_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -895,6 +907,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/ps" | b"ps" => Some(EMBEDDED_PS),
         b"/bin/top" | b"top" => Some(EMBEDDED_TOP),
         b"/bin/pmap" | b"pmap" => Some(EMBEDDED_PMAP),
+        b"/bin/iostat" | b"iostat" => Some(EMBEDDED_IOSTAT),
+        b"/bin/mpstat" | b"mpstat" => Some(EMBEDDED_MPSTAT),
+        b"/bin/pidstat" | b"pidstat" => Some(EMBEDDED_PIDSTAT),
         _ => None,
     }
 }

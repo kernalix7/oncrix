@@ -360,6 +360,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-iostat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-ip"
 version = "0.1.0"
 dependencies = [
@@ -549,6 +556,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-mpstat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-mv"
 version = "0.1.0"
 dependencies = [
@@ -627,6 +641,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-pidof"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pidstat"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
