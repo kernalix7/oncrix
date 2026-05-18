@@ -355,6 +355,18 @@ static EMBEDDED_ARCH: &[u8] = include_bytes!(env!("ONCRIX_ARCH_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_PATHCHK: &[u8] = include_bytes!(env!("ONCRIX_PATHCHK_BIN"));
 
+/// The embedded `/bin/printenv` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PRINTENV: &[u8] = include_bytes!(env!("ONCRIX_PRINTENV_BIN"));
+
+/// The embedded `/bin/nohup` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NOHUP: &[u8] = include_bytes!(env!("ONCRIX_NOHUP_BIN"));
+
+/// The embedded `/bin/mesg` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MESG: &[u8] = include_bytes!(env!("ONCRIX_MESG_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -535,6 +547,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/nproc" | b"nproc" => Some(EMBEDDED_NPROC),
         b"/bin/arch" | b"arch" => Some(EMBEDDED_ARCH),
         b"/bin/pathchk" | b"pathchk" => Some(EMBEDDED_PATHCHK),
+        b"/bin/printenv" | b"printenv" => Some(EMBEDDED_PRINTENV),
+        b"/bin/nohup" | b"nohup" => Some(EMBEDDED_NOHUP),
+        b"/bin/mesg" | b"mesg" => Some(EMBEDDED_MESG),
         _ => None,
     }
 }

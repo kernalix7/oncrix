@@ -155,6 +155,9 @@ fn main() {
         ("oncrix-nproc", "nproc"),
         ("oncrix-arch", "arch"),
         ("oncrix-pathchk", "pathchk"),
+        ("oncrix-printenv", "printenv"),
+        ("oncrix-nohup", "nohup"),
+        ("oncrix-mesg", "mesg"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

@@ -255,6 +255,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-mesg"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-mkdir"
 version = "0.1.0"
 dependencies = [
@@ -270,6 +277,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-nl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-nohup"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -298,6 +312,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-pathchk"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-printenv"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
