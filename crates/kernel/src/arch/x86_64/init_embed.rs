@@ -691,6 +691,18 @@ static EMBEDDED_CHACL: &[u8] = include_bytes!(env!("ONCRIX_CHACL_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_ICONV: &[u8] = include_bytes!(env!("ONCRIX_ICONV_BIN"));
 
+/// The embedded `/bin/shutdown` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHUTDOWN: &[u8] = include_bytes!(env!("ONCRIX_SHUTDOWN_BIN"));
+
+/// The embedded `/bin/reboot` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_REBOOT: &[u8] = include_bytes!(env!("ONCRIX_REBOOT_BIN"));
+
+/// The embedded `/bin/halt` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HALT: &[u8] = include_bytes!(env!("ONCRIX_HALT_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -955,6 +967,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/setfacl" | b"setfacl" => Some(EMBEDDED_SETFACL),
         b"/bin/chacl" | b"chacl" => Some(EMBEDDED_CHACL),
         b"/bin/iconv" | b"iconv" => Some(EMBEDDED_ICONV),
+        b"/bin/shutdown" | b"shutdown" => Some(EMBEDDED_SHUTDOWN),
+        b"/bin/reboot" | b"reboot" => Some(EMBEDDED_REBOOT),
+        b"/bin/halt" | b"halt" => Some(EMBEDDED_HALT),
         _ => None,
     }
 }

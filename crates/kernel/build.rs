@@ -239,6 +239,9 @@ fn main() {
         ("oncrix-setfacl", "setfacl"),
         ("oncrix-chacl", "chacl"),
         ("oncrix-iconv", "iconv"),
+        ("oncrix-shutdown", "shutdown"),
+        ("oncrix-reboot", "reboot"),
+        ("oncrix-halt", "halt"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

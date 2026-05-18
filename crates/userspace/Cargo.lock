@@ -325,6 +325,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-halt"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-head"
 version = "0.1.0"
 dependencies = [
@@ -745,6 +752,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-reboot"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-reset"
 version = "0.1.0"
 dependencies = [
@@ -823,6 +837,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-sha512sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-shutdown"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
