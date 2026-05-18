@@ -535,6 +535,18 @@ static EMBEDDED_CHATTR: &[u8] = include_bytes!(env!("ONCRIX_CHATTR_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_GETFACL: &[u8] = include_bytes!(env!("ONCRIX_GETFACL_BIN"));
 
+/// The embedded `/bin/chmod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHMOD: &[u8] = include_bytes!(env!("ONCRIX_CHMOD_BIN"));
+
+/// The embedded `/bin/chown` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHOWN: &[u8] = include_bytes!(env!("ONCRIX_CHOWN_BIN"));
+
+/// The embedded `/bin/chgrp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHGRP: &[u8] = include_bytes!(env!("ONCRIX_CHGRP_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -760,6 +772,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/lsattr" | b"lsattr" => Some(EMBEDDED_LSATTR),
         b"/bin/chattr" | b"chattr" => Some(EMBEDDED_CHATTR),
         b"/bin/getfacl" | b"getfacl" => Some(EMBEDDED_GETFACL),
+        b"/bin/chmod" | b"chmod" => Some(EMBEDDED_CHMOD),
+        b"/bin/chown" | b"chown" => Some(EMBEDDED_CHOWN),
+        b"/bin/chgrp" | b"chgrp" => Some(EMBEDDED_CHGRP),
         _ => None,
     }
 }

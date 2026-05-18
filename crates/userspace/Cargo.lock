@@ -66,6 +66,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-chgrp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chmod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chown"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-chsh"
 version = "0.1.0"
 dependencies = [

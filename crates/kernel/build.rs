@@ -200,6 +200,9 @@ fn main() {
         ("oncrix-lsattr", "lsattr"),
         ("oncrix-chattr", "chattr"),
         ("oncrix-getfacl", "getfacl"),
+        ("oncrix-chmod", "chmod"),
+        ("oncrix-chown", "chown"),
+        ("oncrix-chgrp", "chgrp"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
