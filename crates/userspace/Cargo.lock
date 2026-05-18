@@ -374,6 +374,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-ionice"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-iostat"
 version = "0.1.0"
 dependencies = [
@@ -906,6 +913,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-taskset"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-tee"
 version = "0.1.0"
 dependencies = [
@@ -1051,6 +1065,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-wall"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-watch"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

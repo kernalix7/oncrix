@@ -667,6 +667,18 @@ static EMBEDDED_NEWGRP: &[u8] = include_bytes!(env!("ONCRIX_NEWGRP_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_CHRT: &[u8] = include_bytes!(env!("ONCRIX_CHRT_BIN"));
 
+/// The embedded `/bin/taskset` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TASKSET: &[u8] = include_bytes!(env!("ONCRIX_TASKSET_BIN"));
+
+/// The embedded `/bin/ionice` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IONICE: &[u8] = include_bytes!(env!("ONCRIX_IONICE_BIN"));
+
+/// The embedded `/bin/watch` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WATCH: &[u8] = include_bytes!(env!("ONCRIX_WATCH_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -925,6 +937,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/finger" | b"finger" => Some(EMBEDDED_FINGER),
         b"/bin/newgrp" | b"newgrp" => Some(EMBEDDED_NEWGRP),
         b"/bin/chrt" | b"chrt" => Some(EMBEDDED_CHRT),
+        b"/bin/taskset" | b"taskset" => Some(EMBEDDED_TASKSET),
+        b"/bin/ionice" | b"ionice" => Some(EMBEDDED_IONICE),
+        b"/bin/watch" | b"watch" => Some(EMBEDDED_WATCH),
         _ => None,
     }
 }

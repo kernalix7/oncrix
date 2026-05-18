@@ -233,6 +233,9 @@ fn main() {
         ("oncrix-finger", "finger"),
         ("oncrix-newgrp", "newgrp"),
         ("oncrix-chrt", "chrt"),
+        ("oncrix-taskset", "taskset"),
+        ("oncrix-ionice", "ionice"),
+        ("oncrix-watch", "watch"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
