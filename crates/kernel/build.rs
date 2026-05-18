@@ -152,6 +152,9 @@ fn main() {
         ("oncrix-groups", "groups"),
         ("oncrix-users", "users"),
         ("oncrix-getent", "getent"),
+        ("oncrix-nproc", "nproc"),
+        ("oncrix-arch", "arch"),
+        ("oncrix-pathchk", "pathchk"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

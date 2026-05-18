@@ -343,6 +343,18 @@ static EMBEDDED_USERS: &[u8] = include_bytes!(env!("ONCRIX_USERS_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_GETENT: &[u8] = include_bytes!(env!("ONCRIX_GETENT_BIN"));
 
+/// The embedded `/bin/nproc` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NPROC: &[u8] = include_bytes!(env!("ONCRIX_NPROC_BIN"));
+
+/// The embedded `/bin/arch` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ARCH: &[u8] = include_bytes!(env!("ONCRIX_ARCH_BIN"));
+
+/// The embedded `/bin/pathchk` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PATHCHK: &[u8] = include_bytes!(env!("ONCRIX_PATHCHK_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -520,6 +532,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/groups" | b"groups" => Some(EMBEDDED_GROUPS),
         b"/bin/users" | b"users" => Some(EMBEDDED_USERS),
         b"/bin/getent" | b"getent" => Some(EMBEDDED_GETENT),
+        b"/bin/nproc" | b"nproc" => Some(EMBEDDED_NPROC),
+        b"/bin/arch" | b"arch" => Some(EMBEDDED_ARCH),
+        b"/bin/pathchk" | b"pathchk" => Some(EMBEDDED_PATHCHK),
         _ => None,
     }
 }

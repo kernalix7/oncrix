@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "oncrix-arch"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-base32"
 version = "0.1.0"
 dependencies = [
@@ -269,6 +276,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-nproc"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-od"
 version = "0.1.0"
 dependencies = [
@@ -277,6 +291,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-paste"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pathchk"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
