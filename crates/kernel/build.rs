@@ -158,6 +158,9 @@ fn main() {
         ("oncrix-printenv", "printenv"),
         ("oncrix-nohup", "nohup"),
         ("oncrix-mesg", "mesg"),
+        ("oncrix-mountpoint", "mountpoint"),
+        ("oncrix-lsmod", "lsmod"),
+        ("oncrix-nice", "nice"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

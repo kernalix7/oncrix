@@ -248,6 +248,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-lsmod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-md5sum"
 version = "0.1.0"
 dependencies = [
@@ -270,6 +277,20 @@ dependencies = [
 
 [[package]]
 name = "oncrix-mmaptest"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mountpoint"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-nice"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

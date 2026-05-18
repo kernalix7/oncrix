@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-mountpoint"
+description = "ONCRIX - /bin/mountpoint utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mountpoint"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true

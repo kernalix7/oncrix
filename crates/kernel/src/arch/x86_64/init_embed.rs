@@ -367,6 +367,18 @@ static EMBEDDED_NOHUP: &[u8] = include_bytes!(env!("ONCRIX_NOHUP_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_MESG: &[u8] = include_bytes!(env!("ONCRIX_MESG_BIN"));
 
+/// The embedded `/bin/mountpoint` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MOUNTPOINT: &[u8] = include_bytes!(env!("ONCRIX_MOUNTPOINT_BIN"));
+
+/// The embedded `/bin/lsmod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSMOD: &[u8] = include_bytes!(env!("ONCRIX_LSMOD_BIN"));
+
+/// The embedded `/bin/nice` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NICE: &[u8] = include_bytes!(env!("ONCRIX_NICE_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -550,6 +562,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/printenv" | b"printenv" => Some(EMBEDDED_PRINTENV),
         b"/bin/nohup" | b"nohup" => Some(EMBEDDED_NOHUP),
         b"/bin/mesg" | b"mesg" => Some(EMBEDDED_MESG),
+        b"/bin/mountpoint" | b"mountpoint" => Some(EMBEDDED_MOUNTPOINT),
+        b"/bin/lsmod" | b"lsmod" => Some(EMBEDDED_LSMOD),
+        b"/bin/nice" | b"nice" => Some(EMBEDDED_NICE),
         _ => None,
     }
 }
