@@ -108,6 +108,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-chrt"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-chsh"
 version = "0.1.0"
 dependencies = [
@@ -235,6 +242,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-file"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-finger"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -571,6 +585,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-netstat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-newgrp"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

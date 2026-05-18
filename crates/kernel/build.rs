@@ -230,6 +230,9 @@ fn main() {
         ("oncrix-iostat", "iostat"),
         ("oncrix-mpstat", "mpstat"),
         ("oncrix-pidstat", "pidstat"),
+        ("oncrix-finger", "finger"),
+        ("oncrix-newgrp", "newgrp"),
+        ("oncrix-chrt", "chrt"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

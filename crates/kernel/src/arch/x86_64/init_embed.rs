@@ -655,6 +655,18 @@ static EMBEDDED_MPSTAT: &[u8] = include_bytes!(env!("ONCRIX_MPSTAT_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_PIDSTAT: &[u8] = include_bytes!(env!("ONCRIX_PIDSTAT_BIN"));
 
+/// The embedded `/bin/finger` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FINGER: &[u8] = include_bytes!(env!("ONCRIX_FINGER_BIN"));
+
+/// The embedded `/bin/newgrp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NEWGRP: &[u8] = include_bytes!(env!("ONCRIX_NEWGRP_BIN"));
+
+/// The embedded `/bin/chrt` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHRT: &[u8] = include_bytes!(env!("ONCRIX_CHRT_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -910,6 +922,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/iostat" | b"iostat" => Some(EMBEDDED_IOSTAT),
         b"/bin/mpstat" | b"mpstat" => Some(EMBEDDED_MPSTAT),
         b"/bin/pidstat" | b"pidstat" => Some(EMBEDDED_PIDSTAT),
+        b"/bin/finger" | b"finger" => Some(EMBEDDED_FINGER),
+        b"/bin/newgrp" | b"newgrp" => Some(EMBEDDED_NEWGRP),
+        b"/bin/chrt" | b"chrt" => Some(EMBEDDED_CHRT),
         _ => None,
     }
 }
