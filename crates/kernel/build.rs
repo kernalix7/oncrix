@@ -218,6 +218,9 @@ fn main() {
         ("oncrix-write", "write"),
         ("oncrix-wall", "wall"),
         ("oncrix-talk", "talk"),
+        ("oncrix-crontab", "crontab"),
+        ("oncrix-at", "at"),
+        ("oncrix-batch", "batch"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

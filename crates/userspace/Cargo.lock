@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-at"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-base32"
 version = "0.1.0"
 dependencies = [
@@ -39,6 +46,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-basename"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-batch"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -130,6 +144,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-cp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-crontab"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

@@ -607,6 +607,18 @@ static EMBEDDED_WALL: &[u8] = include_bytes!(env!("ONCRIX_WALL_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_TALK: &[u8] = include_bytes!(env!("ONCRIX_TALK_BIN"));
 
+/// The embedded `/bin/crontab` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CRONTAB: &[u8] = include_bytes!(env!("ONCRIX_CRONTAB_BIN"));
+
+/// The embedded `/bin/at` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_AT: &[u8] = include_bytes!(env!("ONCRIX_AT_BIN"));
+
+/// The embedded `/bin/batch` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BATCH: &[u8] = include_bytes!(env!("ONCRIX_BATCH_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -850,6 +862,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/write" | b"write" => Some(EMBEDDED_WRITE),
         b"/bin/wall" | b"wall" => Some(EMBEDDED_WALL),
         b"/bin/talk" | b"talk" => Some(EMBEDDED_TALK),
+        b"/bin/crontab" | b"crontab" => Some(EMBEDDED_CRONTAB),
+        b"/bin/at" | b"at" => Some(EMBEDDED_AT),
+        b"/bin/batch" | b"batch" => Some(EMBEDDED_BATCH),
         _ => None,
     }
 }
