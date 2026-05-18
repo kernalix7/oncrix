@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "oncrix-apropos"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-arch"
 version = "0.1.0"
 dependencies = [
@@ -806,6 +813,20 @@ dependencies = [
 
 [[package]]
 name = "oncrix-wc"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-whatis"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-whereis"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

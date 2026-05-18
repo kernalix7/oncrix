@@ -511,6 +511,18 @@ static EMBEDDED_RESET: &[u8] = include_bytes!(env!("ONCRIX_RESET_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_TABS: &[u8] = include_bytes!(env!("ONCRIX_TABS_BIN"));
 
+/// The embedded `/bin/whereis` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHEREIS: &[u8] = include_bytes!(env!("ONCRIX_WHEREIS_BIN"));
+
+/// The embedded `/bin/apropos` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_APROPOS: &[u8] = include_bytes!(env!("ONCRIX_APROPOS_BIN"));
+
+/// The embedded `/bin/whatis` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHATIS: &[u8] = include_bytes!(env!("ONCRIX_WHATIS_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -730,6 +742,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/tput" | b"tput" => Some(EMBEDDED_TPUT),
         b"/bin/reset" | b"reset" => Some(EMBEDDED_RESET),
         b"/bin/tabs" | b"tabs" => Some(EMBEDDED_TABS),
+        b"/bin/whereis" | b"whereis" => Some(EMBEDDED_WHEREIS),
+        b"/bin/apropos" | b"apropos" => Some(EMBEDDED_APROPOS),
+        b"/bin/whatis" | b"whatis" => Some(EMBEDDED_WHATIS),
         _ => None,
     }
 }

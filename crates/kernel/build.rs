@@ -194,6 +194,9 @@ fn main() {
         ("oncrix-tput", "tput"),
         ("oncrix-reset", "reset"),
         ("oncrix-tabs", "tabs"),
+        ("oncrix-whereis", "whereis"),
+        ("oncrix-apropos", "apropos"),
+        ("oncrix-whatis", "whatis"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
