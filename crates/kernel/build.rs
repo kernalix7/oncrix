@@ -167,6 +167,9 @@ fn main() {
         ("oncrix-who", "who"),
         ("oncrix-last", "last"),
         ("oncrix-lsipc", "lsipc"),
+        ("oncrix-ipcs", "ipcs"),
+        ("oncrix-locale", "locale"),
+        ("oncrix-pidof", "pidof"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

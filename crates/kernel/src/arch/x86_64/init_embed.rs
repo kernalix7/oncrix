@@ -403,6 +403,18 @@ static EMBEDDED_LAST: &[u8] = include_bytes!(env!("ONCRIX_LAST_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_LSIPC: &[u8] = include_bytes!(env!("ONCRIX_LSIPC_BIN"));
 
+/// The embedded `/bin/ipcs` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IPCS: &[u8] = include_bytes!(env!("ONCRIX_IPCS_BIN"));
+
+/// The embedded `/bin/locale` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LOCALE: &[u8] = include_bytes!(env!("ONCRIX_LOCALE_BIN"));
+
+/// The embedded `/bin/pidof` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PIDOF: &[u8] = include_bytes!(env!("ONCRIX_PIDOF_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -595,6 +607,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/who" | b"who" => Some(EMBEDDED_WHO),
         b"/bin/last" | b"last" => Some(EMBEDDED_LAST),
         b"/bin/lsipc" | b"lsipc" => Some(EMBEDDED_LSIPC),
+        b"/bin/ipcs" | b"ipcs" => Some(EMBEDDED_IPCS),
+        b"/bin/locale" | b"locale" => Some(EMBEDDED_LOCALE),
+        b"/bin/pidof" | b"pidof" => Some(EMBEDDED_PIDOF),
         _ => None,
     }
 }
