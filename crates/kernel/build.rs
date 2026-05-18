@@ -170,6 +170,9 @@ fn main() {
         ("oncrix-ipcs", "ipcs"),
         ("oncrix-locale", "locale"),
         ("oncrix-pidof", "pidof"),
+        ("oncrix-ldd", "ldd"),
+        ("oncrix-ldconfig", "ldconfig"),
+        ("oncrix-vmstat", "vmstat"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

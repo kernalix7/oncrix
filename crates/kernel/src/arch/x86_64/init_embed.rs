@@ -415,6 +415,18 @@ static EMBEDDED_LOCALE: &[u8] = include_bytes!(env!("ONCRIX_LOCALE_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_PIDOF: &[u8] = include_bytes!(env!("ONCRIX_PIDOF_BIN"));
 
+/// The embedded `/bin/ldd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LDD: &[u8] = include_bytes!(env!("ONCRIX_LDD_BIN"));
+
+/// The embedded `/bin/ldconfig` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LDCONFIG: &[u8] = include_bytes!(env!("ONCRIX_LDCONFIG_BIN"));
+
+/// The embedded `/bin/vmstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_VMSTAT: &[u8] = include_bytes!(env!("ONCRIX_VMSTAT_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -610,6 +622,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/ipcs" | b"ipcs" => Some(EMBEDDED_IPCS),
         b"/bin/locale" | b"locale" => Some(EMBEDDED_LOCALE),
         b"/bin/pidof" | b"pidof" => Some(EMBEDDED_PIDOF),
+        b"/bin/ldd" | b"ldd" => Some(EMBEDDED_LDD),
+        b"/bin/ldconfig" | b"ldconfig" => Some(EMBEDDED_LDCONFIG),
+        b"/bin/vmstat" | b"vmstat" => Some(EMBEDDED_VMSTAT),
         _ => None,
     }
 }

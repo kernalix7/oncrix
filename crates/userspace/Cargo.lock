@@ -262,6 +262,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-ldconfig"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ldd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-locale"
 version = "0.1.0"
 dependencies = [
@@ -631,6 +645,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-users"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-vmstat"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
