@@ -583,6 +583,18 @@ static EMBEDDED_SS: &[u8] = include_bytes!(env!("ONCRIX_SS_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_IP: &[u8] = include_bytes!(env!("ONCRIX_IP_BIN"));
 
+/// The embedded `/bin/su` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SU: &[u8] = include_bytes!(env!("ONCRIX_SU_BIN"));
+
+/// The embedded `/bin/login` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LOGIN: &[u8] = include_bytes!(env!("ONCRIX_LOGIN_BIN"));
+
+/// The embedded `/bin/sudo` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SUDO: &[u8] = include_bytes!(env!("ONCRIX_SUDO_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -820,6 +832,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/arp" | b"arp" => Some(EMBEDDED_ARP),
         b"/bin/ss" | b"ss" => Some(EMBEDDED_SS),
         b"/bin/ip" | b"ip" => Some(EMBEDDED_IP),
+        b"/bin/su" | b"su" => Some(EMBEDDED_SU),
+        b"/bin/login" | b"login" => Some(EMBEDDED_LOGIN),
+        b"/bin/sudo" | b"sudo" => Some(EMBEDDED_SUDO),
         _ => None,
     }
 }

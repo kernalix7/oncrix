@@ -402,6 +402,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-login"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-logname"
 version = "0.1.0"
 dependencies = [
@@ -739,6 +746,20 @@ dependencies = [
 
 [[package]]
 name = "oncrix-strings"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-su"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sudo"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

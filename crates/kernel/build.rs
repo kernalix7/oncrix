@@ -212,6 +212,9 @@ fn main() {
         ("oncrix-arp", "arp"),
         ("oncrix-ss", "ss"),
         ("oncrix-ip", "ip"),
+        ("oncrix-su", "su"),
+        ("oncrix-login", "login"),
+        ("oncrix-sudo", "sudo"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
