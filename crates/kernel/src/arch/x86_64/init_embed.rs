@@ -439,6 +439,18 @@ static EMBEDDED_CHSH: &[u8] = include_bytes!(env!("ONCRIX_CHSH_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_ULIMIT: &[u8] = include_bytes!(env!("ONCRIX_ULIMIT_BIN"));
 
+/// The embedded `/bin/mount` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MOUNT: &[u8] = include_bytes!(env!("ONCRIX_MOUNT_BIN"));
+
+/// The embedded `/bin/lspci` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSPCI: &[u8] = include_bytes!(env!("ONCRIX_LSPCI_BIN"));
+
+/// The embedded `/bin/lsusb` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSUSB: &[u8] = include_bytes!(env!("ONCRIX_LSUSB_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -640,6 +652,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/passwd" | b"passwd" => Some(EMBEDDED_PASSWD),
         b"/bin/chsh" | b"chsh" => Some(EMBEDDED_CHSH),
         b"/bin/ulimit" | b"ulimit" => Some(EMBEDDED_ULIMIT),
+        b"/bin/mount" | b"mount" => Some(EMBEDDED_MOUNT),
+        b"/bin/lspci" | b"lspci" => Some(EMBEDDED_LSPCI),
+        b"/bin/lsusb" | b"lsusb" => Some(EMBEDDED_LSUSB),
         _ => None,
     }
 }

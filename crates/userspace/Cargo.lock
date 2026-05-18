@@ -325,6 +325,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-lspci"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsusb"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-md5sum"
 version = "0.1.0"
 dependencies = [
@@ -347,6 +361,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-mmaptest"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mount"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
