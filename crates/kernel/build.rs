@@ -215,6 +215,9 @@ fn main() {
         ("oncrix-su", "su"),
         ("oncrix-login", "login"),
         ("oncrix-sudo", "sudo"),
+        ("oncrix-write", "write"),
+        ("oncrix-wall", "wall"),
+        ("oncrix-talk", "talk"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

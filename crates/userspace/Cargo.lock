@@ -801,6 +801,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-talk"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-tee"
 version = "0.1.0"
 dependencies = [
@@ -938,6 +945,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-wall"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-wc"
 version = "0.1.0"
 dependencies = [
@@ -974,6 +988,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-whoami"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-write"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
