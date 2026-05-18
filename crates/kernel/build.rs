@@ -179,6 +179,9 @@ fn main() {
         ("oncrix-mount", "mount"),
         ("oncrix-lspci", "lspci"),
         ("oncrix-lsusb", "lsusb"),
+        ("oncrix-blkid", "blkid"),
+        ("oncrix-lsblk", "lsblk"),
+        ("oncrix-swapon", "swapon"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)

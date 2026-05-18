@@ -451,6 +451,18 @@ static EMBEDDED_LSPCI: &[u8] = include_bytes!(env!("ONCRIX_LSPCI_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_LSUSB: &[u8] = include_bytes!(env!("ONCRIX_LSUSB_BIN"));
 
+/// The embedded `/bin/blkid` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BLKID: &[u8] = include_bytes!(env!("ONCRIX_BLKID_BIN"));
+
+/// The embedded `/bin/lsblk` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSBLK: &[u8] = include_bytes!(env!("ONCRIX_LSBLK_BIN"));
+
+/// The embedded `/bin/swapon` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SWAPON: &[u8] = include_bytes!(env!("ONCRIX_SWAPON_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -655,6 +667,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/mount" | b"mount" => Some(EMBEDDED_MOUNT),
         b"/bin/lspci" | b"lspci" => Some(EMBEDDED_LSPCI),
         b"/bin/lsusb" | b"lsusb" => Some(EMBEDDED_LSUSB),
+        b"/bin/blkid" | b"blkid" => Some(EMBEDDED_BLKID),
+        b"/bin/lsblk" | b"lsblk" => Some(EMBEDDED_LSBLK),
+        b"/bin/swapon" | b"swapon" => Some(EMBEDDED_SWAPON),
         _ => None,
     }
 }

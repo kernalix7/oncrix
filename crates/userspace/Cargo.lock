@@ -31,6 +31,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-blkid"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-cal"
 version = "0.1.0"
 dependencies = [
@@ -298,6 +305,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-ls"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsblk"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -578,6 +592,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-swapon"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
