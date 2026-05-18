@@ -381,6 +381,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-killall"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-last"
 version = "0.1.0"
 dependencies = [
@@ -612,7 +619,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-pgrep"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-pidof"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pkill"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

@@ -619,6 +619,18 @@ static EMBEDDED_AT: &[u8] = include_bytes!(env!("ONCRIX_AT_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_BATCH: &[u8] = include_bytes!(env!("ONCRIX_BATCH_BIN"));
 
+/// The embedded `/bin/pgrep` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PGREP: &[u8] = include_bytes!(env!("ONCRIX_PGREP_BIN"));
+
+/// The embedded `/bin/pkill` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PKILL: &[u8] = include_bytes!(env!("ONCRIX_PKILL_BIN"));
+
+/// The embedded `/bin/killall` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_KILLALL: &[u8] = include_bytes!(env!("ONCRIX_KILLALL_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -865,6 +877,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/crontab" | b"crontab" => Some(EMBEDDED_CRONTAB),
         b"/bin/at" | b"at" => Some(EMBEDDED_AT),
         b"/bin/batch" | b"batch" => Some(EMBEDDED_BATCH),
+        b"/bin/pgrep" | b"pgrep" => Some(EMBEDDED_PGREP),
+        b"/bin/pkill" | b"pkill" => Some(EMBEDDED_PKILL),
+        b"/bin/killall" | b"killall" => Some(EMBEDDED_KILLALL),
         _ => None,
     }
 }

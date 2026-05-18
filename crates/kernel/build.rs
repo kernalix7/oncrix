@@ -221,6 +221,9 @@ fn main() {
         ("oncrix-crontab", "crontab"),
         ("oncrix-at", "at"),
         ("oncrix-batch", "batch"),
+        ("oncrix-pgrep", "pgrep"),
+        ("oncrix-pkill", "pkill"),
+        ("oncrix-killall", "killall"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
