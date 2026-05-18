@@ -59,6 +59,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-chattr"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-chsh"
 version = "0.1.0"
 dependencies = [
@@ -206,6 +213,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-getfacl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-grep"
 version = "0.1.0"
 dependencies = [
@@ -347,6 +361,13 @@ dependencies = [
 
 [[package]]
 name = "oncrix-ls"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsattr"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

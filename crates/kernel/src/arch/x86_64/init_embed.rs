@@ -523,6 +523,18 @@ static EMBEDDED_APROPOS: &[u8] = include_bytes!(env!("ONCRIX_APROPOS_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_WHATIS: &[u8] = include_bytes!(env!("ONCRIX_WHATIS_BIN"));
 
+/// The embedded `/bin/lsattr` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSATTR: &[u8] = include_bytes!(env!("ONCRIX_LSATTR_BIN"));
+
+/// The embedded `/bin/chattr` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHATTR: &[u8] = include_bytes!(env!("ONCRIX_CHATTR_BIN"));
+
+/// The embedded `/bin/getfacl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GETFACL: &[u8] = include_bytes!(env!("ONCRIX_GETFACL_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -745,6 +757,9 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/whereis" | b"whereis" => Some(EMBEDDED_WHEREIS),
         b"/bin/apropos" | b"apropos" => Some(EMBEDDED_APROPOS),
         b"/bin/whatis" | b"whatis" => Some(EMBEDDED_WHATIS),
+        b"/bin/lsattr" | b"lsattr" => Some(EMBEDDED_LSATTR),
+        b"/bin/chattr" | b"chattr" => Some(EMBEDDED_CHATTR),
+        b"/bin/getfacl" | b"getfacl" => Some(EMBEDDED_GETFACL),
         _ => None,
     }
 }
