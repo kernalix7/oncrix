@@ -654,6 +654,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_unlink(args.arg0) }
         }
 
+        // SYS_RENAME (82): rename/move a filesystem name.
+        // POSIX.1-2024 rename(3p).
+        oncrix_syscall::number::SYS_RENAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_rename(args.arg0, args.arg1) }
+        }
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {

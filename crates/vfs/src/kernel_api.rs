@@ -205,6 +205,32 @@ impl KernelVfs {
         self.ramfs.unlink_entry(&parent_inode, name)
     }
 
+    /// Rename `old_path` to `new_path`.
+    ///
+    /// POSIX.1-2024 `rename(2)` (ramfs subset). Both paths are resolved
+    /// to (parent dir, final name); the source name is moved to the
+    /// destination, overwriting any existing destination entry. The
+    /// underlying inode is preserved.
+    ///
+    /// Returns `NotFound` if `old_path` does not exist, `InvalidArgument`
+    /// for malformed paths.
+    pub fn rename_path(&mut self, old_path: &[u8], new_path: &[u8]) -> Result<()> {
+        let (old_parent_ino, old_name_bytes) = self.resolve_parent_and_name(old_path)?;
+        let (new_parent_ino, new_name_bytes) = self.resolve_parent_and_name(new_path)?;
+        let old_parent = self
+            .ramfs
+            .inode_by_number(old_parent_ino)
+            .ok_or(Error::NotFound)?;
+        let new_parent = self
+            .ramfs
+            .inode_by_number(new_parent_ino)
+            .ok_or(Error::NotFound)?;
+        let old_name = core::str::from_utf8(old_name_bytes).map_err(|_| Error::InvalidArgument)?;
+        let new_name = core::str::from_utf8(new_name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs
+            .rename(&old_parent, old_name, &new_parent, new_name)
+    }
+
     /// List the contents of the directory at `path`.
     ///
     /// Returns a `Vec<DirEntry>` with one element per child entry.

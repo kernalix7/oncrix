@@ -112,6 +112,8 @@ pub const SYS_MKDIR: SyscallNumber = 83;
 pub const SYS_RMDIR: SyscallNumber = 84;
 /// `unlink(pathname)` — Delete a name from the filesystem.
 pub const SYS_UNLINK: SyscallNumber = 87;
+/// `rename(oldpath, newpath)` — Rename/move a filesystem name.
+pub const SYS_RENAME: SyscallNumber = 82;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.
 pub const SYS_OPENAT: SyscallNumber = 257;
 /// `getdents64(fd, dirp, count)` — Read directory entries.

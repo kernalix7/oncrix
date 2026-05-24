@@ -287,6 +287,86 @@ impl Ramfs {
             Err(Error::InvalidArgument)
         }
     }
+
+    /// Detach the entry named `name` from `parent` WITHOUT freeing the
+    /// child inode, returning the child inode number.
+    ///
+    /// Counterpart to [`unlink_entry`](Self::unlink_entry), which frees
+    /// the inode. Used by [`rename`](Self::rename) to move a name from
+    /// one directory to another while keeping the underlying inode.
+    fn detach_dir_entry(&mut self, parent_slot: usize, name: &str) -> Result<InodeNumber> {
+        let data = self.data[parent_slot].as_mut().ok_or(Error::NotFound)?;
+        if let RamInodeData::Dir { entries, count } = data {
+            let name_bytes = name.as_bytes();
+            for slot in entries.iter_mut() {
+                if let Some(entry) = slot {
+                    if &entry.name[..entry.name_len] == name_bytes {
+                        let ino = entry.inode;
+                        *slot = None;
+                        *count -= 1;
+                        return Ok(ino);
+                    }
+                }
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    /// Rename `old_name` in `old_parent` to `new_name` in `new_parent`.
+    ///
+    /// POSIX.1-2024 `rename(2)` (ramfs subset): the source name is
+    /// detached and re-attached under the destination directory without
+    /// reallocating the inode, so open file handles and inode numbers
+    /// stay valid. If the destination name already exists it is removed
+    /// first (overwrite semantics). Source and destination may be the
+    /// same directory (pure rename) or different directories (move).
+    ///
+    /// Returns `NotFound` if `old_name` does not exist, `AlreadyExists`
+    /// only on internal re-attach failure (should not occur after the
+    /// destination is cleared).
+    pub fn rename(
+        &mut self,
+        old_parent: &Inode,
+        old_name: &str,
+        new_parent: &Inode,
+        new_name: &str,
+    ) -> Result<()> {
+        let old_parent_slot = self.slot_of(old_parent.ino).ok_or(Error::NotFound)?;
+        let new_parent_slot = self.slot_of(new_parent.ino).ok_or(Error::NotFound)?;
+
+        // No-op when source and destination name the same path.
+        if old_parent.ino == new_parent.ino && old_name == new_name {
+            // Still verify the source exists.
+            let data = self.data[old_parent_slot].as_ref().ok_or(Error::NotFound)?;
+            if let RamInodeData::Dir { entries, .. } = data {
+                let nb = old_name.as_bytes();
+                if entries
+                    .iter()
+                    .flatten()
+                    .any(|e| &e.name[..e.name_len] == nb)
+                {
+                    return Ok(());
+                }
+            }
+            return Err(Error::NotFound);
+        }
+
+        // Remove an existing destination entry first (overwrite), freeing
+        // its inode. Ignore NotFound — destination need not pre-exist.
+        let dst_parent_inode = *self.inodes[new_parent_slot]
+            .as_ref()
+            .ok_or(Error::NotFound)?;
+        match self.unlink_entry(&dst_parent_inode, new_name) {
+            Ok(()) | Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Detach the source name (keeps the inode alive).
+        let child_ino = self.detach_dir_entry(old_parent_slot, old_name)?;
+
+        // Re-attach under the destination directory.
+        self.add_dir_entry(new_parent_slot, new_name, child_ino)
+    }
 }
 
 impl InodeOps for Ramfs {

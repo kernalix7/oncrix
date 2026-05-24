@@ -226,6 +226,76 @@ pub unsafe fn sys_unlink(pathname_ptr: u64) -> i64 {
     }
 }
 
+// ── sys_rename ────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_RENAME` (number 82).
+///
+/// POSIX.1-2024 `rename(2)` (ramfs subset): moves `oldpath` to `newpath`,
+/// overwriting an existing `newpath`. The underlying inode is preserved.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. Both
+/// pointers must reference NUL-terminated paths in user space.
+pub unsafe fn sys_rename(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
+    static mut OLD_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut OLD_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut NEW_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut NEW_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // Copy + absolutise the source path.
+    // SAFETY: single-CPU SYSCALL context; OLD_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let old_len = unsafe {
+        match copy_user_path(oldpath_ptr, &mut OLD_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: OLD_PATH[..old_len] written above; OLD_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let old_abs_len = unsafe {
+        match resolve_path_abs(&OLD_PATH[..old_len], &mut OLD_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // Copy + absolutise the destination path.
+    // SAFETY: single-CPU SYSCALL context; NEW_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let new_len = unsafe {
+        match copy_user_path(newpath_ptr, &mut NEW_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: NEW_PATH[..new_len] written above; NEW_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let new_abs_len = unsafe {
+        match resolve_path_abs(&NEW_PATH[..new_len], &mut NEW_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: both abs buffers written to the returned lengths above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let old = &OLD_ABS[..old_abs_len];
+        let new = &NEW_ABS[..new_abs_len];
+        crate::state::with_global_mut(|s| s.vfs.rename_path(old, new))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_getdents64 ────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_GETDENTS64` (number 217).
