@@ -231,6 +231,15 @@ impl KernelVfs {
             .rename(&old_parent, old_name, &new_parent, new_name)
     }
 
+    /// Change the permission bits of the file at `path`.
+    ///
+    /// POSIX.1-2024 `chmod(2)` (ramfs subset): updates the inode mode
+    /// bits only. Returns `NotFound` if the path does not exist.
+    pub fn chmod_path(&mut self, path: &[u8], mode: u32) -> Result<()> {
+        let inode = self.lookup_path(path)?;
+        self.ramfs.set_mode(inode.ino, FileMode(mode as u16))
+    }
+
     /// List the contents of the directory at `path`.
     ///
     /// Returns a `Vec<DirEntry>` with one element per child entry.

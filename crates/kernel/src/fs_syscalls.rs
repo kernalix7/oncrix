@@ -296,6 +296,52 @@ pub unsafe fn sys_rename(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
     }
 }
 
+// ── sys_chmod ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_CHMOD` (number 90).
+///
+/// POSIX.1-2024 `chmod(2)` (ramfs subset): updates the inode permission
+/// bits of the file at `pathname`. ONCRIX does not enforce permissions
+/// yet, so the change is observable via `stat` but has no access effect.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_chmod(pathname_ptr: u64, mode: u64) -> i64 {
+    static mut PATH_BUF3: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut ABS_BUF3: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF3 not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut PATH_BUF3) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: PATH_BUF3[..path_len] written above; ABS_BUF3 exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&PATH_BUF3[..path_len], &mut ABS_BUF3) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: ABS_BUF3[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &ABS_BUF3[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.chmod_path(abs, mode as u32))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_getdents64 ────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_GETDENTS64` (number 217).

@@ -54,6 +54,7 @@ const SYS_CHDIR: u64 = 80;
 const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_RENAME: u64 = 82;
+const SYS_CHMOD: u64 = 90;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -374,6 +375,18 @@ pub unsafe fn unlink(path: *const u8) -> i64 {
 pub unsafe fn rename(oldpath: *const u8, newpath: *const u8) -> i64 {
     // SAFETY: The caller guarantees both paths are null-terminated.
     unsafe { syscall2(SYS_RENAME, oldpath as u64, newpath as u64) }
+}
+
+/// `chmod(2)` — change file permission bits.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn chmod(path: *const u8, mode: u32) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall2(SYS_CHMOD, path as u64, mode as u64) }
 }
 
 /// `getdents64(2)` — get directory entries.

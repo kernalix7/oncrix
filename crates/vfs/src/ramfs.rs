@@ -121,6 +121,21 @@ impl Ramfs {
         self.inodes[slot].as_ref().map(|i| i.size)
     }
 
+    /// Set the permission bits of the inode identified by `ino`.
+    ///
+    /// POSIX.1-2024 `chmod(2)` (ramfs subset): updates only the mode
+    /// bits stored in the inode metadata. ONCRIX does not yet enforce
+    /// permissions, so the change is observable via `stat` but has no
+    /// access-control effect.
+    ///
+    /// Returns `NotFound` if no inode with that number exists.
+    pub fn set_mode(&mut self, ino: InodeNumber, mode: FileMode) -> Result<()> {
+        let slot = self.slot_of(ino).ok_or(Error::NotFound)?;
+        let inode = self.inodes[slot].as_mut().ok_or(Error::NotFound)?;
+        inode.mode = mode;
+        Ok(())
+    }
+
     /// Return a copy of the [`Inode`] with the given number, or `None` if
     /// no such inode exists in this filesystem.
     ///

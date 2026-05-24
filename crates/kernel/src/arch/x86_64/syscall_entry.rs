@@ -661,6 +661,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_rename(args.arg0, args.arg1) }
         }
 
+        // SYS_CHMOD (90): change file permission bits.
+        // POSIX.1-2024 chmod(3p).
+        oncrix_syscall::number::SYS_CHMOD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_chmod(args.arg0, args.arg1) }
+        }
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {
