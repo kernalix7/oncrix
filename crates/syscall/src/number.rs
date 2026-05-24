@@ -118,6 +118,8 @@ pub const SYS_RENAME: SyscallNumber = 82;
 pub const SYS_CHMOD: SyscallNumber = 90;
 /// `link(oldpath, newpath)` — Create a hard link.
 pub const SYS_LINK: SyscallNumber = 86;
+/// `chown(pathname, uid, gid)` — Change file owner/group.
+pub const SYS_CHOWN: SyscallNumber = 92;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.
 pub const SYS_OPENAT: SyscallNumber = 257;
 /// `getdents64(fd, dirp, count)` — Read directory entries.

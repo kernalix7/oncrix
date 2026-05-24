@@ -121,6 +121,26 @@ impl Ramfs {
         self.inodes[slot].as_ref().map(|i| i.size)
     }
 
+    /// Set the owner and/or group of the inode identified by `ino`.
+    ///
+    /// POSIX.1-2024 `chown(2)` (ramfs subset): a field of `u32::MAX`
+    /// leaves that id unchanged (matching the `(uid_t)-1` convention).
+    /// Only the inode metadata is updated; ONCRIX does not enforce
+    /// ownership yet.
+    ///
+    /// Returns `NotFound` if no inode with that number exists.
+    pub fn set_owner(&mut self, ino: InodeNumber, uid: u32, gid: u32) -> Result<()> {
+        let slot = self.slot_of(ino).ok_or(Error::NotFound)?;
+        let inode = self.inodes[slot].as_mut().ok_or(Error::NotFound)?;
+        if uid != u32::MAX {
+            inode.uid = uid;
+        }
+        if gid != u32::MAX {
+            inode.gid = gid;
+        }
+        Ok(())
+    }
+
     /// Set the permission bits of the inode identified by `ino`.
     ///
     /// POSIX.1-2024 `chmod(2)` (ramfs subset): updates only the mode

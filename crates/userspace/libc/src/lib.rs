@@ -56,6 +56,7 @@ const SYS_UNLINK: u64 = 87;
 const SYS_RENAME: u64 = 82;
 const SYS_CHMOD: u64 = 90;
 const SYS_LINK: u64 = 86;
+const SYS_CHOWN: u64 = 92;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -400,6 +401,19 @@ pub unsafe fn chmod(path: *const u8, mode: u32) -> i64 {
 pub unsafe fn link(oldpath: *const u8, newpath: *const u8) -> i64 {
     // SAFETY: The caller guarantees both paths are null-terminated.
     unsafe { syscall2(SYS_LINK, oldpath as u64, newpath as u64) }
+}
+
+/// `chown(2)` — change file owner/group.
+///
+/// A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`) leaves that id unchanged.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall3(SYS_CHOWN, path as u64, uid as u64, gid as u64) }
 }
 
 /// `getdents64(2)` — get directory entries.

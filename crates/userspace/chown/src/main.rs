@@ -1,18 +1,19 @@
 // Copyright 2026 ONCRIX Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! ONCRIX `/bin/chown` — POSIX `chown(1)` utility stub.
+//! ONCRIX `/bin/chown` — POSIX `chown(1)` utility.
 //!
-//! Changes the owner (and optionally group) of the supplied file operands.
-//! ONCRIX ramfs does not yet track owner/group, so this stub treats every
-//! successful invocation as a no-op and exits 0 (POSIX permits exit 0 on
-//! a no-op success). Operand validation is limited to argc.
+//! Usage: `chown OWNER[:GROUP] FILE`. OWNER and GROUP are numeric ids
+//! (ONCRIX has no name service); the change is applied via the
+//! `chown(2)` syscall (`SYS_CHOWN`, number 92). An omitted GROUP leaves
+//! the group unchanged. Owner/group are stored in the inode but not yet
+//! enforced. Symbolic names are not supported.
 //!
 //! Behaviour:
 //!
-//! * `chown` with fewer than two operands (owner + at least one file)
-//!   → write `"chown: missing operand\n"` to fd 2, exit 1.
-//! * Otherwise                                          → silent exit 0.
+//! * fewer than two operands → `"chown: missing operand\n"`, exit 1.
+//! * non-numeric owner/group → `"chown: invalid owner\n"`, exit 1.
+//! * `chown(2)` failure → `"chown: cannot change owner\n"`, exit 1.
 //!
 //! Reference: POSIX `chown(1)`.
 //! See `.priv-storage/.TheOpenGroup/susv5-html/utilities/chown.html`.
@@ -44,17 +45,94 @@ pub extern "C" fn _start() -> ! {
 // chown logic
 // ---------------------------------------------------------------------------
 
-extern "C" fn chown_main(argc: usize, _argv: *const *const u8) -> ! {
-    // POSIX `chown` requires at least an owner operand and one file operand,
-    // so argc must be >= 3 (argv[0] = program name, argv[1] = owner[:group],
-    // argv[2] = file).
+extern "C" fn chown_main(argc: usize, argv: *const *const u8) -> ! {
+    // argv[0] = program, argv[1] = owner[:group], argv[2] = file.
     if argc < 3 {
         write_all(2, b"chown: missing operand\n");
         libc::exit(1)
     }
 
-    // ramfs has no owner/group yet — no-op success.
+    // SAFETY: argc >= 3, so argv[1] and argv[2] are valid pointer slots.
+    let spec = unsafe { argv.add(1).read() };
+    let file = unsafe { argv.add(2).read() };
+    if spec.is_null() || file.is_null() {
+        write_all(2, b"chown: missing operand\n");
+        libc::exit(1)
+    }
+
+    // Parse OWNER[:GROUP]. u32::MAX means "leave unchanged".
+    let (uid, gid) = match parse_owner_group(spec) {
+        Some(pair) => pair,
+        None => {
+            write_all(2, b"chown: invalid owner\n");
+            libc::exit(1)
+        }
+    };
+
+    // SAFETY: file is a NUL-terminated argv string.
+    let rc = unsafe { libc::chown(file, uid, gid) };
+    if rc < 0 {
+        write_all(2, b"chown: cannot change owner\n");
+        libc::exit(1)
+    }
     libc::exit(0)
+}
+
+/// Parse a NUL-terminated `OWNER[:GROUP]` spec into `(uid, gid)`.
+///
+/// Both fields are decimal. An omitted group yields `u32::MAX` (leave
+/// unchanged). Returns `None` on any non-decimal digit or empty owner.
+fn parse_owner_group(ptr: *const u8) -> Option<(u32, u32)> {
+    let mut uid: u32 = 0;
+    let mut have_uid = false;
+    let mut i = 0usize;
+
+    // Owner digits up to ':' or NUL.
+    loop {
+        // SAFETY: ptr is a NUL-terminated argv string.
+        let c = unsafe { ptr.add(i).read() };
+        if c == 0 || c == b':' {
+            break;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        uid = uid.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+        have_uid = true;
+        i += 1;
+    }
+    if !have_uid {
+        return None;
+    }
+
+    // SAFETY: same NUL-terminated string.
+    let sep = unsafe { ptr.add(i).read() };
+    if sep == 0 {
+        // No group component.
+        return Some((uid, u32::MAX));
+    }
+
+    // Group digits after ':'.
+    i += 1;
+    let mut gid: u32 = 0;
+    let mut have_gid = false;
+    loop {
+        // SAFETY: same NUL-terminated string.
+        let c = unsafe { ptr.add(i).read() };
+        if c == 0 {
+            break;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        gid = gid.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+        have_gid = true;
+        i += 1;
+    }
+    if !have_gid {
+        return None;
+    }
+    Some((uid, gid))
 }
 
 // ---------------------------------------------------------------------------

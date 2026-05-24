@@ -44,17 +44,58 @@ pub extern "C" fn _start() -> ! {
 // chgrp logic
 // ---------------------------------------------------------------------------
 
-extern "C" fn chgrp_main(argc: usize, _argv: *const *const u8) -> ! {
-    // POSIX `chgrp` requires at least a group operand and one file operand,
-    // so argc must be >= 3 (argv[0] = program name, argv[1] = group,
-    // argv[2] = file).
+extern "C" fn chgrp_main(argc: usize, argv: *const *const u8) -> ! {
+    // argv[0] = program, argv[1] = group (numeric), argv[2] = file.
     if argc < 3 {
         write_all(2, b"chgrp: missing operand\n");
         libc::exit(1)
     }
 
-    // ramfs has no group ownership yet — no-op success.
+    // SAFETY: argc >= 3, so argv[1] and argv[2] are valid pointer slots.
+    let grp = unsafe { argv.add(1).read() };
+    let file = unsafe { argv.add(2).read() };
+    if grp.is_null() || file.is_null() {
+        write_all(2, b"chgrp: missing operand\n");
+        libc::exit(1)
+    }
+
+    let gid = match parse_u32(grp) {
+        Some(g) => g,
+        None => {
+            write_all(2, b"chgrp: invalid group\n");
+            libc::exit(1)
+        }
+    };
+
+    // chown with uid = u32::MAX leaves the owner unchanged, only the group.
+    // SAFETY: file is a NUL-terminated argv string.
+    let rc = unsafe { libc::chown(file, u32::MAX, gid) };
+    if rc < 0 {
+        write_all(2, b"chgrp: cannot change group\n");
+        libc::exit(1)
+    }
     libc::exit(0)
+}
+
+/// Parse a NUL-terminated decimal string into a `u32`.
+///
+/// Returns `None` on an empty string or any non-decimal digit.
+fn parse_u32(ptr: *const u8) -> Option<u32> {
+    let mut val: u32 = 0;
+    let mut i = 0usize;
+    loop {
+        // SAFETY: ptr is a NUL-terminated argv string.
+        let c = unsafe { ptr.add(i).read() };
+        if c == 0 {
+            break;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+        i += 1;
+    }
+    if i == 0 { None } else { Some(val) }
 }
 
 // ---------------------------------------------------------------------------

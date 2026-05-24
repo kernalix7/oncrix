@@ -675,6 +675,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_link(args.arg0, args.arg1) }
         }
 
+        // SYS_CHOWN (92): change file owner/group.
+        // POSIX.1-2024 chown(3p).
+        oncrix_syscall::number::SYS_CHOWN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_chown(args.arg0, args.arg1, args.arg2) }
+        }
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {

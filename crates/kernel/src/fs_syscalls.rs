@@ -411,6 +411,52 @@ pub unsafe fn sys_chmod(pathname_ptr: u64, mode: u64) -> i64 {
     }
 }
 
+// ── sys_chown ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_CHOWN` (number 92).
+///
+/// POSIX.1-2024 `chown(2)` (ramfs subset): sets the owner/group of the
+/// file at `pathname`. A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`) leaves
+/// that id unchanged. Metadata-only; ownership is not enforced.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_chown(pathname_ptr: u64, uid: u64, gid: u64) -> i64 {
+    static mut PATH_BUF4: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut ABS_BUF4: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF4 not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut PATH_BUF4) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: PATH_BUF4[..path_len] written above; ABS_BUF4 exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&PATH_BUF4[..path_len], &mut ABS_BUF4) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: ABS_BUF4[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &ABS_BUF4[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.chown_path(abs, uid as u32, gid as u32))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_getdents64 ────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_GETDENTS64` (number 217).

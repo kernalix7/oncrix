@@ -247,6 +247,16 @@ impl KernelVfs {
         self.ramfs.link(&target, &new_parent, new_name)
     }
 
+    /// Change the owner/group of the file at `path`.
+    ///
+    /// POSIX.1-2024 `chown(2)` (ramfs subset): `u32::MAX` leaves the
+    /// corresponding id unchanged. Returns `NotFound` if the path does
+    /// not exist.
+    pub fn chown_path(&mut self, path: &[u8], uid: u32, gid: u32) -> Result<()> {
+        let inode = self.lookup_path(path)?;
+        self.ramfs.set_owner(inode.ino, uid, gid)
+    }
+
     /// Change the permission bits of the file at `path`.
     ///
     /// POSIX.1-2024 `chmod(2)` (ramfs subset): updates the inode mode
