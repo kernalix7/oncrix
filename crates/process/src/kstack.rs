@@ -11,17 +11,28 @@
 //! process that traps concurrently with its parent would clobber a
 //! shared stack and triple-fault.
 //!
-//! The buffer is 16 KiB, matching the Linux x86_64 `THREAD_SIZE`
-//! default, and 16-byte aligned so the initial RSP is
+//! The buffer is 32 KiB and 16-byte aligned so the initial RSP is
 //! ABI-compliant for a `call` instruction.
+//!
+//! # Why 32 KiB, not Linux's 16 KiB `THREAD_SIZE`
+//!
+//! ONCRIX has no kernel-stack guard pages: per-thread stacks are
+//! plain heap `Box` allocations placed adjacent to one another. A
+//! deep syscall (notably `sys_execve`, whose ELF-parse + per-process
+//! `UserAddressSpace` rebuild call chain is stack-heavy) overflowed a
+//! 16 KiB stack and underflowed into the *neighbouring* thread's
+//! stack, zeroing that thread's saved `switch_context` return address
+//! and faulting (`#UD`/`#GP` at a tiny RIP) the next time it was
+//! resumed. 32 KiB restores headroom. The proper long-term fix is a
+//! guard page per stack plus trimming `sys_execve`'s frame.
 
 extern crate alloc;
 
 use alloc::boxed::Box;
 use oncrix_lib::{Error, Result};
 
-/// Kernel stack size for every thread (16 KiB).
-pub const KSTACK_SIZE: usize = 16 * 1024;
+/// Kernel stack size for every thread (32 KiB).
+pub const KSTACK_SIZE: usize = 32 * 1024;
 
 /// 16-byte aligned backing buffer.
 ///
