@@ -57,6 +57,7 @@ const SYS_RENAME: u64 = 82;
 const SYS_CHMOD: u64 = 90;
 const SYS_LINK: u64 = 86;
 const SYS_CHOWN: u64 = 92;
+const SYS_SYNC: u64 = 162;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -414,6 +415,15 @@ pub unsafe fn link(oldpath: *const u8, newpath: *const u8) -> i64 {
 pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
     // SAFETY: The caller guarantees `path` is null-terminated.
     unsafe { syscall3(SYS_CHOWN, path as u64, uid as u64, gid as u64) }
+}
+
+/// `sync(2)` — flush filesystem buffers.
+///
+/// On ONCRIX's in-memory ramfs this always succeeds immediately.
+/// Returns 0.
+pub fn sync() -> i64 {
+    // SAFETY: SYS_SYNC takes no arguments; the kernel ignores the dummy.
+    unsafe { syscall1(SYS_SYNC, 0) }
 }
 
 /// `getdents64(2)` — get directory entries.

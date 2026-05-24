@@ -927,6 +927,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-sync"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-tabs"
 version = "0.1.0"
 dependencies = [

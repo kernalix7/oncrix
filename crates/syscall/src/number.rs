@@ -120,6 +120,8 @@ pub const SYS_CHMOD: SyscallNumber = 90;
 pub const SYS_LINK: SyscallNumber = 86;
 /// `chown(pathname, uid, gid)` — Change file owner/group.
 pub const SYS_CHOWN: SyscallNumber = 92;
+/// `sync()` — Flush filesystem buffers to backing store.
+pub const SYS_SYNC: SyscallNumber = 162;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.
 pub const SYS_OPENAT: SyscallNumber = 257;
 /// `getdents64(fd, dirp, count)` — Read directory entries.

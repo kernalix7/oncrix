@@ -703,6 +703,10 @@ static EMBEDDED_REBOOT: &[u8] = include_bytes!(env!("ONCRIX_REBOOT_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_HALT: &[u8] = include_bytes!(env!("ONCRIX_HALT_BIN"));
 
+/// The embedded `/bin/sync` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SYNC: &[u8] = include_bytes!(env!("ONCRIX_SYNC_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -970,6 +974,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/shutdown" | b"shutdown" => Some(EMBEDDED_SHUTDOWN),
         b"/bin/reboot" | b"reboot" => Some(EMBEDDED_REBOOT),
         b"/bin/halt" | b"halt" => Some(EMBEDDED_HALT),
+        b"/bin/sync" | b"sync" => Some(EMBEDDED_SYNC),
         _ => None,
     }
 }

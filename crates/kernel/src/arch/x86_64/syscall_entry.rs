@@ -682,6 +682,11 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_chown(args.arg0, args.arg1, args.arg2) }
         }
 
+        // SYS_SYNC (162): flush filesystem buffers.
+        // POSIX.1-2024 sync(3p). ramfs is in-memory, so there is nothing
+        // to flush — return success immediately.
+        oncrix_syscall::number::SYS_SYNC => 0,
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {

@@ -242,6 +242,7 @@ fn main() {
         ("oncrix-shutdown", "shutdown"),
         ("oncrix-reboot", "reboot"),
         ("oncrix-halt", "halt"),
+        ("oncrix-sync", "sync"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
