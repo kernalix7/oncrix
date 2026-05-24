@@ -668,6 +668,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_chmod(args.arg0, args.arg1) }
         }
 
+        // SYS_LINK (86): create a hard link.
+        // POSIX.1-2024 link(3p).
+        oncrix_syscall::number::SYS_LINK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_link(args.arg0, args.arg1) }
+        }
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {

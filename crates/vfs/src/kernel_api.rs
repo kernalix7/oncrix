@@ -231,6 +231,22 @@ impl KernelVfs {
             .rename(&old_parent, old_name, &new_parent, new_name)
     }
 
+    /// Create a hard link `new_path` pointing at the existing `old_path`.
+    ///
+    /// POSIX.1-2024 `link(2)` (ramfs subset). Returns `NotFound` if
+    /// `old_path` does not exist, `AlreadyExists` if `new_path` does,
+    /// `InvalidArgument` for malformed paths or a directory target.
+    pub fn link_path(&mut self, old_path: &[u8], new_path: &[u8]) -> Result<()> {
+        let target = self.lookup_path(old_path)?;
+        let (new_parent_ino, new_name_bytes) = self.resolve_parent_and_name(new_path)?;
+        let new_parent = self
+            .ramfs
+            .inode_by_number(new_parent_ino)
+            .ok_or(Error::NotFound)?;
+        let new_name = core::str::from_utf8(new_name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.link(&target, &new_parent, new_name)
+    }
+
     /// Change the permission bits of the file at `path`.
     ///
     /// POSIX.1-2024 `chmod(2)` (ramfs subset): updates the inode mode

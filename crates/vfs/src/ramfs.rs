@@ -208,7 +208,10 @@ impl Ramfs {
     ///
     /// - Returns `NotFound` if the entry does not exist.
     /// - Returns `InvalidArgument` if the entry is a directory (use rmdir).
-    /// - On success the child inode and its data are freed.
+    /// - The directory entry is always removed. The child inode and its
+    ///   data are freed only when the inode's link count drops to zero
+    ///   (POSIX hard-link semantics); other names for the same inode
+    ///   keep it alive. See [`link`](Self::link).
     pub fn unlink_entry(&mut self, parent: &Inode, name: &str) -> Result<()> {
         let parent_slot = self.slot_of(parent.ino).ok_or(Error::NotFound)?;
 
@@ -245,9 +248,21 @@ impl Ramfs {
                         let ino = entry.inode;
                         *slot = None;
                         *count -= 1;
+                        // Decrement the link count; free the inode + data
+                        // only when no names remain (POSIX hard links).
                         if let Some(child_slot) = self.slot_of(ino) {
-                            self.inodes[child_slot] = None;
-                            self.data[child_slot] = None;
+                            let nlink = self.inodes[child_slot]
+                                .as_ref()
+                                .map(|i| i.nlink)
+                                .unwrap_or(0);
+                            if nlink > 1 {
+                                if let Some(inode) = self.inodes[child_slot].as_mut() {
+                                    inode.nlink -= 1;
+                                }
+                            } else {
+                                self.inodes[child_slot] = None;
+                                self.data[child_slot] = None;
+                            }
                         }
                         return Ok(());
                     }
@@ -382,6 +397,38 @@ impl Ramfs {
         // Re-attach under the destination directory.
         self.add_dir_entry(new_parent_slot, new_name, child_ino)
     }
+
+    /// Create a hard link `new_name` in `new_parent` pointing at the
+    /// same inode as `target`.
+    ///
+    /// POSIX.1-2024 `link(2)` (ramfs subset): adds a second directory
+    /// entry for an existing regular file and bumps its link count, so
+    /// removing either name keeps the inode alive until the last link
+    /// is unlinked. Hard-linking directories is rejected
+    /// (`InvalidArgument`), matching POSIX.
+    ///
+    /// Returns `NotFound` if `target` does not exist, `AlreadyExists` if
+    /// `new_name` is already present in `new_parent`.
+    pub fn link(&mut self, target: &Inode, new_parent: &Inode, new_name: &str) -> Result<()> {
+        let target_slot = self.slot_of(target.ino).ok_or(Error::NotFound)?;
+        let new_parent_slot = self.slot_of(new_parent.ino).ok_or(Error::NotFound)?;
+
+        // POSIX: hard links to directories are not permitted.
+        if let Some(inode) = self.inodes[target_slot].as_ref() {
+            if inode.file_type == FileType::Directory {
+                return Err(Error::InvalidArgument);
+            }
+        }
+
+        let target_ino = target.ino;
+        self.add_dir_entry(new_parent_slot, new_name, target_ino)?;
+
+        // Bump the link count only after the entry is committed.
+        if let Some(inode) = self.inodes[target_slot].as_mut() {
+            inode.nlink += 1;
+        }
+        Ok(())
+    }
 }
 
 impl InodeOps for Ramfs {
@@ -467,9 +514,21 @@ impl InodeOps for Ramfs {
                         let ino = entry.inode;
                         *slot = None;
                         *count -= 1;
+                        // Decrement the link count; free the inode + data
+                        // only when no names remain (POSIX hard links).
                         if let Some(child_slot) = self.slot_of(ino) {
-                            self.inodes[child_slot] = None;
-                            self.data[child_slot] = None;
+                            let nlink = self.inodes[child_slot]
+                                .as_ref()
+                                .map(|i| i.nlink)
+                                .unwrap_or(0);
+                            if nlink > 1 {
+                                if let Some(inode) = self.inodes[child_slot].as_mut() {
+                                    inode.nlink -= 1;
+                                }
+                            } else {
+                                self.inodes[child_slot] = None;
+                                self.data[child_slot] = None;
+                            }
                         }
                         return Ok(());
                     }

@@ -296,6 +296,75 @@ pub unsafe fn sys_rename(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
     }
 }
 
+// ── sys_link ──────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_LINK` (number 86).
+///
+/// POSIX.1-2024 `link(2)` (ramfs subset): creates `newpath` as a hard
+/// link to the existing `oldpath`, bumping the inode link count.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. Both
+/// pointers must reference NUL-terminated paths in user space.
+pub unsafe fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
+    static mut L_OLD_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut L_OLD_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut L_NEW_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut L_NEW_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // SAFETY: single-CPU SYSCALL context; L_OLD_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let old_len = unsafe {
+        match copy_user_path(oldpath_ptr, &mut L_OLD_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: L_OLD_PATH[..old_len] written above; L_OLD_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let old_abs_len = unsafe {
+        match resolve_path_abs(&L_OLD_PATH[..old_len], &mut L_OLD_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: single-CPU SYSCALL context; L_NEW_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let new_len = unsafe {
+        match copy_user_path(newpath_ptr, &mut L_NEW_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: L_NEW_PATH[..new_len] written above; L_NEW_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let new_abs_len = unsafe {
+        match resolve_path_abs(&L_NEW_PATH[..new_len], &mut L_NEW_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: both abs buffers written to the returned lengths above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let old = &L_OLD_ABS[..old_abs_len];
+        let new = &L_NEW_ABS[..new_abs_len];
+        crate::state::with_global_mut(|s| s.vfs.link_path(old, new))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::AlreadyExists)) => -17, // EEXIST
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL (e.g. dir)
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_chmod ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_CHMOD` (number 90).

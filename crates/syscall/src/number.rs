@@ -116,6 +116,8 @@ pub const SYS_UNLINK: SyscallNumber = 87;
 pub const SYS_RENAME: SyscallNumber = 82;
 /// `chmod(pathname, mode)` — Change file permission bits.
 pub const SYS_CHMOD: SyscallNumber = 90;
+/// `link(oldpath, newpath)` — Create a hard link.
+pub const SYS_LINK: SyscallNumber = 86;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.
 pub const SYS_OPENAT: SyscallNumber = 257;
 /// `getdents64(fd, dirp, count)` — Read directory entries.
