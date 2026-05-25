@@ -687,6 +687,20 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         // to flush — return success immediately.
         oncrix_syscall::number::SYS_SYNC => 0,
 
+        // SYS_SYMLINK (88): create a symbolic link.
+        // POSIX.1-2024 symlink(3p).
+        oncrix_syscall::number::SYS_SYMLINK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_symlink(args.arg0, args.arg1) }
+        }
+
+        // SYS_READLINK (89): read a symbolic link target.
+        // POSIX.1-2024 readlink(3p).
+        oncrix_syscall::number::SYS_READLINK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_readlink(args.arg0, args.arg1, args.arg2) }
+        }
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {

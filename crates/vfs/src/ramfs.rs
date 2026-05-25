@@ -21,6 +21,9 @@ const MAX_FILE_SIZE: usize = 4096;
 /// Maximum directory entries per directory.
 const MAX_DIR_ENTRIES: usize = 32;
 
+/// Maximum symbolic-link target length (bytes).
+const SYMLINK_MAX: usize = 256;
+
 /// A directory entry in ramfs.
 #[derive(Debug, Clone)]
 struct RamDirEntry {
@@ -49,6 +52,13 @@ enum RamInodeData {
         entries: [Option<RamDirEntry>; MAX_DIR_ENTRIES],
         /// Number of entries.
         count: usize,
+    },
+    /// Symbolic-link target path.
+    Symlink {
+        /// Target path bytes.
+        target: [u8; SYMLINK_MAX],
+        /// Actual target length.
+        len: usize,
     },
 }
 
@@ -448,6 +458,53 @@ impl Ramfs {
             inode.nlink += 1;
         }
         Ok(())
+    }
+
+    /// Create a symbolic link `name` in `parent` whose target is `target`.
+    ///
+    /// POSIX.1-2024 `symlink(2)` (ramfs subset): allocates a new inode of
+    /// type [`FileType::Symlink`] storing the literal `target` bytes. The
+    /// link is not yet followed by path resolution — use
+    /// [`read_link`](Self::read_link) to retrieve the target.
+    ///
+    /// Returns `AlreadyExists` if `name` exists, `InvalidArgument` if the
+    /// target exceeds [`SYMLINK_MAX`] bytes, `OutOfMemory` if the inode
+    /// or directory table is full.
+    pub fn symlink(&mut self, parent: &Inode, name: &str, target: &[u8]) -> Result<Inode> {
+        if target.len() > SYMLINK_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        let parent_slot = self.slot_of(parent.ino).ok_or(Error::NotFound)?;
+        let (child_slot, child_ino) =
+            self.alloc_inode(FileType::Symlink, FileMode::FILE_DEFAULT)?;
+        let mut buf = [0u8; SYMLINK_MAX];
+        buf[..target.len()].copy_from_slice(target);
+        self.data[child_slot] = Some(RamInodeData::Symlink {
+            target: buf,
+            len: target.len(),
+        });
+        if let Some(inode) = self.inodes[child_slot].as_mut() {
+            inode.size = target.len() as u64;
+        }
+        self.add_dir_entry(parent_slot, name, child_ino)?;
+        Ok(*self.inodes[child_slot].as_ref().ok_or(Error::NotFound)?)
+    }
+
+    /// Read the target of the symbolic link identified by `ino` into `buf`.
+    ///
+    /// Returns the number of bytes copied (≤ `buf.len()`). Returns
+    /// `InvalidArgument` if the inode is not a symlink, `NotFound` if no
+    /// such inode exists.
+    pub fn read_link(&self, ino: InodeNumber, buf: &mut [u8]) -> Result<usize> {
+        let slot = self.slot_of(ino).ok_or(Error::NotFound)?;
+        let data = self.data[slot].as_ref().ok_or(Error::NotFound)?;
+        if let RamInodeData::Symlink { target, len } = data {
+            let n = (*len).min(buf.len());
+            buf[..n].copy_from_slice(&target[..n]);
+            Ok(n)
+        } else {
+            Err(Error::InvalidArgument)
+        }
     }
 }
 

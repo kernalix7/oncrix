@@ -707,6 +707,10 @@ static EMBEDDED_HALT: &[u8] = include_bytes!(env!("ONCRIX_HALT_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_SYNC: &[u8] = include_bytes!(env!("ONCRIX_SYNC_BIN"));
 
+/// The embedded `/bin/readlink` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_READLINK: &[u8] = include_bytes!(env!("ONCRIX_READLINK_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -975,6 +979,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/reboot" | b"reboot" => Some(EMBEDDED_REBOOT),
         b"/bin/halt" | b"halt" => Some(EMBEDDED_HALT),
         b"/bin/sync" | b"sync" => Some(EMBEDDED_SYNC),
+        b"/bin/readlink" | b"readlink" => Some(EMBEDDED_READLINK),
         _ => None,
     }
 }

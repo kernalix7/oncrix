@@ -247,6 +247,31 @@ impl KernelVfs {
         self.ramfs.link(&target, &new_parent, new_name)
     }
 
+    /// Create a symbolic link at `link_path` whose target is `target`.
+    ///
+    /// POSIX.1-2024 `symlink(2)` (ramfs subset). The target is stored
+    /// verbatim and not yet followed by path resolution. Returns
+    /// `AlreadyExists` if `link_path` exists, `InvalidArgument` for a
+    /// malformed path or an over-long target.
+    pub fn symlink_path(&mut self, target: &[u8], link_path: &[u8]) -> Result<()> {
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(link_path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.symlink(&parent, name, target).map(|_| ())
+    }
+
+    /// Read the target of the symbolic link at `path` into `buf`.
+    ///
+    /// Returns the number of bytes copied. Returns `InvalidArgument` if
+    /// `path` is not a symlink, `NotFound` if it does not exist.
+    pub fn readlink_path(&self, path: &[u8], buf: &mut [u8]) -> Result<usize> {
+        let inode = self.lookup_path(path)?;
+        self.ramfs.read_link(inode.ino, buf)
+    }
+
     /// Change the owner/group of the file at `path`.
     ///
     /// POSIX.1-2024 `chown(2)` (ramfs subset): `u32::MAX` leaves the

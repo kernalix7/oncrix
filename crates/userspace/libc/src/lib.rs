@@ -58,6 +58,8 @@ const SYS_CHMOD: u64 = 90;
 const SYS_LINK: u64 = 86;
 const SYS_CHOWN: u64 = 92;
 const SYS_SYNC: u64 = 162;
+const SYS_SYMLINK: u64 = 88;
+const SYS_READLINK: u64 = 89;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -424,6 +426,31 @@ pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
 pub fn sync() -> i64 {
     // SAFETY: SYS_SYNC takes no arguments; the kernel ignores the dummy.
     unsafe { syscall1(SYS_SYNC, 0) }
+}
+
+/// `symlink(2)` — create a symbolic link `linkpath` with value `target`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `target` and `linkpath` must be valid null-terminated string pointers.
+pub unsafe fn symlink(target: *const u8, linkpath: *const u8) -> i64 {
+    // SAFETY: The caller guarantees both strings are null-terminated.
+    unsafe { syscall2(SYS_SYMLINK, target as u64, linkpath as u64) }
+}
+
+/// `readlink(2)` — read the target of symbolic link `path`.
+///
+/// Copies up to `bufsiz` bytes (no NUL terminator) into `buf`. Returns
+/// the byte count on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be null-terminated; `buf` must be writable for `bufsiz` bytes.
+pub unsafe fn readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    // SAFETY: caller guarantees the buffer and path validity.
+    unsafe { syscall3(SYS_READLINK, path as u64, buf as u64, bufsiz as u64) }
 }
 
 /// `getdents64(2)` — get directory entries.

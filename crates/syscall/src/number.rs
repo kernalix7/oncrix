@@ -122,6 +122,10 @@ pub const SYS_LINK: SyscallNumber = 86;
 pub const SYS_CHOWN: SyscallNumber = 92;
 /// `sync()` — Flush filesystem buffers to backing store.
 pub const SYS_SYNC: SyscallNumber = 162;
+/// `symlink(target, linkpath)` — Create a symbolic link.
+pub const SYS_SYMLINK: SyscallNumber = 88;
+/// `readlink(pathname, buf, bufsiz)` — Read a symbolic link target.
+pub const SYS_READLINK: SyscallNumber = 89;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.
 pub const SYS_OPENAT: SyscallNumber = 257;
 /// `getdents64(fd, dirp, count)` — Read directory entries.

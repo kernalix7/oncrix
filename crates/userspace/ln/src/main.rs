@@ -8,8 +8,8 @@
 //! target inode's link count, so removing either name keeps the file
 //! alive until the last link is unlinked.
 //!
-//! Usage: `ln TARGET LINK_NAME`. Symbolic links (`-s`) are not yet
-//! supported (ramfs has no symlink inode type) and are rejected.
+//! Usage: `ln TARGET LINK_NAME` (hard link) or
+//! `ln -s TARGET LINK_NAME` (symbolic link via `symlink(2)`).
 //!
 //! POSIX reference: `.priv-storage/.TheOpenGroup/susv5-html/utilities/ln.html`
 
@@ -32,8 +32,7 @@ pub extern "C" fn _start() -> ! {
     );
 }
 
-const USAGE: &[u8] = b"ln: usage: ln TARGET LINK_NAME\n";
-const ESYM: &[u8] = b"ln: symbolic links not supported on ONCRIX\n";
+const USAGE: &[u8] = b"ln: usage: ln [-s] TARGET LINK_NAME\n";
 const EFAIL: &[u8] = b"ln: cannot create link\n";
 
 extern "C" fn ln_main(argc: usize, argv: *const *const u8) -> ! {
@@ -50,14 +49,31 @@ extern "C" fn ln_main(argc: usize, argv: *const *const u8) -> ! {
         libc::exit(1)
     }
 
-    // Reject the `-s` (symbolic) option — unsupported.
-    if first_two(a1) == [b'-', b's'] {
-        write_all(2, ESYM);
-        libc::exit(1)
-    }
+    // `-s` selects a symbolic link; target/link shift to argv[2]/argv[3].
+    let symbolic = first_two(a1) == [b'-', b's'];
+    let (target, linkname) = if symbolic {
+        if argc < 4 {
+            write_all(2, USAGE);
+            libc::exit(1)
+        }
+        // SAFETY: argc >= 4, so argv[2] and argv[3] are valid pointer slots.
+        let t = unsafe { argv.add(2).read() };
+        let l = unsafe { argv.add(3).read() };
+        if t.is_null() || l.is_null() {
+            write_all(2, USAGE);
+            libc::exit(1)
+        }
+        (t, l)
+    } else {
+        (a1, a2)
+    };
 
-    // SAFETY: a1 (target) and a2 (link name) are NUL-terminated argv strings.
-    let rc = unsafe { libc::link(a1, a2) };
+    // SAFETY: target and linkname are NUL-terminated argv strings.
+    let rc = if symbolic {
+        unsafe { libc::symlink(target, linkname) }
+    } else {
+        unsafe { libc::link(target, linkname) }
+    };
     if rc < 0 {
         write_all(2, EFAIL);
         libc::exit(1)

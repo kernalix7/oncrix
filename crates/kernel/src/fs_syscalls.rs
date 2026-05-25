@@ -411,6 +411,136 @@ pub unsafe fn sys_chmod(pathname_ptr: u64, mode: u64) -> i64 {
     }
 }
 
+// ── sys_symlink ───────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_SYMLINK` (number 88).
+///
+/// POSIX.1-2024 `symlink(2)` (ramfs subset): creates `linkpath` as a
+/// symbolic link with literal contents `target`. The link is not yet
+/// followed by path resolution.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. Both
+/// pointers must reference NUL-terminated strings in user space.
+pub unsafe fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> i64 {
+    static mut SL_TARGET: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut SL_LINK: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut SL_LINK_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // Copy the target verbatim (stored as-is, not resolved).
+    // SAFETY: single-CPU SYSCALL context; SL_TARGET not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let tgt_len = unsafe {
+        match copy_user_path(target_ptr, &mut SL_TARGET) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // Copy + absolutise the link path.
+    // SAFETY: single-CPU SYSCALL context; SL_LINK not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let link_len = unsafe {
+        match copy_user_path(linkpath_ptr, &mut SL_LINK) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: SL_LINK[..link_len] written above; SL_LINK_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let link_abs_len = unsafe {
+        match resolve_path_abs(&SL_LINK[..link_len], &mut SL_LINK_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: SL_TARGET[..tgt_len] and SL_LINK_ABS[..link_abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let target = &SL_TARGET[..tgt_len];
+        let link = &SL_LINK_ABS[..link_abs_len];
+        crate::state::with_global_mut(|s| s.vfs.symlink_path(target, link))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::AlreadyExists)) => -17, // EEXIST
+        Some(Err(oncrix_lib::Error::NotFound)) => -2,       // ENOENT
+        Some(Err(_)) => -22,                                // EINVAL
+        None => -5,                                         // EIO
+    }
+}
+
+// ── sys_readlink ──────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_READLINK` (number 89).
+///
+/// POSIX.1-2024 `readlink(2)`: copies up to `bufsiz` bytes of the
+/// symlink target at `pathname` into the user buffer. Does NOT
+/// NUL-terminate (per POSIX). Returns the byte count, or a negative
+/// errno.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must be a NUL-terminated path; `buf_ptr..buf_ptr+bufsiz` must be
+/// writable user memory.
+pub unsafe fn sys_readlink(pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
+    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    static mut RL_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut RL_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut RL_OUT: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // SAFETY: single-CPU SYSCALL context; RL_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut RL_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: RL_PATH[..path_len] written above; RL_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&RL_PATH[..path_len], &mut RL_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // Read the link target into a kernel staging buffer.
+    let cap = (bufsiz as usize).min(PATH_BUF_LEN);
+    // SAFETY: RL_ABS[..abs_len] written above; RL_OUT exclusively owned.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &RL_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.readlink_path(abs, &mut RL_OUT[..cap]))
+    };
+
+    let n = match result {
+        Some(Ok(n)) => n,
+        Some(Err(oncrix_lib::Error::NotFound)) => return -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => return -22, // EINVAL (not a symlink)
+        Some(Err(_)) => return -22,
+        None => return -5,
+    };
+
+    // Copy out to user (no NUL terminator, per POSIX).
+    // SAFETY: buf_ptr validated non-null user address; n <= cap <= bufsiz.
+    unsafe {
+        let dst = buf_ptr as *mut u8;
+        #[allow(static_mut_refs)]
+        for (i, &b) in RL_OUT[..n].iter().enumerate() {
+            dst.add(i).write_volatile(b);
+        }
+    }
+    n as i64
+}
+
 // ── sys_chown ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_CHOWN` (number 92).

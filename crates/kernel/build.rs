@@ -243,6 +243,7 @@ fn main() {
         ("oncrix-reboot", "reboot"),
         ("oncrix-halt", "halt"),
         ("oncrix-sync", "sync"),
+        ("oncrix-readlink", "readlink"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
