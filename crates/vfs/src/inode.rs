@@ -140,4 +140,12 @@ pub trait InodeOps {
 
     /// Truncate a file to the given size.
     fn truncate(&mut self, inode: &Inode, size: u64) -> Result<()>;
+
+    /// Read a symbolic-link target into `buf`, returning the byte count.
+    ///
+    /// Default implementation returns `InvalidArgument` (the inode is not
+    /// a symlink). Filesystems that support symlinks override this.
+    fn readlink(&self, _inode: &Inode, _buf: &mut [u8]) -> Result<usize> {
+        Err(oncrix_lib::Error::InvalidArgument)
+    }
 }

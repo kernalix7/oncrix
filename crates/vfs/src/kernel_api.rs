@@ -265,10 +265,21 @@ impl KernelVfs {
 
     /// Read the target of the symbolic link at `path` into `buf`.
     ///
-    /// Returns the number of bytes copied. Returns `InvalidArgument` if
-    /// `path` is not a symlink, `NotFound` if it does not exist.
+    /// Resolves `path` WITHOUT following its final component (so the
+    /// symlink itself is returned, not its target), then reads the link.
+    /// Returns the number of bytes copied. `InvalidArgument` if `path`
+    /// is not a symlink, `NotFound` if it does not exist.
     pub fn readlink_path(&self, path: &[u8], buf: &mut [u8]) -> Result<usize> {
-        let inode = self.lookup_path(path)?;
+        // Resolve parent + final name and look up the final component
+        // directly (`lookup` does not follow symlinks, unlike the
+        // symlink-following `lookup_path`).
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        let inode = self.ramfs.lookup(&parent, name)?;
         self.ramfs.read_link(inode.ino, buf)
     }
 

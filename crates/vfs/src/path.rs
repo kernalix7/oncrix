@@ -81,6 +81,36 @@ pub fn resolve_path(
     _mount_table: &MountTable,
     _dcache: &DentryCache,
 ) -> Result<Inode> {
+    let mut current = walk_components(path, root_inode, fs)?;
+
+    // Follow a terminal symbolic link to its target. Only absolute
+    // targets are followed (relative-target following needs the link's
+    // parent directory, deferred); a relative target yields the symlink
+    // inode itself. A depth limit guards against link cycles (ELOOP).
+    let mut target_buf = [0u8; 256];
+    let mut depth = 0u32;
+    while current.file_type == FileType::Symlink {
+        depth += 1;
+        if depth > 8 {
+            return Err(Error::InvalidArgument); // ELOOP
+        }
+        let n = fs.readlink(&current, &mut target_buf)?;
+        let target = &target_buf[..n];
+        if target.is_empty() || target[0] != b'/' {
+            // Relative target — leave the symlink inode unresolved.
+            break;
+        }
+        current = walk_components(target, root_inode, fs)?;
+    }
+
+    Ok(current)
+}
+
+/// Walk an absolute path one component at a time WITHOUT following a
+/// terminal symlink, returning the inode the final component names.
+///
+/// `.` is skipped; `..` is passed through to `InodeOps::lookup`.
+fn walk_components(path: &[u8], root_inode: &Inode, fs: &dyn InodeOps) -> Result<Inode> {
     if path.is_empty() || path[0] != b'/' {
         return Err(Error::InvalidArgument);
     }
