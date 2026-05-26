@@ -81,13 +81,26 @@ pub fn resolve_path(
     _mount_table: &MountTable,
     _dcache: &DentryCache,
 ) -> Result<Inode> {
-    let mut current = walk_components(path, root_inode, fs)?;
+    // `cur_path` tracks the absolute path that produced `current`, so a
+    // relative symlink target can be resolved against the link's parent
+    // directory. It starts as the caller's path. Bounded to SYMPATH_MAX
+    // (not PATH_MAX) to keep the kernel-stack footprint small — ONCRIX
+    // paths are short and a 4 KiB buffer here is wasteful/risky.
+    const SYMPATH_MAX: usize = 512;
+    let mut cur_path = [0u8; SYMPATH_MAX];
+    if path.len() > SYMPATH_MAX {
+        return Err(Error::InvalidArgument);
+    }
+    cur_path[..path.len()].copy_from_slice(path);
+    let mut cur_len = path.len();
 
-    // Follow a terminal symbolic link to its target. Only absolute
-    // targets are followed (relative-target following needs the link's
-    // parent directory, deferred); a relative target yields the symlink
-    // inode itself. A depth limit guards against link cycles (ELOOP).
+    let mut current = walk_components(&cur_path[..cur_len], root_inode, fs)?;
+
+    // Follow a terminal symbolic link to its target. Absolute targets
+    // resolve from root; relative targets resolve against the link's
+    // parent directory. A depth limit guards against cycles (ELOOP).
     let mut target_buf = [0u8; 256];
+    let mut next_path = [0u8; SYMPATH_MAX];
     let mut depth = 0u32;
     while current.file_type == FileType::Symlink {
         depth += 1;
@@ -96,14 +109,63 @@ pub fn resolve_path(
         }
         let n = fs.readlink(&current, &mut target_buf)?;
         let target = &target_buf[..n];
-        if target.is_empty() || target[0] != b'/' {
-            // Relative target — leave the symlink inode unresolved.
+        if target.is_empty() {
             break;
         }
-        current = walk_components(target, root_inode, fs)?;
+
+        let new_len = if target[0] == b'/' {
+            // Absolute target: replace the path entirely.
+            if n > SYMPATH_MAX {
+                return Err(Error::InvalidArgument);
+            }
+            next_path[..n].copy_from_slice(target);
+            n
+        } else {
+            // Relative target: <dirname(cur_path)> '/' <target>.
+            let dir = parent_slice(&cur_path[..cur_len]);
+            // Join: dir + '/' + target (avoid a double slash after root).
+            let mut len = 0usize;
+            for &b in dir {
+                if len >= SYMPATH_MAX {
+                    return Err(Error::InvalidArgument);
+                }
+                next_path[len] = b;
+                len += 1;
+            }
+            if dir.last() != Some(&b'/') {
+                if len >= SYMPATH_MAX {
+                    return Err(Error::InvalidArgument);
+                }
+                next_path[len] = b'/';
+                len += 1;
+            }
+            for &b in target {
+                if len >= SYMPATH_MAX {
+                    return Err(Error::InvalidArgument);
+                }
+                next_path[len] = b;
+                len += 1;
+            }
+            len
+        };
+
+        cur_path[..new_len].copy_from_slice(&next_path[..new_len]);
+        cur_len = new_len;
+        current = walk_components(&cur_path[..cur_len], root_inode, fs)?;
     }
 
     Ok(current)
+}
+
+/// Return the parent-directory slice of an absolute path.
+///
+/// `/a/b` → `/a`, `/a` → `/`, `/` → `/`. The result always begins with
+/// `/` and never has a trailing slash unless it is the bare root.
+fn parent_slice(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => b"/",
+        Some(i) => &path[..i],
+    }
 }
 
 /// Walk an absolute path one component at a time WITHOUT following a
