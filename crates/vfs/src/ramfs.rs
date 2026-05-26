@@ -744,4 +744,8 @@ impl InodeOps for Ramfs {
             Err(Error::InvalidArgument)
         }
     }
+
+    fn readlink(&self, inode: &Inode, buf: &mut [u8]) -> Result<usize> {
+        self.read_link(inode.ino, buf)
+    }
 }

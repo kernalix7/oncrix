@@ -47,6 +47,8 @@ const SYS_STAT: u64 = 4;
 const SYS_FSTAT: u64 = 5;
 const SYS_MMAP: u64 = 9;
 const SYS_RT_SIGACTION: u64 = 13;
+const SYS_ACCESS: u64 = 21;
+const SYS_FSYNC: u64 = 74;
 const SYS_DUP2: u64 = 33;
 const SYS_GETPID: u64 = 39;
 const SYS_GETCWD: u64 = 79;
@@ -61,6 +63,7 @@ const SYS_SYNC: u64 = 162;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
 const SYS_TRUNCATE: u64 = 76;
+const SYS_RMDIR: u64 = 84;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -420,6 +423,29 @@ pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
     unsafe { syscall3(SYS_CHOWN, path as u64, uid as u64, gid as u64) }
 }
 
+/// `access(2)` — check file accessibility.
+///
+/// POSIX.1-2024 `access(3p)`. On ONCRIX ramfs, only existence is checked;
+/// permission bits (R_OK / W_OK / X_OK) are accepted but not enforced.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn access(path: *const u8, mode: i32) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall2(SYS_ACCESS, path as u64, mode as u64) }
+}
+
+/// `fsync(2)` — synchronize file state with backing store.
+///
+/// On ONCRIX's in-memory ramfs this always succeeds immediately.
+/// Returns 0.
+pub fn fsync(fd: i32) -> i64 {
+    // SAFETY: SYS_FSYNC is idempotent on ramfs; no user pointers involved.
+    unsafe { syscall1(SYS_FSYNC, fd as u64) }
+}
+
 /// `sync(2)` — flush filesystem buffers.
 ///
 /// On ONCRIX's in-memory ramfs this always succeeds immediately.
@@ -464,6 +490,18 @@ pub unsafe fn readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
 pub unsafe fn truncate(path: *const u8, length: u64) -> i64 {
     // SAFETY: The caller guarantees `path` is null-terminated.
     unsafe { syscall2(SYS_TRUNCATE, path as u64, length) }
+}
+
+/// `rmdir(2)` — remove the empty directory at `path`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn rmdir(path: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall1(SYS_RMDIR, path as u64) }
 }
 
 /// `getdents64(2)` — get directory entries.

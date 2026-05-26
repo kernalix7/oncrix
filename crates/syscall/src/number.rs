@@ -120,8 +120,12 @@ pub const SYS_CHMOD: SyscallNumber = 90;
 pub const SYS_LINK: SyscallNumber = 86;
 /// `chown(pathname, uid, gid)` — Change file owner/group.
 pub const SYS_CHOWN: SyscallNumber = 92;
+/// `access(pathname, mode)` — Check file accessibility.
+pub const SYS_ACCESS: SyscallNumber = 21;
 /// `sync()` — Flush filesystem buffers to backing store.
 pub const SYS_SYNC: SyscallNumber = 162;
+/// `fsync(fd)` — Synchronize file state with backing store.
+pub const SYS_FSYNC: SyscallNumber = 74;
 /// `symlink(target, linkpath)` — Create a symbolic link.
 pub const SYS_SYMLINK: SyscallNumber = 88;
 /// `readlink(pathname, buf, bufsiz)` — Read a symbolic link target.

@@ -715,6 +715,10 @@ static EMBEDDED_READLINK: &[u8] = include_bytes!(env!("ONCRIX_READLINK_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_TRUNCATE: &[u8] = include_bytes!(env!("ONCRIX_TRUNCATE_BIN"));
 
+/// The embedded `/bin/rmdir` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_RMDIR: &[u8] = include_bytes!(env!("ONCRIX_RMDIR_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -985,6 +989,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/sync" | b"sync" => Some(EMBEDDED_SYNC),
         b"/bin/readlink" | b"readlink" => Some(EMBEDDED_READLINK),
         b"/bin/truncate" | b"truncate" => Some(EMBEDDED_TRUNCATE),
+        b"/bin/rmdir" | b"rmdir" => Some(EMBEDDED_RMDIR),
         _ => None,
     }
 }

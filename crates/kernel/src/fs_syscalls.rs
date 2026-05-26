@@ -541,6 +541,51 @@ pub unsafe fn sys_readlink(pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 
     n as i64
 }
 
+// ── sys_rmdir ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_RMDIR` (number 84).
+///
+/// POSIX.1-2024 `rmdir(2)`: removes the empty directory at `pathname`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_rmdir(pathname_ptr: u64) -> i64 {
+    static mut RD_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut RD_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; RD_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut RD_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: RD_PATH[..path_len] written above; RD_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&RD_PATH[..path_len], &mut RD_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: RD_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &RD_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.rmdir_path(abs))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -39, // ENOTEMPTY / ENOTDIR
+        Some(Err(_)) => -22,
+        None => -5,
+    }
+}
+
 // ── sys_truncate ──────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_TRUNCATE` (number 76).
@@ -965,5 +1010,53 @@ pub unsafe fn sys_fstat(fd: i32, statbuf_ptr: u64) -> i64 {
             0
         }
         None => -9, // EBADF
+    }
+}
+
+// ── sys_access ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_ACCESS` (number 21).
+///
+/// POSIX.1-2024 `access(3p)`: check whether the calling process can access
+/// the file at `pathname`. ONCRIX's single-user ramfs has no permission
+/// enforcement, so this handler only checks for existence — a path that
+/// resolves via VFS returns 0, otherwise ENOENT. The `mode` argument
+/// (F_OK / R_OK / W_OK / X_OK) is accepted but not enforced.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_access(pathname_ptr: u64, _mode: u64) -> i64 {
+    static mut AC_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut AC_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; AC_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut AC_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: AC_PATH[..path_len] written above; AC_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&AC_PATH[..path_len], &mut AC_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: AC_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        // SAFETY: AC_ABS slice is valid for abs_len bytes written above.
+        crate::state::with_global(|s| s.vfs.lookup_path(&AC_ABS[..abs_len]))
+    };
+
+    match result {
+        Some(Ok(_)) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
     }
 }

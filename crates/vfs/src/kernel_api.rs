@@ -247,6 +247,21 @@ impl KernelVfs {
         self.ramfs.link(&target, &new_parent, new_name)
     }
 
+    /// Remove the empty directory at `path`.
+    ///
+    /// POSIX.1-2024 `rmdir(2)`: fails with `InvalidArgument` if `path`
+    /// is not a directory or is non-empty, `NotFound` if it does not
+    /// exist.
+    pub fn rmdir_path(&mut self, path: &[u8]) -> Result<()> {
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.rmdir(&parent, name)
+    }
+
     /// Set the length of the file at `path` to `length` bytes.
     ///
     /// POSIX.1-2024 `truncate(2)` (ramfs subset): shrinking discards the

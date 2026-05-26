@@ -787,6 +787,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-rmdir"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-route"
 version = "0.1.0"
 dependencies = [

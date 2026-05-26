@@ -245,6 +245,7 @@ fn main() {
         ("oncrix-sync", "sync"),
         ("oncrix-readlink", "readlink"),
         ("oncrix-truncate", "truncate"),
+        ("oncrix-rmdir", "rmdir"),
     ];
     for (pkg, bin_name) in userspace_bins {
         let status = Command::new(&cargo_bin)
