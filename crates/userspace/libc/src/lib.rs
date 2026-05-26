@@ -728,6 +728,16 @@ pub const fn s_isreg(mode: u32) -> bool {
     (mode & S_IFMT) == S_IFREG
 }
 
+/// Returns `true` if `mode` describes a symbolic link.
+pub const fn s_islnk(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFLNK
+}
+
+/// Returns `true` if `mode` describes a FIFO (named pipe).
+pub const fn s_isfifo(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFIFO
+}
+
 /// `stat(2)` — get file status by pathname.
 ///
 /// Returns 0 on success, or a negative errno value.

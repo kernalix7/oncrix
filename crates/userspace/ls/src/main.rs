@@ -174,6 +174,10 @@ fn list_dir(target: &[u8], long_fmt: bool) -> bool {
                 // Format: type_char + permission string + "  " + size + "  " + name + "\n"
                 let type_char = if libc::s_isdir(st.st_mode) {
                     b'd'
+                } else if libc::s_islnk(st.st_mode) {
+                    b'l'
+                } else if libc::s_isfifo(st.st_mode) {
+                    b'p'
                 } else if libc::s_isreg(st.st_mode) {
                     b'-'
                 } else {
