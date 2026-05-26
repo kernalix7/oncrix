@@ -541,6 +541,54 @@ pub unsafe fn sys_readlink(pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 
     n as i64
 }
 
+// ── sys_mknod ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_MKNOD` (number 133).
+///
+/// POSIX.1-2024 `mkfifo(2)` subset: creates a named pipe (FIFO) at
+/// `pathname`. Only the FIFO node type is supported (the `mode`'s
+/// file-type bits are ignored; any invocation creates a FIFO). The FIFO
+/// is not yet connected to a pipe ring.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_mknod(pathname_ptr: u64, mode: u64) -> i64 {
+    static mut MN_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut MN_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; MN_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut MN_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: MN_PATH[..path_len] written above; MN_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&MN_PATH[..path_len], &mut MN_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: MN_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &MN_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.mkfifo_path(abs, mode as u32 & 0o7777))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::AlreadyExists)) => -17, // EEXIST
+        Some(Err(oncrix_lib::Error::NotFound)) => -2,       // ENOENT
+        Some(Err(_)) => -22,                                // EINVAL
+        None => -5,
+    }
+}
+
 // ── sys_rmdir ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_RMDIR` (number 84).

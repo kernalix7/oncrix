@@ -60,6 +60,10 @@ enum RamInodeData {
         /// Actual target length.
         len: usize,
     },
+    /// Named pipe (FIFO). Carries no in-ramfs payload yet — opening it as
+    /// a working pipe is not wired (Phase: create-only so `mkfifo` + `ls`
+    /// report the node correctly).
+    Fifo,
 }
 
 /// Ramfs filesystem.
@@ -486,6 +490,23 @@ impl Ramfs {
         if let Some(inode) = self.inodes[child_slot].as_mut() {
             inode.size = target.len() as u64;
         }
+        self.add_dir_entry(parent_slot, name, child_ino)?;
+        Ok(*self.inodes[child_slot].as_ref().ok_or(Error::NotFound)?)
+    }
+
+    /// Create a named pipe (FIFO) `name` in `parent`.
+    ///
+    /// POSIX.1-2024 `mkfifo(2)` (ramfs subset): allocates a new inode of
+    /// type [`FileType::Fifo`]. The FIFO is not yet connected to a pipe
+    /// ring — this only makes the node exist so `mkfifo` succeeds and
+    /// `ls -l` reports it as `p`.
+    ///
+    /// Returns `AlreadyExists` if `name` exists, `OutOfMemory` if the
+    /// inode/directory table is full.
+    pub fn mknod_fifo(&mut self, parent: &Inode, name: &str, mode: FileMode) -> Result<Inode> {
+        let parent_slot = self.slot_of(parent.ino).ok_or(Error::NotFound)?;
+        let (child_slot, child_ino) = self.alloc_inode(FileType::Fifo, mode)?;
+        self.data[child_slot] = Some(RamInodeData::Fifo);
         self.add_dir_entry(parent_slot, name, child_ino)?;
         Ok(*self.inodes[child_slot].as_ref().ok_or(Error::NotFound)?)
     }

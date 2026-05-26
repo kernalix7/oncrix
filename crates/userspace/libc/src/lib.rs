@@ -64,6 +64,7 @@ const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
 const SYS_TRUNCATE: u64 = 76;
 const SYS_RMDIR: u64 = 84;
+const SYS_MKNOD: u64 = 133;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -502,6 +503,19 @@ pub unsafe fn truncate(path: *const u8, length: u64) -> i64 {
 pub unsafe fn rmdir(path: *const u8) -> i64 {
     // SAFETY: The caller guarantees `path` is null-terminated.
     unsafe { syscall1(SYS_RMDIR, path as u64) }
+}
+
+/// `mkfifo(3)` — create a named pipe (FIFO) at `path` with `mode`.
+///
+/// Implemented via `mknod(2)` (`SYS_MKNOD`) with the FIFO type bit set.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn mkfifo(path: *const u8, mode: u32) -> i64 {
+    // SAFETY: `path` is null-terminated; SYS_MKNOD creates a FIFO node.
+    unsafe { syscall2(SYS_MKNOD, path as u64, (mode | S_IFIFO) as u64) }
 }
 
 /// `getdents64(2)` — get directory entries.

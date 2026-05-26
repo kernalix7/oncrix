@@ -741,6 +741,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_rmdir(args.arg0) }
         }
 
+        // SYS_MKNOD (133): create a FIFO node (mkfifo subset).
+        // POSIX.1-2024 mkfifo(3p).
+        oncrix_syscall::number::SYS_MKNOD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_mknod(args.arg0, args.arg1) }
+        }
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {

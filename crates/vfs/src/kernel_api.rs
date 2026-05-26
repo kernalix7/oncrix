@@ -247,6 +247,23 @@ impl KernelVfs {
         self.ramfs.link(&target, &new_parent, new_name)
     }
 
+    /// Create a named pipe (FIFO) at `path`.
+    ///
+    /// POSIX.1-2024 `mkfifo(2)` (ramfs subset, create-only). Returns
+    /// `AlreadyExists` if the path exists, `NotFound` if the parent does
+    /// not, `InvalidArgument` for a malformed path.
+    pub fn mkfifo_path(&mut self, path: &[u8], mode: u32) -> Result<()> {
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs
+            .mknod_fifo(&parent, name, FileMode(mode as u16))
+            .map(|_| ())
+    }
+
     /// Remove the empty directory at `path`.
     ///
     /// POSIX.1-2024 `rmdir(2)`: fails with `InvalidArgument` if `path`

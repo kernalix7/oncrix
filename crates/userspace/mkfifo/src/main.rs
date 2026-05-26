@@ -1,12 +1,15 @@
 // Copyright 2026 ONCRIX Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! ONCRIX `/bin/mkfifo` — POSIX `mkfifo(1)` utility stub.
+//! ONCRIX `/bin/mkfifo` — POSIX `mkfifo(1)` utility.
 //!
-//! POSIX `mkfifo(1)` creates FIFO special files (named pipes). ONCRIX
-//! currently does not implement the `SYS_MKNOD` syscall and lacks FIFO
-//! inode support in the VFS layer. This stub reports failure on stderr
-//! and exits 1.
+//! Creates named pipes (FIFOs) via `mkfifo(3)` → `mknod(2)`
+//! (`SYS_MKNOD`, number 133). The FIFO node is created in the ramfs
+//! with type `FileType::Fifo`; connecting it to a working pipe ring on
+//! open is not yet wired, so the node exists (visible to `ls`) but
+//! read/write through it is not yet supported.
+//!
+//! Usage: `mkfifo NAME...`. Default mode 0644.
 //!
 //! POSIX reference: `.priv-storage/.TheOpenGroup/susv5-html/utilities/mkfifo.html`
 
@@ -17,12 +20,41 @@ use core::panic::PanicInfo;
 
 use oncrix_ulibc as libc;
 
-const MSG: &[u8] = b"mkfifo: SYS_MKNOD not implemented on ONCRIX\n";
-
 #[unsafe(no_mangle)]
+#[unsafe(naked)]
 pub extern "C" fn _start() -> ! {
-    write_all(2, MSG);
-    libc::exit(1)
+    core::arch::naked_asm!(
+        "mov rdi, [rsp]",
+        "lea rsi, [rsp + 8]",
+        "call {main}",
+        "ud2",
+        main = sym mkfifo_main,
+    );
+}
+
+extern "C" fn mkfifo_main(argc: usize, argv: *const *const u8) -> ! {
+    if argc < 2 {
+        write_all(2, b"mkfifo: missing operand\n");
+        libc::exit(1)
+    }
+
+    let mut status = 0;
+    let mut i = 1usize;
+    while i < argc {
+        // SAFETY: i < argc, so argv[i] is a valid pointer slot.
+        let path = unsafe { argv.add(i).read() };
+        if path.is_null() {
+            break;
+        }
+        // SAFETY: path is a NUL-terminated argv string.
+        let rc = unsafe { libc::mkfifo(path, 0o644) };
+        if rc < 0 {
+            write_all(2, b"mkfifo: cannot create fifo\n");
+            status = 1;
+        }
+        i += 1;
+    }
+    libc::exit(status)
 }
 
 /// Write all bytes in `buf` to `fd`, retrying on short writes.
