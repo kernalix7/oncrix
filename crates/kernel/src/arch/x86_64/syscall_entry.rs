@@ -356,10 +356,12 @@ pub extern "C" fn syscall_entry() {
             // value in r10 across the `syscall` (e.g. /bin/rmdir's argv
             // loop counter) then read garbage and faulted #GP on the next
             // r10-indexed access.
-            "mov r10, 0x00007FFFFFFFFFFF",
-            "cmp rcx, r10",
+            "mov r11, 0x00007FFFFFFFFFFF",
+            "cmp rcx, r11",
             "ja  2f",
-            // --- Normal SYSRET path --- (TEMP: old r10-scratch revert for A/B test)
+            // --- Normal SYSRET path ---
+            // Load and sanitize the user RFLAGS into r11: clear IOPL, NT,
+            // TF, force IF=1 + reserved bit 1=1. Restore user RSP last.
             "mov r11, [{saved_user_rflags}]",
             "and r11, 0x3C7FD7",
             "or  r11, 0x202",
