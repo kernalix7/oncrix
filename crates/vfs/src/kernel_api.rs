@@ -247,6 +247,17 @@ impl KernelVfs {
         self.ramfs.link(&target, &new_parent, new_name)
     }
 
+    /// Set the length of the file at `path` to `length` bytes.
+    ///
+    /// POSIX.1-2024 `truncate(2)` (ramfs subset): shrinking discards the
+    /// tail, growing zero-fills. Follows symlinks (resolves `path`).
+    /// Returns `NotFound` if the path does not exist, `InvalidArgument`
+    /// if it is not a regular file.
+    pub fn truncate_path(&mut self, path: &[u8], length: u64) -> Result<()> {
+        let inode = self.lookup_path(path)?;
+        self.ramfs.truncate(&inode, length)
+    }
+
     /// Create a symbolic link at `link_path` whose target is `target`.
     ///
     /// POSIX.1-2024 `symlink(2)` (ramfs subset). The target is stored

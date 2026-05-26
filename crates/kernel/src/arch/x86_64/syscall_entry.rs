@@ -701,6 +701,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_readlink(args.arg0, args.arg1, args.arg2) }
         }
 
+        // SYS_TRUNCATE (76): set file length.
+        // POSIX.1-2024 truncate(3p).
+        oncrix_syscall::number::SYS_TRUNCATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_truncate(args.arg0, args.arg1) }
+        }
+
         // SYS_GETDENTS64 (217): read directory entries.
         // Linux getdents64(2) / POSIX.1-2024 readdir(3p) equivalent.
         oncrix_syscall::number::SYS_GETDENTS64 => {

@@ -711,6 +711,10 @@ static EMBEDDED_SYNC: &[u8] = include_bytes!(env!("ONCRIX_SYNC_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_READLINK: &[u8] = include_bytes!(env!("ONCRIX_READLINK_BIN"));
 
+/// The embedded `/bin/truncate` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TRUNCATE: &[u8] = include_bytes!(env!("ONCRIX_TRUNCATE_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -980,6 +984,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/halt" | b"halt" => Some(EMBEDDED_HALT),
         b"/bin/sync" | b"sync" => Some(EMBEDDED_SYNC),
         b"/bin/readlink" | b"readlink" => Some(EMBEDDED_READLINK),
+        b"/bin/truncate" | b"truncate" => Some(EMBEDDED_TRUNCATE),
         _ => None,
     }
 }

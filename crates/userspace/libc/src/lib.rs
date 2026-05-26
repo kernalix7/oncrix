@@ -60,6 +60,7 @@ const SYS_CHOWN: u64 = 92;
 const SYS_SYNC: u64 = 162;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
+const SYS_TRUNCATE: u64 = 76;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
@@ -451,6 +452,18 @@ pub unsafe fn symlink(target: *const u8, linkpath: *const u8) -> i64 {
 pub unsafe fn readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
     // SAFETY: caller guarantees the buffer and path validity.
     unsafe { syscall3(SYS_READLINK, path as u64, buf as u64, bufsiz as u64) }
+}
+
+/// `truncate(2)` — set the length of the file at `path` to `length`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn truncate(path: *const u8, length: u64) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall2(SYS_TRUNCATE, path as u64, length) }
 }
 
 /// `getdents64(2)` — get directory entries.

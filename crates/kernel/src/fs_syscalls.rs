@@ -541,6 +541,53 @@ pub unsafe fn sys_readlink(pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 
     n as i64
 }
 
+// ── sys_truncate ──────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_TRUNCATE` (number 76).
+///
+/// POSIX.1-2024 `truncate(2)` (ramfs subset): sets the length of the
+/// file at `pathname`. Shrinking discards the tail; growing zero-fills.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_truncate(pathname_ptr: u64, length: u64) -> i64 {
+    static mut TR_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut TR_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; TR_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut TR_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: TR_PATH[..path_len] written above; TR_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&TR_PATH[..path_len], &mut TR_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: TR_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &TR_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.truncate_path(abs, length))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL (not a regular file)
+        Some(Err(oncrix_lib::Error::OutOfMemory)) => -27, // EFBIG (exceeds ramfs file cap)
+        Some(Err(_)) => -22,
+        None => -5, // EIO
+    }
+}
+
 // ── sys_chown ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_CHOWN` (number 92).
