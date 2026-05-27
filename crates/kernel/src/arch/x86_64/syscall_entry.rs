@@ -912,6 +912,20 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fd_table::sys_poll(args.arg0, args.arg1, args.arg2 as i64) }
         }
 
+        // SYS_SELECT (23): synchronous I/O multiplexing over fd_set bitmaps.
+        oncrix_syscall::number::SYS_SELECT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_select(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                    args.arg4,
+                )
+            }
+        }
+
         // SYS_TIMES (100) / SYS_GETRUSAGE (98): process CPU-time accounting.
         oncrix_syscall::number::SYS_TIMES => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
@@ -920,6 +934,21 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         oncrix_syscall::number::SYS_GETRUSAGE => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::sched_syscalls::sys_getrusage(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_SCHED_GETAFFINITY (204) / SYS_SCHED_SETAFFINITY (203): CPU
+        // affinity. Single-CPU system, so the only valid mask is {CPU 0}.
+        oncrix_syscall::number::SYS_SCHED_GETAFFINITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_getaffinity(args.arg0 as i64, args.arg1, args.arg2)
+            }
+        }
+        oncrix_syscall::number::SYS_SCHED_SETAFFINITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_setaffinity(args.arg0 as i64, args.arg1, args.arg2)
+            }
         }
 
         // ── Everything else ──────────────────────────────────────

@@ -433,3 +433,102 @@ fn ticks_to_timeval(ticks: u64) -> (i64, i64) {
     let usec = ((ticks % CLK_TCK) * 1_000_000 / CLK_TCK) as i64;
     (sec, usec)
 }
+
+/// `sched_getaffinity(pid, cpusetsize, mask)` — report the calling
+/// thread's CPU affinity.
+///
+/// Writes the thread's affinity bitmask into the user `cpu_set_t` at
+/// `mask`, which is `cpusetsize` bytes long. ONCRIX is single-CPU, so at
+/// most bit 0 is ever set; bytes beyond the low 8 are zeroed. `pid` is
+/// treated as the calling thread (no cross-pid lookup yet — documented).
+///
+/// Returns the number of bytes written (`cpusetsize`, Linux semantics)
+/// on success, `-22` (`EINVAL`) if `cpusetsize` is 0 or not a multiple
+/// of 8 (a `cpu_set_t` is an array of 8-byte words), `-14` (`EFAULT`)
+/// for a bad `mask`, `-3` (`ESRCH`) if there is no current thread.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path (single-CPU, IF=0). `mask` is a raw user
+/// pointer; non-canonical addresses are rejected and unmapped-canonical
+/// accesses fault into the user handler (SIGSEGV).
+pub unsafe fn sys_sched_getaffinity(_pid: i64, cpusetsize: u64, mask: u64) -> i64 {
+    if cpusetsize == 0 || cpusetsize % 8 != 0 {
+        return -22; // EINVAL
+    }
+    if bad_user_ptr(mask) {
+        return -14; // EFAULT
+    }
+    // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
+    let cpu_mask = match unsafe { current_thread_mut() } {
+        Some(t) => t.cpu_mask(),
+        None => return -3, // ESRCH
+    };
+
+    // Zero the whole user buffer, then write our 8-byte mask in the first
+    // word. Done byte-by-byte so we never write past `cpusetsize`.
+    let size = cpusetsize as usize;
+    for i in 0..size {
+        let byte = if i < 8 {
+            ((cpu_mask >> (i * 8)) & 0xFF) as u8
+        } else {
+            0
+        };
+        // SAFETY: i < cpusetsize and the base is canonical user space
+        // (checked); each byte write stays within the user buffer and
+        // faults to SIGSEGV if unmapped.
+        unsafe {
+            core::ptr::write_unaligned((mask as *mut u8).add(i), byte);
+        }
+    }
+    cpusetsize as i64
+}
+
+/// `sched_setaffinity(pid, cpusetsize, mask)` — set the calling thread's
+/// CPU affinity.
+///
+/// Reads the user `cpu_set_t` at `mask` (`cpusetsize` bytes) and stores
+/// it on the thread. Because ONCRIX has only CPU 0, the requested mask
+/// **must include bit 0** or `-22` (`EINVAL`) is returned (an affinity
+/// excluding the only CPU would leave the thread unrunnable). `pid` is
+/// treated as the calling thread.
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for a zero/misaligned
+/// `cpusetsize` or a mask without CPU 0, `-14` (`EFAULT`) for a bad
+/// `mask`, `-3` (`ESRCH`) if there is no current thread.
+///
+/// # Safety
+///
+/// See [`sys_sched_getaffinity`].
+pub unsafe fn sys_sched_setaffinity(_pid: i64, cpusetsize: u64, mask: u64) -> i64 {
+    if cpusetsize == 0 || cpusetsize % 8 != 0 {
+        return -22; // EINVAL
+    }
+    if bad_user_ptr(mask) {
+        return -14; // EFAULT
+    }
+
+    // Read the low 8 bytes (the only CPUs we can model). Higher bytes are
+    // ignored: on a single CPU they can only ever request absent CPUs.
+    let mut low: u64 = 0;
+    for i in 0..8usize {
+        // SAFETY: cpusetsize >= 8 (non-zero multiple of 8) so bytes 0..8
+        // are within the user buffer; canonical base checked above.
+        let byte = unsafe { core::ptr::read_unaligned((mask as *const u8).add(i)) };
+        low |= (byte as u64) << (i * 8);
+    }
+
+    // The only runnable CPU is 0; the mask must select it.
+    if low & 1 == 0 {
+        return -22; // EINVAL
+    }
+
+    // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
+    match unsafe { current_thread_mut() } {
+        Some(t) => {
+            t.set_cpu_mask(low);
+            0
+        }
+        None => -3, // ESRCH
+    }
+}

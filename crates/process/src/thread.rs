@@ -185,6 +185,14 @@ pub struct Thread {
     /// Reserved for a future user/system split; currently always `0`
     /// (see [`utime_ticks`](Self::utime_ticks)).
     stime_ticks: u64,
+    /// CPU affinity mask (`sched_setaffinity(2)`).
+    ///
+    /// Bit `n` set means the thread may run on CPU `n`. ONCRIX is
+    /// single-CPU, so the only valid runnable CPU is `0`; the mask is
+    /// initialised to `1` (CPU 0 only) and any `setaffinity` mask must
+    /// keep bit 0 set. Stored for fidelity / future SMP — it does not
+    /// change placement on a single CPU.
+    cpu_mask: u64,
     /// Stack pointer (legacy field, still used by the kthread path).
     stack_pointer: u64,
     /// Thread-local storage base address (FS base on x86_64).
@@ -291,6 +299,7 @@ impl Thread {
             sched_credit: 0,
             utime_ticks: 0,
             stime_ticks: 0,
+            cpu_mask: 1,
             stack_pointer: 0,
             tls_base: 0,
             cpu_context: CpuContext::empty(),
@@ -391,6 +400,20 @@ impl Thread {
     /// the counter.
     pub fn charge_tick(&mut self) {
         self.utime_ticks = self.utime_ticks.saturating_add(1);
+    }
+
+    /// Return the CPU affinity mask (`sched_getaffinity(2)`).
+    pub const fn cpu_mask(&self) -> u64 {
+        self.cpu_mask
+    }
+
+    /// Set the CPU affinity mask (`sched_setaffinity(2)`).
+    ///
+    /// The caller is responsible for validating that the mask includes a
+    /// runnable CPU (bit 0 on this single-CPU build); this setter stores
+    /// the value verbatim.
+    pub fn set_cpu_mask(&mut self, mask: u64) {
+        self.cpu_mask = mask;
     }
 
     /// Return the accumulated scheduling credit (priority-aware picker).

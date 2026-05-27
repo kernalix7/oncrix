@@ -543,14 +543,21 @@ unsafe fn poll_now_ticks() -> u64 {
 /// # Safety
 ///
 /// Must be called from the SYSCALL dispatch path.
-unsafe fn poll_one(fd: usize, events: i16) -> i16 {
+/// Compute `(readable, writable, hup)` readiness for an open `fd`.
+///
+/// Shared by `poll(2)` and `select(2)`. Returns `None` if `fd` is not open.
+/// Pipes consult [`crate::pipe::pipe_poll`]; the console reports `POLLIN`
+/// when input is buffered and is always writable; regular files, `/dev`,
+/// `/proc`, and sockets always poll ready for both directions (POSIX:
+/// regular files always poll TRUE).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn fd_readiness(fd: usize) -> Option<(bool, bool, bool)> {
     // SAFETY: single-CPU SYSCALL context.
-    let handle = match unsafe { fd_get(fd) } {
-        Some(h) => h,
-        None => return POLLNVAL,
-    };
-
-    let (readable, writable, hup) = match handle.backend {
+    let handle = unsafe { fd_get(fd) }?;
+    let ready = match handle.backend {
         FileBackend::Pipe { ring_id, .. } => {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { crate::pipe::pipe_poll(ring_id) }
@@ -560,12 +567,19 @@ unsafe fn poll_one(fd: usize, events: i16) -> i16 {
             let readable = unsafe { crate::console::console_has_byte() };
             (readable, true, false)
         }
-        // Regular files, /dev/{null,zero}, and /proc always poll ready for
-        // both reading and writing and never hang up.
         FileBackend::RamfsFile { .. }
         | FileBackend::DevFile { .. }
         | FileBackend::ProcFile { .. }
         | FileBackend::Socket { .. } => (true, true, false),
+    };
+    Some(ready)
+}
+
+unsafe fn poll_one(fd: usize, events: i16) -> i16 {
+    // SAFETY: single-CPU SYSCALL context.
+    let (readable, writable, hup) = match unsafe { fd_readiness(fd) } {
+        Some(r) => r,
+        None => return POLLNVAL,
     };
 
     let mut revents = 0i16;
@@ -684,6 +698,197 @@ pub unsafe fn sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> i64 {
 
         // Nothing ready yet and we may still block: yield and rescan.
         // SAFETY: SYSCALL context; cooperative yield (same model as nanosleep).
+        unsafe {
+            let _ = crate::current::yield_now();
+        }
+    }
+}
+
+// ── select ────────────────────────────────────────────────────────
+
+/// `fd_set` size in bits — the classic 1024-descriptor limit.
+const FD_SETSIZE: usize = 1024;
+/// `fd_set` size in `u64` words (`1024 / 64`).
+const FD_SET_WORDS: usize = FD_SETSIZE / 64;
+
+/// Read an `fd_set` bitmap (`[u64; FD_SET_WORDS]`) from user space, or
+/// return an all-zero set if `ptr` is null.
+///
+/// # Safety
+///
+/// `ptr`, when non-null, must address a readable `fd_set` (128 bytes).
+unsafe fn fdset_read(ptr: u64, out: &mut [u64; FD_SET_WORDS]) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: caller guarantees `ptr` addresses a 128-byte fd_set.
+    unsafe {
+        let words = ptr as *const u64;
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = words.add(i).read_volatile();
+        }
+    }
+}
+
+/// Write an `fd_set` bitmap back to user space; no-op if `ptr` is null.
+///
+/// # Safety
+///
+/// `ptr`, when non-null, must address a writable `fd_set` (128 bytes).
+unsafe fn fdset_write(ptr: u64, src: &[u64; FD_SET_WORDS]) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: caller guarantees `ptr` addresses a 128-byte fd_set.
+    unsafe {
+        let words = ptr as *mut u64;
+        for (i, &w) in src.iter().enumerate() {
+            words.add(i).write_volatile(w);
+        }
+    }
+}
+
+/// Test bit `fd` in an `fd_set` bitmap.
+fn fdset_test(set: &[u64; FD_SET_WORDS], fd: usize) -> bool {
+    (set[fd / 64] >> (fd % 64)) & 1 != 0
+}
+
+/// Set bit `fd` in an `fd_set` bitmap.
+fn fdset_set(set: &mut [u64; FD_SET_WORDS], fd: usize) {
+    set[fd / 64] |= 1u64 << (fd % 64);
+}
+
+/// Kernel handler for `SYS_SELECT` (Linux number 23).
+///
+/// POSIX.1-2024 `select(2)`: examines descriptors `0..nfds` in the three
+/// `fd_set` bitmaps and reports which are ready for reading, writing, or
+/// have an exceptional condition. Each `fd_set` is a 1024-bit bitmap
+/// (`[u64; 16]`, 128 bytes). A null set pointer means "not interested".
+///
+/// `timeout_ptr` points to a `struct timeval { tv_sec: i64, tv_usec: i64 }`:
+/// null blocks indefinitely; a zero-valued timeval performs a single
+/// non-blocking scan; a positive value bounds the wait. Blocking uses
+/// cooperative `yield_now` polling (same model as `poll`).
+///
+/// On return the three bitmaps are rewritten in place to contain only the
+/// ready descriptors. Readiness reuses [`fd_readiness`]: a pipe writer
+/// hangup counts as read-ready (read returns EOF); the exceptfds set is
+/// only marked for a not-open fd is impossible here (those are simply not
+/// reported), so no exceptional conditions are currently raised.
+///
+/// Returns the total number of ready descriptors across all sets, `0` on
+/// timeout, or a negative errno: `-EINVAL` (22) if `nfds` is negative or
+/// exceeds [`FD_SETSIZE`], `-EFAULT` (14) for a bad pointer.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// effectively disabled). The set and timeout pointers, when non-null, must
+/// address writable user memory of the documented sizes.
+pub unsafe fn sys_select(
+    nfds: i64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ptr: u64,
+) -> i64 {
+    if nfds < 0 || nfds as usize > FD_SETSIZE {
+        return -22; // EINVAL
+    }
+    let nfds = nfds as usize;
+
+    // Reject non-null but non-canonical user pointers.
+    for &p in &[readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ptr] {
+        if p != 0 && p >= 0xFFFF_8000_0000_0000 {
+            return -14; // EFAULT
+        }
+    }
+
+    // Snapshot the input sets once (POSIX: only ready bits remain on output).
+    let mut in_read = [0u64; FD_SET_WORDS];
+    let mut in_write = [0u64; FD_SET_WORDS];
+    let mut in_except = [0u64; FD_SET_WORDS];
+    // SAFETY: pointers validated user-canonical above.
+    unsafe {
+        fdset_read(readfds_ptr, &mut in_read);
+        fdset_read(writefds_ptr, &mut in_write);
+        fdset_read(exceptfds_ptr, &mut in_except);
+    }
+
+    // Resolve the timeout: None = block forever; Some(ticks) = a deadline
+    // (0 ticks => non-blocking single scan).
+    let timeout_ticks: Option<u64> = if timeout_ptr == 0 {
+        None
+    } else {
+        // SAFETY: pointer validated user-canonical above; reads two i64.
+        let (secs, usecs) = unsafe {
+            let p = timeout_ptr as *const i64;
+            (p.read_volatile(), p.add(1).read_volatile())
+        };
+        if secs < 0 || usecs < 0 {
+            return -22; // EINVAL
+        }
+        let total_us = (secs as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add(usecs as u64);
+        Some(total_us.saturating_mul(POLL_TIMER_HZ) / 1_000_000)
+    };
+
+    let nonblocking = matches!(timeout_ticks, Some(0));
+    let deadline = match timeout_ticks {
+        Some(t) if t > 0 => {
+            // SAFETY: single-CPU SYSCALL context.
+            Some(unsafe { poll_now_ticks() }.saturating_add(t))
+        }
+        _ => None,
+    };
+
+    loop {
+        let mut out_read = [0u64; FD_SET_WORDS];
+        let mut out_write = [0u64; FD_SET_WORDS];
+        let out_except = [0u64; FD_SET_WORDS];
+        let mut ready = 0i64;
+
+        for fd in 0..nfds {
+            let want_read = fdset_test(&in_read, fd);
+            let want_write = fdset_test(&in_write, fd);
+            let want_except = fdset_test(&in_except, fd);
+            if !want_read && !want_write && !want_except {
+                continue;
+            }
+            // SAFETY: single-CPU SYSCALL context.
+            let (readable, writable, hup) = match unsafe { fd_readiness(fd) } {
+                Some(r) => r,
+                None => continue, // not open: not reported ready
+            };
+            if want_read && (readable || hup) {
+                fdset_set(&mut out_read, fd);
+                ready += 1;
+            }
+            if want_write && writable {
+                fdset_set(&mut out_write, fd);
+                ready += 1;
+            }
+            // No exceptional conditions are currently raised for any backend.
+        }
+
+        let expired = match deadline {
+            // SAFETY: single-CPU SYSCALL context.
+            Some(d) => (unsafe { poll_now_ticks() }) >= d,
+            None => false,
+        };
+
+        if ready > 0 || nonblocking || expired {
+            // SAFETY: pointers validated user-canonical above.
+            unsafe {
+                fdset_write(readfds_ptr, &out_read);
+                fdset_write(writefds_ptr, &out_write);
+                fdset_write(exceptfds_ptr, &out_except);
+            }
+            return ready;
+        }
+
+        // SAFETY: SYSCALL context; cooperative yield (same model as poll).
         unsafe {
             let _ = crate::current::yield_now();
         }

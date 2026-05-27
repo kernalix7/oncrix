@@ -251,6 +251,10 @@ pub const SYS_SCHED_GETPARAM: SyscallNumber = 143;
 pub const SYS_SCHED_SETSCHEDULER: SyscallNumber = 144;
 /// `sched_getscheduler(pid)` — Get scheduling policy.
 pub const SYS_SCHED_GETSCHEDULER: SyscallNumber = 145;
+/// `sched_setaffinity(pid, cpusetsize, mask)` — Set CPU affinity mask.
+pub const SYS_SCHED_SETAFFINITY: SyscallNumber = 203;
+/// `sched_getaffinity(pid, cpusetsize, mask)` — Get CPU affinity mask.
+pub const SYS_SCHED_GETAFFINITY: SyscallNumber = 204;
 
 // ── Time ──────────────────────────────────────────────────────
 

@@ -86,8 +86,11 @@ const SYS_SCHED_GETPARAM: u64 = 143;
 const SYS_SCHED_SETSCHEDULER: u64 = 144;
 const SYS_SCHED_GETSCHEDULER: u64 = 145;
 const SYS_POLL: u64 = 7;
+const SYS_SELECT: u64 = 23;
 const SYS_TIMES: u64 = 100;
 const SYS_GETRUSAGE: u64 = 98;
+const SYS_SCHED_SETAFFINITY: u64 = 203;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -583,6 +586,39 @@ pub unsafe fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: i32) -> i64 {
     unsafe { syscall3(SYS_POLL, fds as u64, nfds, timeout_ms as i64 as u64) }
 }
 
+/// `select(2)` — synchronous I/O multiplexing.
+///
+/// Each of `readfds`/`writefds`/`exceptfds` (may be NULL) is a `fd_set`
+/// bitmap of up to `FD_SETSIZE` bits; the kernel rewrites them in place to
+/// the ready set. `timeout` (may be NULL = block forever) is a `timeval`.
+/// Returns the number of ready descriptors, 0 on timeout, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Any non-null `fd_set`/`timeval` pointer must reference valid storage.
+pub unsafe fn select(
+    nfds: i32,
+    readfds: *mut u8,
+    writefds: *mut u8,
+    exceptfds: *mut u8,
+    timeout: *mut u8,
+) -> i64 {
+    // SAFETY: caller guarantees pointer validity. select takes 5 args; the
+    // 6th register is unused (passed 0).
+    unsafe {
+        syscall6(
+            SYS_SELECT,
+            nfds as u64,
+            readfds as u64,
+            writefds as u64,
+            exceptfds as u64,
+            timeout as u64,
+            0,
+        )
+    }
+}
+
 /// `times(2)` — process times. `buf` is a `struct tms` (4 × `i64`:
 /// utime, stime, cutime, cstime). Returns elapsed ticks since boot, or a
 /// negative errno value.
@@ -605,6 +641,34 @@ pub unsafe fn times(buf: *mut u8) -> i64 {
 pub unsafe fn getrusage(who: i32, usage: *mut u8) -> i64 {
     // SAFETY: caller guarantees `usage` validity.
     unsafe { syscall2(SYS_GETRUSAGE, who as u64, usage as u64) }
+}
+
+/// `sched_getaffinity(2)` — read the CPU affinity mask into `mask`.
+///
+/// `pid` of 0 targets the calling thread. On this single-CPU system the
+/// returned mask always has bit 0 set. Returns `cpusetsize` on success, or
+/// a negative errno value.
+///
+/// # Safety
+///
+/// `mask` must point to `cpusetsize` writable bytes.
+pub unsafe fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `mask`/`cpusetsize` validity.
+    unsafe { syscall3(SYS_SCHED_GETAFFINITY, pid as u64, cpusetsize as u64, mask as u64) }
+}
+
+/// `sched_setaffinity(2)` — set the CPU affinity mask from `mask`.
+///
+/// `pid` of 0 targets the calling thread. The mask must include CPU 0 (the
+/// only CPU) or `-EINVAL` is returned. Returns 0 on success, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// `mask` must point to `cpusetsize` readable bytes.
+pub unsafe fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i64 {
+    // SAFETY: caller guarantees `mask`/`cpusetsize` validity.
+    unsafe { syscall3(SYS_SCHED_SETAFFINITY, pid as u64, cpusetsize as u64, mask as u64) }
 }
 
 /// `access(2)` — check file accessibility.
