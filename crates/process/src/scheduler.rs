@@ -32,11 +32,17 @@
 
 use crate::context::CpuContext;
 use crate::pid::Tid;
-use crate::thread::{Thread, ThreadState};
+use crate::thread::{SchedPolicy, Thread, ThreadState};
 use oncrix_lib::{Error, Result};
 
 /// Maximum number of threads the scheduler can manage.
 const MAX_THREADS: usize = 256;
+
+/// Returns `true` for the real-time policies (`SCHED_FIFO`/`SCHED_RR`),
+/// which are scheduled in a strictly higher tier than `SCHED_OTHER`.
+const fn is_realtime(policy: SchedPolicy) -> bool {
+    matches!(policy, SchedPolicy::Fifo | SchedPolicy::RoundRobin)
+}
 
 /// Information needed by the architecture-specific context switch.
 ///
@@ -93,46 +99,83 @@ impl RoundRobinScheduler {
         }
     }
 
-    /// Select the next Ready slot using priority credit + aging.
+    /// Select the next Ready slot, honouring scheduling policy.
     ///
-    /// Scans the ring starting at `start` (wrapping), and over the
-    /// candidates it considers (every slot except `exclude`):
+    /// Scans the ring starting at `start` (wrapping) over every slot
+    /// except `exclude`, and chooses by a two-tier rule:
     ///
-    /// 1. Grants each *Ready* candidate credit equal to its priority
-    ///    [`weight`](crate::thread::Priority::weight) for this pass.
-    /// 2. Tracks the Ready candidate with the highest resulting credit;
-    ///    ties keep the earliest-scanned slot (round-robin tie-break).
+    /// **Tier 1 — real-time (`SCHED_FIFO` / `SCHED_RR`) outranks
+    /// `SCHED_OTHER`.** Any Ready real-time thread is preferred over any
+    /// Ready `SCHED_OTHER` thread, regardless of credit. This matches
+    /// POSIX real-time semantics: an RT thread may legitimately starve
+    /// time-sharing threads while it is runnable.
     ///
-    /// Returns the chosen slot index, or `None` if no candidate is
-    /// Ready. The caller is responsible for the state transition and for
-    /// calling [`Thread::reset_sched_credit`] on the winner. Aging is
-    /// applied to *all* Ready candidates (including the winner) so the
-    /// winner's pre-reset credit reflects this pass; the reset then
-    /// clears it.
+    /// Within the real-time tier the thread with the highest *static*
+    /// priority wins (lowest raw [`Priority`] level). Equal-priority RT
+    /// threads break ties by policy:
     ///
+    /// * `SCHED_FIFO` — the earliest-scanned slot wins and is **not**
+    ///   rotated; with a fixed scan order this keeps the same FIFO thread
+    ///   selected pass after pass until it blocks or yields (no rotation
+    ///   among equal-priority FIFO peers).
+    /// * `SCHED_RR` — equal-priority RR threads round-robin: callers
+    ///   advance `start` past the previous winner each pass (the existing
+    ///   cursor behaviour), so a different RR peer is reached first.
+    ///
+    /// **Tier 2 — `SCHED_OTHER`.** Used only when no RT thread is Ready.
+    /// Selection is the original weighted-credit + aging scheme: each
+    /// Ready `OTHER` candidate earns credit equal to its priority
+    /// [`weight`](crate::thread::Priority::weight); the highest-credit one
+    /// wins (ties keep the earliest scanned slot). Because every weight is
+    /// `>= 1`, no `OTHER` thread starves relative to its peers.
+    ///
+    /// Credit is only aged for `SCHED_OTHER` candidates (RT threads do not
+    /// use the credit axis). The caller resets the winner's credit.
+    ///
+    /// Returns the chosen slot index, or `None` if no candidate is Ready.
     /// `O(MAX_THREADS)` — same scan cost as the original picker.
     fn select_ready(&mut self, start: usize, exclude: Option<usize>) -> Option<usize> {
-        let mut best: Option<usize> = None;
-        let mut best_credit: u32 = 0;
+        // Tier 1: pick the best Ready real-time thread, if any.
+        let mut rt_best: Option<usize> = None;
+        let mut rt_best_level: u8 = u8::MAX;
+        // Tier 2: pick the best Ready SCHED_OTHER thread by credit.
+        let mut other_best: Option<usize> = None;
+        let mut other_best_credit: u32 = 0;
+
         for offset in 0..MAX_THREADS {
             let idx = (start + offset) % MAX_THREADS;
             if exclude == Some(idx) {
                 continue;
             }
-            if let Some(t) = self.threads[idx].as_mut()
-                && t.state() == ThreadState::Ready
-            {
+            let Some(t) = self.threads[idx].as_mut() else {
+                continue;
+            };
+            if t.state() != ThreadState::Ready {
+                continue;
+            }
+
+            if is_realtime(t.policy()) {
+                // Lower raw level = higher priority. Strictly-less keeps
+                // the earliest scanned slot on equal priority, which is
+                // the FIFO (no-rotation) / RR (cursor-rotated) tie-break.
+                let level = t.priority().as_u8();
+                if rt_best.is_none() || level < rt_best_level {
+                    rt_best = Some(idx);
+                    rt_best_level = level;
+                }
+            } else {
+                // SCHED_OTHER: age credit and track the richest.
                 t.add_sched_credit(t.priority().weight());
                 let credit = t.sched_credit();
-                // Strictly-greater keeps the earliest slot on ties,
-                // which is the round-robin order of the scan.
-                if best.is_none() || credit > best_credit {
-                    best = Some(idx);
-                    best_credit = credit;
+                if other_best.is_none() || credit > other_best_credit {
+                    other_best = Some(idx);
+                    other_best_credit = credit;
                 }
             }
         }
-        best
+
+        // Real-time tier always wins when populated.
+        rt_best.or(other_best)
     }
 
     /// Add a thread to the scheduler.
@@ -203,9 +246,18 @@ impl RoundRobinScheduler {
         if let Some(ref mut t) = self.threads[idx] {
             t.set_state(ThreadState::Running);
             t.reset_sched_credit();
+            let is_fifo = t.policy() == SchedPolicy::Fifo;
+            let tid = t.tid();
             self.current = Some(idx);
-            self.cursor = (idx + 1) % MAX_THREADS;
-            return Some(t.tid());
+            // FIFO does not rotate: leave the cursor on the winner so the
+            // next pick re-reaches it first (it keeps running until it
+            // blocks or yields). RR / OTHER advance past it for fairness.
+            self.cursor = if is_fifo {
+                idx
+            } else {
+                (idx + 1) % MAX_THREADS
+            };
+            return Some(tid);
         }
         None
     }
@@ -278,6 +330,20 @@ impl RoundRobinScheduler {
     /// besides the current one.
     pub fn prepare_switch(&mut self) -> Option<SwitchTargets> {
         let prev_idx = self.current?;
+        // Snapshot prev's policy + priority before we touch state: a
+        // running SCHED_FIFO thread must NOT be preempted by an equal-
+        // or-lower priority peer (POSIX: no timeslice rotation among
+        // equals). Only a strictly higher-priority real-time thread may
+        // displace it. SCHED_RR and SCHED_OTHER are freely preemptible.
+        let prev_is_fifo = self.threads[prev_idx]
+            .as_ref()
+            .map(|t| t.policy() == SchedPolicy::Fifo)
+            .unwrap_or(false);
+        let prev_level = self.threads[prev_idx]
+            .as_ref()
+            .map(|t| t.priority().as_u8())
+            .unwrap_or(u8::MAX);
+
         // Move prev: Running -> Ready (if still Running) BEFORE selecting,
         // so the outgoing thread is a candidate for re-selection and its
         // priority credit is aged alongside its peers.
@@ -304,6 +370,22 @@ impl RoundRobinScheduler {
             }
         };
 
+        // FIFO non-preemption guard: if prev is a Ready FIFO thread and
+        // the candidate is not strictly higher priority (lower raw level),
+        // keep prev running — do not rotate it out on a timer tick.
+        if prev_is_fifo {
+            let next_rt_higher = self.threads[next_idx]
+                .as_ref()
+                .map(|t| is_realtime(t.policy()) && t.priority().as_u8() < prev_level)
+                .unwrap_or(false);
+            if !next_rt_higher {
+                if let Some(prev) = self.threads[prev_idx].as_mut() {
+                    prev.set_state(ThreadState::Running);
+                }
+                return None;
+            }
+        }
+
         // Move next: Ready -> Running and reset its earned credit.
         if let Some(next) = self.threads[next_idx].as_mut() {
             next.set_state(ThreadState::Running);
@@ -326,9 +408,18 @@ impl RoundRobinScheduler {
             .map(|t| t.kernel_stack_top())
             .unwrap_or(0);
         let next_tid = self.threads[next_idx].as_ref().map(|t| t.tid());
+        let next_is_fifo = self.threads[next_idx]
+            .as_ref()
+            .map(|t| t.policy() == SchedPolicy::Fifo)
+            .unwrap_or(false);
 
         self.current = Some(next_idx);
-        self.cursor = (next_idx + 1) % MAX_THREADS;
+        // FIFO does not rotate; RR/OTHER advance past the winner.
+        self.cursor = if next_is_fifo {
+            next_idx
+        } else {
+            (next_idx + 1) % MAX_THREADS
+        };
 
         Some(SwitchTargets {
             prev_ctx,
