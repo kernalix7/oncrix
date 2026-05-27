@@ -14,6 +14,7 @@
 //! - `time(3p)` — `functions/time.html`
 //! - `clock_gettime(3p)` — `functions/clock_gettime.html`
 //! - `nanosleep(3p)` — `functions/nanosleep.html`
+//! - `clock_nanosleep(3p)` — `functions/clock_nanosleep.html`
 
 use oncrix_hal::timer::Timer;
 
@@ -177,6 +178,137 @@ pub unsafe fn sys_nanosleep(req_ptr: u64, rem_ptr: u64) -> i64 {
         // SAFETY: pointer validated above.
         unsafe {
             let p = rem_ptr as *mut i64;
+            p.write_volatile(0);
+            p.add(1).write_volatile(0);
+        }
+    }
+    0
+}
+
+/// `TIMER_ABSTIME` flag for `clock_nanosleep(2)`: interpret the request
+/// as an absolute deadline on the chosen clock rather than a relative
+/// duration.
+const TIMER_ABSTIME: i32 = 1;
+
+/// Convert a `(secs, nsec)` timespec to an absolute PIT-tick deadline,
+/// rounding the nanosecond fraction up so a sub-tick request still waits
+/// at least one full tick.
+fn timespec_to_ticks(secs: i64, nsec: i64) -> u64 {
+    let whole = (secs as u64).saturating_mul(TIMER_HZ);
+    let frac = (nsec as u64 * TIMER_HZ).div_ceil(1_000_000_000);
+    whole.saturating_add(frac)
+}
+
+/// Busy-idle until the global PIT tick counter reaches `deadline`.
+///
+/// Returns immediately if the deadline is already in the past. Uses the
+/// `sti; hlt; cli` idle pattern so the timer IRQ can advance the tick
+/// counter while the syscall is otherwise running with `IF=0`.
+///
+/// # Safety
+///
+/// Must run on the SYSCALL dispatch path with no live borrows of any
+/// single-CPU-protected data — identical contract to [`sys_nanosleep`]'s
+/// inner loop, from which this is factored out.
+unsafe fn sleep_until_ticks(deadline: u64) {
+    // SAFETY: see module-level note; current_ticks reads PIT only.
+    while unsafe { current_ticks() } < deadline {
+        // SAFETY: see [`sys_nanosleep`] — brief interrupt window around
+        // `hlt` lets the 100 Hz timer advance the counter, then `cli`
+        // restores the syscall's IF=0 contract before the next read.
+        unsafe {
+            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+        }
+    }
+}
+
+/// `clock_nanosleep(clockid, flags, request, remain)` — high-resolution
+/// sleep against a specified clock, relative or absolute.
+///
+/// Supported clocks: `CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1) —
+/// both back onto the same since-boot PIT counter (no RTC). `flags` may
+/// be `0` (relative, like `nanosleep`) or `TIMER_ABSTIME` (1, sleep
+/// until the absolute clock value `*request`).
+///
+/// Relative mode sleeps for the `*request` duration; on normal
+/// completion `*remain` (if non-null) is written `(0, 0)` since there is
+/// no signal-interrupt path yet. In absolute mode `remain` is ignored
+/// (POSIX: it is unused for `TIMER_ABSTIME`); an already-past deadline
+/// returns `0` immediately.
+///
+/// Returns `0` on completion, `-22` (`EINVAL`) for a bad clock, unknown
+/// flag bits, or an out-of-range `tv_nsec`, `-14` (`EFAULT`) for a bad
+/// `request`/`remain` pointer.
+///
+/// # Safety
+///
+/// Same single-CPU SYSCALL invariant as the rest of this module; the
+/// pointers are validated user-canonical before any dereference.
+pub unsafe fn sys_clock_nanosleep(clockid: u32, flags: i32, request: u64, remain: u64) -> i64 {
+    // CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1; reject anything else.
+    if clockid > 1 {
+        return -22; // EINVAL
+    }
+    // Only TIMER_ABSTIME (or none) is defined.
+    if flags & !TIMER_ABSTIME != 0 {
+        return -22; // EINVAL
+    }
+    let absolute = flags & TIMER_ABSTIME != 0;
+
+    if request == 0 || request >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // `remain` is only consulted in relative mode, but validate it
+    // unconditionally when non-null so a bogus pointer is caught early.
+    if remain != 0 && remain >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // SAFETY: request validated user-canonical above.
+    let (secs, nsec) = unsafe {
+        let p = request as *const i64;
+        (p.read_volatile(), p.add(1).read_volatile())
+    };
+    if secs < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return -22; // EINVAL
+    }
+
+    let want_ticks = timespec_to_ticks(secs, nsec);
+
+    if absolute {
+        // Absolute: the request IS the deadline (in since-boot ticks).
+        // SAFETY: see module-level note.
+        let now = unsafe { current_ticks() };
+        if want_ticks > now {
+            // SAFETY: SYSCALL path, no live borrows — see helper docs.
+            unsafe { sleep_until_ticks(want_ticks) };
+        }
+        // remain is unused for TIMER_ABSTIME (POSIX); do not write it.
+        return 0;
+    }
+
+    // Relative: sleep `want_ticks` from now.
+    if want_ticks == 0 {
+        if remain != 0 {
+            // SAFETY: remain validated above.
+            unsafe {
+                let p = remain as *mut i64;
+                p.write_volatile(0);
+                p.add(1).write_volatile(0);
+            }
+        }
+        return 0;
+    }
+    // SAFETY: see module-level note.
+    let deadline = unsafe { current_ticks() }.saturating_add(want_ticks);
+    // SAFETY: SYSCALL path, no live borrows — see helper docs.
+    unsafe { sleep_until_ticks(deadline) };
+
+    if remain != 0 {
+        // SAFETY: remain validated above; full sleep completed so the
+        // remaining time is zero (no early signal return path yet).
+        unsafe {
+            let p = remain as *mut i64;
             p.write_volatile(0);
             p.add(1).write_volatile(0);
         }

@@ -912,6 +912,20 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fd_table::sys_poll(args.arg0, args.arg1, args.arg2 as i64) }
         }
 
+        // SYS_CLOCK_NANOSLEEP (230): sleep against a clock, relative or
+        // TIMER_ABSTIME. POSIX.1-2024 clock_nanosleep(3p).
+        oncrix_syscall::number::SYS_CLOCK_NANOSLEEP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::time_syscalls::sys_clock_nanosleep(
+                    args.arg0 as u32,
+                    args.arg1 as i32,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+
         // SYS_SELECT (23): synchronous I/O multiplexing over fd_set bitmaps.
         oncrix_syscall::number::SYS_SELECT => {
             // SAFETY: Single-CPU SYSCALL dispatch path.

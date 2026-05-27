@@ -262,6 +262,9 @@ pub const SYS_SCHED_GETAFFINITY: SyscallNumber = 204;
 pub const SYS_NANOSLEEP: SyscallNumber = 35;
 /// `clock_gettime(clk_id, tp)` — Get clock time.
 pub const SYS_CLOCK_GETTIME: SyscallNumber = 228;
+/// `clock_nanosleep(clk_id, flags, request, remain)` — High-resolution
+/// sleep against a specific clock (relative or `TIMER_ABSTIME`).
+pub const SYS_CLOCK_NANOSLEEP: SyscallNumber = 230;
 /// `time(tloc)` — Seconds since the Epoch (or boot, on systems without RTC).
 pub const SYS_TIME: SyscallNumber = 201;
 

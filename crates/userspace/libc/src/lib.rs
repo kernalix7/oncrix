@@ -75,6 +75,7 @@ const SYS_GETDENTS64: u64 = 217;
 const SYS_PIPE2: u64 = 293;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_CLOCK_GETTIME: u64 = 228;
+const SYS_CLOCK_NANOSLEEP: u64 = 230;
 const SYS_TIME: u64 = 201;
 const SYS_GETPRIORITY: u64 = 140;
 const SYS_SETPRIORITY: u64 = 141;
@@ -669,6 +670,30 @@ pub unsafe fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i
 pub unsafe fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i64 {
     // SAFETY: caller guarantees `mask`/`cpusetsize` validity.
     unsafe { syscall3(SYS_SCHED_SETAFFINITY, pid as u64, cpusetsize as u64, mask as u64) }
+}
+
+/// `clock_nanosleep(2)` — high-resolution sleep against a clock.
+///
+/// `clockid` is `CLOCK_REALTIME`(0)/`CLOCK_MONOTONIC`(1); `flags` is 0
+/// (relative) or `TIMER_ABSTIME`(1). `request`/`remain` are `timespec`
+/// (`[i64;2]` = tv_sec, tv_nsec); `remain` may be NULL. Returns 0, or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// `request` must point to a valid `timespec`; `remain`, if non-null, must
+/// be writable.
+pub unsafe fn clock_nanosleep(clockid: i32, flags: i32, request: *const u8, remain: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_CLOCK_NANOSLEEP,
+            clockid as u64,
+            flags as u64,
+            request as u64,
+            remain as u64,
+        )
+    }
 }
 
 /// `access(2)` — check file accessibility.
