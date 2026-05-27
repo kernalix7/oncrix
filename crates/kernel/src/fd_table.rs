@@ -230,16 +230,33 @@ pub unsafe fn install_stdio() {
 /// pipe end refcount is bumped so that `read`/`write` see the correct
 /// EOF / `EPIPE` semantics and the ring frees when both ends close.
 ///
+/// # POSIX.1-2024 `open(2)` FIFO blocking semantics
+///
+/// Without `O_NONBLOCK`:
+/// - `O_RDONLY` blocks until a writer opens the same FIFO.
+/// - `O_WRONLY` blocks until a reader opens the same FIFO.
+///
+/// With `O_NONBLOCK`:
+/// - `O_RDONLY` returns immediately (success even with no writer).
+/// - `O_WRONLY` returns `-ENXIO` (6) if no reader is currently open.
+///
+/// `O_RDWR` on a FIFO is a Linux extension that never blocks; it is treated
+/// here as a read-end open.
+///
 /// Returns the assigned fd on success, or a negative errno:
 /// `-ENFILE` (23) if no pipe slot is free, `-EMFILE` (24) if the fd table
-/// is full, `-EINVAL` (22) if `ino` is not a FIFO, `-EIO` (5) if the VFS
-/// is uninitialised.
+/// is full, `-ENXIO` (6) for non-blocking `O_WRONLY` with no reader,
+/// `-EINVAL` (22) if `ino` is not a FIFO, `-EIO` (5) if the VFS is
+/// uninitialised.
 ///
 /// # Safety
 ///
 /// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
 /// effectively disabled).
 pub unsafe fn open_fifo(ino: oncrix_vfs::inode::InodeNumber, flags: u32) -> i64 {
+    /// `O_NONBLOCK` flag bit (octal 04000), matching `oncrix_vfs::file_ops`.
+    const O_NONBLOCK: u32 = 0o4000;
+
     // Resolve the FIFO's backing ring, allocating one on first open.
     let ring_id = crate::state::with_global_mut(|s| match s.vfs.fifo_ring_id(ino) {
         Ok(Some(id)) => Ok(id),
@@ -265,10 +282,35 @@ pub unsafe fn open_fifo(ino: oncrix_vfs::inode::InodeNumber, flags: u32) -> i64 
 
     // O_WRONLY (bit 0 set, bit 1 clear) → write end; otherwise read end.
     let is_write_end = (flags & 0b11) == 1;
+    let nonblock = (flags & O_NONBLOCK) != 0;
+
+    // Non-blocking O_WRONLY with no reader currently attached → ENXIO,
+    // before we bump any refcount.
+    if is_write_end && nonblock {
+        // SAFETY: single-CPU SYSCALL context.
+        if unsafe { crate::pipe::pipe_peer_refs(ring_id, true) } == 0 {
+            return -6; // ENXIO
+        }
+    }
 
     // SAFETY: single-CPU SYSCALL context; pipe table exclusively owned here.
     if !unsafe { crate::pipe::pipe_open_end(ring_id, is_write_end) } {
         return -5; // EIO — slot vanished (should not happen)
+    }
+
+    // Blocking open: wait until the peer end attaches. O_RDWR and any
+    // O_NONBLOCK open skip the wait (peer presence not required to proceed).
+    if !nonblock && (flags & 0b11) != 2 {
+        loop {
+            // SAFETY: single-CPU SYSCALL context.
+            if unsafe { crate::pipe::pipe_peer_refs(ring_id, is_write_end) } > 0 {
+                break;
+            }
+            // SAFETY: SYSCALL context; cooperative yield (same model as nanosleep).
+            unsafe {
+                let _ = crate::current::yield_now();
+            }
+        }
     }
 
     let handle = FileHandle {

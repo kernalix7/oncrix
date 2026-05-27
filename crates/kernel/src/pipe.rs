@@ -269,6 +269,33 @@ pub unsafe fn pipe_open_end(ring_id: u32, is_write_end: bool) -> bool {
     false
 }
 
+/// Return the reference count of the **peer** end of FIFO ring `ring_id`.
+///
+/// For a caller opening the write end (`opening_write_end == true`) this is
+/// the read-end refcount, and vice versa. Used by blocking FIFO `open(2)`
+/// to wait until a peer has attached. Returns 0 if the slot is out of range
+/// or not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_peer_refs(ring_id: u32, opening_write_end: bool) -> u32 {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get(ring_id as usize)
+            && slot.in_use
+        {
+            return if opening_write_end {
+                slot.read_refs
+            } else {
+                slot.write_refs
+            };
+        }
+    }
+    0
+}
+
 /// Get a shared reference to the pipe ring for `ring_id`.
 ///
 /// Returns `None` if the id is out of range or the slot is not in use.
