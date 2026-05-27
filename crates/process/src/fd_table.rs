@@ -109,6 +109,21 @@ impl HandleFlags {
     /// Append mode: writes always go to EOF.
     pub const APPEND: Self = Self(0o2000);
 
+    /// Non-blocking mode (`O_NONBLOCK`).
+    pub const NONBLOCK: u32 = 0o4000;
+
+    /// File-status flag bits settable via `fcntl(F_SETFL)`.
+    ///
+    /// POSIX restricts `F_SETFL` to the file-status flags; the access mode
+    /// and creation flags in `arg` are ignored. We honour `O_APPEND` and
+    /// `O_NONBLOCK`.
+    pub const SETFL_MASK: u32 = 0o2000 | 0o4000;
+
+    /// `FD_CLOEXEC` descriptor flag, stored in a reserved high bit so it
+    /// never collides with `O_*` open-flag bits. Manipulated only via
+    /// `fcntl(F_GETFD/F_SETFD)`.
+    pub const FD_CLOEXEC_BIT: u32 = 0x8000_0000;
+
     /// Return `true` if writing is allowed (O_WRONLY or O_RDWR).
     pub const fn is_writable(self) -> bool {
         (self.0 & 0b11) != 0
@@ -122,6 +137,22 @@ impl HandleFlags {
     /// Return `true` if O_APPEND is set.
     pub const fn is_append(self) -> bool {
         (self.0 & 0o2000) != 0
+    }
+
+    /// Return `true` if O_NONBLOCK is set.
+    pub const fn is_nonblock(self) -> bool {
+        (self.0 & Self::NONBLOCK) != 0
+    }
+
+    /// Return `true` if the `FD_CLOEXEC` descriptor flag is set.
+    pub const fn is_cloexec(self) -> bool {
+        (self.0 & Self::FD_CLOEXEC_BIT) != 0
+    }
+
+    /// Return the open flags with the reserved `FD_CLOEXEC` bit masked off
+    /// (the value `fcntl(F_GETFL)` should report).
+    pub const fn open_flags(self) -> u32 {
+        self.0 & !Self::FD_CLOEXEC_BIT
     }
 }
 
@@ -211,6 +242,25 @@ impl KernelFdTable {
     /// Allocate the lowest available fd for `handle`.
     pub fn install(&mut self, handle: FileHandle) -> Result<usize> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(handle);
+                return Ok(i);
+            }
+        }
+        Err(Error::OutOfMemory) // EMFILE
+    }
+
+    /// Allocate the lowest available fd `>= min_fd` for `handle`.
+    ///
+    /// Backs `fcntl(F_DUPFD)`, which requires the new descriptor be the
+    /// lowest free one at or above the caller-supplied floor. Returns
+    /// `Err(InvalidArgument)` if `min_fd` is out of range, `OutOfMemory`
+    /// (EMFILE) if no slot at or above `min_fd` is free.
+    pub fn install_from(&mut self, min_fd: usize, handle: FileHandle) -> Result<usize> {
+        if min_fd >= MAX_FDS {
+            return Err(Error::InvalidArgument);
+        }
+        for (i, slot) in self.slots.iter_mut().enumerate().skip(min_fd) {
             if slot.is_none() {
                 *slot = Some(handle);
                 return Ok(i);

@@ -79,6 +79,12 @@ const SYS_TIME: u64 = 201;
 const SYS_GETPRIORITY: u64 = 140;
 const SYS_SETPRIORITY: u64 = 141;
 const SYS_NICE: u64 = 34;
+const SYS_FCNTL: u64 = 72;
+const SYS_SCHED_YIELD: u64 = 24;
+const SYS_SCHED_SETPARAM: u64 = 142;
+const SYS_SCHED_GETPARAM: u64 = 143;
+const SYS_SCHED_SETSCHEDULER: u64 = 144;
+const SYS_SCHED_GETSCHEDULER: u64 = 145;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -466,6 +472,76 @@ pub unsafe fn setpriority(which: i32, who: i32, prio: i32) -> i64 {
 pub unsafe fn nice(inc: i32) -> i64 {
     // SAFETY: scalar-only syscall.
     unsafe { syscall1(SYS_NICE, inc as u64) }
+}
+
+/// `fcntl(2)` — file/descriptor control.
+///
+/// Supports `F_DUPFD`(0)/`F_DUPFD_CLOEXEC`(1030), `F_GETFD`(1)/`F_SETFD`(2)
+/// for `FD_CLOEXEC`, and `F_GETFL`(3)/`F_SETFL`(4) for the file-status flags
+/// (`O_NONBLOCK`/`O_APPEND`). Returns a command-specific value, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_FCNTL, fd as u64, cmd as u64, arg) }
+}
+
+/// `sched_yield(2)` — yield the processor to another runnable thread.
+///
+/// Always returns 0.
+pub fn sched_yield() -> i64 {
+    // SAFETY: no arguments, no memory access.
+    unsafe { syscall1(SYS_SCHED_YIELD, 0) }
+}
+
+/// `sched_setscheduler(2)` — set scheduling policy and parameters.
+///
+/// `pid` of 0 targets the calling thread; `policy` is `SCHED_OTHER`(0) /
+/// `SCHED_FIFO`(1) / `SCHED_RR`(2); `param` points to a `struct sched_param`.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `param` must point to a valid `sched_param` for the call's duration.
+pub unsafe fn sched_setscheduler(pid: i32, policy: i32, param: *const u8) -> i64 {
+    // SAFETY: caller guarantees `param` validity.
+    unsafe { syscall3(SYS_SCHED_SETSCHEDULER, pid as u64, policy as u64, param as u64) }
+}
+
+/// `sched_getscheduler(2)` — return the scheduling policy (`SCHED_*`).
+///
+/// `pid` of 0 targets the calling thread. Returns the policy, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn sched_getscheduler(pid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_SCHED_GETSCHEDULER, pid as u64) }
+}
+
+/// `sched_getparam(2)` — read scheduling parameters into `param`.
+///
+/// # Safety
+///
+/// `param` must point to a writable `sched_param`.
+pub unsafe fn sched_getparam(pid: i32, param: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `param` validity.
+    unsafe { syscall2(SYS_SCHED_GETPARAM, pid as u64, param as u64) }
+}
+
+/// `sched_setparam(2)` — set scheduling parameters from `param`.
+///
+/// # Safety
+///
+/// `param` must point to a valid `sched_param`.
+pub unsafe fn sched_setparam(pid: i32, param: *const u8) -> i64 {
+    // SAFETY: caller guarantees `param` validity.
+    unsafe { syscall2(SYS_SCHED_SETPARAM, pid as u64, param as u64) }
 }
 
 /// `access(2)` — check file accessibility.

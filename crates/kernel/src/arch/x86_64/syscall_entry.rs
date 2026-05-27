@@ -870,6 +870,44 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::sched_syscalls::sys_nice(args.arg0 as i64) }
         }
 
+        // SYS_FCNTL (72): file/descriptor control — F_DUPFD, F_GETFD/SETFD
+        // (FD_CLOEXEC), F_GETFL/SETFL (O_NONBLOCK/O_APPEND). POSIX.1-2024.
+        oncrix_syscall::number::SYS_FCNTL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_fcntl(args.arg0 as usize, args.arg1 as i32, args.arg2)
+            }
+        }
+
+        // SYS_SCHED_* (24/142-145): POSIX.1-2024 scheduling policy/params.
+        // pid is treated as the calling thread (no cross-pid lookup yet).
+        oncrix_syscall::number::SYS_SCHED_YIELD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_yield() }
+        }
+        oncrix_syscall::number::SYS_SCHED_SETSCHEDULER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_setscheduler(
+                    args.arg0 as i64,
+                    args.arg1 as i64,
+                    args.arg2,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_SCHED_GETSCHEDULER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_getscheduler(args.arg0 as i64) }
+        }
+        oncrix_syscall::number::SYS_SCHED_GETPARAM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_getparam(args.arg0 as i64, args.arg1) }
+        }
+        oncrix_syscall::number::SYS_SCHED_SETPARAM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_setparam(args.arg0 as i64, args.arg1) }
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
     };

@@ -23,6 +23,46 @@ pub enum ThreadState {
     Exited,
 }
 
+/// POSIX scheduling policy (`SCHED_*`).
+///
+/// Values match the conventional Linux ABI so the syscall layer can
+/// pass them through unchanged: `SCHED_OTHER = 0`, `SCHED_FIFO = 1`,
+/// `SCHED_RR = 2`. ONCRIX currently records the policy per thread but
+/// its credit/aging picker behaves identically across policies; the
+/// stored value lets a future real-time picker honour `FIFO`/`RR`
+/// without an ABI change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum SchedPolicy {
+    /// Standard time-sharing policy (the default).
+    #[default]
+    Other = 0,
+    /// First-in-first-out real-time policy.
+    Fifo = 1,
+    /// Round-robin real-time policy.
+    RoundRobin = 2,
+}
+
+impl SchedPolicy {
+    /// Convert a raw `SCHED_*` integer to a [`SchedPolicy`].
+    ///
+    /// Returns `None` for unrecognised values so the caller can map it
+    /// to `EINVAL`.
+    pub const fn from_raw(raw: i32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Other),
+            1 => Some(Self::Fifo),
+            2 => Some(Self::RoundRobin),
+            _ => None,
+        }
+    }
+
+    /// Return the raw `SCHED_*` integer for this policy.
+    pub const fn as_raw(self) -> i32 {
+        self as i32
+    }
+}
+
 /// Thread priority level (0 = highest, 255 = lowest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -119,6 +159,10 @@ pub struct Thread {
     state: ThreadState,
     /// Scheduling priority.
     priority: Priority,
+    /// POSIX scheduling policy (`SCHED_*`). Stored per thread; the
+    /// credit/aging picker is policy-agnostic today, so this only
+    /// affects what `sched_getscheduler(2)` reports back.
+    policy: SchedPolicy,
     /// Accumulated scheduling credit for the priority-aware picker.
     ///
     /// Ready threads gain credit equal to their [`Priority::weight`] on
@@ -230,6 +274,7 @@ impl Thread {
             pid,
             state: ThreadState::Ready,
             priority,
+            policy: SchedPolicy::Other,
             sched_credit: 0,
             stack_pointer: 0,
             tls_base: 0,
@@ -299,6 +344,16 @@ impl Thread {
     /// Set the scheduling priority.
     pub fn set_priority(&mut self, priority: Priority) {
         self.priority = priority;
+    }
+
+    /// Return the scheduling policy (`SCHED_*`).
+    pub const fn policy(&self) -> SchedPolicy {
+        self.policy
+    }
+
+    /// Set the scheduling policy (`SCHED_*`).
+    pub fn set_policy(&mut self, policy: SchedPolicy) {
+        self.policy = policy;
     }
 
     /// Return the accumulated scheduling credit (priority-aware picker).

@@ -340,6 +340,166 @@ pub unsafe fn open_fifo(ino: oncrix_vfs::inode::InodeNumber, flags: u32) -> i64 
     }
 }
 
+// ── fcntl ─────────────────────────────────────────────────────────
+
+/// `fcntl(2)` command numbers (Linux/glibc ABI).
+const F_DUPFD: i32 = 0;
+/// Get the file-descriptor flags (`FD_CLOEXEC`).
+const F_GETFD: i32 = 1;
+/// Set the file-descriptor flags (`FD_CLOEXEC`).
+const F_SETFD: i32 = 2;
+/// Get the file-status flags and access mode.
+const F_GETFL: i32 = 3;
+/// Set the file-status flags (`O_APPEND` / `O_NONBLOCK`).
+const F_SETFL: i32 = 4;
+/// Like `F_DUPFD` but set `FD_CLOEXEC` on the new descriptor.
+const F_DUPFD_CLOEXEC: i32 = 1030;
+
+/// `FD_CLOEXEC` flag value as seen by user space (`fcntl.h`).
+const FD_CLOEXEC: i32 = 1;
+
+/// Kernel handler for `SYS_FCNTL` (Linux number 72).
+///
+/// POSIX.1-2024 `fcntl(2)` subset:
+/// - `F_DUPFD` / `F_DUPFD_CLOEXEC` — duplicate `fd` to the lowest free
+///   descriptor `>= arg`. The duplicate shares the open file description
+///   (same backend / offset); `FD_CLOEXEC` is cleared (`F_DUPFD`) or set
+///   (`F_DUPFD_CLOEXEC`) on the new fd.
+/// - `F_GETFD` — return the `FD_CLOEXEC` descriptor flag (0 or 1).
+/// - `F_SETFD` — set/clear `FD_CLOEXEC` from `arg`.
+/// - `F_GETFL` — return the open flags (access mode + status flags).
+/// - `F_SETFL` — set `O_APPEND` / `O_NONBLOCK` from `arg`; access-mode and
+///   creation bits in `arg` are ignored (POSIX).
+///
+/// Returns the command-specific value on success or a negative errno:
+/// `-EBADF` (9) if `fd` is not open, `-EINVAL` (22) for an unsupported
+/// `cmd` or out-of-range `arg`, `-EMFILE` (24) if no descriptor is free.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// effectively disabled).
+pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let handle = unsafe {
+        match fd_get(fd) {
+            Some(h) => h,
+            None => return -9, // EBADF
+        }
+    };
+
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            let min_fd = arg as usize;
+            if min_fd >= MAX_FDS {
+                return -22; // EINVAL
+            }
+
+            // The duplicate references the same backend; bump its refcount.
+            match handle.backend {
+                FileBackend::Pipe {
+                    ring_id,
+                    is_write_end,
+                } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe {
+                        if is_write_end {
+                            crate::pipe::pipe_dup_write(ring_id);
+                        } else {
+                            crate::pipe::pipe_dup_read(ring_id);
+                        }
+                    }
+                }
+                FileBackend::Console
+                | FileBackend::RamfsFile { .. }
+                | FileBackend::Socket { .. }
+                | FileBackend::DevFile { .. }
+                | FileBackend::ProcFile { .. } => {}
+            }
+
+            // The new fd's FD_CLOEXEC is cleared for F_DUPFD, set for
+            // F_DUPFD_CLOEXEC. The shared file-status flags are preserved.
+            let mut dup = handle;
+            let base = dup.flags.0 & !HandleFlags::FD_CLOEXEC_BIT;
+            dup.flags = HandleFlags(if cmd == F_DUPFD_CLOEXEC {
+                base | HandleFlags::FD_CLOEXEC_BIT
+            } else {
+                base
+            });
+
+            // SAFETY: single-CPU SYSCALL context.
+            let installed = unsafe {
+                match crate::current::current_thread_mut() {
+                    Some(t) => t.fd_table.install_from(min_fd, dup),
+                    None => return -9, // EBADF — no current thread
+                }
+            };
+            match installed {
+                Ok(newfd) => newfd as i64,
+                Err(_) => {
+                    // Roll back the backend refcount bump.
+                    if let FileBackend::Pipe {
+                        ring_id,
+                        is_write_end,
+                    } = handle.backend
+                    {
+                        // SAFETY: single-CPU SYSCALL context.
+                        unsafe {
+                            if is_write_end {
+                                crate::pipe::pipe_close_write(ring_id);
+                            } else {
+                                crate::pipe::pipe_close_read(ring_id);
+                            }
+                        }
+                    }
+                    -24 // EMFILE
+                }
+            }
+        }
+        F_GETFD => {
+            if handle.flags.is_cloexec() {
+                FD_CLOEXEC as i64
+            } else {
+                0
+            }
+        }
+        F_SETFD => {
+            let set_cloexec = (arg as i32 & FD_CLOEXEC) != 0;
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe {
+                if let Some(h) = fd_get_mut(fd) {
+                    if set_cloexec {
+                        h.flags.0 |= HandleFlags::FD_CLOEXEC_BIT;
+                    } else {
+                        h.flags.0 &= !HandleFlags::FD_CLOEXEC_BIT;
+                    }
+                    0
+                } else {
+                    -9 // EBADF
+                }
+            }
+        }
+        F_GETFL => handle.flags.open_flags() as i64,
+        F_SETFL => {
+            // Only O_APPEND / O_NONBLOCK are honoured; access mode and
+            // creation flags in `arg` are ignored (POSIX).
+            let new_status = arg as u32 & HandleFlags::SETFL_MASK;
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe {
+                if let Some(h) = fd_get_mut(fd) {
+                    // Preserve access mode, creation flags, and the reserved
+                    // FD_CLOEXEC bit; replace only the settable status flags.
+                    h.flags.0 = (h.flags.0 & !HandleFlags::SETFL_MASK) | new_status;
+                    0
+                } else {
+                    -9 // EBADF
+                }
+            }
+        }
+        _ => -22, // EINVAL — unsupported command
+    }
+}
+
 // ── I/O dispatch ─────────────────────────────────────────────────
 
 /// Write `count` bytes from the user-space buffer `buf_ptr` to fd `fd`.

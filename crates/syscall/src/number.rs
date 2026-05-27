@@ -241,6 +241,16 @@ pub const SYS_GETPRIORITY: SyscallNumber = 140;
 pub const SYS_SETPRIORITY: SyscallNumber = 141;
 /// `nice(inc)` — Add `inc` to the calling thread's nice value.
 pub const SYS_NICE: SyscallNumber = 34;
+/// `sched_yield()` — Yield the processor to another runnable thread.
+pub const SYS_SCHED_YIELD: SyscallNumber = 24;
+/// `sched_setparam(pid, param)` — Set scheduling parameters.
+pub const SYS_SCHED_SETPARAM: SyscallNumber = 142;
+/// `sched_getparam(pid, param)` — Get scheduling parameters.
+pub const SYS_SCHED_GETPARAM: SyscallNumber = 143;
+/// `sched_setscheduler(pid, policy, param)` — Set scheduling policy + params.
+pub const SYS_SCHED_SETSCHEDULER: SyscallNumber = 144;
+/// `sched_getscheduler(pid)` — Get scheduling policy.
+pub const SYS_SCHED_GETSCHEDULER: SyscallNumber = 145;
 
 // ── Time ──────────────────────────────────────────────────────
 
