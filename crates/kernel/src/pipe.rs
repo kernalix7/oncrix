@@ -312,6 +312,35 @@ pub unsafe fn pipe_get(ring_id: u32) -> Option<&'static PipeRing> {
     }
 }
 
+/// Readiness flags for poll(2): `(readable, writable, hup)`.
+///
+/// For a pipe ring `ring_id`, reports whether a read would not block
+/// (`readable` — data buffered, or the write end is closed so a read
+/// returns EOF immediately), whether a write would not block (`writable`
+/// — free space remains AND a reader is still attached), and whether the
+/// pipe has hung up (`hup` — the write end is closed). Returns
+/// `(false, false, true)` if the slot is out of range or not in use, so
+/// callers surface POLLHUP/POLLNVAL rather than spinning.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_poll(ring_id: u32) -> (bool, bool, bool) {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get(ring_id as usize)
+            && slot.in_use
+        {
+            let readable = slot.available() > 0 || !slot.write_open;
+            let writable = slot.read_open && slot.free_space() > 0;
+            let hup = !slot.write_open;
+            return (readable, writable, hup);
+        }
+    }
+    (false, false, true)
+}
+
 /// Get a mutable reference to the pipe ring for `ring_id`.
 ///
 /// Returns `None` if the id is out of range or the slot is not in use.

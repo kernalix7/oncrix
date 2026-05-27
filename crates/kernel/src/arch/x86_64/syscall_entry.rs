@@ -906,6 +906,22 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::sched_syscalls::sys_sched_setparam(args.arg0 as i64, args.arg1) }
         }
 
+        // SYS_POLL (7): wait for readiness on a set of fds. POSIX.1-2024.
+        oncrix_syscall::number::SYS_POLL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_poll(args.arg0, args.arg1, args.arg2 as i64) }
+        }
+
+        // SYS_TIMES (100) / SYS_GETRUSAGE (98): process CPU-time accounting.
+        oncrix_syscall::number::SYS_TIMES => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_times(args.arg0) }
+        }
+        oncrix_syscall::number::SYS_GETRUSAGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getrusage(args.arg0 as i64, args.arg1) }
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
     };

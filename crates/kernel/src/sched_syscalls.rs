@@ -34,6 +34,7 @@
 //! - `nice(3p)` — `functions/nice.html`
 
 use crate::current::{current_thread_mut, yield_now};
+use oncrix_hal::timer::Timer;
 use oncrix_process::thread::{Priority, SchedPolicy};
 
 /// `which` selector: act on a process (the only mode ONCRIX supports).
@@ -303,4 +304,132 @@ fn sched_priority_to_priority(sp: i32) -> Priority {
 /// back to a POSIX `sched_priority` in `[0, 99]`.
 fn priority_to_sched_priority(p: Priority) -> i32 {
     99 - (p.as_u8() as i32) * 99 / 255
+}
+
+/// PIT tick frequency in hertz (clock ticks per second). Matches the
+/// divisor configured by `init_pic_and_timer` (~100 Hz) and the
+/// `TIMER_HZ` used by the time syscalls. This is also the effective
+/// `CLK_TCK` reported through `times(2)`'s `clock_t` units.
+const CLK_TCK: u64 = 100;
+
+/// Read the current global PIT tick count (elapsed ticks since boot).
+///
+/// # Safety
+///
+/// Single-CPU SYSCALL dispatch path; `PIT_TIMER` is only mutated from
+/// the timer IRQ (IF=0 gate) and read here under the same IF=0 FMASK
+/// invariant, so there is no concurrent mutation.
+unsafe fn global_ticks() -> u64 {
+    // SAFETY: see fn-level note.
+    unsafe {
+        let pit_ptr = &raw const crate::arch::x86_64::init::PIT_TIMER;
+        (*pit_ptr).current_ticks()
+    }
+}
+
+/// Reject obviously non-canonical / kernel-half user pointers.
+fn bad_user_ptr(p: u64) -> bool {
+    p == 0 || p >= 0xFFFF_8000_0000_0000
+}
+
+/// `times(buffer)` — report the calling thread's CPU times.
+///
+/// Writes a `struct tms { clock_t tms_utime, tms_stime, tms_cutime,
+/// tms_cstime; }` (four 64-bit `clock_t`s) to `buffer` and returns the
+/// elapsed real time in clock ticks since boot.
+///
+/// ONCRIX coarse accounting: all charged ticks land in `tms_utime`;
+/// `tms_stime` is `0`. Child times (`tms_cutime`/`tms_cstime`) are `0`
+/// because per-process child-time aggregation is not wired yet
+/// (documented divergence from POSIX).
+///
+/// Returns elapsed ticks on success, `-14` (`EFAULT`) for a bad
+/// `buffer`, `-3` (`ESRCH`) if there is no current thread.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path (single-CPU, IF=0). `buffer` is a raw user
+/// pointer; non-canonical addresses are rejected and unmapped-canonical
+/// accesses fault into the user handler (SIGSEGV).
+pub unsafe fn sys_times(buffer: u64) -> i64 {
+    if bad_user_ptr(buffer) {
+        return -14; // EFAULT
+    }
+    // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
+    let (utime, stime) = match unsafe { current_thread_mut() } {
+        Some(t) => (t.utime_ticks(), t.stime_ticks()),
+        None => return -3, // ESRCH
+    };
+    // struct tms layout: [utime, stime, cutime, cstime] as i64 clock_t.
+    let tms: [i64; 4] = [utime as i64, stime as i64, 0, 0];
+    // SAFETY: buffer is canonical user space (checked). We write four
+    // contiguous i64s; an unmapped page faults into the user handler.
+    unsafe {
+        core::ptr::write_unaligned(buffer as *mut [i64; 4], tms);
+    }
+    // SAFETY: see global_ticks fn-level note.
+    let elapsed = unsafe { global_ticks() };
+    elapsed as i64
+}
+
+/// `getrusage(who, r_usage)` — report resource usage.
+///
+/// Fills the leading `ru_utime` / `ru_stime` `struct timeval`s of a
+/// `struct rusage`; the remaining `long` counters (`ru_maxrss`, page
+/// faults, etc.) are zeroed. `who` selects `RUSAGE_SELF` (0) or
+/// `RUSAGE_CHILDREN` (-1); ONCRIX reports the calling thread for `SELF`
+/// and all-zero for `CHILDREN` (no child aggregation yet — documented).
+///
+/// The `timeval`s are derived from the per-thread tick counter at
+/// [`CLK_TCK`] resolution: `tv_sec = ticks / CLK_TCK`, `tv_usec =
+/// (ticks % CLK_TCK) * 1_000_000 / CLK_TCK`.
+///
+/// Returns `0` on success, `-14` (`EFAULT`) for a bad `r_usage`, `-22`
+/// (`EINVAL`) for an unknown `who`, `-3` (`ESRCH`) if no current thread.
+///
+/// # Safety
+///
+/// See [`sys_times`] regarding the user pointer.
+pub unsafe fn sys_getrusage(who: i64, r_usage: u64) -> i64 {
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
+        return -22; // EINVAL
+    }
+    if bad_user_ptr(r_usage) {
+        return -14; // EFAULT
+    }
+
+    // The full struct rusage on the LP64 ABI is 144 bytes: two timevals
+    // (each two i64) followed by 14 `long` counters. We zero it then set
+    // the two timevals for RUSAGE_SELF.
+    let mut buf = [0i64; 18];
+    if who == RUSAGE_SELF {
+        // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
+        let (utime, stime) = match unsafe { current_thread_mut() } {
+            Some(t) => (t.utime_ticks(), t.stime_ticks()),
+            None => return -3, // ESRCH
+        };
+        let (us, uu) = ticks_to_timeval(utime);
+        let (ss, su) = ticks_to_timeval(stime);
+        // ru_utime = buf[0..2], ru_stime = buf[2..4].
+        buf[0] = us;
+        buf[1] = uu;
+        buf[2] = ss;
+        buf[3] = su;
+    }
+    // SAFETY: r_usage is canonical user space (checked). We write 18
+    // contiguous i64s (144 bytes); an unmapped page faults to SIGSEGV.
+    unsafe {
+        core::ptr::write_unaligned(r_usage as *mut [i64; 18], buf);
+    }
+    0
+}
+
+/// Convert a PIT tick count to a `(tv_sec, tv_usec)` pair at
+/// [`CLK_TCK`] resolution.
+fn ticks_to_timeval(ticks: u64) -> (i64, i64) {
+    let sec = (ticks / CLK_TCK) as i64;
+    let usec = ((ticks % CLK_TCK) * 1_000_000 / CLK_TCK) as i64;
+    (sec, usec)
 }

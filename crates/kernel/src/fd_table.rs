@@ -500,6 +500,196 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
     }
 }
 
+// ── poll ──────────────────────────────────────────────────────────
+
+/// `poll(2)` event bits (Linux/POSIX `poll.h`).
+const POLLIN: i16 = 0x0001;
+/// The descriptor is ready for writing.
+const POLLOUT: i16 = 0x0004;
+/// An error condition (revents only). Reserved; not yet raised.
+const _POLLERR: i16 = 0x0008;
+/// The writer hung up (revents only).
+const POLLHUP: i16 = 0x0010;
+/// The fd value is not an open descriptor (revents only).
+const POLLNVAL: i16 = 0x0020;
+
+/// Maximum number of `pollfd` entries accepted in a single call.
+const POLL_MAX_FDS: usize = 64;
+
+/// PIT tick frequency (Hz) — matches `crate::time_syscalls::TIMER_HZ`.
+const POLL_TIMER_HZ: u64 = 100;
+
+/// Read the current PIT tick count for poll's timeout accounting.
+///
+/// # Safety
+///
+/// Single-CPU SYSCALL dispatch path; `PIT_TIMER` has no concurrent
+/// mutation (timer IRQ runs with IF=0, SYSCALL entry clears IF via FMASK).
+unsafe fn poll_now_ticks() -> u64 {
+    use oncrix_hal::timer::Timer;
+    // SAFETY: see fn-level note.
+    unsafe {
+        let pit_ptr = &raw const crate::arch::x86_64::init::PIT_TIMER;
+        (*pit_ptr).current_ticks()
+    }
+}
+
+/// Compute the `revents` for one `pollfd` given its requested `events`.
+///
+/// Returns the readiness bitmask: `POLLNVAL` for a closed/out-of-range fd,
+/// otherwise the requested `POLLIN`/`POLLOUT` bits that are satisfiable plus
+/// any `POLLHUP`. Regular files, `/dev`, and `/proc` always poll ready.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn poll_one(fd: usize, events: i16) -> i16 {
+    // SAFETY: single-CPU SYSCALL context.
+    let handle = match unsafe { fd_get(fd) } {
+        Some(h) => h,
+        None => return POLLNVAL,
+    };
+
+    let (readable, writable, hup) = match handle.backend {
+        FileBackend::Pipe { ring_id, .. } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { crate::pipe::pipe_poll(ring_id) }
+        }
+        FileBackend::Console => {
+            // SAFETY: single-CPU SYSCALL context.
+            let readable = unsafe { crate::console::console_has_byte() };
+            (readable, true, false)
+        }
+        // Regular files, /dev/{null,zero}, and /proc always poll ready for
+        // both reading and writing and never hang up.
+        FileBackend::RamfsFile { .. }
+        | FileBackend::DevFile { .. }
+        | FileBackend::ProcFile { .. }
+        | FileBackend::Socket { .. } => (true, true, false),
+    };
+
+    let mut revents = 0i16;
+    if events & POLLIN != 0 && readable {
+        revents |= POLLIN;
+    }
+    if events & POLLOUT != 0 && writable {
+        revents |= POLLOUT;
+    }
+    // POLLHUP and POLLERR are reported regardless of the events mask.
+    if hup {
+        revents |= POLLHUP;
+    }
+    revents
+}
+
+/// Kernel handler for `SYS_POLL` (Linux number 7).
+///
+/// POSIX.1-2024 `poll(2)`: examines `nfds` `pollfd` structures at `fds_ptr`,
+/// each `struct pollfd { fd: i32, events: i16, revents: i16 }` (8 bytes),
+/// and reports per-fd readiness in `revents`.
+///
+/// `timeout_ms`: `< 0` blocks indefinitely; `0` performs a single
+/// non-blocking scan; `> 0` blocks up to that many milliseconds. Blocking
+/// uses cooperative `yield_now` polling (same model as `nanosleep`).
+///
+/// Readiness rules:
+/// - `POLLIN` when a read would not block (pipe has data, console has input,
+///   or a pipe writer has hung up so a read returns EOF).
+/// - `POLLOUT` when a write would not block (pipe not full and a reader
+///   remains; regular files / devices always writable).
+/// - `POLLHUP` (revents-only) when a pipe's write end is closed.
+/// - `POLLNVAL` (revents-only) for an fd that is not open.
+/// - A negative `fd` entry is skipped and its `revents` cleared to 0.
+///
+/// Returns the number of fds with a non-zero `revents`, `0` on timeout, or
+/// a negative errno: `-EFAULT` (14) for a bad pointer, `-EINVAL` (22) if
+/// `nfds` exceeds [`POLL_MAX_FDS`].
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// effectively disabled). `fds_ptr` must address `nfds` writable `pollfd`
+/// structs in user space.
+pub unsafe fn sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> i64 {
+    let nfds = nfds as usize;
+    if nfds == 0 {
+        // No descriptors: poll degenerates to a (bounded) sleep. Treat as an
+        // immediate timeout return of 0 to avoid an unbounded spin.
+        return 0;
+    }
+    if nfds > POLL_MAX_FDS {
+        return -22; // EINVAL
+    }
+    if fds_ptr == 0 || fds_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Snapshot the requested (fd, events) pairs from user space once; the
+    // POSIX contract forbids modifying the fd/events members, so we only
+    // write back revents.
+    let mut fds = [0i32; POLL_MAX_FDS];
+    let mut events = [0i16; POLL_MAX_FDS];
+    // SAFETY: `fds_ptr` validated user-canonical above; each entry is 8 bytes.
+    unsafe {
+        let base = fds_ptr as *const u8;
+        for i in 0..nfds {
+            let entry = base.add(i * 8);
+            fds[i] = (entry as *const i32).read_volatile();
+            events[i] = (entry.add(4) as *const i16).read_volatile();
+        }
+    }
+
+    // Compute the deadline in PIT ticks for a positive timeout.
+    let deadline = if timeout_ms > 0 {
+        let ticks = (timeout_ms as u64).saturating_mul(POLL_TIMER_HZ) / 1000;
+        // SAFETY: single-CPU SYSCALL context.
+        Some(unsafe { poll_now_ticks() }.saturating_add(ticks.max(1)))
+    } else {
+        None
+    };
+
+    loop {
+        let mut ready = 0i64;
+        let mut revents = [0i16; POLL_MAX_FDS];
+        for i in 0..nfds {
+            if fds[i] < 0 {
+                continue; // Negative fd: skip, revents already 0.
+            }
+            // SAFETY: single-CPU SYSCALL context.
+            let r = unsafe { poll_one(fds[i] as usize, events[i]) };
+            revents[i] = r;
+            if r != 0 {
+                ready += 1;
+            }
+        }
+
+        // Write revents back and return if any fd is ready, or if this is a
+        // non-blocking poll (timeout == 0), or if a positive timeout expired.
+        let expired = match deadline {
+            // SAFETY: single-CPU SYSCALL context.
+            Some(d) => (unsafe { poll_now_ticks() }) >= d,
+            None => false,
+        };
+        if ready > 0 || timeout_ms == 0 || expired {
+            // SAFETY: `fds_ptr` validated above; writing the 2-byte revents
+            // field (offset 6) of each entry.
+            unsafe {
+                let base = fds_ptr as *mut u8;
+                for (i, &rv) in revents.iter().take(nfds).enumerate() {
+                    (base.add(i * 8 + 6) as *mut i16).write_volatile(rv);
+                }
+            }
+            return ready;
+        }
+
+        // Nothing ready yet and we may still block: yield and rescan.
+        // SAFETY: SYSCALL context; cooperative yield (same model as nanosleep).
+        unsafe {
+            let _ = crate::current::yield_now();
+        }
+    }
+}
+
 // ── I/O dispatch ─────────────────────────────────────────────────
 
 /// Write `count` bytes from the user-space buffer `buf_ptr` to fd `fd`.

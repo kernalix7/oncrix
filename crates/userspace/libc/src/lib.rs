@@ -85,6 +85,9 @@ const SYS_SCHED_SETPARAM: u64 = 142;
 const SYS_SCHED_GETPARAM: u64 = 143;
 const SYS_SCHED_SETSCHEDULER: u64 = 144;
 const SYS_SCHED_GETSCHEDULER: u64 = 145;
+const SYS_POLL: u64 = 7;
+const SYS_TIMES: u64 = 100;
+const SYS_GETRUSAGE: u64 = 98;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -542,6 +545,66 @@ pub unsafe fn sched_getparam(pid: i32, param: *mut u8) -> i64 {
 pub unsafe fn sched_setparam(pid: i32, param: *const u8) -> i64 {
     // SAFETY: caller guarantees `param` validity.
     unsafe { syscall2(SYS_SCHED_SETPARAM, pid as u64, param as u64) }
+}
+
+/// A single `poll(2)` file-descriptor request/result entry (8 bytes).
+#[repr(C)]
+pub struct PollFd {
+    /// File descriptor to watch (negative = ignored, `revents` set 0).
+    pub fd: i32,
+    /// Requested events bitmask (`POLLIN`/`POLLOUT`).
+    pub events: i16,
+    /// Returned events bitmask, written by the kernel.
+    pub revents: i16,
+}
+
+/// `poll` event: data available to read.
+pub const POLLIN: i16 = 0x0001;
+/// `poll` event: writing will not block.
+pub const POLLOUT: i16 = 0x0004;
+/// `poll` event: error condition (output only).
+pub const POLLERR: i16 = 0x0008;
+/// `poll` event: hang-up — peer closed (output only).
+pub const POLLHUP: i16 = 0x0010;
+/// `poll` event: fd not open (output only).
+pub const POLLNVAL: i16 = 0x0020;
+
+/// `poll(2)` — wait for events on a set of file descriptors.
+///
+/// `timeout_ms` < 0 blocks indefinitely, 0 polls once without blocking,
+/// > 0 waits up to that many milliseconds. Returns the number of fds with
+/// non-zero `revents`, 0 on timeout, or a negative errno value.
+///
+/// # Safety
+///
+/// `fds` must point to `nfds` writable `PollFd` entries.
+pub unsafe fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: i32) -> i64 {
+    // SAFETY: caller guarantees `fds`/`nfds` validity.
+    unsafe { syscall3(SYS_POLL, fds as u64, nfds, timeout_ms as i64 as u64) }
+}
+
+/// `times(2)` — process times. `buf` is a `struct tms` (4 × `i64`:
+/// utime, stime, cutime, cstime). Returns elapsed ticks since boot, or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to a writable `tms` (32 bytes).
+pub unsafe fn times(buf: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `buf` validity.
+    unsafe { syscall1(SYS_TIMES, buf as u64) }
+}
+
+/// `getrusage(2)` — resource usage. `who` is `RUSAGE_SELF`(0) or
+/// `RUSAGE_CHILDREN`(-1); `usage` is a `struct rusage` whose leading fields
+/// `ru_utime`/`ru_stime` are `timeval`s. Returns 0, or a negative errno.
+///
+/// # Safety
+///
+/// `usage` must point to a writable `rusage` (144 bytes).
+pub unsafe fn getrusage(who: i32, usage: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `usage` validity.
+    unsafe { syscall2(SYS_GETRUSAGE, who as u64, usage as u64) }
 }
 
 /// `access(2)` — check file accessibility.

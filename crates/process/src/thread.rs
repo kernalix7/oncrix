@@ -172,6 +172,19 @@ pub struct Thread {
     /// anti-starvation (aging) mechanism. Saturating arithmetic bounds
     /// the value so a long-blocked low-priority thread cannot overflow.
     sched_credit: u32,
+    /// CPU ticks charged to user-mode execution for this thread.
+    ///
+    /// Incremented once per PIT timer tick while this thread is the
+    /// current (running) thread. ONCRIX does not yet distinguish the
+    /// trap-from-ring-3 vs trap-from-ring-0 case at the timer, so *all*
+    /// charged ticks land in this user bucket; `stime` stays `0` until a
+    /// finer split is added. Consumed by `times(2)` / `getrusage(2)`.
+    utime_ticks: u64,
+    /// CPU ticks charged to kernel-mode execution for this thread.
+    ///
+    /// Reserved for a future user/system split; currently always `0`
+    /// (see [`utime_ticks`](Self::utime_ticks)).
+    stime_ticks: u64,
     /// Stack pointer (legacy field, still used by the kthread path).
     stack_pointer: u64,
     /// Thread-local storage base address (FS base on x86_64).
@@ -276,6 +289,8 @@ impl Thread {
             priority,
             policy: SchedPolicy::Other,
             sched_credit: 0,
+            utime_ticks: 0,
+            stime_ticks: 0,
             stack_pointer: 0,
             tls_base: 0,
             cpu_context: CpuContext::empty(),
@@ -354,6 +369,28 @@ impl Thread {
     /// Set the scheduling policy (`SCHED_*`).
     pub fn set_policy(&mut self, policy: SchedPolicy) {
         self.policy = policy;
+    }
+
+    /// Return the user-mode CPU ticks charged to this thread.
+    pub const fn utime_ticks(&self) -> u64 {
+        self.utime_ticks
+    }
+
+    /// Return the kernel-mode CPU ticks charged to this thread.
+    ///
+    /// Always `0` today (coarse accounting charges everything to
+    /// [`utime_ticks`](Self::utime_ticks)).
+    pub const fn stime_ticks(&self) -> u64 {
+        self.stime_ticks
+    }
+
+    /// Charge one PIT tick of CPU time to this thread (user bucket).
+    ///
+    /// Called from the timer interrupt for the currently running thread.
+    /// Uses saturating arithmetic so a long-lived thread cannot overflow
+    /// the counter.
+    pub fn charge_tick(&mut self) {
+        self.utime_ticks = self.utime_ticks.saturating_add(1);
     }
 
     /// Return the accumulated scheduling credit (priority-aware picker).
