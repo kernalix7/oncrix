@@ -1,11 +1,34 @@
 // Copyright 2026 ONCRIX Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Round-robin scheduler.
+//! Priority-aware round-robin scheduler with credit aging.
 //!
-//! A simple fixed-timeslice scheduler that cycles through ready threads
-//! in a circular queue. This serves as the initial scheduler; it will
-//! be replaced with a multi-level feedback queue (MLFQ) in the future.
+//! The scheduler keeps a fixed-size array of thread slots and a cursor
+//! for round-robin fairness. On top of plain round-robin it consumes
+//! [`Thread::priority`](crate::thread::Thread::priority) through a
+//! lightweight **credit / aging** scheme so higher-priority (lower
+//! nice) threads run preferentially without starving low-priority ones:
+//!
+//! * Each Ready thread carries an integer `sched_credit`.
+//! * On every pick pass, every *Ready* thread earns credit equal to its
+//!   [`Priority::weight`](crate::thread::Priority::weight) (`256 - level`,
+//!   so HIGHEST earns 256/pass, IDLE earns 1/pass).
+//! * The Ready thread with the **most accumulated credit** is selected;
+//!   ties break by round-robin cursor order (the first such thread the
+//!   scan reaches), preserving fairness among equal-priority peers.
+//! * The picked thread's credit is reset to zero, so it must re-earn its
+//!   way back to the front.
+//!
+//! Because every weight is `>= 1`, a low-priority thread's credit only
+//! ever grows while it waits and is guaranteed to eventually exceed any
+//! repeatedly-reset high-priority thread — this is the anti-starvation
+//! (aging) guarantee. Credit uses saturating arithmetic so a long wait
+//! cannot overflow.
+//!
+//! This is intentionally conservative: the ring scan, slot layout, and
+//! the `current`/`cursor` bookkeeping are unchanged from the original
+//! round-robin picker — only the *selection rule* within the Ready set
+//! is upgraded, which keeps the context-switch datapath identical.
 
 use crate::context::CpuContext;
 use crate::pid::Tid;
@@ -70,6 +93,48 @@ impl RoundRobinScheduler {
         }
     }
 
+    /// Select the next Ready slot using priority credit + aging.
+    ///
+    /// Scans the ring starting at `start` (wrapping), and over the
+    /// candidates it considers (every slot except `exclude`):
+    ///
+    /// 1. Grants each *Ready* candidate credit equal to its priority
+    ///    [`weight`](crate::thread::Priority::weight) for this pass.
+    /// 2. Tracks the Ready candidate with the highest resulting credit;
+    ///    ties keep the earliest-scanned slot (round-robin tie-break).
+    ///
+    /// Returns the chosen slot index, or `None` if no candidate is
+    /// Ready. The caller is responsible for the state transition and for
+    /// calling [`Thread::reset_sched_credit`] on the winner. Aging is
+    /// applied to *all* Ready candidates (including the winner) so the
+    /// winner's pre-reset credit reflects this pass; the reset then
+    /// clears it.
+    ///
+    /// `O(MAX_THREADS)` — same scan cost as the original picker.
+    fn select_ready(&mut self, start: usize, exclude: Option<usize>) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        let mut best_credit: u32 = 0;
+        for offset in 0..MAX_THREADS {
+            let idx = (start + offset) % MAX_THREADS;
+            if exclude == Some(idx) {
+                continue;
+            }
+            if let Some(t) = self.threads[idx].as_mut()
+                && t.state() == ThreadState::Ready
+            {
+                t.add_sched_credit(t.priority().weight());
+                let credit = t.sched_credit();
+                // Strictly-greater keeps the earliest slot on ties,
+                // which is the round-robin order of the scan.
+                if best.is_none() || credit > best_credit {
+                    best = Some(idx);
+                    best_credit = credit;
+                }
+            }
+        }
+        best
+    }
+
     /// Add a thread to the scheduler.
     ///
     /// The thread must be in the `Ready` state.
@@ -131,20 +196,17 @@ impl RoundRobinScheduler {
             self.current = None;
         }
 
-        // Scan for next Ready thread starting from cursor.
-        for _ in 0..MAX_THREADS {
-            let idx = self.cursor % MAX_THREADS;
-            self.cursor = (self.cursor + 1) % MAX_THREADS;
-
-            if let Some(ref mut t) = self.threads[idx] {
-                if t.state() == ThreadState::Ready {
-                    t.set_state(ThreadState::Running);
-                    self.current = Some(idx);
-                    return Some(t.tid());
-                }
-            }
+        // Pick the highest-credit Ready thread starting from the cursor
+        // (priority-aware, with aging). See module docs.
+        let start = self.cursor % MAX_THREADS;
+        let idx = self.select_ready(start, None)?;
+        if let Some(ref mut t) = self.threads[idx] {
+            t.set_state(ThreadState::Running);
+            t.reset_sched_credit();
+            self.current = Some(idx);
+            self.cursor = (idx + 1) % MAX_THREADS;
+            return Some(t.tid());
         }
-
         None
     }
 
@@ -216,33 +278,36 @@ impl RoundRobinScheduler {
     /// besides the current one.
     pub fn prepare_switch(&mut self) -> Option<SwitchTargets> {
         let prev_idx = self.current?;
-        // Walk the ring starting from the slot after `prev_idx` to
-        // enforce round-robin fairness.
-        let start = (prev_idx + 1) % MAX_THREADS;
-        let mut found: Option<usize> = None;
-        for offset in 0..MAX_THREADS {
-            let idx = (start + offset) % MAX_THREADS;
-            if idx == prev_idx {
-                continue;
-            }
-            if let Some(t) = self.threads[idx].as_ref()
-                && t.state() == ThreadState::Ready
-            {
-                found = Some(idx);
-                break;
-            }
-        }
-        let next_idx = found?;
-
-        // Move prev: Running -> Ready (if still Running).
+        // Move prev: Running -> Ready (if still Running) BEFORE selecting,
+        // so the outgoing thread is a candidate for re-selection and its
+        // priority credit is aged alongside its peers.
         if let Some(prev) = self.threads[prev_idx].as_mut()
             && prev.state() == ThreadState::Running
         {
             prev.set_state(ThreadState::Ready);
         }
-        // Move next: Ready -> Running.
+
+        // Pick the highest-credit Ready thread (priority-aware, aging),
+        // excluding the just-descheduled `prev_idx` so a switch always
+        // makes forward progress when another runnable thread exists.
+        // Start the scan after `prev_idx` for round-robin tie-breaking.
+        let start = (prev_idx + 1) % MAX_THREADS;
+        let next_idx = match self.select_ready(start, Some(prev_idx)) {
+            Some(idx) => idx,
+            None => {
+                // No other runnable thread: restore prev to Running and
+                // report "nothing to switch to".
+                if let Some(prev) = self.threads[prev_idx].as_mut() {
+                    prev.set_state(ThreadState::Running);
+                }
+                return None;
+            }
+        };
+
+        // Move next: Ready -> Running and reset its earned credit.
         if let Some(next) = self.threads[next_idx].as_mut() {
             next.set_state(ThreadState::Running);
+            next.reset_sched_credit();
         }
 
         // Extract raw pointers and the kstack top. We intentionally

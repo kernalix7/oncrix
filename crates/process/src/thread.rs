@@ -70,6 +70,19 @@ impl Priority {
         Self(level)
     }
 
+    /// Scheduling weight derived from this priority.
+    ///
+    /// Higher-priority threads (lower raw level) get a larger weight so
+    /// the priority-aware picker grants them credit faster. The mapping
+    /// is the linear inverse of the raw level: `weight = 256 - level`,
+    /// giving `HIGHEST (0) → 256`, `NORMAL (128) → 128`, and
+    /// `IDLE (255) → 1`. The minimum weight is `1`, never `0`, so even
+    /// the lowest-priority thread keeps accruing credit and cannot
+    /// starve (see the scheduler's aging loop).
+    pub const fn weight(self) -> u32 {
+        256 - self.0 as u32
+    }
+
     /// Convert this kernel [`Priority`] back to a POSIX nice value.
     ///
     /// Inverse of [`from_nice`](Self::from_nice): `nice = level * 39 / 255
@@ -106,6 +119,15 @@ pub struct Thread {
     state: ThreadState,
     /// Scheduling priority.
     priority: Priority,
+    /// Accumulated scheduling credit for the priority-aware picker.
+    ///
+    /// Ready threads gain credit equal to their [`Priority::weight`] on
+    /// each pick pass; the thread with the most credit is chosen and has
+    /// its credit reset. Because every weight is `>= 1`, low-priority
+    /// threads keep accruing and are eventually selected — this is the
+    /// anti-starvation (aging) mechanism. Saturating arithmetic bounds
+    /// the value so a long-blocked low-priority thread cannot overflow.
+    sched_credit: u32,
     /// Stack pointer (legacy field, still used by the kthread path).
     stack_pointer: u64,
     /// Thread-local storage base address (FS base on x86_64).
@@ -208,6 +230,7 @@ impl Thread {
             pid,
             state: ThreadState::Ready,
             priority,
+            sched_credit: 0,
             stack_pointer: 0,
             tls_base: 0,
             cpu_context: CpuContext::empty(),
@@ -276,6 +299,27 @@ impl Thread {
     /// Set the scheduling priority.
     pub fn set_priority(&mut self, priority: Priority) {
         self.priority = priority;
+    }
+
+    /// Return the accumulated scheduling credit (priority-aware picker).
+    pub const fn sched_credit(&self) -> u32 {
+        self.sched_credit
+    }
+
+    /// Add `amount` to the scheduling credit (saturating).
+    ///
+    /// Called by the scheduler's aging pass on every Ready thread that
+    /// was *not* picked, so waiting threads gradually rise to the top.
+    pub fn add_sched_credit(&mut self, amount: u32) {
+        self.sched_credit = self.sched_credit.saturating_add(amount);
+    }
+
+    /// Reset the scheduling credit to zero.
+    ///
+    /// Called when a thread is picked to run, so it must re-earn its
+    /// way to the front against the others' accumulated credit.
+    pub fn reset_sched_credit(&mut self) {
+        self.sched_credit = 0;
     }
 
     /// Set the thread state.
