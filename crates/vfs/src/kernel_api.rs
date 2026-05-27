@@ -485,6 +485,23 @@ impl KernelVfs {
         self.ramfs.inode_by_number(ino)
     }
 
+    /// Return the pipe-ring index backing the FIFO `ino`, if allocated.
+    ///
+    /// `Ok(None)` means the FIFO exists but has not yet been opened.
+    /// Returns `Err(InvalidArgument)` if `ino` is not a FIFO, `NotFound`
+    /// if no such inode exists. Backs lazy FIFO ring wiring in the fd layer.
+    pub fn fifo_ring_id(&self, ino: InodeNumber) -> Result<Option<u32>> {
+        self.ramfs.fifo_ring_id(ino)
+    }
+
+    /// Record the pipe-ring index backing the FIFO `ino`.
+    ///
+    /// Returns `Err(InvalidArgument)` if `ino` is not a FIFO, `NotFound`
+    /// if no such inode exists.
+    pub fn set_fifo_ring_id(&mut self, ino: InodeNumber, id: u32) -> Result<()> {
+        self.ramfs.set_fifo_ring_id(ino, id)
+    }
+
     /// Read the entire contents of the file at `path` into a `Vec<u8>`.
     ///
     /// `path` must be absolute (start with `b'/'`). The root path `b"/"`

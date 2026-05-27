@@ -766,6 +766,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-renice"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-reset"
 version = "0.1.0"
 dependencies = [

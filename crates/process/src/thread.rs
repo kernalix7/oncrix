@@ -45,6 +45,40 @@ impl Priority {
     pub const fn as_u8(self) -> u8 {
         self.0
     }
+
+    /// Convert a POSIX nice value (`[-20, 19]`) to a kernel [`Priority`].
+    ///
+    /// POSIX nice runs from `-20` (most favourable, highest priority) to
+    /// `+19` (least favourable, lowest priority). The kernel priority axis
+    /// is inverted: `0` is highest, `255` is lowest. We map the 40-step
+    /// nice range linearly onto `[0, 255]`, keeping nice `0` near
+    /// [`Priority::NORMAL`].
+    ///
+    /// Mapping: `level = (nice + 20) * 255 / 39`, with `nice` clamped to
+    /// `[-20, 19]` first. So `-20 → 0` (HIGHEST), `+19 → 255` (IDLE), and
+    /// `0 → 130` (just below NORMAL).
+    pub const fn from_nice(nice: i32) -> Self {
+        let clamped = if nice < -20 {
+            -20
+        } else if nice > 19 {
+            19
+        } else {
+            nice
+        };
+        // (clamped + 20) is in [0, 39]; scale to [0, 255].
+        let level = ((clamped + 20) * 255 / 39) as u8;
+        Self(level)
+    }
+
+    /// Convert this kernel [`Priority`] back to a POSIX nice value.
+    ///
+    /// Inverse of [`from_nice`](Self::from_nice): `nice = level * 39 / 255
+    /// - 20`, yielding a value in `[-20, 19]`. The round-trip is not exact
+    /// for every raw level (the 256→40 quantisation is lossy), but it is
+    /// stable for any nice the kernel itself produced via `from_nice`.
+    pub const fn to_nice(self) -> i32 {
+        (self.0 as i32) * 39 / 255 - 20
+    }
 }
 
 /// A kernel thread.
@@ -237,6 +271,11 @@ impl Thread {
     /// Return the scheduling priority.
     pub const fn priority(&self) -> Priority {
         self.priority
+    }
+
+    /// Set the scheduling priority.
+    pub fn set_priority(&mut self, priority: Priority) {
+        self.priority = priority;
     }
 
     /// Set the thread state.

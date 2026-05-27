@@ -233,6 +233,15 @@ pub const SYS_INOTIFY_INIT1: SyscallNumber = 294;
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)` — Fast user-space locking.
 pub const SYS_FUTEX: SyscallNumber = 202;
 
+// ── Scheduling priority ──────────────────────────────────────────
+
+/// `getpriority(which, who)` — Get the scheduling priority (nice value).
+pub const SYS_GETPRIORITY: SyscallNumber = 140;
+/// `setpriority(which, who, prio)` — Set the scheduling priority (nice value).
+pub const SYS_SETPRIORITY: SyscallNumber = 141;
+/// `nice(inc)` — Add `inc` to the calling thread's nice value.
+pub const SYS_NICE: SyscallNumber = 34;
+
 // ── Time ──────────────────────────────────────────────────────
 
 /// `nanosleep(req, rem)` — High-resolution sleep.

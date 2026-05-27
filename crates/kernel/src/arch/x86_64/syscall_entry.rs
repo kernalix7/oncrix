@@ -848,6 +848,28 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::time_syscalls::sys_nanosleep(args.arg0, args.arg1) }
         }
 
+        // SYS_GETPRIORITY (140) / SYS_SETPRIORITY (141) / SYS_NICE (34):
+        // POSIX.1-2024 process scheduling priority. Handlers live in the
+        // kernel sched_syscalls module and operate on the current thread.
+        oncrix_syscall::number::SYS_GETPRIORITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getpriority(args.arg0 as i64, args.arg1 as i64) }
+        }
+        oncrix_syscall::number::SYS_SETPRIORITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_setpriority(
+                    args.arg0 as i64,
+                    args.arg1 as i64,
+                    args.arg2 as i64,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_NICE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_nice(args.arg0 as i64) }
+        }
+
         // ── Everything else ──────────────────────────────────────
         _ => oncrix_syscall::dispatch::dispatch(args),
     };
@@ -1015,6 +1037,11 @@ unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
 
     match result {
         Some(Ok(inode)) => {
+            // FIFO: route to the pipe-backed open path instead of a ramfs handle.
+            if inode.file_type == oncrix_vfs::inode::FileType::Fifo {
+                // SAFETY: single-CPU SYSCALL context.
+                return unsafe { crate::fd_table::open_fifo(inode.ino, flags as u32) };
+            }
             // Build a FileHandle for the ramfs inode.
             let handle_flags = crate::fd_table::HandleFlags(flags as u32);
             let handle = crate::fd_table::FileHandle::ramfs_file(inode.ino, handle_flags);

@@ -218,6 +218,86 @@ pub unsafe fn install_stdio() {
     }
 }
 
+/// Open the FIFO inode `ino` and install a pipe-backed fd for it.
+///
+/// Wires a `/bin/mkfifo`-created FIFO node to the kernel pipe machinery:
+/// the inode carries a lazily-allocated pipe `ring_id` (allocated here on
+/// first open and persisted in the ramfs inode), so a writer and a reader
+/// opening the same path share one ring buffer.
+///
+/// `flags` are the raw `open(2)` flags. `O_WRONLY` selects the write end;
+/// anything else (`O_RDONLY`, `O_RDWR`) selects the read end. The matching
+/// pipe end refcount is bumped so that `read`/`write` see the correct
+/// EOF / `EPIPE` semantics and the ring frees when both ends close.
+///
+/// Returns the assigned fd on success, or a negative errno:
+/// `-ENFILE` (23) if no pipe slot is free, `-EMFILE` (24) if the fd table
+/// is full, `-EINVAL` (22) if `ino` is not a FIFO, `-EIO` (5) if the VFS
+/// is uninitialised.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// effectively disabled).
+pub unsafe fn open_fifo(ino: oncrix_vfs::inode::InodeNumber, flags: u32) -> i64 {
+    // Resolve the FIFO's backing ring, allocating one on first open.
+    let ring_id = crate::state::with_global_mut(|s| match s.vfs.fifo_ring_id(ino) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => {
+            // SAFETY: single-CPU SYSCALL context; pipe table exclusively owned here.
+            let id = match unsafe { crate::pipe::pipe_alloc_fifo() } {
+                Some(id) => id,
+                None => return Err(Error::Busy), // ENFILE proxy — no pipe slots
+            };
+            s.vfs.set_fifo_ring_id(ino, id)?;
+            Ok(id)
+        }
+        Err(e) => Err(e),
+    });
+
+    let ring_id = match ring_id {
+        Some(Ok(id)) => id,
+        Some(Err(Error::Busy)) => return -23, // ENFILE
+        Some(Err(Error::InvalidArgument)) => return -22, // EINVAL — not a FIFO
+        Some(Err(_)) => return -22,           // EINVAL
+        None => return -5,                    // EIO — VFS not initialised
+    };
+
+    // O_WRONLY (bit 0 set, bit 1 clear) → write end; otherwise read end.
+    let is_write_end = (flags & 0b11) == 1;
+
+    // SAFETY: single-CPU SYSCALL context; pipe table exclusively owned here.
+    if !unsafe { crate::pipe::pipe_open_end(ring_id, is_write_end) } {
+        return -5; // EIO — slot vanished (should not happen)
+    }
+
+    let handle = FileHandle {
+        backend: FileBackend::Pipe {
+            ring_id,
+            is_write_end,
+        },
+        offset: 0,
+        flags: HandleFlags(flags),
+    };
+
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { fd_install(handle) } {
+        Ok(fd) => fd as i64,
+        Err(_) => {
+            // Roll back the refcount bump so the slot can free.
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe {
+                if is_write_end {
+                    crate::pipe::pipe_close_write(ring_id);
+                } else {
+                    crate::pipe::pipe_close_read(ring_id);
+                }
+            }
+            -24 // EMFILE
+        }
+    }
+}
+
 // ── I/O dispatch ─────────────────────────────────────────────────
 
 /// Write `count` bytes from the user-space buffer `buf_ptr` to fd `fd`.

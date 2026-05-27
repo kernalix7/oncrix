@@ -60,10 +60,16 @@ enum RamInodeData {
         /// Actual target length.
         len: usize,
     },
-    /// Named pipe (FIFO). Carries no in-ramfs payload yet — opening it as
-    /// a working pipe is not wired (Phase: create-only so `mkfifo` + `ls`
-    /// report the node correctly).
-    Fifo,
+    /// Named pipe (FIFO).
+    ///
+    /// `ring_id` is the index of the kernel pipe ring backing this FIFO,
+    /// allocated lazily on first `open` and persisting for the inode's
+    /// lifetime so that a writer and a reader opening the same path share
+    /// one buffer. `None` until the first open wires the ring.
+    Fifo {
+        /// Backing pipe-ring index, or `None` if not yet opened.
+        ring_id: Option<u32>,
+    },
 }
 
 /// Ramfs filesystem.
@@ -506,7 +512,7 @@ impl Ramfs {
     pub fn mknod_fifo(&mut self, parent: &Inode, name: &str, mode: FileMode) -> Result<Inode> {
         let parent_slot = self.slot_of(parent.ino).ok_or(Error::NotFound)?;
         let (child_slot, child_ino) = self.alloc_inode(FileType::Fifo, mode)?;
-        self.data[child_slot] = Some(RamInodeData::Fifo);
+        self.data[child_slot] = Some(RamInodeData::Fifo { ring_id: None });
         self.add_dir_entry(parent_slot, name, child_ino)?;
         Ok(*self.inodes[child_slot].as_ref().ok_or(Error::NotFound)?)
     }
@@ -525,6 +531,34 @@ impl Ramfs {
             Ok(n)
         } else {
             Err(Error::InvalidArgument)
+        }
+    }
+
+    /// Return the pipe-ring index backing the FIFO `ino`, if one has been
+    /// allocated.
+    ///
+    /// Returns `Err(InvalidArgument)` if `ino` is not a FIFO, `NotFound`
+    /// if no such inode exists.
+    pub fn fifo_ring_id(&self, ino: InodeNumber) -> Result<Option<u32>> {
+        let slot = self.slot_of(ino).ok_or(Error::NotFound)?;
+        match self.data[slot].as_ref() {
+            Some(RamInodeData::Fifo { ring_id }) => Ok(*ring_id),
+            _ => Err(Error::InvalidArgument),
+        }
+    }
+
+    /// Record the pipe-ring index backing the FIFO `ino`.
+    ///
+    /// Returns `Err(InvalidArgument)` if `ino` is not a FIFO, `NotFound`
+    /// if no such inode exists.
+    pub fn set_fifo_ring_id(&mut self, ino: InodeNumber, id: u32) -> Result<()> {
+        let slot = self.slot_of(ino).ok_or(Error::NotFound)?;
+        match self.data[slot].as_mut() {
+            Some(RamInodeData::Fifo { ring_id }) => {
+                *ring_id = Some(id);
+                Ok(())
+            }
+            _ => Err(Error::InvalidArgument),
         }
     }
 }

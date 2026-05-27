@@ -76,6 +76,9 @@ const SYS_PIPE2: u64 = 293;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_CLOCK_GETTIME: u64 = 228;
 const SYS_TIME: u64 = 201;
+const SYS_GETPRIORITY: u64 = 140;
+const SYS_SETPRIORITY: u64 = 141;
+const SYS_NICE: u64 = 34;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -423,6 +426,46 @@ pub unsafe fn link(oldpath: *const u8, newpath: *const u8) -> i64 {
 pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
     // SAFETY: The caller guarantees `path` is null-terminated.
     unsafe { syscall3(SYS_CHOWN, path as u64, uid as u64, gid as u64) }
+}
+
+/// `getpriority(2)` — get the scheduling priority (nice value).
+///
+/// `which` selects the target class (0 = `PRIO_PROCESS`); `who` is the id
+/// (0 = the calling process). Returns the nice value in `[-20, 19]`, or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn getpriority(which: i32, who: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_GETPRIORITY, which as u64, who as u64) }
+}
+
+/// `setpriority(2)` — set the scheduling priority (nice value).
+///
+/// `which` selects the target class (0 = `PRIO_PROCESS`); `who` is the id
+/// (0 = the calling process); `prio` is the new nice value in `[-20, 19]`.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn setpriority(which: i32, who: i32, prio: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_SETPRIORITY, which as u64, who as u64, prio as u64) }
+}
+
+/// `nice(2)` — add `inc` to the calling thread's nice value.
+///
+/// Returns the new nice value, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn nice(inc: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_NICE, inc as u64) }
 }
 
 /// `access(2)` — check file accessibility.

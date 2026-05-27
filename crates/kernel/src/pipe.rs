@@ -106,6 +106,23 @@ impl PipeRing {
         self.read_refs = 1;
     }
 
+    /// Initialize this slot as a FIFO backing ring with **no** fds attached.
+    ///
+    /// Unlike [`open`](Self::open), both ends start with a zero refcount and
+    /// are marked closed; each `open(2)` of the FIFO path bumps exactly one
+    /// end via [`pipe_open_end`]. This lets a writer and a reader that open
+    /// the same FIFO path independently share one buffer, and lets the slot
+    /// free itself once both ends drop back to zero.
+    pub fn open_fifo(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.write_open = false;
+        self.read_open = false;
+        self.in_use = true;
+        self.write_refs = 0;
+        self.read_refs = 0;
+    }
+
     /// Number of bytes available to read.
     pub fn available(&self) -> usize {
         (self.tail + PIPE_BUF - self.head) % PIPE_BUF
@@ -196,6 +213,60 @@ pub unsafe fn pipe_alloc() -> Option<u32> {
         }
     }
     None
+}
+
+/// Allocate a free pipe slot as a FIFO backing ring and return its `ring_id`.
+///
+/// The slot is initialized with [`PipeRing::open_fifo`] (both ends closed,
+/// zero refs); the caller must follow up with [`pipe_open_end`] for each
+/// fd that opens the FIFO. Returns `None` if all [`MAX_PIPES`] slots are
+/// occupied (`ENFILE`).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU,
+/// interrupts effectively disabled).
+pub unsafe fn pipe_alloc_fifo() -> Option<u32> {
+    // SAFETY: Single-CPU SYSCALL context; no aliased mutation.
+    unsafe {
+        #[allow(static_mut_refs)]
+        for (i, slot) in PIPE_TABLE.iter_mut().enumerate() {
+            if !slot.in_use {
+                slot.open_fifo();
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Attach one fd to an end of FIFO ring `ring_id`, bumping its refcount and
+/// marking that end open.
+///
+/// `is_write_end` selects the write end (`true`) or read end (`false`).
+/// Returns `false` if the slot is out of range or not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_open_end(ring_id: u32, is_write_end: bool) -> bool {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get_mut(ring_id as usize)
+            && slot.in_use
+        {
+            if is_write_end {
+                slot.write_refs = slot.write_refs.saturating_add(1);
+                slot.write_open = true;
+            } else {
+                slot.read_refs = slot.read_refs.saturating_add(1);
+                slot.read_open = true;
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Get a shared reference to the pipe ring for `ring_id`.

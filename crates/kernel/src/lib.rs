@@ -111,6 +111,8 @@ pub mod rseq;
 #[allow(dead_code, clippy::all)]
 pub mod safesetid;
 pub mod sched;
+#[allow(dead_code, clippy::all)]
+pub mod sched_syscalls;
 pub mod sctp;
 pub mod seccomp;
 pub mod seccomp_filter;
