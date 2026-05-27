@@ -611,6 +611,7 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                     *b = ptr.add(i).read_volatile();
                 }
             }
+            let nonblock = handle.flags.is_nonblock();
             let mut written = 0usize;
             loop {
                 // SAFETY: Single-CPU SYSCALL context.
@@ -626,6 +627,15 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 written += ring.push(&kbuf[written..count]);
                 if written >= count {
                     return written as i64;
+                }
+                // Buffer is full and the request is unfinished. With
+                // O_NONBLOCK, return the partial count if any bytes were
+                // written, else -EAGAIN; otherwise block via yield.
+                if nonblock {
+                    if written > 0 {
+                        return written as i64;
+                    }
+                    return -11; // EAGAIN
                 }
                 // SAFETY: SYSCALL context; yield_now is documented for this.
                 unsafe {
@@ -754,6 +764,7 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             if is_write_end {
                 return -9; // EBADF — cannot read from write end
             }
+            let nonblock = handle.flags.is_nonblock();
             let user_ptr = buf_ptr as *mut u8;
             loop {
                 // SAFETY: Single-CPU SYSCALL context.
@@ -777,6 +788,11 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
                 if !ring.write_open {
                     return 0; // POSIX EOF
+                }
+                // Buffer is empty but writers remain. With O_NONBLOCK return
+                // -EAGAIN rather than blocking; otherwise yield and retry.
+                if nonblock {
+                    return -11; // EAGAIN
                 }
                 // SAFETY: SYSCALL context.
                 unsafe {
