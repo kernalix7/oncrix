@@ -874,9 +874,7 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         // (FD_CLOEXEC), F_GETFL/SETFL (O_NONBLOCK/O_APPEND). POSIX.1-2024.
         oncrix_syscall::number::SYS_FCNTL => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
-            unsafe {
-                crate::fd_table::sys_fcntl(args.arg0 as usize, args.arg1 as i32, args.arg2)
-            }
+            unsafe { crate::fd_table::sys_fcntl(args.arg0 as usize, args.arg1 as i32, args.arg2) }
         }
 
         // SYS_SCHED_* (24/142-145): POSIX.1-2024 scheduling policy/params.
