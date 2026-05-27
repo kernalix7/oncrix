@@ -1004,6 +1004,59 @@ pub unsafe fn sys_stat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
     }
 }
 
+// ── sys_lstat ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_LSTAT` (number 6).
+///
+/// POSIX.1-2024 `lstat(2)`: like `stat`, but does NOT follow a terminal
+/// symbolic link — reports the link itself (S_IFLNK) rather than its
+/// target.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `statbuf_ptr`
+/// must point to >= 144 writable user bytes.
+pub unsafe fn sys_lstat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
+    if statbuf_ptr == 0 || statbuf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    static mut LSTAT_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut LSTAT_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; buffers exclusively owned here.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(path_ptr, &mut LSTAT_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: LSTAT_PATH[..path_len] written above; LSTAT_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&LSTAT_PATH[..path_len], &mut LSTAT_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: LSTAT_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &LSTAT_ABS[..abs_len];
+        crate::state::with_global(|s| s.vfs.lookup_path_nofollow(abs))
+    };
+
+    match result {
+        Some(Ok(inode)) => {
+            // SAFETY: statbuf_ptr validated; fill_stat_buf writes STAT_SIZE bytes.
+            unsafe { fill_stat_buf(statbuf_ptr as *mut u8, &inode) };
+            0
+        }
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_fstat ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_FSTAT` (number 5).

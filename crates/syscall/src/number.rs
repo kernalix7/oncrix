@@ -98,6 +98,8 @@ pub const SYS_SETGROUPS: SyscallNumber = 116;
 pub const SYS_STAT: SyscallNumber = 4;
 /// `fstat(fd, statbuf)` — Get file status by fd.
 pub const SYS_FSTAT: SyscallNumber = 5;
+/// `lstat(pathname, statbuf)` — Get file status, not following symlinks.
+pub const SYS_LSTAT: SyscallNumber = 6;
 /// `lseek(fd, offset, whence)` — Reposition file offset.
 pub const SYS_LSEEK: SyscallNumber = 8;
 /// `dup2(oldfd, newfd)` — Duplicate a file descriptor.

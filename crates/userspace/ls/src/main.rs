@@ -168,8 +168,10 @@ fn list_dir(target: &[u8], long_fmt: bool) -> bool {
                     st_ctime_ns: 0,
                     __unused: [0; 3],
                 };
+                // lstat (not stat): `ls -l` reports the symlink itself, not
+                // its target, so links display with type 'l'.
                 // SAFETY: entry_path is NUL-terminated; st is valid for write.
-                let _ = unsafe { libc::stat(entry_path.as_ptr(), &mut st) };
+                let _ = unsafe { libc::lstat(entry_path.as_ptr(), &mut st) };
 
                 // Format: type_char + permission string + "  " + size + "  " + name + "\n"
                 let type_char = if libc::s_isdir(st.st_mode) {

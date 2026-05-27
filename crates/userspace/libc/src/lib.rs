@@ -44,6 +44,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_STAT: u64 = 4;
+const SYS_LSTAT: u64 = 6;
 const SYS_FSTAT: u64 = 5;
 const SYS_MMAP: u64 = 9;
 const SYS_RT_SIGACTION: u64 = 13;
@@ -749,6 +750,19 @@ pub const fn s_isfifo(mode: u32) -> bool {
 pub unsafe fn stat(path: *const u8, buf: *mut Stat) -> i64 {
     // SAFETY: caller guarantees both pointers are valid.
     unsafe { syscall2(SYS_STAT, path as u64, buf as u64) }
+}
+
+/// `lstat(2)` — get file status without following a terminal symlink.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+/// `buf` must be a valid pointer to a writable [`Stat`].
+pub unsafe fn lstat(path: *const u8, buf: *mut Stat) -> i64 {
+    // SAFETY: caller guarantees both pointers are valid.
+    unsafe { syscall2(SYS_LSTAT, path as u64, buf as u64) }
 }
 
 /// `fstat(2)` — get file status by file descriptor.

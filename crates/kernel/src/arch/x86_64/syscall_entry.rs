@@ -501,6 +501,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_fstat(args.arg0 as i32, args.arg1) }
         }
 
+        // SYS_LSTAT (6): get file status without following symlinks.
+        // POSIX.1-2024 lstat(3p).
+        oncrix_syscall::number::SYS_LSTAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_lstat(args.arg0, args.arg1) }
+        }
+
         // SYS_LSEEK (8): reposition the file offset.
         // POSIX.1-2024 lseek(3p).
         oncrix_syscall::number::SYS_LSEEK => {

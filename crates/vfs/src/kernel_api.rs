@@ -247,6 +247,25 @@ impl KernelVfs {
         self.ramfs.link(&target, &new_parent, new_name)
     }
 
+    /// Resolve `path` to its inode WITHOUT following a terminal symlink.
+    ///
+    /// Intermediate components are resolved normally (following), but the
+    /// final component is returned as-is — so a symlink yields the link
+    /// inode itself. Backs `lstat(2)`. Returns `NotFound` if absent.
+    pub fn lookup_path_nofollow(&self, path: &[u8]) -> Result<Inode> {
+        // Root has no parent/name; return it directly.
+        if path == b"/" {
+            return Ok(self.root_inode());
+        }
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.lookup(&parent, name)
+    }
+
     /// Create a named pipe (FIFO) at `path`.
     ///
     /// POSIX.1-2024 `mkfifo(2)` (ramfs subset, create-only). Returns
