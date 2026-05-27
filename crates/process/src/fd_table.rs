@@ -91,6 +91,12 @@ pub enum FileBackend {
         /// Which `/proc` entry this handle targets.
         kind: ProcFileKind,
     },
+
+    /// An `eventfd(2)` counter object.
+    EventFd {
+        /// Index into the global eventfd registry.
+        id: u32,
+    },
 }
 
 // ── HandleFlags ───────────────────────────────────────────────────

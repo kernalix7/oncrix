@@ -36,6 +36,197 @@ pub use oncrix_process::fd_table::{
     DevFileKind, FileBackend, FileHandle, HandleFlags, KernelFdTable, MAX_FDS, ProcFileKind,
 };
 
+// ── eventfd backing store ─────────────────────────────────────────
+
+/// Maximum number of simultaneously open `eventfd` objects.
+const MAX_EVENTFDS: usize = 32;
+
+/// Largest counter value a write may leave behind. `eventfd(2)` reserves
+/// `u64::MAX` as the "would overflow" sentinel; a write that would push the
+/// counter past this value blocks (or returns `EAGAIN`).
+const EVENTFD_MAX: u64 = u64::MAX - 1;
+
+/// One `eventfd` slot: a `u64` counter plus its semaphore-mode flag.
+#[derive(Clone, Copy)]
+struct EventFdSlot {
+    /// `true` when this slot is in use.
+    in_use: bool,
+    /// The 64-bit counter.
+    counter: u64,
+    /// `EFD_SEMAPHORE`: read decrements by 1 and returns 1, rather than
+    /// returning and zeroing the whole counter.
+    semaphore: bool,
+    /// Number of fds referencing this slot (`dup`/`dup2`/`fork` increment,
+    /// `close` decrements). The slot frees when this reaches zero.
+    refs: u32,
+}
+
+impl EventFdSlot {
+    const fn new() -> Self {
+        Self {
+            in_use: false,
+            counter: 0,
+            semaphore: false,
+            refs: 0,
+        }
+    }
+}
+
+/// Global eventfd registry (single-CPU, no heap).
+///
+/// # Safety invariant
+///
+/// Accessed exclusively from the SYSCALL dispatch path (single CPU, IF
+/// cleared on entry via FMASK), identical to the pipe table invariant.
+// SAFETY: See note. Single-CPU SYSCALL context only.
+static mut EVENTFD_TABLE: [EventFdSlot; MAX_EVENTFDS] = {
+    const EMPTY: EventFdSlot = EventFdSlot::new();
+    [EMPTY; MAX_EVENTFDS]
+};
+
+/// Allocate an eventfd slot initialised to `initval`/`semaphore`.
+///
+/// Returns the slot id, or `None` if all [`MAX_EVENTFDS`] slots are in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn eventfd_alloc(initval: u64, semaphore: bool) -> Option<u32> {
+    // SAFETY: single-CPU SYSCALL context; no aliased mutation.
+    unsafe {
+        #[allow(static_mut_refs)]
+        for (i, slot) in EVENTFD_TABLE.iter_mut().enumerate() {
+            if !slot.in_use {
+                slot.in_use = true;
+                slot.counter = initval;
+                slot.semaphore = semaphore;
+                slot.refs = 1;
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Drop one reference to eventfd `id`; free the slot when it hits zero.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn eventfd_close(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = EVENTFD_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_sub(1);
+            if slot.refs == 0 {
+                *slot = EventFdSlot::new();
+            }
+        }
+    }
+}
+
+/// Add one reference to eventfd `id` (for `dup`/`dup2`/`fork`).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn eventfd_dup(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = EVENTFD_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_add(1);
+        }
+    }
+}
+
+/// Return `(counter, semaphore)` for eventfd `id`, or `None` if not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn eventfd_peek(id: u32) -> Option<(u64, bool)> {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let slot = EVENTFD_TABLE.get(id as usize)?;
+        if slot.in_use {
+            Some((slot.counter, slot.semaphore))
+        } else {
+            None
+        }
+    }
+}
+
+/// `EFD_SEMAPHORE` flag — read decrements by 1 instead of zeroing.
+const EFD_SEMAPHORE: u32 = 1;
+/// `EFD_NONBLOCK` flag (octal 04000) — equivalent to `O_NONBLOCK`.
+const EFD_NONBLOCK: u32 = 0o4000;
+/// `EFD_CLOEXEC` flag (octal 02000000) — set `FD_CLOEXEC` on the new fd.
+const EFD_CLOEXEC: u32 = 0o2000000;
+
+/// Kernel handler for `SYS_EVENTFD2` (Linux number 290).
+///
+/// Linux `eventfd2(initval, flags)`: creates an fd backed by a `u64`
+/// counter initialised to `initval`. Recognised flags:
+/// - `EFD_SEMAPHORE` (1) — semaphore-mode reads (return 1, decrement by 1).
+/// - `EFD_NONBLOCK` (0o4000) — set `O_NONBLOCK` on the fd (read/write return
+///   `-EAGAIN` instead of blocking).
+/// - `EFD_CLOEXEC` (0o2000000) — set `FD_CLOEXEC` on the fd.
+///
+/// Returns the new fd, or a negative errno: `-EINVAL` (22) for an unknown
+/// flag bit, `-ENFILE` (23) if no eventfd slot is free, `-EMFILE` (24) if
+/// the fd table is full.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// effectively disabled).
+pub unsafe fn sys_eventfd2(initval: u64, flags: u32) -> i64 {
+    let known = EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC;
+    if flags & !known != 0 {
+        return -22; // EINVAL — unsupported flag bit
+    }
+
+    let semaphore = flags & EFD_SEMAPHORE != 0;
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { eventfd_alloc(initval, semaphore) } {
+        Some(id) => id,
+        None => return -23, // ENFILE — no free eventfd slots
+    };
+
+    // Map EFD_NONBLOCK -> O_NONBLOCK and EFD_CLOEXEC -> reserved cloexec bit
+    // in the handle flags (RDWR access mode: eventfd is read/write).
+    let mut hflags = HandleFlags::RDWR.0;
+    if flags & EFD_NONBLOCK != 0 {
+        hflags |= HandleFlags::NONBLOCK;
+    }
+    if flags & EFD_CLOEXEC != 0 {
+        hflags |= HandleFlags::FD_CLOEXEC_BIT;
+    }
+
+    let handle = FileHandle {
+        backend: FileBackend::EventFd { id },
+        offset: 0,
+        flags: HandleFlags(hflags),
+    };
+
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { fd_install(handle) } {
+        Ok(fd) => fd as i64,
+        Err(_) => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { eventfd_close(id) };
+            -24 // EMFILE
+        }
+    }
+}
+
 // ── Current-thread fd table helpers ───────────────────────────────
 
 /// Install a [`FileHandle`] in the current thread's fd table,
@@ -126,6 +317,10 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { crate::socket::socket_close(handle_id) }
         }
+        FileBackend::EventFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { eventfd_close(id) }
+        }
         _ => {}
     }
 
@@ -181,6 +376,10 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
                     crate::pipe::pipe_dup_read(ring_id);
                 }
             }
+        }
+        FileBackend::EventFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { eventfd_dup(id) }
         }
         FileBackend::Console
         | FileBackend::RamfsFile { .. }
@@ -410,6 +609,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                         }
                     }
                 }
+                FileBackend::EventFd { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { eventfd_dup(id) }
+                }
                 FileBackend::Console
                 | FileBackend::RamfsFile { .. }
                 | FileBackend::Socket { .. }
@@ -438,19 +641,25 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                 Ok(newfd) => newfd as i64,
                 Err(_) => {
                     // Roll back the backend refcount bump.
-                    if let FileBackend::Pipe {
-                        ring_id,
-                        is_write_end,
-                    } = handle.backend
-                    {
-                        // SAFETY: single-CPU SYSCALL context.
-                        unsafe {
-                            if is_write_end {
-                                crate::pipe::pipe_close_write(ring_id);
-                            } else {
-                                crate::pipe::pipe_close_read(ring_id);
+                    match handle.backend {
+                        FileBackend::Pipe {
+                            ring_id,
+                            is_write_end,
+                        } => {
+                            // SAFETY: single-CPU SYSCALL context.
+                            unsafe {
+                                if is_write_end {
+                                    crate::pipe::pipe_close_write(ring_id);
+                                } else {
+                                    crate::pipe::pipe_close_read(ring_id);
+                                }
                             }
                         }
+                        FileBackend::EventFd { id } => {
+                            // SAFETY: single-CPU SYSCALL context.
+                            unsafe { eventfd_close(id) }
+                        }
+                        _ => {}
                     }
                     -24 // EMFILE
                 }
@@ -566,6 +775,15 @@ unsafe fn fd_readiness(fd: usize) -> Option<(bool, bool, bool)> {
             // SAFETY: single-CPU SYSCALL context.
             let readable = unsafe { crate::console::console_has_byte() };
             (readable, true, false)
+        }
+        FileBackend::EventFd { id } => {
+            // Readable when the counter is non-zero; writable when a write of
+            // at least 1 would not overflow (counter < EVENTFD_MAX).
+            // SAFETY: single-CPU SYSCALL context.
+            match unsafe { eventfd_peek(id) } {
+                Some((counter, _)) => (counter > 0, counter < EVENTFD_MAX, false),
+                None => (false, false, false),
+            }
         }
         FileBackend::RamfsFile { .. }
         | FileBackend::DevFile { .. }
@@ -1061,6 +1279,53 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
         }
         FileBackend::DevFile { .. } => count as i64, // /dev/null and /dev/zero discard writes
         FileBackend::ProcFile { .. } => -30,         // EROFS — proc files are read-only
+        FileBackend::EventFd { id } => {
+            // eventfd write: the buffer must hold a u64; the value
+            // 0xffff_ffff_ffff_ffff is rejected; otherwise the value is added
+            // to the counter, blocking (or EAGAIN) if it would overflow past
+            // EVENTFD_MAX until a read drains it.
+            if count < 8 {
+                return -22; // EINVAL — short write
+            }
+            // SAFETY: `buf_ptr` validated above; reading 8 bytes.
+            let add = unsafe {
+                let mut bytes = [0u8; 8];
+                let ptr = buf_ptr as *const u8;
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = ptr.add(i).read_volatile();
+                }
+                u64::from_ne_bytes(bytes)
+            };
+            if add == u64::MAX {
+                return -22; // EINVAL — reserved sentinel
+            }
+            let nonblock = handle.flags.is_nonblock();
+            loop {
+                // SAFETY: single-CPU SYSCALL context.
+                let cur = match unsafe { eventfd_peek(id) } {
+                    Some((c, _)) => c,
+                    None => return -9, // EBADF — slot gone
+                };
+                // The add fits iff cur + add <= EVENTFD_MAX.
+                if add <= EVENTFD_MAX - cur {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe {
+                        #[allow(static_mut_refs)]
+                        if let Some(slot) = EVENTFD_TABLE.get_mut(id as usize) {
+                            slot.counter = cur + add;
+                        }
+                    }
+                    return 8;
+                }
+                if nonblock {
+                    return -11; // EAGAIN
+                }
+                // SAFETY: SYSCALL context; cooperative yield.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
+        }
     }
 }
 
@@ -1264,6 +1529,49 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             }
             n as i64
         }
+        FileBackend::EventFd { id } => {
+            // eventfd read: the buffer must hold a u64. Blocks (or EAGAIN)
+            // while the counter is zero. On a non-zero counter: in semaphore
+            // mode return 1 and decrement by 1; otherwise return the whole
+            // counter and zero it.
+            if count < 8 {
+                return -22; // EINVAL — short read
+            }
+            let nonblock = handle.flags.is_nonblock();
+            loop {
+                // SAFETY: single-CPU SYSCALL context.
+                let (counter, semaphore) = match unsafe { eventfd_peek(id) } {
+                    Some(v) => v,
+                    None => return -9, // EBADF — slot gone
+                };
+                if counter > 0 {
+                    let out = if semaphore { 1u64 } else { counter };
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe {
+                        #[allow(static_mut_refs)]
+                        if let Some(slot) = EVENTFD_TABLE.get_mut(id as usize) {
+                            slot.counter = if semaphore { counter - 1 } else { 0 };
+                        }
+                    }
+                    // SAFETY: `buf_ptr` validated above; writing 8 bytes.
+                    unsafe {
+                        let bytes = out.to_ne_bytes();
+                        let ptr = buf_ptr as *mut u8;
+                        for (i, &b) in bytes.iter().enumerate() {
+                            ptr.add(i).write_volatile(b);
+                        }
+                    }
+                    return 8;
+                }
+                if nonblock {
+                    return -11; // EAGAIN
+                }
+                // SAFETY: SYSCALL context; cooperative yield.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
+        }
     }
 }
 
@@ -1292,6 +1600,7 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
         FileBackend::Socket { .. } => -29,   // ESPIPE
         FileBackend::DevFile { .. } => -29,  // ESPIPE
         FileBackend::ProcFile { .. } => -29, // ESPIPE
+        FileBackend::EventFd { .. } => -29,  // ESPIPE
         FileBackend::RamfsFile { ino } => {
             let current_offset = handle.offset;
 

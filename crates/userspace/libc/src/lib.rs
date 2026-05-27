@@ -92,6 +92,7 @@ const SYS_TIMES: u64 = 100;
 const SYS_GETRUSAGE: u64 = 98;
 const SYS_SCHED_SETAFFINITY: u64 = 203;
 const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_EVENTFD2: u64 = 290;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -694,6 +695,27 @@ pub unsafe fn clock_nanosleep(clockid: i32, flags: i32, request: *const u8, rema
             remain as u64,
         )
     }
+}
+
+/// `eventfd` flag: each `read` decrements the counter by 1 (semaphore mode).
+pub const EFD_SEMAPHORE: i32 = 1;
+/// `eventfd` flag: set the descriptor non-blocking.
+pub const EFD_NONBLOCK: i32 = 0o4000;
+/// `eventfd` flag: set `FD_CLOEXEC` on the new descriptor.
+pub const EFD_CLOEXEC: i32 = 0o2000000;
+
+/// `eventfd(2)` — create a file descriptor backed by a `u64` counter.
+///
+/// `read` returns (and clears, or decrements in `EFD_SEMAPHORE` mode) the
+/// counter; `write` adds to it. The fd is pollable via [`poll`]/[`select`].
+/// Returns the new fd, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn eventfd(initval: u32, flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_EVENTFD2, initval as u64, flags as i64 as u64) }
 }
 
 /// `access(2)` — check file accessibility.

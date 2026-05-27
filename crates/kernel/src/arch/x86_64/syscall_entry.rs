@@ -926,6 +926,12 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             }
         }
 
+        // SYS_EVENTFD2 (290): create a pollable u64 counter fd.
+        oncrix_syscall::number::SYS_EVENTFD2 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_eventfd2(args.arg0, args.arg1 as u32) }
+        }
+
         // SYS_SELECT (23): synchronous I/O multiplexing over fd_set bitmaps.
         oncrix_syscall::number::SYS_SELECT => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
