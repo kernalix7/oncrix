@@ -922,6 +922,25 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             }
         }
 
+        // SYS_SETPGID (109) / SYS_GETPGID (121) / SYS_SETSID (112) /
+        // SYS_GETSID (124): POSIX.1-2024 process group + session API.
+        oncrix_syscall::number::SYS_SETPGID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setpgid(args.arg0, args.arg1) }
+        }
+        oncrix_syscall::number::SYS_GETPGID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getpgid(args.arg0) }
+        }
+        oncrix_syscall::number::SYS_SETSID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setsid() }
+        }
+        oncrix_syscall::number::SYS_GETSID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getsid(args.arg0) }
+        }
+
         // SYS_RT_SIGACTION (13) / SYS_RT_SIGPROCMASK (14): per-process
         // signal disposition + per-thread blocked-signal mask.
         oncrix_syscall::number::SYS_RT_SIGACTION => {
@@ -951,6 +970,19 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         oncrix_syscall::number::SYS_EVENTFD2 => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::fd_table::sys_eventfd2(args.arg0, args.arg1 as u32) }
+        }
+
+        // SYS_SIGNALFD4 (289): pollable signal file descriptor.
+        oncrix_syscall::number::SYS_SIGNALFD4 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_signalfd4(
+                    args.arg0 as i32,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as i32,
+                )
+            }
         }
 
         // SYS_TIMERFD_* (283/286/287): pollable timer file descriptors.

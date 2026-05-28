@@ -35,6 +35,7 @@
 
 use crate::current::{current_pid, current_thread_mut, yield_now};
 use oncrix_hal::timer::Timer;
+use oncrix_process::pid::Pid;
 use oncrix_process::signal::{
     SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, Signal, SignalAction, SignalMask,
 };
@@ -960,4 +961,216 @@ pub unsafe fn sys_rt_sigprocmask(how: i64, set: u64, oldset: u64, sigsetsize: u6
         }
     }
     0
+}
+
+// ── setpgid(2) / getpgid(2) / setsid(2) / getsid(2) ───────────────────
+
+/// Resolve a `pid` argument of `0` to the calling process; otherwise
+/// turn the raw `u64` into a [`Pid`]. Returns `None` if the calling
+/// thread has no associated process (used to map to `ESRCH`).
+fn resolve_target_pid(pid: u64) -> Option<Pid> {
+    if pid == 0 {
+        current_pid()
+    } else {
+        Some(Pid::new(pid))
+    }
+}
+
+/// `setpgid(pid, pgid)` — set the process group ID of `pid` to `pgid`.
+///
+/// `pid` of `0` selects the calling process; `pgid` of `0` selects the
+/// same value as `pid`. The target must be either the caller or one of
+/// the caller's children (`parent == self`); a session leader cannot
+/// change its group (`EPERM`); the target and the requested `pgid`
+/// owner (a process whose `pid == pgid`) must be in the same session
+/// as the caller; otherwise `EPERM`. ONCRIX does not yet model "the
+/// target has already exec'd in the child" → there is no
+/// `EACCES`-after-exec semantics; the rest of the failure set is honoured.
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for a negative `pgid` /
+/// out-of-range PID, `-1` (`EPERM`) for the disallowed transitions
+/// above, `-3` (`ESRCH`) if `pid` does not exist.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path (single-CPU, IF=0); the process-table borrow
+/// is exclusive within this call.
+pub unsafe fn sys_setpgid(pid_arg: u64, pgid_arg: u64) -> i64 {
+    // pgid as signed i64 to reject obviously negative values.
+    let pgid_signed = pgid_arg as i64;
+    if pgid_signed < 0 {
+        return -22; // EINVAL
+    }
+    let caller = match current_pid() {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    let target = match resolve_target_pid(pid_arg) {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    // pgid==0 ⇒ use the target pid.
+    let new_pgid = if pgid_arg == 0 {
+        target
+    } else {
+        Pid::new(pgid_arg)
+    };
+
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+
+        // Capture the caller's session for the "same session" checks
+        // without holding a borrow across the mutable lookup below.
+        let caller_sid = match table.get(caller) {
+            Some(e) => e.sid,
+            None => return -3, // ESRCH
+        };
+
+        let target_entry = match table.get(target) {
+            Some(e) => e,
+            None => return -3, // ESRCH
+        };
+        // Target must be the caller or a child of the caller.
+        if target != caller && target_entry.parent != caller {
+            return -1; // EPERM (target outside caller's reach)
+        }
+        // A session leader's pgid cannot change.
+        if target_entry.sid == target {
+            return -1; // EPERM (target is a session leader)
+        }
+        // Target must be in the caller's session.
+        if target_entry.sid != caller_sid {
+            return -1; // EPERM (different session)
+        }
+
+        // The requested pgid must either equal the target's pid (creating
+        // a new group with the target as leader) or already exist as a
+        // pgid in the caller's session.
+        if new_pgid != target {
+            let mut found = false;
+            for e in table.iter() {
+                if e.pgid == new_pgid && e.sid == caller_sid {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return -1; // EPERM (no such group in this session)
+            }
+        }
+
+        // All checks passed — apply the change.
+        let entry_mut = match table.get_mut(target) {
+            Some(e) => e,
+            None => return -3, // ESRCH (raced; defensive)
+        };
+        entry_mut.pgid = new_pgid;
+    }
+    0
+}
+
+/// `getpgid(pid)` — return the process group ID of `pid`.
+///
+/// `pid` of `0` queries the calling process. Returns the `pgid` (as a
+/// non-negative `i64`) on success, `-3` (`ESRCH`) if `pid` does not
+/// exist.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path.
+pub unsafe fn sys_getpgid(pid_arg: u64) -> i64 {
+    let target = match resolve_target_pid(pid_arg) {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        match table.get(target) {
+            Some(e) => e.pgid.as_u64() as i64,
+            None => -3, // ESRCH
+        }
+    }
+}
+
+/// `setsid()` — create a new session.
+///
+/// The caller becomes the session leader and the process-group leader
+/// of a brand-new session whose ID equals the caller's PID. Fails with
+/// `-1` (`EPERM`) if the caller is already a process-group leader
+/// (i.e. `pgid == pid`), per POSIX. On success returns the new
+/// (caller PID) session ID.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path.
+pub unsafe fn sys_setsid() -> i64 {
+    let caller = match current_pid() {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+
+        // Capture the caller's current pgid via a brief immutable
+        // borrow, then drop it before the leader-check scan.
+        let our_pgid = match table.get(caller) {
+            Some(e) => e.pgid,
+            None => return -3, // ESRCH
+        };
+
+        // POSIX: setsid fails if the caller is **already a real**
+        // process-group leader — i.e. some *other* process shares this
+        // pgid. Our default `pgid = pid` makes every freshly-spawned
+        // process formally a "leader" of a one-process group, but POSIX
+        // permits setsid in that case (it just folds the trivial group
+        // into the new session). We therefore only reject when at least
+        // one other process is in the same pgrp.
+        for e in table.iter() {
+            if e.pid() != caller && e.pgid == our_pgid {
+                return -1; // EPERM (real pgrp leader)
+            }
+        }
+
+        // Commit the new session and group.
+        let entry = match table.get_mut(caller) {
+            Some(e) => e,
+            None => return -3, // ESRCH (defensive)
+        };
+        entry.sid = caller;
+        entry.pgid = caller;
+        caller.as_u64() as i64
+    }
+}
+
+/// `getsid(pid)` — return the session ID of `pid`.
+///
+/// `pid` of `0` queries the calling process. Returns the `sid` on
+/// success, `-3` (`ESRCH`) if `pid` does not exist. ONCRIX has no
+/// cross-session permission model, so the optional POSIX `EPERM` case
+/// ("target is in a different session and the implementation does not
+/// permit cross-session queries") is not returned.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path.
+pub unsafe fn sys_getsid(pid_arg: u64) -> i64 {
+    let target = match resolve_target_pid(pid_arg) {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        match table.get(target) {
+            Some(e) => e.sid.as_u64() as i64,
+            None => -3, // ESRCH
+        }
+    }
 }

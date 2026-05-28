@@ -125,17 +125,40 @@ pub struct ProcessEntry {
     pub exit_status: Option<ExitStatus>,
     /// `ITIMER_REAL` interval timer (`setitimer`/`alarm`).
     pub itimer_real: ItimerReal,
+    /// Process group ID (`getpgid(2)`/`setpgid(2)`).
+    ///
+    /// At construction this is initialised to the process's own PID, so
+    /// a brand-new process is in its own process group (and is therefore
+    /// the leader of that group). `sys_fork` is responsible for
+    /// overwriting this with the parent's `pgid` so children inherit
+    /// the group POSIX-correctly; `setpgid(2)` mutates it explicitly.
+    pub pgid: Pid,
+    /// Session ID (`getsid(2)`/`setsid(2)`).
+    ///
+    /// Initialised to the process's own PID — same inheritance rule as
+    /// [`pgid`](Self::pgid): the fork path must propagate the parent's
+    /// `sid`. `setsid(2)` creates a new session and resets both fields
+    /// to the caller's PID.
+    pub sid: Pid,
 }
 
 impl ProcessEntry {
     /// Create a new process entry.
+    ///
+    /// `pgid` and `sid` default to the process's own PID, matching the
+    /// "every process is initially its own session/group leader"
+    /// convenience used at boot. The fork path overrides these to
+    /// inherit from the parent before insertion.
     pub fn new(process: Process, parent: Pid) -> Self {
+        let pid = process.pid();
         Self {
             process,
             parent,
             signals: SignalState::new(),
             exit_status: None,
             itimer_real: ItimerReal::new(),
+            pgid: pid,
+            sid: pid,
         }
     }
 

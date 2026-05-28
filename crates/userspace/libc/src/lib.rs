@@ -96,6 +96,7 @@ const SYS_EVENTFD2: u64 = 290;
 const SYS_TIMERFD_CREATE: u64 = 283;
 const SYS_TIMERFD_SETTIME: u64 = 286;
 const SYS_TIMERFD_GETTIME: u64 = 287;
+const SYS_SIGNALFD4: u64 = 289;
 const SYS_EPOLL_WAIT: u64 = 232;
 const SYS_EPOLL_CTL: u64 = 233;
 const SYS_EPOLL_CREATE1: u64 = 291;
@@ -104,6 +105,10 @@ const SYS_ALARM: u64 = 37;
 const SYS_SETITIMER: u64 = 38;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_SETPGID: u64 = 109;
+const SYS_SETSID: u64 = 112;
+const SYS_GETPGID: u64 = 121;
+const SYS_GETSID: u64 = 124;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -804,6 +809,40 @@ pub unsafe fn timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
     unsafe { syscall2(SYS_TIMERFD_GETTIME, fd as u64, curr_value as u64) }
 }
 
+/// `signalfd` flag: set the descriptor non-blocking.
+pub const SFD_NONBLOCK: i32 = 0o4000;
+/// `signalfd` flag: set `FD_CLOEXEC`.
+pub const SFD_CLOEXEC: i32 = 0o2000000;
+
+/// `struct signalfd_siginfo` — 128-byte ABI record returned by reads on a
+/// signalfd. Only `ssi_signo`/`ssi_errno`/`ssi_code` are populated; the
+/// remaining 116 bytes are zero-padded.
+#[repr(C)]
+pub struct SignalfdSiginfo {
+    /// Signal number that delivered.
+    pub ssi_signo: u32,
+    /// Reserved; always 0.
+    pub ssi_errno: i32,
+    /// Signal code (`SI_KERNEL`/`SI_USER`/…).
+    pub ssi_code: i32,
+    /// Padding to the 128-byte ABI size.
+    pub _pad: [u8; 116],
+}
+
+/// `signalfd4(2)` — create or update a pollable signal file descriptor.
+///
+/// `fd` of -1 creates a new fd; otherwise the existing signalfd's mask is
+/// replaced. `mask` is a `u64` sigset (sigsetsize implicit = 8). Returns the
+/// fd or a negative errno value.
+///
+/// # Safety
+///
+/// `mask` must point to a valid `u64`.
+pub unsafe fn signalfd(fd: i32, mask: *const u64, flags: i32) -> i64 {
+    // SAFETY: caller guarantees `mask` validity.
+    unsafe { syscall4(SYS_SIGNALFD4, fd as i64 as u64, mask as u64, 8, flags as i64 as u64) }
+}
+
 /// A single epoll interest/event record (packed: `events` then `data`).
 #[repr(C, packed)]
 pub struct EpollEvent {
@@ -943,6 +982,45 @@ pub unsafe fn rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsi
             sigsetsize as u64,
         )
     }
+}
+
+/// `setpgid(2)` — set the process group of `pid` (0 = self) to `pgid`
+/// (0 = use `pid`). Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn setpgid(pid: i32, pgid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_SETPGID, pid as i64 as u64, pgid as i64 as u64) }
+}
+
+/// `getpgid(2)` — return the process group of `pid` (0 = self).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn getpgid(pid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_GETPGID, pid as i64 as u64) }
+}
+
+/// `setsid(2)` — start a new session with the caller as leader.
+///
+/// Returns the new session id (= caller PID), or a negative errno value.
+pub fn setsid() -> i64 {
+    // SAFETY: no arguments, no memory access.
+    unsafe { syscall1(SYS_SETSID, 0) }
+}
+
+/// `getsid(2)` — return the session id of `pid` (0 = self).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn getsid(pid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_GETSID, pid as i64 as u64) }
 }
 
 /// `access(2)` — check file accessibility.

@@ -243,7 +243,18 @@ pub unsafe fn sys_fork() -> i64 {
 
     // Register child in the process table so wait4 can find it.
     let child_process = Process::new(child_pid);
-    let child_entry = ProcessEntry::new(child_process, parent_pid);
+    let mut child_entry = ProcessEntry::new(child_process, parent_pid);
+    // POSIX.1-2024: a forked child inherits the parent's process group
+    // and session, not its own PID. Without this, setpgid's same-session
+    // check would mis-treat every child as its own session leader.
+    // SAFETY: single-CPU SYSCALL context; no aliased access.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(parent_entry) = PROCESS_TABLE.get(parent_pid) {
+            child_entry.pgid = parent_entry.pgid;
+            child_entry.sid = parent_entry.sid;
+        }
+    }
     // SAFETY: single-CPU SYSCALL context.
     unsafe { register_process(child_entry) };
 

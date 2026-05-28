@@ -109,6 +109,12 @@ pub enum FileBackend {
         /// Index into the global timerfd registry.
         id: u32,
     },
+
+    /// A `signalfd(2)` signal-pending file descriptor.
+    SignalFd {
+        /// Index into the global signalfd registry.
+        id: u32,
+    },
 }
 
 // ── HandleFlags ───────────────────────────────────────────────────

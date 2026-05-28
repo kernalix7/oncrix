@@ -1054,6 +1054,296 @@ pub unsafe fn sys_timerfd_gettime(fd: usize, cur_ptr: u64) -> i64 {
     0
 }
 
+// ── signalfd backing store ────────────────────────────────────────
+
+/// Maximum number of simultaneously open `signalfd` objects.
+const MAX_SIGNALFDS: usize = 16;
+
+/// `signalfd4(2)` flag — set `O_NONBLOCK` on the fd.
+const SFD_NONBLOCK: i32 = 0o4000;
+/// `signalfd4(2)` flag — set `FD_CLOEXEC` on the fd.
+const SFD_CLOEXEC: i32 = 0o2000000;
+
+/// Size of a `struct signalfd_siginfo` (Linux ABI).
+const SIGNALFD_SIGINFO_SIZE: usize = 128;
+
+/// One `signalfd` slot.
+///
+/// `mask` is the caller-supplied 64-bit sigset (only the low 32 bits are
+/// meaningful here; signals are numbered 1..32). `owner_pid` records the
+/// process whose pending mask is queried — the fd inherits the creator's
+/// pid even when read after a fork (matches Linux signalfd semantics
+/// where the fd watches the calling thread group's pending signals).
+#[derive(Clone, Copy)]
+struct SignalFdSlot {
+    in_use: bool,
+    refs: u32,
+    mask: u64,
+    owner_pid: u64,
+}
+
+impl SignalFdSlot {
+    const fn new() -> Self {
+        Self {
+            in_use: false,
+            refs: 0,
+            mask: 0,
+            owner_pid: 0,
+        }
+    }
+}
+
+/// Global signalfd registry (single-CPU, no heap).
+///
+/// # Safety invariant
+///
+/// Accessed exclusively from the SYSCALL dispatch path (single CPU,
+/// IF=0 via FMASK), identical to the other fd backend tables.
+// SAFETY: See note. Single-CPU SYSCALL context only.
+static mut SIGNALFD_TABLE: [SignalFdSlot; MAX_SIGNALFDS] = {
+    const EMPTY: SignalFdSlot = SignalFdSlot::new();
+    [EMPTY; MAX_SIGNALFDS]
+};
+
+/// Allocate a free signalfd slot.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn signalfd_alloc(mask: u64, owner_pid: u64) -> Option<u32> {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        for (i, slot) in SIGNALFD_TABLE.iter_mut().enumerate() {
+            if !slot.in_use {
+                *slot = SignalFdSlot::new();
+                slot.in_use = true;
+                slot.refs = 1;
+                slot.mask = mask;
+                slot.owner_pid = owner_pid;
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Drop one reference to signalfd `id`; free the slot when it hits zero.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn signalfd_close(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = SIGNALFD_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_sub(1);
+            if slot.refs == 0 {
+                *slot = SignalFdSlot::new();
+            }
+        }
+    }
+}
+
+/// Add one reference to signalfd `id` (for `dup`/`dup2`/`fork`).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn signalfd_dup(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = SIGNALFD_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_add(1);
+        }
+    }
+}
+
+/// Look up a signalfd slot without taking a mutable borrow.
+///
+/// Returns `(mask, owner_pid)` or `None` if the slot is not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn signalfd_peek(id: u32) -> Option<(u64, u64)> {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let slot = SIGNALFD_TABLE.get(id as usize)?;
+        if slot.in_use {
+            Some((slot.mask, slot.owner_pid))
+        } else {
+            None
+        }
+    }
+}
+
+/// Replace the watched mask on signalfd `id`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn signalfd_set_mask(id: u32, mask: u64) -> bool {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = SIGNALFD_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.mask = mask;
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the lowest signal number (1..=32) that is both pending on the
+/// owning process and present in `mask`, or `None` if none.
+///
+/// Consults the process table read-only (does not mutate pending state) so
+/// it is safe to call from the readiness scan.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn signalfd_next_pending(owner_pid: u64, mask: u64) -> Option<u8> {
+    use oncrix_process::pid::Pid;
+    use oncrix_process::signal::Signal;
+    // SAFETY: single-CPU SYSCALL context; we drop the borrow before
+    // returning.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        let entry = table.get_mut(Pid::new(owner_pid))?;
+        for bit in 0..Signal::MAX {
+            let signo = bit + 1;
+            if mask & (1u64 << bit) == 0 {
+                continue;
+            }
+            if entry.signals.pending.is_pending(Signal(signo)) {
+                return Some(signo);
+            }
+        }
+        None
+    }
+}
+
+/// Consume (clear) the pending bit for `signo` on the owning process,
+/// returning `true` if it was actually set.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn signalfd_consume(owner_pid: u64, signo: u8) -> bool {
+    use oncrix_process::pid::Pid;
+    use oncrix_process::signal::Signal;
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        let entry = match table.get_mut(Pid::new(owner_pid)) {
+            Some(e) => e,
+            None => return false,
+        };
+        let sig = Signal(signo);
+        if entry.signals.pending.is_pending(sig) {
+            entry.signals.pending.clear(sig);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Kernel handler for `SYS_SIGNALFD4` (Linux number 289).
+///
+/// `signalfd4(fd, mask_ptr, sigsetsize, flags)`:
+/// - If `fd == -1`, allocates a new signalfd slot, installs it in the fd
+///   table, and returns the new fd.
+/// - Otherwise the existing slot's mask is replaced and `fd` is returned.
+///
+/// `sigsetsize` must equal `8` (one `u64` sigset word — Linux glibc ABI).
+/// Recognised flags: `SFD_NONBLOCK` (sets `O_NONBLOCK`) and `SFD_CLOEXEC`
+/// (sets `FD_CLOEXEC`).
+///
+/// Returns the fd on success, or a negative errno: `-EBADF` (9) if `fd`
+/// is not a signalfd, `-EINVAL` (22) for a bad sigsetsize/flag, `-EFAULT`
+/// (14) for a bad mask pointer, `-ENFILE` (23) if no slot is free,
+/// `-EMFILE` (24) if the fd table is full.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_signalfd4(fd: i32, mask_ptr: u64, sigsetsize: u64, flags: i32) -> i64 {
+    if sigsetsize != 8 {
+        return -22; // EINVAL
+    }
+    if flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
+        return -22; // EINVAL
+    }
+    if mask_ptr == 0 || mask_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // SAFETY: `mask_ptr` validated user-canonical above; reads 8 bytes.
+    let mask = unsafe { (mask_ptr as *const u64).read_volatile() };
+
+    if fd >= 0 {
+        // Update an existing signalfd's mask.
+        // SAFETY: single-CPU SYSCALL context.
+        let id = match unsafe { fd_get(fd as usize) } {
+            Some(FileHandle {
+                backend: FileBackend::SignalFd { id },
+                ..
+            }) => id,
+            _ => return -9, // EBADF
+        };
+        // SAFETY: single-CPU SYSCALL context.
+        if !unsafe { signalfd_set_mask(id, mask) } {
+            return -9; // EBADF — slot vanished
+        }
+        return fd as i64;
+    }
+
+    // Allocate a fresh signalfd, owned by the current process.
+    let owner_pid = match crate::current::current_pid() {
+        Some(p) => p.as_u64(),
+        None => return -9, // EBADF — no current thread
+    };
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { signalfd_alloc(mask, owner_pid) } {
+        Some(id) => id,
+        None => return -23, // ENFILE
+    };
+
+    let mut hflags = HandleFlags::RDWR.0;
+    if flags & SFD_NONBLOCK != 0 {
+        hflags |= HandleFlags::NONBLOCK;
+    }
+    if flags & SFD_CLOEXEC != 0 {
+        hflags |= HandleFlags::FD_CLOEXEC_BIT;
+    }
+    let handle = FileHandle {
+        backend: FileBackend::SignalFd { id },
+        offset: 0,
+        flags: HandleFlags(hflags),
+    };
+
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { fd_install(handle) } {
+        Ok(new_fd) => new_fd as i64,
+        Err(_) => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { signalfd_close(id) };
+            -24 // EMFILE
+        }
+    }
+}
+
 // ── Current-thread fd table helpers ───────────────────────────────
 
 /// Install a [`FileHandle`] in the current thread's fd table,
@@ -1156,6 +1446,10 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { timerfd_close(id) }
         }
+        FileBackend::SignalFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { signalfd_close(id) }
+        }
         _ => {}
     }
 
@@ -1223,6 +1517,10 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
         FileBackend::TimerFd { id } => {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { timerfd_dup(id) }
+        }
+        FileBackend::SignalFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { signalfd_dup(id) }
         }
         FileBackend::Console
         | FileBackend::RamfsFile { .. }
@@ -1464,6 +1762,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                     // SAFETY: single-CPU SYSCALL context.
                     unsafe { timerfd_dup(id) }
                 }
+                FileBackend::SignalFd { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { signalfd_dup(id) }
+                }
                 FileBackend::Console
                 | FileBackend::RamfsFile { .. }
                 | FileBackend::Socket { .. }
@@ -1517,6 +1819,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                         FileBackend::TimerFd { id } => {
                             // SAFETY: single-CPU SYSCALL context.
                             unsafe { timerfd_close(id) }
+                        }
+                        FileBackend::SignalFd { id } => {
+                            // SAFETY: single-CPU SYSCALL context.
+                            unsafe { signalfd_close(id) }
                         }
                         _ => {}
                     }
@@ -1658,6 +1964,18 @@ unsafe fn fd_readiness(fd: usize) -> Option<(bool, bool, bool)> {
                 Some(exp) => (exp > 0, false, false),
                 None => (false, false, false),
             }
+        }
+        FileBackend::SignalFd { id } => {
+            // Readable when any signal in the watched mask is pending on
+            // the owning process; never writable; no hangup.
+            // SAFETY: single-CPU SYSCALL context.
+            let pending = unsafe {
+                match signalfd_peek(id) {
+                    Some((mask, owner)) => signalfd_next_pending(owner, mask).is_some(),
+                    None => false,
+                }
+            };
+            (pending, false, false)
         }
         FileBackend::RamfsFile { .. }
         | FileBackend::DevFile { .. }
@@ -2202,6 +2520,7 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
         }
         FileBackend::EpollInstance { .. } => -22, // EINVAL — epoll fd is not writable
         FileBackend::TimerFd { .. } => -22,       // EINVAL — timerfd is not writable
+        FileBackend::SignalFd { .. } => -22,      // EINVAL — signalfd is not writable
     }
 }
 
@@ -2490,6 +2809,54 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
         }
+        FileBackend::SignalFd { id } => {
+            // signalfd read: emit one signalfd_siginfo per call. Block (or
+            // -EAGAIN) until a signal in the watched mask is pending on the
+            // owning process; consume the pending bit before returning.
+            if count < SIGNALFD_SIGINFO_SIZE {
+                return -22; // EINVAL — short read
+            }
+            // SAFETY: single-CPU SYSCALL context.
+            let (mask, owner_pid) = match unsafe { signalfd_peek(id) } {
+                Some(v) => v,
+                None => return -9, // EBADF — slot gone
+            };
+            let nonblock = handle.flags.is_nonblock();
+            loop {
+                // SAFETY: single-CPU SYSCALL context.
+                let next = unsafe { signalfd_next_pending(owner_pid, mask) };
+                if let Some(signo) = next {
+                    // SAFETY: single-CPU SYSCALL context.
+                    let consumed = unsafe { signalfd_consume(owner_pid, signo) };
+                    if !consumed {
+                        // Lost the race — re-scan.
+                        continue;
+                    }
+                    // Build a zeroed signalfd_siginfo and fill ssi_signo
+                    // (u32 @0) and ssi_code (i32 @8). Phase: other fields
+                    // (errno, pid, uid, status, etc.) are not populated.
+                    let mut info = [0u8; SIGNALFD_SIGINFO_SIZE];
+                    info[0..4].copy_from_slice(&(signo as u32).to_ne_bytes());
+                    // ssi_code = SI_KERNEL (0x80) for kernel-raised signals.
+                    info[8..12].copy_from_slice(&0x80i32.to_ne_bytes());
+                    // SAFETY: `buf_ptr` validated above; writing 128 bytes.
+                    unsafe {
+                        let ptr = buf_ptr as *mut u8;
+                        for (i, &b) in info.iter().enumerate() {
+                            ptr.add(i).write_volatile(b);
+                        }
+                    }
+                    return SIGNALFD_SIGINFO_SIZE as i64;
+                }
+                if nonblock {
+                    return -11; // EAGAIN
+                }
+                // SAFETY: SYSCALL context; cooperative yield.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
+        }
     }
 }
 
@@ -2521,6 +2888,7 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
         FileBackend::EventFd { .. } => -29,       // ESPIPE
         FileBackend::EpollInstance { .. } => -29, // ESPIPE
         FileBackend::TimerFd { .. } => -29,       // ESPIPE
+        FileBackend::SignalFd { .. } => -29,      // ESPIPE
         FileBackend::RamfsFile { ino } => {
             let current_offset = handle.offset;
 
