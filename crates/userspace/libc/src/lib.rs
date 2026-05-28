@@ -103,7 +103,6 @@ const SYS_EPOLL_CREATE1: u64 = 291;
 const SYS_GETITIMER: u64 = 36;
 const SYS_ALARM: u64 = 37;
 const SYS_SETITIMER: u64 = 38;
-const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_SETPGID: u64 = 109;
 const SYS_SETSID: u64 = 112;
@@ -752,11 +751,9 @@ pub struct ITimerSpec {
     pub it_value: TimeSpec,
 }
 
-/// `clock_gettime`/`timerfd` clock id: real (wall) clock.
-pub const CLOCK_REALTIME: i32 = 0;
-/// `clock_gettime`/`timerfd` clock id: monotonic since boot.
-pub const CLOCK_MONOTONIC: i32 = 1;
 /// `clock_gettime`/`timerfd` clock id: monotonic incl. suspend.
+/// (`CLOCK_REALTIME`/`CLOCK_MONOTONIC` are defined once with the other
+/// clock-id constants below.)
 pub const CLOCK_BOOTTIME: i32 = 7;
 /// `timerfd_create` flag: set the descriptor non-blocking.
 pub const TFD_NONBLOCK: i32 = 0o4000;
