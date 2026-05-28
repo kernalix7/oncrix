@@ -57,6 +57,60 @@ impl core::fmt::Display for ExitStatus {
 
 /// A process entry in the global process table.
 ///
+/// Per-process `ITIMER_REAL` interval timer state (`setitimer(2)` /
+/// `alarm(2)`).
+///
+/// Counted down in PIT ticks by the timer interrupt. When `value_ticks`
+/// reaches zero the kernel raises `SIGALRM` on the owning process and, if
+/// `interval_ticks` is non-zero, reloads `value_ticks` from it (periodic
+/// timer); otherwise the timer disarms (`value_ticks` stays `0`).
+///
+/// All durations are stored in PIT ticks (100 Hz) rather than `timeval`s
+/// so the timer-tick decrement is a single subtraction. A `value_ticks`
+/// of `0` means "disarmed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ItimerReal {
+    /// Ticks remaining until the next `SIGALRM`. `0` = disarmed.
+    pub value_ticks: u64,
+    /// Reload value in ticks for a periodic timer. `0` = one-shot.
+    pub interval_ticks: u64,
+}
+
+impl ItimerReal {
+    /// Create a disarmed timer.
+    pub const fn new() -> Self {
+        Self {
+            value_ticks: 0,
+            interval_ticks: 0,
+        }
+    }
+
+    /// Returns `true` if the timer is currently armed (counting down).
+    pub const fn is_armed(&self) -> bool {
+        self.value_ticks != 0
+    }
+
+    /// Advance the timer by one PIT tick.
+    ///
+    /// Returns `true` if the timer expired on this tick (the caller must
+    /// then raise `SIGALRM`). On expiry the timer reloads from
+    /// `interval_ticks` for a periodic timer, or disarms for a one-shot.
+    /// A disarmed timer is a no-op and returns `false`.
+    pub fn tick(&mut self) -> bool {
+        if self.value_ticks == 0 {
+            return false;
+        }
+        self.value_ticks -= 1;
+        if self.value_ticks == 0 {
+            // Expired: reload for periodic, else stay disarmed.
+            self.value_ticks = self.interval_ticks;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Extends [`Process`] with parent relationship, signal state,
 /// and exit information needed by `wait4` and `kill`.
 #[derive(Debug)]
@@ -69,6 +123,8 @@ pub struct ProcessEntry {
     pub signals: SignalState,
     /// Exit status, set when the process terminates.
     pub exit_status: Option<ExitStatus>,
+    /// `ITIMER_REAL` interval timer (`setitimer`/`alarm`).
+    pub itimer_real: ItimerReal,
 }
 
 impl ProcessEntry {
@@ -79,6 +135,7 @@ impl ProcessEntry {
             parent,
             signals: SignalState::new(),
             exit_status: None,
+            itimer_real: ItimerReal::new(),
         }
     }
 

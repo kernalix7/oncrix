@@ -265,6 +265,15 @@ pub const SYS_CLOCK_GETTIME: SyscallNumber = 228;
 /// `clock_nanosleep(clk_id, flags, request, remain)` — High-resolution
 /// sleep against a specific clock (relative or `TIMER_ABSTIME`).
 pub const SYS_CLOCK_NANOSLEEP: SyscallNumber = 230;
+
+// ── Interval timers ──────────────────────────────────────────────
+
+/// `getitimer(which, curr_value)` — Get an interval timer.
+pub const SYS_GETITIMER: SyscallNumber = 36;
+/// `alarm(seconds)` — Schedule a one-shot `SIGALRM`.
+pub const SYS_ALARM: SyscallNumber = 37;
+/// `setitimer(which, new_value, old_value)` — Set an interval timer.
+pub const SYS_SETITIMER: SyscallNumber = 38;
 /// `time(tloc)` — Seconds since the Epoch (or boot, on systems without RTC).
 pub const SYS_TIME: SyscallNumber = 201;
 

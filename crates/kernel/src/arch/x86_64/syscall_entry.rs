@@ -932,6 +932,49 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fd_table::sys_eventfd2(args.arg0, args.arg1 as u32) }
         }
 
+        // SYS_EPOLL_* (291/233/232): scalable I/O event notification.
+        oncrix_syscall::number::SYS_EPOLL_CREATE1 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_epoll_create1(args.arg0 as i32) }
+        }
+        oncrix_syscall::number::SYS_EPOLL_CTL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_epoll_ctl(
+                    args.arg0 as usize,
+                    args.arg1 as i32,
+                    args.arg2 as usize,
+                    args.arg3,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_EPOLL_WAIT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_epoll_wait(
+                    args.arg0 as usize,
+                    args.arg1,
+                    args.arg2 as i32,
+                    args.arg3 as i64,
+                )
+            }
+        }
+
+        // SYS_ALARM (37) / SYS_SETITIMER (38) / SYS_GETITIMER (36):
+        // ITIMER_REAL interval timers; expiry raises SIGALRM. POSIX.1-2024.
+        oncrix_syscall::number::SYS_ALARM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_alarm(args.arg0) }
+        }
+        oncrix_syscall::number::SYS_SETITIMER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setitimer(args.arg0 as i64, args.arg1, args.arg2) }
+        }
+        oncrix_syscall::number::SYS_GETITIMER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getitimer(args.arg0 as i64, args.arg1) }
+        }
+
         // SYS_SELECT (23): synchronous I/O multiplexing over fd_set bitmaps.
         oncrix_syscall::number::SYS_SELECT => {
             // SAFETY: Single-CPU SYSCALL dispatch path.

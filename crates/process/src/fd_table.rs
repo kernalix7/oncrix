@@ -97,6 +97,12 @@ pub enum FileBackend {
         /// Index into the global eventfd registry.
         id: u32,
     },
+
+    /// An `epoll(7)` instance.
+    EpollInstance {
+        /// Index into the global epoll registry.
+        id: u32,
+    },
 }
 
 // ── HandleFlags ───────────────────────────────────────────────────

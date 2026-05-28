@@ -33,8 +33,9 @@
 //! - `setpriority(3p)` — `functions/setpriority.html`
 //! - `nice(3p)` — `functions/nice.html`
 
-use crate::current::{current_thread_mut, yield_now};
+use crate::current::{current_pid, current_thread_mut, yield_now};
 use oncrix_hal::timer::Timer;
+use oncrix_process::signal::Signal;
 use oncrix_process::thread::{Priority, SchedPolicy};
 
 /// `which` selector: act on a process (the only mode ONCRIX supports).
@@ -531,4 +532,216 @@ pub unsafe fn sys_sched_setaffinity(_pid: i64, cpusetsize: u64, mask: u64) -> i6
         }
         None => -3, // ESRCH
     }
+}
+
+// ── ITIMER_REAL: alarm(2) / setitimer(2) / getitimer(2) ──────────────
+
+/// `which` selector for `setitimer`/`getitimer`: real (wall-clock) time.
+const ITIMER_REAL: i64 = 0;
+/// `which` selector: virtual (user CPU) time — unsupported.
+const _ITIMER_VIRTUAL: i64 = 1;
+/// `which` selector: profiling (user + system CPU) time — unsupported.
+const _ITIMER_PROF: i64 = 2;
+
+/// Advance every armed `ITIMER_REAL` by one PIT tick and raise `SIGALRM`
+/// on each process whose timer expires this tick.
+///
+/// Called from the timer interrupt handler. Periodic timers reload
+/// automatically (see [`ItimerReal::tick`](oncrix_process::table::ItimerReal::tick)).
+///
+/// # Safety
+///
+/// Must be called from the timer IRQ (single-CPU, IF=0 interrupt gate):
+/// the process-table `&mut` borrow taken here is exclusive only under
+/// that invariant, and is fully dropped before this function returns.
+pub unsafe fn tick_itimers() {
+    // SAFETY: timer IRQ context (single-CPU, IF=0) — no other code path
+    // holds the process table; the borrow is released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        for entry in table.iter_mut() {
+            if entry.itimer_real.tick() {
+                entry.signals.pending.raise(Signal::SIGALRM);
+            }
+        }
+    }
+}
+
+/// Convert a `(tv_sec, tv_usec)` pair to PIT ticks, rounding the
+/// sub-tick remainder up so a small non-zero interval still arms for at
+/// least one tick. Used for `itimerval` fields.
+fn timeval_to_ticks(sec: i64, usec: i64) -> u64 {
+    let whole = (sec as u64).saturating_mul(CLK_TCK);
+    // usec → ticks: ceil(usec * CLK_TCK / 1_000_000).
+    let frac = ((usec as u64).saturating_mul(CLK_TCK)).div_ceil(1_000_000);
+    whole.saturating_add(frac)
+}
+
+/// Convert PIT ticks back to a `(tv_sec, tv_usec)` pair for reporting an
+/// `itimerval` field.
+fn ticks_to_timeval_usec(ticks: u64) -> (i64, i64) {
+    let sec = (ticks / CLK_TCK) as i64;
+    let usec = ((ticks % CLK_TCK) * 1_000_000 / CLK_TCK) as i64;
+    (sec, usec)
+}
+
+/// Read the calling process's current `ITIMER_REAL` `(value_ticks,
+/// interval_ticks)`, or `None` if there is no current process.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path (single-CPU, IF=0); the process-table borrow is
+/// dropped before returning.
+unsafe fn read_itimer_real() -> Option<(u64, u64)> {
+    let pid = current_pid()?;
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        table
+            .get(pid)
+            .map(|e| (e.itimer_real.value_ticks, e.itimer_real.interval_ticks))
+    }
+}
+
+/// Arm/replace the calling process's `ITIMER_REAL`, returning the
+/// previous `(value_ticks, interval_ticks)`. Returns `None` if there is
+/// no current process.
+///
+/// # Safety
+///
+/// See [`read_itimer_real`].
+unsafe fn set_itimer_real(value_ticks: u64, interval_ticks: u64) -> Option<(u64, u64)> {
+    let pid = current_pid()?;
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        let e = table.get_mut(pid)?;
+        let prev = (e.itimer_real.value_ticks, e.itimer_real.interval_ticks);
+        e.itimer_real.value_ticks = value_ticks;
+        e.itimer_real.interval_ticks = interval_ticks;
+        Some(prev)
+    }
+}
+
+/// `alarm(seconds)` — arrange for `SIGALRM` after `seconds` real seconds.
+///
+/// A thin one-shot `ITIMER_REAL`: arms a non-periodic timer for
+/// `seconds` and returns the number of whole seconds remaining on any
+/// previously-set alarm (rounded up), or `0` if none was pending.
+/// `alarm(0)` cancels any pending alarm and returns the seconds that
+/// were left. POSIX `alarm` never fails.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path; the process-table borrows are confined to the
+/// helper calls and released before return.
+pub unsafe fn sys_alarm(seconds: u64) -> i64 {
+    let new_value = seconds.saturating_mul(CLK_TCK);
+    // SAFETY: SYSCALL context — see fn-level note.
+    let prev = unsafe { set_itimer_real(new_value, 0) };
+    match prev {
+        // Round remaining ticks up to whole seconds for the return value.
+        Some((prev_value, _)) => prev_value.div_ceil(CLK_TCK) as i64,
+        None => 0,
+    }
+}
+
+/// `getitimer(which, curr_value)` — report the calling process's timer.
+///
+/// Only `ITIMER_REAL` (0) is supported; `ITIMER_VIRTUAL`/`ITIMER_PROF`
+/// return `-22` (`EINVAL`) (documented divergence — no CPU-time timers
+/// yet). Writes a `struct itimerval { it_interval, it_value }` (two
+/// `timeval`s, four `i64`s) to `curr_value`: `it_value` is the time left
+/// until the next `SIGALRM`, `it_interval` the reload period.
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for an unsupported `which`,
+/// `-14` (`EFAULT`) for a bad `curr_value`, `-3` (`ESRCH`) if no current
+/// process.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path; `curr_value` validated user-canonical first.
+pub unsafe fn sys_getitimer(which: i64, curr_value: u64) -> i64 {
+    if which != ITIMER_REAL {
+        return -22; // EINVAL
+    }
+    if bad_user_ptr(curr_value) {
+        return -14; // EFAULT
+    }
+    // SAFETY: SYSCALL context — see fn-level note.
+    let (value_ticks, interval_ticks) = match unsafe { read_itimer_real() } {
+        Some(v) => v,
+        None => return -3, // ESRCH
+    };
+    let (iv_sec, iv_usec) = ticks_to_timeval_usec(interval_ticks);
+    let (vv_sec, vv_usec) = ticks_to_timeval_usec(value_ticks);
+    // itimerval: [it_interval.sec, it_interval.usec, it_value.sec, it_value.usec].
+    let buf: [i64; 4] = [iv_sec, iv_usec, vv_sec, vv_usec];
+    // SAFETY: curr_value is canonical user space (checked); writes four
+    // contiguous i64s, faulting to SIGSEGV on an unmapped page.
+    unsafe {
+        core::ptr::write_unaligned(curr_value as *mut [i64; 4], buf);
+    }
+    0
+}
+
+/// `setitimer(which, new_value, old_value)` — arm the calling process's
+/// timer.
+///
+/// Only `ITIMER_REAL` (0) is supported. Reads `struct itimerval` from
+/// `new_value` (it_interval then it_value, four `i64`s); if `old_value`
+/// is non-null the previous setting is written there first (same layout
+/// as [`sys_getitimer`]). An `it_value` of `(0, 0)` disarms the timer.
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for an unsupported `which`
+/// or out-of-range `tv_usec`, `-14` (`EFAULT`) for a bad pointer, `-3`
+/// (`ESRCH`) if no current process.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path; both pointers validated user-canonical first.
+pub unsafe fn sys_setitimer(which: i64, new_value: u64, old_value: u64) -> i64 {
+    if which != ITIMER_REAL {
+        return -22; // EINVAL
+    }
+    if bad_user_ptr(new_value) {
+        return -14; // EFAULT
+    }
+    if old_value != 0 && bad_user_ptr(old_value) {
+        return -14; // EFAULT
+    }
+
+    // SAFETY: new_value canonical (checked); read four contiguous i64s.
+    let nv = unsafe { core::ptr::read_unaligned(new_value as *const [i64; 4]) };
+    let (iv_sec, iv_usec, vv_sec, vv_usec) = (nv[0], nv[1], nv[2], nv[3]);
+    // Validate tv_usec ranges and non-negative seconds.
+    if iv_sec < 0
+        || vv_sec < 0
+        || !(0..1_000_000).contains(&iv_usec)
+        || !(0..1_000_000).contains(&vv_usec)
+    {
+        return -22; // EINVAL
+    }
+
+    let interval_ticks = timeval_to_ticks(iv_sec, iv_usec);
+    let value_ticks = timeval_to_ticks(vv_sec, vv_usec);
+
+    // SAFETY: SYSCALL context — see fn-level note.
+    let prev = match unsafe { set_itimer_real(value_ticks, interval_ticks) } {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+
+    if old_value != 0 {
+        let (piv_sec, piv_usec) = ticks_to_timeval_usec(prev.1);
+        let (pvv_sec, pvv_usec) = ticks_to_timeval_usec(prev.0);
+        let buf: [i64; 4] = [piv_sec, piv_usec, pvv_sec, pvv_usec];
+        // SAFETY: old_value canonical (checked); writes four i64s.
+        unsafe {
+            core::ptr::write_unaligned(old_value as *mut [i64; 4], buf);
+        }
+    }
+    0
 }

@@ -62,6 +62,13 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         }
     }
 
+    // Advance per-process ITIMER_REAL timers; raise SIGALRM on expiry.
+    // SAFETY: timer IRQ context (single-CPU, IF=0); tick_itimers takes
+    // and releases its own process-table borrow within the call.
+    unsafe {
+        crate::sched_syscalls::tick_itimers();
+    }
+
     // Acknowledge IRQ 0 via PIC *before* running the scheduler.
     // Sending EOI first allows higher-priority interrupts to be
     // serviced if the scheduler re-enables interrupts.

@@ -196,6 +196,11 @@ pub fn arch_clone_thread(parent: &Thread, snapshot: &ForkSnapshot) -> Result<Thr
             // SAFETY: single-CPU SYSCALL context; sole accessor of eventfd table.
             unsafe { crate::fd_table::eventfd_dup(id) }
         }
+        // Bump epoll refcount so close on either thread decrements correctly.
+        if let oncrix_process::fd_table::FileBackend::EpollInstance { id } = handle.backend {
+            // SAFETY: single-CPU SYSCALL context; sole accessor of epoll table.
+            unsafe { crate::fd_table::epoll_dup(id) }
+        }
         // Console, RamfsFile, DevFile, ProcFile: trivial copy, no refcount.
         // Socket: documented limitation — no socket_dup yet.
         let _ = child.fd_table.install_at(fd_idx, *handle);

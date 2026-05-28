@@ -93,6 +93,12 @@ const SYS_GETRUSAGE: u64 = 98;
 const SYS_SCHED_SETAFFINITY: u64 = 203;
 const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_EVENTFD2: u64 = 290;
+const SYS_EPOLL_WAIT: u64 = 232;
+const SYS_EPOLL_CTL: u64 = 233;
+const SYS_EPOLL_CREATE1: u64 = 291;
+const SYS_GETITIMER: u64 = 36;
+const SYS_ALARM: u64 = 37;
+const SYS_SETITIMER: u64 = 38;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -716,6 +722,103 @@ pub const EFD_CLOEXEC: i32 = 0o2000000;
 pub unsafe fn eventfd(initval: u32, flags: i32) -> i64 {
     // SAFETY: scalar-only syscall.
     unsafe { syscall2(SYS_EVENTFD2, initval as u64, flags as i64 as u64) }
+}
+
+/// A single epoll interest/event record (packed: `events` then `data`).
+#[repr(C, packed)]
+pub struct EpollEvent {
+    /// Event bitmask (`EPOLLIN`/`EPOLLOUT`/`EPOLLHUP`).
+    pub events: u32,
+    /// Opaque user data echoed back by `epoll_wait`.
+    pub data: u64,
+}
+
+/// `epoll` event: data available to read.
+pub const EPOLLIN: u32 = 0x0001;
+/// `epoll` event: writing will not block.
+pub const EPOLLOUT: u32 = 0x0004;
+/// `epoll` event: hang-up (output only).
+pub const EPOLLHUP: u32 = 0x0010;
+/// `epoll_create1` flag: set `FD_CLOEXEC`.
+pub const EPOLL_CLOEXEC: i32 = 0o2000000;
+/// `epoll_ctl` op: register a new fd.
+pub const EPOLL_CTL_ADD: i32 = 1;
+/// `epoll_ctl` op: deregister an fd.
+pub const EPOLL_CTL_DEL: i32 = 2;
+/// `epoll_ctl` op: modify a registered fd's interest.
+pub const EPOLL_CTL_MOD: i32 = 3;
+
+/// `epoll_create1(2)` — create an epoll instance. Returns the fd or errno.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn epoll_create1(flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_EPOLL_CREATE1, flags as i64 as u64) }
+}
+
+/// `epoll_ctl(2)` — add/modify/remove an fd in an epoll instance.
+///
+/// # Safety
+///
+/// For ADD/MOD, `ev` must point to a valid [`EpollEvent`].
+pub unsafe fn epoll_ctl(epfd: i32, op: i32, fd: i32, ev: *mut EpollEvent) -> i64 {
+    // SAFETY: caller guarantees `ev` validity for ADD/MOD.
+    unsafe { syscall4(SYS_EPOLL_CTL, epfd as u64, op as u64, fd as u64, ev as u64) }
+}
+
+/// `epoll_wait(2)` — wait for events. Returns the number of ready fds, 0 on
+/// timeout, or a negative errno value.
+///
+/// # Safety
+///
+/// `events` must point to `maxevents` writable [`EpollEvent`]s.
+pub unsafe fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i64 {
+    // SAFETY: caller guarantees `events`/`maxevents` validity.
+    unsafe {
+        syscall4(
+            SYS_EPOLL_WAIT,
+            epfd as u64,
+            events as u64,
+            maxevents as i64 as u64,
+            timeout as i64 as u64,
+        )
+    }
+}
+
+/// `alarm(2)` — schedule a one-shot `SIGALRM` after `seconds`.
+///
+/// Returns the number of seconds remaining on any previously set alarm.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn alarm(seconds: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_ALARM, seconds as u64) }
+}
+
+/// `setitimer(2)` — arm an interval timer. `which` is `ITIMER_REAL`(0);
+/// `new`/`old` are `struct itimerval` (`[i64;4]`: it_interval{sec,usec},
+/// it_value{sec,usec}). Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `new` must point to a valid `itimerval`; `old`, if non-null, writable.
+pub unsafe fn setitimer(which: i32, new: *const u8, old: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe { syscall3(SYS_SETITIMER, which as u64, new as u64, old as u64) }
+}
+
+/// `getitimer(2)` — read the current value of an interval timer.
+///
+/// # Safety
+///
+/// `curr` must point to a writable `itimerval`.
+pub unsafe fn getitimer(which: i32, curr: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `curr` validity.
+    unsafe { syscall2(SYS_GETITIMER, which as u64, curr as u64) }
 }
 
 /// `access(2)` — check file accessibility.

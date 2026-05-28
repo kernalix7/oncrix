@@ -227,6 +227,401 @@ pub unsafe fn sys_eventfd2(initval: u64, flags: u32) -> i64 {
     }
 }
 
+// ── epoll backing store ───────────────────────────────────────────
+
+/// Maximum number of simultaneously open epoll instances.
+const MAX_EPOLLS: usize = 16;
+
+/// Maximum interests (registered fds) per epoll instance.
+const MAX_EPOLL_INTERESTS: usize = 32;
+
+/// `epoll_ctl(2)` operations.
+const EPOLL_CTL_ADD: i32 = 1;
+/// Remove an fd from the interest list.
+const EPOLL_CTL_DEL: i32 = 2;
+/// Modify an existing fd's interest.
+const EPOLL_CTL_MOD: i32 = 3;
+
+/// `epoll_create1(2)` `EPOLL_CLOEXEC` flag (octal 02000000).
+const EPOLL_CLOEXEC: i32 = 0o2000000;
+
+/// `EPOLLIN` — the fd is readable.
+const EPOLLIN: u32 = 0x0001;
+/// `EPOLLOUT` — the fd is writable.
+const EPOLLOUT: u32 = 0x0004;
+/// `EPOLLHUP` — the fd hung up (revents-only; always reported).
+const EPOLLHUP: u32 = 0x0010;
+
+/// One registered interest in an epoll instance.
+#[derive(Clone, Copy)]
+struct EpollInterest {
+    /// Watched file descriptor (in the owning thread's fd table).
+    fd: u32,
+    /// Requested event mask (`EPOLLIN`/`EPOLLOUT`/…); `EPOLLHUP`/`EPOLLERR`
+    /// are always reported regardless of this mask.
+    events: u32,
+    /// Opaque user token echoed back in `epoll_wait` results.
+    data: u64,
+}
+
+/// One epoll instance: a fixed interest list plus a refcount.
+struct EpollSlot {
+    /// `true` when this slot is in use.
+    in_use: bool,
+    /// Number of fds referencing this instance.
+    refs: u32,
+    /// Registered interests (slot occupied when `Some`).
+    interests: [Option<EpollInterest>; MAX_EPOLL_INTERESTS],
+}
+
+impl EpollSlot {
+    const fn new() -> Self {
+        const NONE: Option<EpollInterest> = None;
+        Self {
+            in_use: false,
+            refs: 0,
+            interests: [NONE; MAX_EPOLL_INTERESTS],
+        }
+    }
+}
+
+/// Global epoll registry (single-CPU, no heap).
+///
+/// # Safety invariant
+///
+/// Accessed exclusively from the SYSCALL dispatch path (single CPU, IF
+/// cleared via FMASK), identical to the pipe / eventfd table invariant.
+// SAFETY: See note. Single-CPU SYSCALL context only.
+static mut EPOLL_TABLE: [EpollSlot; MAX_EPOLLS] = {
+    const EMPTY: EpollSlot = EpollSlot::new();
+    [EMPTY; MAX_EPOLLS]
+};
+
+/// Allocate a free epoll instance and return its id.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn epoll_alloc() -> Option<u32> {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        for (i, slot) in EPOLL_TABLE.iter_mut().enumerate() {
+            if !slot.in_use {
+                *slot = EpollSlot::new();
+                slot.in_use = true;
+                slot.refs = 1;
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Drop one reference to epoll instance `id`; free it when it hits zero.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn epoll_close(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = EPOLL_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_sub(1);
+            if slot.refs == 0 {
+                *slot = EpollSlot::new();
+            }
+        }
+    }
+}
+
+/// Add one reference to epoll instance `id` (for `dup`/`dup2`/`fork`).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn epoll_dup(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = EPOLL_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_add(1);
+        }
+    }
+}
+
+/// Kernel handler for `SYS_EPOLL_CREATE1` (Linux number 291).
+///
+/// Creates an epoll instance and returns an fd referencing it. The only
+/// recognised flag is `EPOLL_CLOEXEC` (0o2000000), which sets `FD_CLOEXEC`
+/// on the new fd.
+///
+/// Returns the fd, or `-EINVAL` (22) for an unknown flag, `-ENFILE` (23) if
+/// no epoll slot is free, `-EMFILE` (24) if the fd table is full.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_epoll_create1(flags: i32) -> i64 {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return -22; // EINVAL — unsupported flag
+    }
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { epoll_alloc() } {
+        Some(id) => id,
+        None => return -23, // ENFILE
+    };
+
+    let mut hflags = HandleFlags::RDWR.0;
+    if flags & EPOLL_CLOEXEC != 0 {
+        hflags |= HandleFlags::FD_CLOEXEC_BIT;
+    }
+    let handle = FileHandle {
+        backend: FileBackend::EpollInstance { id },
+        offset: 0,
+        flags: HandleFlags(hflags),
+    };
+
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { fd_install(handle) } {
+        Ok(fd) => fd as i64,
+        Err(_) => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { epoll_close(id) };
+            -24 // EMFILE
+        }
+    }
+}
+
+/// Resolve `epfd` to its epoll instance id, or `None` if it is not an
+/// open epoll fd.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn epoll_id_of(epfd: usize) -> Option<u32> {
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { fd_get(epfd) } {
+        Some(FileHandle {
+            backend: FileBackend::EpollInstance { id },
+            ..
+        }) => Some(id),
+        _ => None,
+    }
+}
+
+/// Kernel handler for `SYS_EPOLL_CTL` (Linux number 233).
+///
+/// `epoll_ctl(epfd, op, fd, event)`: registers (`EPOLL_CTL_ADD`), modifies
+/// (`EPOLL_CTL_MOD`), or removes (`EPOLL_CTL_DEL`) an interest in `fd`.
+/// `event` points to a packed `struct epoll_event { events: u32, data: u64 }`
+/// (12 bytes); it is ignored for `EPOLL_CTL_DEL`.
+///
+/// Returns 0 on success, or a negative errno: `-EBADF` (9) if `epfd` is not
+/// an epoll fd or `fd` is not open, `-EINVAL` (22) for a bad `op` or
+/// `epfd == fd`, `-EEXIST` (17) on ADD of an already-registered fd,
+/// `-ENOENT` (2) on MOD/DEL of an unregistered fd, `-ENOSPC` (28) when the
+/// interest list is full, `-EFAULT` (14) for a bad `event` pointer.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path. `event_ptr`, when used,
+/// must address a readable 12-byte `epoll_event`.
+pub unsafe fn sys_epoll_ctl(epfd: usize, op: i32, fd: usize, event_ptr: u64) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { epoll_id_of(epfd) } {
+        Some(id) => id,
+        None => return -9, // EBADF — not an epoll fd
+    };
+    if epfd == fd {
+        return -22; // EINVAL — cannot watch the epoll fd itself this way
+    }
+
+    // Read the epoll_event for ADD/MOD (packed: events @0 u32, data @4 u64).
+    let (events, data) = if op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD {
+        if event_ptr == 0 || event_ptr >= 0xFFFF_8000_0000_0000 {
+            return -14; // EFAULT
+        }
+        // SAFETY: pointer validated user-canonical above; unaligned packed read.
+        unsafe {
+            let base = event_ptr as *const u8;
+            let ev = (base as *const u32).read_unaligned();
+            let dt = (base.add(4) as *const u64).read_unaligned();
+            (ev, dt)
+        }
+    } else {
+        (0, 0)
+    };
+
+    let fd32 = fd as u32;
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let slot = match EPOLL_TABLE.get_mut(id as usize) {
+            Some(s) if s.in_use => s,
+            _ => return -9, // EBADF
+        };
+
+        match op {
+            EPOLL_CTL_ADD => {
+                // The target fd must be open.
+                if fd_get(fd).is_none() {
+                    return -9; // EBADF
+                }
+                if slot.interests.iter().flatten().any(|i| i.fd == fd32) {
+                    return -17; // EEXIST
+                }
+                match slot.interests.iter_mut().find(|s| s.is_none()) {
+                    Some(empty) => {
+                        *empty = Some(EpollInterest {
+                            fd: fd32,
+                            events,
+                            data,
+                        });
+                        0
+                    }
+                    None => -28, // ENOSPC — interest list full
+                }
+            }
+            EPOLL_CTL_MOD => {
+                match slot.interests.iter_mut().flatten().find(|i| i.fd == fd32) {
+                    Some(interest) => {
+                        interest.events = events;
+                        interest.data = data;
+                        0
+                    }
+                    None => -2, // ENOENT
+                }
+            }
+            EPOLL_CTL_DEL => {
+                match slot
+                    .interests
+                    .iter_mut()
+                    .find(|s| s.is_some_and(|i| i.fd == fd32))
+                {
+                    Some(entry) => {
+                        *entry = None;
+                        0
+                    }
+                    None => -2, // ENOENT
+                }
+            }
+            _ => -22, // EINVAL — bad op
+        }
+    }
+}
+
+/// Kernel handler for `SYS_EPOLL_WAIT` (Linux number 232).
+///
+/// `epoll_wait(epfd, events, maxevents, timeout_ms)`: scans the instance's
+/// registered interests (level-triggered) via [`fd_readiness`] and writes up
+/// to `maxevents` ready `struct epoll_event { events: u32, data: u64 }`
+/// (12 bytes each) to `events_ptr`. `EPOLLIN`/`EPOLLOUT`/`EPOLLHUP` are
+/// reported. Blocks via cooperative `yield_now` until at least one fd is
+/// ready or the timeout elapses (`timeout_ms < 0` = infinite, `0` = single
+/// scan).
+///
+/// Returns the number of ready fds, `0` on timeout, or a negative errno:
+/// `-EBADF` (9) if `epfd` is not an epoll fd, `-EINVAL` (22) if `maxevents`
+/// is not positive, `-EFAULT` (14) for a bad `events` pointer.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path. `events_ptr` must address
+/// `maxevents` writable 12-byte `epoll_event` structs.
+pub unsafe fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: i32, timeout_ms: i64) -> i64 {
+    if maxevents <= 0 {
+        return -22; // EINVAL
+    }
+    if events_ptr == 0 || events_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { epoll_id_of(epfd) } {
+        Some(id) => id,
+        None => return -9, // EBADF
+    };
+    let maxevents = maxevents as usize;
+
+    let deadline = if timeout_ms > 0 {
+        let ticks = (timeout_ms as u64).saturating_mul(POLL_TIMER_HZ) / 1000;
+        // SAFETY: single-CPU SYSCALL context.
+        Some(unsafe { poll_now_ticks() }.saturating_add(ticks.max(1)))
+    } else {
+        None
+    };
+
+    loop {
+        // Snapshot the interest list, then evaluate readiness outside the
+        // table borrow so fd_readiness can take its own references.
+        let mut interests = [(0u32, 0u32, 0u64); MAX_EPOLL_INTERESTS];
+        let mut n_interests = 0usize;
+        // SAFETY: single-CPU SYSCALL context.
+        unsafe {
+            #[allow(static_mut_refs)]
+            let slot = match EPOLL_TABLE.get(id as usize) {
+                Some(s) if s.in_use => s,
+                _ => return -9, // EBADF — instance vanished
+            };
+            for i in slot.interests.iter().flatten() {
+                interests[n_interests] = (i.fd, i.events, i.data);
+                n_interests += 1;
+            }
+        }
+
+        let mut written = 0usize;
+        for &(fd, want, data) in interests.iter().take(n_interests) {
+            if written >= maxevents {
+                break;
+            }
+            // SAFETY: single-CPU SYSCALL context.
+            let (readable, writable, hup) = match unsafe { fd_readiness(fd as usize) } {
+                Some(r) => r,
+                None => continue, // fd closed out from under us: skip
+            };
+            let mut revents = 0u32;
+            if want & EPOLLIN != 0 && readable {
+                revents |= EPOLLIN;
+            }
+            if want & EPOLLOUT != 0 && writable {
+                revents |= EPOLLOUT;
+            }
+            if hup {
+                revents |= EPOLLHUP;
+            }
+            if revents == 0 {
+                continue;
+            }
+            // SAFETY: events_ptr validated above; packed 12-byte write.
+            unsafe {
+                let entry = (events_ptr as *mut u8).add(written * 12);
+                (entry as *mut u32).write_unaligned(revents);
+                (entry.add(4) as *mut u64).write_unaligned(data);
+            }
+            written += 1;
+        }
+
+        let expired = match deadline {
+            // SAFETY: single-CPU SYSCALL context.
+            Some(d) => (unsafe { poll_now_ticks() }) >= d,
+            None => false,
+        };
+        if written > 0 || timeout_ms == 0 || expired {
+            return written as i64;
+        }
+
+        // SAFETY: SYSCALL context; cooperative yield (same model as poll).
+        unsafe {
+            let _ = crate::current::yield_now();
+        }
+    }
+}
+
 // ── Current-thread fd table helpers ───────────────────────────────
 
 /// Install a [`FileHandle`] in the current thread's fd table,
@@ -321,6 +716,10 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { eventfd_close(id) }
         }
+        FileBackend::EpollInstance { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { epoll_close(id) }
+        }
         _ => {}
     }
 
@@ -380,6 +779,10 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
         FileBackend::EventFd { id } => {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { eventfd_dup(id) }
+        }
+        FileBackend::EpollInstance { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { epoll_dup(id) }
         }
         FileBackend::Console
         | FileBackend::RamfsFile { .. }
@@ -613,6 +1016,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                     // SAFETY: single-CPU SYSCALL context.
                     unsafe { eventfd_dup(id) }
                 }
+                FileBackend::EpollInstance { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { epoll_dup(id) }
+                }
                 FileBackend::Console
                 | FileBackend::RamfsFile { .. }
                 | FileBackend::Socket { .. }
@@ -658,6 +1065,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                         FileBackend::EventFd { id } => {
                             // SAFETY: single-CPU SYSCALL context.
                             unsafe { eventfd_close(id) }
+                        }
+                        FileBackend::EpollInstance { id } => {
+                            // SAFETY: single-CPU SYSCALL context.
+                            unsafe { epoll_close(id) }
                         }
                         _ => {}
                     }
@@ -784,6 +1195,12 @@ unsafe fn fd_readiness(fd: usize) -> Option<(bool, bool, bool)> {
                 Some((counter, _)) => (counter > 0, counter < EVENTFD_MAX, false),
                 None => (false, false, false),
             }
+        }
+        FileBackend::EpollInstance { .. } => {
+            // A nested epoll fd is reported never-ready to avoid recursing
+            // into epoll_wait from the readiness scan. (Nested epoll is rare
+            // and out of scope this phase.)
+            (false, false, false)
         }
         FileBackend::RamfsFile { .. }
         | FileBackend::DevFile { .. }
@@ -1326,6 +1743,7 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
         }
+        FileBackend::EpollInstance { .. } => -22, // EINVAL — epoll fd is not writable
     }
 }
 
@@ -1572,6 +1990,7 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
         }
+        FileBackend::EpollInstance { .. } => -22, // EINVAL — epoll fd is not readable
     }
 }
 
@@ -1595,12 +2014,13 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
     };
 
     match handle.backend {
-        FileBackend::Console => -29,         // ESPIPE
-        FileBackend::Pipe { .. } => -29,     // ESPIPE
-        FileBackend::Socket { .. } => -29,   // ESPIPE
-        FileBackend::DevFile { .. } => -29,  // ESPIPE
-        FileBackend::ProcFile { .. } => -29, // ESPIPE
-        FileBackend::EventFd { .. } => -29,  // ESPIPE
+        FileBackend::Console => -29,              // ESPIPE
+        FileBackend::Pipe { .. } => -29,          // ESPIPE
+        FileBackend::Socket { .. } => -29,        // ESPIPE
+        FileBackend::DevFile { .. } => -29,       // ESPIPE
+        FileBackend::ProcFile { .. } => -29,      // ESPIPE
+        FileBackend::EventFd { .. } => -29,       // ESPIPE
+        FileBackend::EpollInstance { .. } => -29, // ESPIPE
         FileBackend::RamfsFile { ino } => {
             let current_offset = handle.offset;
 
