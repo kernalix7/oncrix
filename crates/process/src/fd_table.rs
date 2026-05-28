@@ -103,6 +103,12 @@ pub enum FileBackend {
         /// Index into the global epoll registry.
         id: u32,
     },
+
+    /// A `timerfd(2)` timer object.
+    TimerFd {
+        /// Index into the global timerfd registry.
+        id: u32,
+    },
 }
 
 // ── HandleFlags ───────────────────────────────────────────────────

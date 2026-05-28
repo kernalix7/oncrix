@@ -622,6 +622,438 @@ pub unsafe fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: i32, timeo
     }
 }
 
+// ── timerfd backing store ─────────────────────────────────────────
+
+/// Maximum number of simultaneously open `timerfd` objects.
+const MAX_TIMERFDS: usize = 16;
+
+/// `timerfd_settime(2)` flag — interpret `new_value.it_value` as absolute.
+const TFD_TIMER_ABSTIME: i32 = 1;
+
+/// `timerfd_create(2)` flag — equivalent to `O_NONBLOCK` on the fd.
+const TFD_NONBLOCK: i32 = 0o4000;
+
+/// `timerfd_create(2)` flag — set `FD_CLOEXEC` on the fd.
+const TFD_CLOEXEC: i32 = 0o2000000;
+
+/// Recognised clock ids.  All map to the same PIT-derived source on this
+/// build, so the difference is currently only validated, not enforced.
+const CLOCK_REALTIME: i32 = 0;
+/// Monotonic clock id.
+const CLOCK_MONOTONIC: i32 = 1;
+/// Boot-time clock id (Linux extension; alias for MONOTONIC here).
+const CLOCK_BOOTTIME: i32 = 7;
+
+/// One `timerfd` slot.
+///
+/// Times are kept in PIT ticks (100 Hz, 10 ms each). `expires_at` is the
+/// absolute tick at which the timer next fires (0 == disarmed).
+/// `interval_ticks` is the auto-reload period (0 == one-shot).
+#[derive(Clone, Copy)]
+struct TimerFdSlot {
+    /// `true` when this slot is in use.
+    in_use: bool,
+    /// Number of fds referencing this slot.
+    refs: u32,
+    /// Clock id (`CLOCK_REALTIME`/`CLOCK_MONOTONIC`/`CLOCK_BOOTTIME`).
+    clockid: i32,
+    /// Absolute next-fire tick; 0 disarms the timer.
+    expires_at: u64,
+    /// Reload period in ticks; 0 marks a one-shot timer.
+    interval_ticks: u64,
+    /// Number of unread expirations since the last `read(2)`.
+    expirations: u64,
+}
+
+impl TimerFdSlot {
+    const fn new() -> Self {
+        Self {
+            in_use: false,
+            refs: 0,
+            clockid: 0,
+            expires_at: 0,
+            interval_ticks: 0,
+            expirations: 0,
+        }
+    }
+}
+
+/// Global timerfd registry (single-CPU, no heap).
+///
+/// # Safety invariant
+///
+/// Mutated from two contexts — the SYSCALL dispatch path (single CPU,
+/// IF=0 via FMASK) and the PIT timer IRQ (interrupt gate, IF=0). Both are
+/// IF=0 on a single-CPU build, so no concurrent mutation is possible.
+// SAFETY: See note. Accessed only with IF=0.
+static mut TIMERFD_TABLE: [TimerFdSlot; MAX_TIMERFDS] = {
+    const EMPTY: TimerFdSlot = TimerFdSlot::new();
+    [EMPTY; MAX_TIMERFDS]
+};
+
+/// PIT-tick equivalent of one second.
+const TIMERFD_HZ: u64 = POLL_TIMER_HZ;
+/// PIT tick period in nanoseconds (1 / 100 Hz = 10 ms).
+const TIMERFD_TICK_NS: u64 = 1_000_000_000 / TIMERFD_HZ;
+
+/// Convert `(secs, nsec)` to PIT ticks, rounding up so a sub-tick interval
+/// still produces a single tick of delay rather than firing immediately.
+fn timespec_to_ticks(secs: i64, nsec: i64) -> u64 {
+    let secs = secs.max(0) as u64;
+    let nsec = nsec.max(0) as u64;
+    let mut ticks = secs.saturating_mul(TIMERFD_HZ);
+    ticks = ticks.saturating_add(nsec.div_ceil(TIMERFD_TICK_NS));
+    ticks
+}
+
+/// Convert PIT ticks back to a `(secs, nsec)` pair for `gettime`.
+fn ticks_to_timespec(ticks: u64) -> (i64, i64) {
+    let secs = ticks / TIMERFD_HZ;
+    let nsec = (ticks % TIMERFD_HZ) * TIMERFD_TICK_NS;
+    (secs as i64, nsec as i64)
+}
+
+/// Read the current PIT tick count without taking the trait into module scope.
+///
+/// # Safety
+///
+/// Caller must guarantee IF=0 (SYSCALL dispatch or timer IRQ).
+unsafe fn timerfd_now_ticks() -> u64 {
+    // SAFETY: see fn-level note.
+    unsafe { poll_now_ticks() }
+}
+
+/// Allocate a free timerfd slot; return its id.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn timerfd_alloc(clockid: i32) -> Option<u32> {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        for (i, slot) in TIMERFD_TABLE.iter_mut().enumerate() {
+            if !slot.in_use {
+                *slot = TimerFdSlot::new();
+                slot.in_use = true;
+                slot.refs = 1;
+                slot.clockid = clockid;
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Drop one reference to timerfd `id`; free the slot when it hits zero.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn timerfd_close(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = TIMERFD_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_sub(1);
+            if slot.refs == 0 {
+                *slot = TimerFdSlot::new();
+            }
+        }
+    }
+}
+
+/// Snapshot the expiration count of timerfd `id`, or `None` if not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn timerfd_peek(id: u32) -> Option<u64> {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let slot = TIMERFD_TABLE.get(id as usize)?;
+        if slot.in_use {
+            Some(slot.expirations)
+        } else {
+            None
+        }
+    }
+}
+
+/// Add one reference to timerfd `id` (for `dup`/`dup2`/`fork`).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn timerfd_dup(id: u32) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = TIMERFD_TABLE.get_mut(id as usize)
+            && slot.in_use
+        {
+            slot.refs = slot.refs.saturating_add(1);
+        }
+    }
+}
+
+/// Advance every armed timerfd by one PIT tick, accumulating expirations
+/// and reloading interval timers.
+///
+/// Called from the PIT timer IRQ in
+/// `crate::arch::x86_64::interrupts::timer_handler` immediately after
+/// `tick_itimers` so timerfd readers see expirations at the same cadence
+/// as the rest of the kernel's tick-driven state.
+///
+/// # Safety
+///
+/// Must be called with IF=0 (interrupt gate context). No concurrent mutator
+/// of [`TIMERFD_TABLE`] can run on a single-CPU build.
+pub unsafe fn tick_timerfds() {
+    // SAFETY: see fn-level note.
+    unsafe {
+        let now = timerfd_now_ticks();
+        #[allow(static_mut_refs)]
+        for slot in TIMERFD_TABLE.iter_mut() {
+            if !slot.in_use || slot.expires_at == 0 {
+                continue;
+            }
+            // Fire as many times as elapsed ticks allow. With an interval of
+            // zero a single expiration disarms the timer; with a non-zero
+            // interval we accumulate one expiration per period boundary.
+            while slot.expires_at != 0 && now >= slot.expires_at {
+                slot.expirations = slot.expirations.saturating_add(1);
+                if slot.interval_ticks == 0 {
+                    slot.expires_at = 0; // one-shot: disarm
+                    break;
+                }
+                slot.expires_at = slot.expires_at.saturating_add(slot.interval_ticks);
+            }
+        }
+    }
+}
+
+/// Resolve `fd` to a timerfd id, or return `-EINVAL` shape `None`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+unsafe fn timerfd_id_of(fd: usize) -> Option<u32> {
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { fd_get(fd) } {
+        Some(FileHandle {
+            backend: FileBackend::TimerFd { id },
+            ..
+        }) => Some(id),
+        _ => None,
+    }
+}
+
+/// Kernel handler for `SYS_TIMERFD_CREATE` (Linux number 283).
+///
+/// Creates a disarmed timerfd backed by [`TIMERFD_TABLE`]. Recognised
+/// `clockid` values are `CLOCK_REALTIME`/`CLOCK_MONOTONIC`/`CLOCK_BOOTTIME`;
+/// all map to the same PIT-derived monotonic source on this build.
+/// Recognised flags: `TFD_NONBLOCK` (sets `O_NONBLOCK`) and `TFD_CLOEXEC`
+/// (sets `FD_CLOEXEC`).
+///
+/// Returns the new fd, or a negative errno: `-EINVAL` (22) for an unknown
+/// clockid/flag, `-ENFILE` (23) if no timer slot is free, `-EMFILE` (24)
+/// if the fd table is full.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_timerfd_create(clockid: i32, flags: i32) -> i64 {
+    match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME => {}
+        _ => return -22, // EINVAL
+    }
+    if flags & !(TFD_NONBLOCK | TFD_CLOEXEC) != 0 {
+        return -22; // EINVAL
+    }
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { timerfd_alloc(clockid) } {
+        Some(id) => id,
+        None => return -23, // ENFILE
+    };
+
+    let mut hflags = HandleFlags::RDWR.0;
+    if flags & TFD_NONBLOCK != 0 {
+        hflags |= HandleFlags::NONBLOCK;
+    }
+    if flags & TFD_CLOEXEC != 0 {
+        hflags |= HandleFlags::FD_CLOEXEC_BIT;
+    }
+    let handle = FileHandle {
+        backend: FileBackend::TimerFd { id },
+        offset: 0,
+        flags: HandleFlags(hflags),
+    };
+
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { fd_install(handle) } {
+        Ok(fd) => fd as i64,
+        Err(_) => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { timerfd_close(id) };
+            -24 // EMFILE
+        }
+    }
+}
+
+/// Read an `itimerspec { it_interval: timespec, it_value: timespec }` from
+/// user space. Each `timespec` is `(i64 tv_sec, i64 tv_nsec)` = 16 bytes;
+/// the whole struct is 32 bytes.
+///
+/// # Safety
+///
+/// `ptr` must address a readable 32-byte `itimerspec`.
+unsafe fn read_itimerspec(ptr: u64) -> ((i64, i64), (i64, i64)) {
+    // SAFETY: caller validated `ptr`.
+    unsafe {
+        let p = ptr as *const i64;
+        let it_interval = (p.read_volatile(), p.add(1).read_volatile());
+        let it_value = (p.add(2).read_volatile(), p.add(3).read_volatile());
+        (it_interval, it_value)
+    }
+}
+
+/// Write an `itimerspec` to user space.
+///
+/// # Safety
+///
+/// `ptr` must address a writable 32-byte `itimerspec`.
+unsafe fn write_itimerspec(ptr: u64, it_interval: (i64, i64), it_value: (i64, i64)) {
+    // SAFETY: caller validated `ptr`.
+    unsafe {
+        let p = ptr as *mut i64;
+        p.write_volatile(it_interval.0);
+        p.add(1).write_volatile(it_interval.1);
+        p.add(2).write_volatile(it_value.0);
+        p.add(3).write_volatile(it_value.1);
+    }
+}
+
+/// Kernel handler for `SYS_TIMERFD_SETTIME` (Linux number 286).
+///
+/// `timerfd_settime(fd, flags, new_value, old_value)`: arms or disarms `fd`.
+/// `new_value->it_value` is the first expiry — absolute monotonic time when
+/// `flags & TFD_TIMER_ABSTIME != 0`, otherwise a relative duration. A
+/// zero-valued `it_value` disarms. `it_interval` (nonzero) sets the
+/// auto-reload period. If `old_value` is non-null, the previous settings
+/// are written there before the new ones take effect.
+///
+/// Returns 0 on success, or a negative errno: `-EBADF` (9) if `fd` is not a
+/// timerfd, `-EINVAL` (22) for a bad flag or negative timespec field,
+/// `-EFAULT` (14) for a bad pointer.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_timerfd_settime(fd: usize, flags: i32, new_ptr: u64, old_ptr: u64) -> i64 {
+    if flags & !TFD_TIMER_ABSTIME != 0 {
+        return -22; // EINVAL
+    }
+    if new_ptr == 0 || new_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    if old_ptr != 0 && old_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { timerfd_id_of(fd) } {
+        Some(id) => id,
+        None => return -9, // EBADF
+    };
+
+    // SAFETY: `new_ptr` validated user-canonical above.
+    let ((iv_s, iv_n), (val_s, val_n)) = unsafe { read_itimerspec(new_ptr) };
+    if iv_s < 0 || iv_n < 0 || val_s < 0 || val_n < 0 {
+        return -22; // EINVAL
+    }
+    if iv_n >= 1_000_000_000 || val_n >= 1_000_000_000 {
+        return -22; // EINVAL
+    }
+
+    let now = unsafe { timerfd_now_ticks() };
+    let interval_ticks = timespec_to_ticks(iv_s, iv_n);
+    let initial_ticks = timespec_to_ticks(val_s, val_n);
+    let abstime = flags & TFD_TIMER_ABSTIME != 0;
+
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let slot = match TIMERFD_TABLE.get_mut(id as usize) {
+            Some(s) if s.in_use => s,
+            _ => return -9, // EBADF — slot vanished
+        };
+
+        // Optionally publish the previous arming.
+        if old_ptr != 0 {
+            let it_interval_old = ticks_to_timespec(slot.interval_ticks);
+            let remaining = slot.expires_at.saturating_sub(now);
+            let it_value_old = ticks_to_timespec(remaining);
+            // SAFETY: `old_ptr` validated above.
+            write_itimerspec(old_ptr, it_interval_old, it_value_old);
+        }
+
+        // Apply the new arming.
+        if val_s == 0 && val_n == 0 {
+            // Disarm (interval is ignored when value is zero).
+            slot.expires_at = 0;
+            slot.interval_ticks = 0;
+        } else {
+            slot.interval_ticks = interval_ticks;
+            slot.expires_at = if abstime {
+                initial_ticks
+            } else {
+                now.saturating_add(initial_ticks.max(1))
+            };
+            slot.expirations = 0;
+        }
+        0
+    }
+}
+
+/// Kernel handler for `SYS_TIMERFD_GETTIME` (Linux number 287).
+///
+/// Writes the current arming (`it_interval`, remaining `it_value`) of
+/// timerfd `fd` to `cur_ptr`. Returns 0 on success, `-EBADF` (9) if `fd` is
+/// not a timerfd, `-EFAULT` (14) for a bad pointer.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn sys_timerfd_gettime(fd: usize, cur_ptr: u64) -> i64 {
+    if cur_ptr == 0 || cur_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // SAFETY: single-CPU SYSCALL context.
+    let id = match unsafe { timerfd_id_of(fd) } {
+        Some(id) => id,
+        None => return -9, // EBADF
+    };
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        let now = timerfd_now_ticks();
+        #[allow(static_mut_refs)]
+        let slot = match TIMERFD_TABLE.get(id as usize) {
+            Some(s) if s.in_use => s,
+            _ => return -9, // EBADF
+        };
+        let it_interval = ticks_to_timespec(slot.interval_ticks);
+        let remaining = slot.expires_at.saturating_sub(now);
+        let it_value = ticks_to_timespec(remaining);
+        // SAFETY: `cur_ptr` validated above.
+        write_itimerspec(cur_ptr, it_interval, it_value);
+    }
+    0
+}
+
 // ── Current-thread fd table helpers ───────────────────────────────
 
 /// Install a [`FileHandle`] in the current thread's fd table,
@@ -720,6 +1152,10 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { epoll_close(id) }
         }
+        FileBackend::TimerFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { timerfd_close(id) }
+        }
         _ => {}
     }
 
@@ -783,6 +1219,10 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
         FileBackend::EpollInstance { id } => {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { epoll_dup(id) }
+        }
+        FileBackend::TimerFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { timerfd_dup(id) }
         }
         FileBackend::Console
         | FileBackend::RamfsFile { .. }
@@ -1020,6 +1460,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                     // SAFETY: single-CPU SYSCALL context.
                     unsafe { epoll_dup(id) }
                 }
+                FileBackend::TimerFd { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { timerfd_dup(id) }
+                }
                 FileBackend::Console
                 | FileBackend::RamfsFile { .. }
                 | FileBackend::Socket { .. }
@@ -1069,6 +1513,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                         FileBackend::EpollInstance { id } => {
                             // SAFETY: single-CPU SYSCALL context.
                             unsafe { epoll_close(id) }
+                        }
+                        FileBackend::TimerFd { id } => {
+                            // SAFETY: single-CPU SYSCALL context.
+                            unsafe { timerfd_close(id) }
                         }
                         _ => {}
                     }
@@ -1201,6 +1649,15 @@ unsafe fn fd_readiness(fd: usize) -> Option<(bool, bool, bool)> {
             // into epoll_wait from the readiness scan. (Nested epoll is rare
             // and out of scope this phase.)
             (false, false, false)
+        }
+        FileBackend::TimerFd { id } => {
+            // Readable once any expiration has accumulated; never writable
+            // and no hangup.
+            // SAFETY: single-CPU SYSCALL context.
+            match unsafe { timerfd_peek(id) } {
+                Some(exp) => (exp > 0, false, false),
+                None => (false, false, false),
+            }
         }
         FileBackend::RamfsFile { .. }
         | FileBackend::DevFile { .. }
@@ -1744,6 +2201,7 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             }
         }
         FileBackend::EpollInstance { .. } => -22, // EINVAL — epoll fd is not writable
+        FileBackend::TimerFd { .. } => -22,       // EINVAL — timerfd is not writable
     }
 }
 
@@ -1991,6 +2449,47 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
             }
         }
         FileBackend::EpollInstance { .. } => -22, // EINVAL — epoll fd is not readable
+        FileBackend::TimerFd { id } => {
+            // timerfd read: yields the accumulated expiration count as a
+            // u64 then zeros it. Blocks while the count is zero unless
+            // O_NONBLOCK is set, in which case returns -EAGAIN.
+            if count < 8 {
+                return -22; // EINVAL — short read
+            }
+            let nonblock = handle.flags.is_nonblock();
+            loop {
+                // SAFETY: single-CPU SYSCALL context.
+                let exp = match unsafe { timerfd_peek(id) } {
+                    Some(c) => c,
+                    None => return -9, // EBADF — slot gone
+                };
+                if exp > 0 {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe {
+                        #[allow(static_mut_refs)]
+                        if let Some(slot) = TIMERFD_TABLE.get_mut(id as usize) {
+                            slot.expirations = 0;
+                        }
+                    }
+                    // SAFETY: `buf_ptr` validated above; writing 8 bytes.
+                    unsafe {
+                        let bytes = exp.to_ne_bytes();
+                        let ptr = buf_ptr as *mut u8;
+                        for (i, &b) in bytes.iter().enumerate() {
+                            ptr.add(i).write_volatile(b);
+                        }
+                    }
+                    return 8;
+                }
+                if nonblock {
+                    return -11; // EAGAIN
+                }
+                // SAFETY: SYSCALL context; cooperative yield.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
+        }
     }
 }
 
@@ -2021,6 +2520,7 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
         FileBackend::ProcFile { .. } => -29,      // ESPIPE
         FileBackend::EventFd { .. } => -29,       // ESPIPE
         FileBackend::EpollInstance { .. } => -29, // ESPIPE
+        FileBackend::TimerFd { .. } => -29,       // ESPIPE
         FileBackend::RamfsFile { ino } => {
             let current_offset = handle.offset;
 

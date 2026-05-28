@@ -281,6 +281,9 @@ pub const SYS_TIME: SyscallNumber = 201;
 
 /// `rt_sigaction(sig, act, oldact)` — Set signal action.
 pub const SYS_RT_SIGACTION: SyscallNumber = 13;
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)` — Examine/change blocked
+/// signal mask.
+pub const SYS_RT_SIGPROCMASK: SyscallNumber = 14;
 /// `rt_sigreturn()` — Return from signal handler.
 pub const SYS_RT_SIGRETURN: SyscallNumber = 15;
 

@@ -764,12 +764,8 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
 
         // ── Signal syscalls ──────────────────────────────────────
 
-        // SYS_RT_SIGACTION (13): install a user-space signal handler.
-        // POSIX.1-2024 sigaction(3p).
-        oncrix_syscall::number::SYS_RT_SIGACTION => {
-            // SAFETY: Single-CPU SYSCALL dispatch path.
-            unsafe { crate::signal_syscall::sys_rt_sigaction(args.arg0, args.arg1, args.arg2) }
-        }
+        // Superseded by the full rt_sigaction below (sched_syscalls path
+        // with sigsetsize). Old 3-arg stub kept out of the dispatch table.
 
         // SYS_RT_SIGRETURN (15): return from a user-mode signal handler.
         // Reads the kernel-pushed UserSignalFrame at `arg0` and restores
@@ -926,10 +922,56 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             }
         }
 
+        // SYS_RT_SIGACTION (13) / SYS_RT_SIGPROCMASK (14): per-process
+        // signal disposition + per-thread blocked-signal mask.
+        oncrix_syscall::number::SYS_RT_SIGACTION => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_rt_sigaction(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_RT_SIGPROCMASK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_rt_sigprocmask(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+
         // SYS_EVENTFD2 (290): create a pollable u64 counter fd.
         oncrix_syscall::number::SYS_EVENTFD2 => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::fd_table::sys_eventfd2(args.arg0, args.arg1 as u32) }
+        }
+
+        // SYS_TIMERFD_* (283/286/287): pollable timer file descriptors.
+        oncrix_syscall::number::SYS_TIMERFD_CREATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_timerfd_create(args.arg0 as i32, args.arg1 as i32) }
+        }
+        oncrix_syscall::number::SYS_TIMERFD_SETTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_timerfd_settime(
+                    args.arg0 as usize,
+                    args.arg1 as i32,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_TIMERFD_GETTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_timerfd_gettime(args.arg0 as usize, args.arg1) }
         }
 
         // SYS_EPOLL_* (291/233/232): scalable I/O event notification.

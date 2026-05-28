@@ -127,6 +127,25 @@ impl SignalMask {
         }
         self.0 & (1 << (sig.0 - 1)) != 0
     }
+
+    /// Return the raw bitset of blocked signals.
+    ///
+    /// Bit `n-1` set ⇒ signal `n` is blocked. Used by `rt_sigprocmask`
+    /// to populate the user-visible `sigset_t`.
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Build a [`SignalMask`] from a raw bitset.
+    ///
+    /// `SIGKILL` (9) and `SIGSTOP` (19) can never be masked; their bits
+    /// are silently cleared so a malicious or buggy `rt_sigprocmask`
+    /// caller cannot disable termination/stop.
+    pub const fn from_u32(raw: u32) -> Self {
+        let kill_bit = 1u32 << (9 - 1);
+        let stop_bit = 1u32 << (19 - 1);
+        Self(raw & !(kill_bit | stop_bit))
+    }
 }
 
 /// Pending signal set — signals waiting to be delivered.
@@ -180,12 +199,35 @@ impl PendingSignals {
 
 /// `SA_NOCLDSTOP` — do not generate `SIGCHLD` when children stop.
 pub const SA_NOCLDSTOP: u64 = 0x0000_0001;
+/// `SA_NOCLDWAIT` — do not transform children into zombies on death.
+pub const SA_NOCLDWAIT: u64 = 0x0000_0002;
 /// `SA_SIGINFO` — invoke handler with three arguments
 /// (`int signum, siginfo_t *info, void *uctx`) instead of one.
 pub const SA_SIGINFO: u64 = 0x0000_0004;
+/// `SA_ONSTACK` — deliver on the alternate signal stack (unsupported;
+/// accepted and ignored).
+pub const SA_ONSTACK: u64 = 0x0800_0000;
 /// `SA_RESTART` — automatically restart certain syscalls interrupted
 /// by this signal.
 pub const SA_RESTART: u64 = 0x1000_0000;
+/// `SA_NODEFER` — do not auto-mask the signal during its own handler.
+///
+/// Without this flag, the signal that triggered delivery is added to the
+/// thread's signal mask for the lifetime of the handler so it cannot
+/// recursively interrupt itself. With this flag, the handler runs with
+/// the unchanged mask, permitting re-entry. (Consumed by the signal
+/// delivery path in `signal_dispatch::deliver_pending_signals`.)
+pub const SA_NODEFER: u64 = 0x4000_0000;
+/// `SA_RESETHAND` — reset the disposition to `SIG_DFL` after one
+/// delivery (one-shot handler). (Consumed by the signal delivery path.)
+pub const SA_RESETHAND: u64 = 0x8000_0000;
+
+/// `how` value for `rt_sigprocmask`: add `set` to the current mask.
+pub const SIG_BLOCK: i32 = 0;
+/// `how` value for `rt_sigprocmask`: remove `set` from the current mask.
+pub const SIG_UNBLOCK: i32 = 1;
+/// `how` value for `rt_sigprocmask`: replace the current mask with `set`.
+pub const SIG_SETMASK: i32 = 2;
 
 /// Per-process signal state.
 #[derive(Debug, Clone, Copy)]

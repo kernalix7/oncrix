@@ -93,12 +93,17 @@ const SYS_GETRUSAGE: u64 = 98;
 const SYS_SCHED_SETAFFINITY: u64 = 203;
 const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_EVENTFD2: u64 = 290;
+const SYS_TIMERFD_CREATE: u64 = 283;
+const SYS_TIMERFD_SETTIME: u64 = 286;
+const SYS_TIMERFD_GETTIME: u64 = 287;
 const SYS_EPOLL_WAIT: u64 = 232;
 const SYS_EPOLL_CTL: u64 = 233;
 const SYS_EPOLL_CREATE1: u64 = 291;
 const SYS_GETITIMER: u64 = 36;
 const SYS_ALARM: u64 = 37;
 const SYS_SETITIMER: u64 = 38;
+const SYS_RT_SIGACTION: u64 = 13;
+const SYS_RT_SIGPROCMASK: u64 = 14;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -724,6 +729,81 @@ pub unsafe fn eventfd(initval: u32, flags: i32) -> i64 {
     unsafe { syscall2(SYS_EVENTFD2, initval as u64, flags as i64 as u64) }
 }
 
+/// `timespec` — seconds + nanoseconds.
+#[repr(C)]
+pub struct TimeSpec {
+    /// Whole seconds.
+    pub tv_sec: i64,
+    /// Nanoseconds, in `[0, 1e9)`.
+    pub tv_nsec: i64,
+}
+
+/// `itimerspec` — interval + initial expiration `timespec`s.
+#[repr(C)]
+pub struct ITimerSpec {
+    /// Reload interval (zero = one-shot).
+    pub it_interval: TimeSpec,
+    /// Initial expiration (zero = disarmed).
+    pub it_value: TimeSpec,
+}
+
+/// `clock_gettime`/`timerfd` clock id: real (wall) clock.
+pub const CLOCK_REALTIME: i32 = 0;
+/// `clock_gettime`/`timerfd` clock id: monotonic since boot.
+pub const CLOCK_MONOTONIC: i32 = 1;
+/// `clock_gettime`/`timerfd` clock id: monotonic incl. suspend.
+pub const CLOCK_BOOTTIME: i32 = 7;
+/// `timerfd_create` flag: set the descriptor non-blocking.
+pub const TFD_NONBLOCK: i32 = 0o4000;
+/// `timerfd_create` flag: set `FD_CLOEXEC`.
+pub const TFD_CLOEXEC: i32 = 0o2000000;
+/// `timerfd_settime` flag: `it_value` is an absolute time on `clockid`.
+pub const TFD_TIMER_ABSTIME: i32 = 1;
+
+/// `timerfd_create(2)` — create a pollable timer fd. Returns the fd or errno.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn timerfd_create(clockid: i32, flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_TIMERFD_CREATE, clockid as i64 as u64, flags as i64 as u64) }
+}
+
+/// `timerfd_settime(2)` — arm/disarm the timer.
+///
+/// # Safety
+///
+/// `new_value` must point to a valid [`ITimerSpec`]; `old_value`, if
+/// non-null, must be writable.
+pub unsafe fn timerfd_settime(
+    fd: i32,
+    flags: i32,
+    new_value: *const ITimerSpec,
+    old_value: *mut ITimerSpec,
+) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_TIMERFD_SETTIME,
+            fd as u64,
+            flags as i64 as u64,
+            new_value as u64,
+            old_value as u64,
+        )
+    }
+}
+
+/// `timerfd_gettime(2)` — read the current timer setting.
+///
+/// # Safety
+///
+/// `curr_value` must point to a writable [`ITimerSpec`].
+pub unsafe fn timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe { syscall2(SYS_TIMERFD_GETTIME, fd as u64, curr_value as u64) }
+}
+
 /// A single epoll interest/event record (packed: `events` then `data`).
 #[repr(C, packed)]
 pub struct EpollEvent {
@@ -819,6 +899,50 @@ pub unsafe fn setitimer(which: i32, new: *const u8, old: *mut u8) -> i64 {
 pub unsafe fn getitimer(which: i32, curr: *mut u8) -> i64 {
     // SAFETY: caller guarantees `curr` validity.
     unsafe { syscall2(SYS_GETITIMER, which as u64, curr as u64) }
+}
+
+/// `rt_sigaction(2)` — examine/change a signal disposition.
+///
+/// `sig` is the signal number; `act`/`oact` point to `struct sigaction`
+/// (`[u64;4]` = handler, flags, restorer, mask). `sigsetsize` must be 8.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `act`/`oact`, if non-null, must reference valid `sigaction` storage.
+pub unsafe fn rt_sigaction(sig: i32, act: *const u8, oact: *mut u8, sigsetsize: usize) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_RT_SIGACTION,
+            sig as u64,
+            act as u64,
+            oact as u64,
+            sigsetsize as u64,
+        )
+    }
+}
+
+/// `rt_sigprocmask(2)` — examine/change the blocked-signal mask.
+///
+/// `how` is `SIG_BLOCK`(0) / `SIG_UNBLOCK`(1) / `SIG_SETMASK`(2); `set`
+/// (may be NULL = read-only) and `oldset` (may be NULL) are `u64` sigsets.
+/// `sigsetsize` must be 8. Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `set`/`oldset`, if non-null, must reference valid `u64` storage.
+pub unsafe fn rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize: usize) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_RT_SIGPROCMASK,
+            how as u64,
+            set as u64,
+            oldset as u64,
+            sigsetsize as u64,
+        )
+    }
 }
 
 /// `access(2)` — check file accessibility.

@@ -69,6 +69,13 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         crate::sched_syscalls::tick_itimers();
     }
 
+    // Advance armed timerfds and accumulate their expiration counts.
+    // SAFETY: timer IRQ context (single-CPU, IF=0); the timerfd table is
+    // only mutated with IF=0 (here and from the SYSCALL dispatch path).
+    unsafe {
+        crate::fd_table::tick_timerfds();
+    }
+
     // Acknowledge IRQ 0 via PIC *before* running the scheduler.
     // Sending EOI first allows higher-priority interrupts to be
     // serviced if the scheduler re-enables interrupts.

@@ -35,7 +35,9 @@
 
 use crate::current::{current_pid, current_thread_mut, yield_now};
 use oncrix_hal::timer::Timer;
-use oncrix_process::signal::Signal;
+use oncrix_process::signal::{
+    SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, Signal, SignalAction, SignalMask,
+};
 use oncrix_process::thread::{Priority, SchedPolicy};
 
 /// `which` selector: act on a process (the only mode ONCRIX supports).
@@ -741,6 +743,220 @@ pub unsafe fn sys_setitimer(which: i64, new_value: u64, old_value: u64) -> i64 {
         // SAFETY: old_value canonical (checked); writes four i64s.
         unsafe {
             core::ptr::write_unaligned(old_value as *mut [i64; 4], buf);
+        }
+    }
+    0
+}
+
+// ── rt_sigaction(2) / rt_sigprocmask(2) ───────────────────────────────
+
+/// Sentinel `sa_handler` for `SIG_DFL` — restore the default action.
+const SIG_DFL_HANDLER: u64 = 0;
+/// Sentinel `sa_handler` for `SIG_IGN` — ignore the signal.
+const SIG_IGN_HANDLER: u64 = 1;
+
+/// Wire layout of the `struct sigaction` passed to `rt_sigaction(2)`.
+///
+/// Matches the Linux x86_64 ABI for `sigsetsize == 8`: a 64-bit handler
+/// pointer, 64-bit flags, 64-bit restorer (unused — we round-trip but do
+/// not invoke a separate restorer), and a single 64-bit `sigset_t` word
+/// (low 32 bits used; high 32 reserved). Total 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawSigaction {
+    sa_handler: u64,
+    sa_flags: u64,
+    sa_restorer: u64,
+    sa_mask: u64,
+}
+
+/// Decode a [`RawSigaction`] into a [`SignalAction`].
+fn raw_to_action(handler: u64) -> SignalAction {
+    match handler {
+        SIG_DFL_HANDLER => SignalAction::Default,
+        SIG_IGN_HANDLER => SignalAction::Ignore,
+        rip => SignalAction::Handler(rip),
+    }
+}
+
+/// Encode a [`SignalAction`] into the raw `sa_handler` value.
+const fn action_to_raw(action: SignalAction) -> u64 {
+    match action {
+        SignalAction::Default => SIG_DFL_HANDLER,
+        SignalAction::Ignore => SIG_IGN_HANDLER,
+        SignalAction::Handler(rip) => rip,
+    }
+}
+
+/// `rt_sigaction(sig, act, oact, sigsetsize)` — examine or change the
+/// disposition of a signal.
+///
+/// Reads a `struct sigaction` from `act` (if non-null) and installs it
+/// on the calling process. If `oact` is non-null, the previous setting
+/// is written there first. `sigsetsize` must equal the kernel's
+/// `sigset_t` size (8 bytes — one 64-bit word covers the 32 signals
+/// ONCRIX models); other sizes return `-22` (`EINVAL`). Signals
+/// `SIGKILL` and `SIGSTOP` cannot be caught or ignored — attempting to
+/// install a handler for them returns `-22` (`EINVAL`).
+///
+/// Recognised `sa_flags`: `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND`,
+/// `SA_SIGINFO`, `SA_NOCLDSTOP`, `SA_NOCLDWAIT`, `SA_ONSTACK`. They are
+/// stored unchanged; the signal-delivery path is responsible for
+/// honouring `SA_NODEFER` / `SA_RESETHAND` (see [`SA_NODEFER`] docs).
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for a bad signal,
+/// `sigsetsize`, or attempt to catch SIGKILL/SIGSTOP, `-14` (`EFAULT`)
+/// for a bad pointer, `-3` (`ESRCH`) if there is no current process.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path (single-CPU, IF=0); `act`/`oact` are validated
+/// user-canonical before any access.
+pub unsafe fn sys_rt_sigaction(sig: i64, act: u64, oact: u64, sigsetsize: u64) -> i64 {
+    if sigsetsize != 8 {
+        return -22; // EINVAL — only the 8-byte sigset_t is supported.
+    }
+    if sig <= 0 || sig as u32 > Signal::MAX as u32 {
+        return -22; // EINVAL
+    }
+    let signum = Signal(sig as u8);
+    if act != 0 && bad_user_ptr(act) {
+        return -14; // EFAULT
+    }
+    if oact != 0 && bad_user_ptr(oact) {
+        return -14; // EFAULT
+    }
+    if act == 0 && oact == 0 {
+        // Nothing to read or write — pure no-op query, succeed.
+        return 0;
+    }
+
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+
+    // Snapshot old and (optionally) apply new under one process-table
+    // borrow so the read/write pair is atomic w.r.t. signal delivery.
+    //
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    let result = unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        let entry = match table.get_mut(pid) {
+            Some(e) => e,
+            None => return -3, // ESRCH
+        };
+
+        let old_action = entry.signals.get_action(signum);
+        let old_flags = entry.signals.get_flags(signum);
+
+        if act != 0 {
+            // SAFETY: act validated canonical above; read 32 bytes.
+            let new = core::ptr::read_unaligned(act as *const RawSigaction);
+            let new_action = raw_to_action(new.sa_handler);
+            if entry
+                .signals
+                .set_action_with_flags(signum, new_action, new.sa_flags)
+                .is_err()
+            {
+                // SIGKILL/SIGSTOP or out-of-range signum.
+                return -22; // EINVAL
+            }
+            // Note: `sa_mask` is read from userspace but not applied to
+            // the per-process mask — POSIX `sigaction` only affects the
+            // mask *during handler invocation*. The delivery path is the
+            // right place to add those bits when entering the handler.
+            // Stored implicitly through `handler_flags` (SA_NODEFER) for
+            // now; per-signal sa_mask plumbing is a follow-up.
+            let _ = new.sa_mask;
+        }
+
+        if oact != 0 {
+            let old = RawSigaction {
+                sa_handler: action_to_raw(old_action),
+                sa_flags: old_flags,
+                sa_restorer: 0,
+                sa_mask: 0,
+            };
+            // SAFETY: oact validated canonical above; write 32 bytes.
+            core::ptr::write_unaligned(oact as *mut RawSigaction, old);
+        }
+        0i64
+    };
+    result
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)` — examine or change
+/// the calling process's signal mask.
+///
+/// If `set` is non-null, the new mask is computed from `how`:
+///   * `SIG_BLOCK`   (0): `mask |= *set`
+///   * `SIG_UNBLOCK` (1): `mask &= ~*set`
+///   * `SIG_SETMASK` (2): `mask  = *set`
+///
+/// `SIGKILL` and `SIGSTOP` can never be masked: those bits are silently
+/// cleared from the resulting mask (see
+/// [`SignalMask::from_u32`](oncrix_process::signal::SignalMask::from_u32)).
+/// If `oldset` is non-null the previous mask is written there first.
+/// `sigsetsize` must be 8 bytes.
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for a bad `how` or
+/// `sigsetsize`, `-14` (`EFAULT`) for a bad pointer, `-3` (`ESRCH`) if
+/// there is no current process.
+///
+/// # Safety
+///
+/// SYSCALL dispatch path; `set`/`oldset` validated user-canonical.
+pub unsafe fn sys_rt_sigprocmask(how: i64, set: u64, oldset: u64, sigsetsize: u64) -> i64 {
+    if sigsetsize != 8 {
+        return -22; // EINVAL
+    }
+    if set != 0 && bad_user_ptr(set) {
+        return -14; // EFAULT
+    }
+    if oldset != 0 && bad_user_ptr(oldset) {
+        return -14; // EFAULT
+    }
+    let how_i32 = how as i32;
+    if set != 0 && how_i32 != SIG_BLOCK && how_i32 != SIG_UNBLOCK && how_i32 != SIG_SETMASK {
+        return -22; // EINVAL
+    }
+
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+
+    // SAFETY: SYSCALL context — exclusive process-table access; borrow
+    // released at scope end.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        let entry = match table.get_mut(pid) {
+            Some(e) => e,
+            None => return -3, // ESRCH
+        };
+
+        let old_mask = entry.signals.mask;
+
+        if set != 0 {
+            // SAFETY: set validated canonical above; read 8 bytes (the
+            // low 32 bits are the only ones we model, the rest reserved).
+            let raw = core::ptr::read_unaligned(set as *const u64);
+            let new_bits = raw as u32;
+            let new_mask = match how_i32 {
+                SIG_BLOCK => SignalMask::from_u32(old_mask.as_u32() | new_bits),
+                SIG_UNBLOCK => SignalMask::from_u32(old_mask.as_u32() & !new_bits),
+                SIG_SETMASK => SignalMask::from_u32(new_bits),
+                _ => return -22, // EINVAL (already filtered, but defensive)
+            };
+            entry.signals.mask = new_mask;
+        }
+
+        if oldset != 0 {
+            let raw = old_mask.as_u32() as u64;
+            // SAFETY: oldset validated canonical above; write 8 bytes.
+            core::ptr::write_unaligned(oldset as *mut u64, raw);
         }
     }
     0
