@@ -1174,3 +1174,107 @@ pub unsafe fn sys_getsid(pid_arg: u64) -> i64 {
         }
     }
 }
+
+// ── Resource limits (getrlimit/setrlimit/prlimit64) ──────────────
+
+/// Wire layout of `struct rlimit` / `struct rlimit64`: two `u64`s
+/// (`rlim_cur`, `rlim_max`).
+const RLIMIT_WIRE_LEN: usize = 16;
+
+/// Shared core for `prlimit64`/`getrlimit`/`setrlimit`.
+///
+/// Reads the old value into `*old_ptr` (when non-null) before applying the
+/// new value from `*new_ptr` (when non-null). `target` of 0 means the
+/// calling process. Returns 0 on success or a negative errno.
+///
+/// # Safety
+///
+/// `old_ptr`/`new_ptr`, when non-zero, must reference 16 writable/readable
+/// user bytes respectively. Caller runs in SYSCALL context.
+unsafe fn rlimit_op(target: u64, resource: u64, new_ptr: u64, old_ptr: u64) -> i64 {
+    use oncrix_process::table::{RLIMIT_NLIMITS, Rlimit};
+
+    let res = resource as usize;
+    if res >= RLIMIT_NLIMITS {
+        return -22; // EINVAL
+    }
+    if (old_ptr != 0 && bad_user_ptr(old_ptr)) || (new_ptr != 0 && bad_user_ptr(new_ptr)) {
+        return -14; // EFAULT
+    }
+    let target_pid = match resolve_target_pid(target) {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+
+    // SAFETY: SYSCALL context — exclusive process-table access.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        let entry = match table.get_mut(target_pid) {
+            Some(e) => e,
+            None => return -3, // ESRCH
+        };
+
+        if old_ptr != 0 {
+            let cur = entry.rlimits[res];
+            let buf = [cur.rlim_cur, cur.rlim_max];
+            // SAFETY: old_ptr validated above; 16 bytes.
+            core::ptr::write_unaligned(old_ptr as *mut [u64; 2], buf);
+        }
+
+        if new_ptr != 0 {
+            // SAFETY: new_ptr validated above; 16 bytes.
+            let buf = core::ptr::read_unaligned(new_ptr as *const [u64; 2]);
+            let (cur, max) = (buf[0], buf[1]);
+            if cur > max {
+                return -22; // EINVAL — soft limit above hard limit
+            }
+            entry.rlimits[res] = Rlimit {
+                rlim_cur: cur,
+                rlim_max: max,
+            };
+        }
+    }
+    0
+}
+
+/// `prlimit64(2)` — get and/or set a resource limit of process `pid`
+/// (0 = caller). Writes the previous value to `old_value` (if non-null),
+/// then applies `new_value` (if non-null).
+///
+/// # Safety
+///
+/// `new_value`/`old_value`, when non-zero, must be valid user pointers to a
+/// 16-byte `rlimit64`. SYSCALL context only.
+pub unsafe fn sys_prlimit64(pid: u64, resource: u64, new_value: u64, old_value: u64) -> i64 {
+    // SAFETY: forwarded to rlimit_op under SYSCALL context.
+    unsafe { rlimit_op(pid, resource, new_value, old_value) }
+}
+
+/// `getrlimit(2)` — read the calling process's limit for `resource` into
+/// `rlim` (a 16-byte `rlimit`).
+///
+/// # Safety
+///
+/// `rlim` must point to 16 writable user bytes. SYSCALL context only.
+pub unsafe fn sys_getrlimit(resource: u64, rlim: u64) -> i64 {
+    if rlim == 0 {
+        return -14; // EFAULT
+    }
+    let _ = RLIMIT_WIRE_LEN;
+    // SAFETY: read current value into `rlim`, apply nothing.
+    unsafe { rlimit_op(0, resource, 0, rlim) }
+}
+
+/// `setrlimit(2)` — set the calling process's limit for `resource` from
+/// `rlim` (a 16-byte `rlimit`).
+///
+/// # Safety
+///
+/// `rlim` must point to 16 readable user bytes. SYSCALL context only.
+pub unsafe fn sys_setrlimit(resource: u64, rlim: u64) -> i64 {
+    if rlim == 0 {
+        return -14; // EFAULT
+    }
+    // SAFETY: apply new value from `rlim`, report no old value.
+    unsafe { rlimit_op(0, resource, rlim, 0) }
+}

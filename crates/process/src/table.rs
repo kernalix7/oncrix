@@ -111,6 +111,33 @@ impl ItimerReal {
     }
 }
 
+/// A single resource limit, as reported by `getrlimit(2)` / set by
+/// `setrlimit(2)` / `prlimit64(2)`.
+///
+/// `rlim_cur` is the soft limit (the value the kernel enforces), and
+/// `rlim_max` is the hard limit (the ceiling to which an unprivileged
+/// process may raise the soft limit). [`RLIM_INFINITY`] means "no limit".
+#[derive(Debug, Clone, Copy)]
+pub struct Rlimit {
+    /// Soft limit (enforced value).
+    pub rlim_cur: u64,
+    /// Hard limit (ceiling for `rlim_cur`).
+    pub rlim_max: u64,
+}
+
+/// `RLIM_INFINITY` — sentinel meaning "no limit".
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// Number of modelled resource-limit slots (`RLIMIT_*` indices `0..16`).
+pub const RLIMIT_NLIMITS: usize = 16;
+
+/// `RLIMIT_NOFILE` index — maximum number of open file descriptors.
+pub const RLIMIT_NOFILE: usize = 7;
+
+/// Default soft/hard cap for `RLIMIT_NOFILE`, matching the per-process
+/// file-descriptor table capacity.
+pub const RLIMIT_NOFILE_DEFAULT: u64 = 256;
+
 /// Extends [`Process`] with parent relationship, signal state,
 /// and exit information needed by `wait4` and `kill`.
 #[derive(Debug)]
@@ -140,6 +167,11 @@ pub struct ProcessEntry {
     /// `sid`. `setsid(2)` creates a new session and resets both fields
     /// to the caller's PID.
     pub sid: Pid,
+    /// Per-process resource limits, indexed by `RLIMIT_*` resource id
+    /// (`getrlimit`/`setrlimit`/`prlimit64`). All default to
+    /// [`RLIM_INFINITY`] except `RLIMIT_NOFILE`. Stored for query/retrieval;
+    /// enforcement is not yet wired into the allocators.
+    pub rlimits: [Rlimit; RLIMIT_NLIMITS],
 }
 
 impl ProcessEntry {
@@ -159,6 +191,17 @@ impl ProcessEntry {
             itimer_real: ItimerReal::new(),
             pgid: pid,
             sid: pid,
+            rlimits: {
+                let mut limits = [Rlimit {
+                    rlim_cur: RLIM_INFINITY,
+                    rlim_max: RLIM_INFINITY,
+                }; RLIMIT_NLIMITS];
+                limits[RLIMIT_NOFILE] = Rlimit {
+                    rlim_cur: RLIMIT_NOFILE_DEFAULT,
+                    rlim_max: RLIMIT_NOFILE_DEFAULT,
+                };
+                limits
+            },
         }
     }
 

@@ -941,6 +941,23 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::sched_syscalls::sys_getsid(args.arg0) }
         }
 
+        // SYS_PRLIMIT64 (302) / SYS_GETRLIMIT (97) / SYS_SETRLIMIT (160):
+        // POSIX.1-2024 resource limits.
+        oncrix_syscall::number::SYS_PRLIMIT64 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_prlimit64(args.arg0, args.arg1, args.arg2, args.arg3)
+            }
+        }
+        oncrix_syscall::number::SYS_GETRLIMIT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getrlimit(args.arg0, args.arg1) }
+        }
+        oncrix_syscall::number::SYS_SETRLIMIT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setrlimit(args.arg0, args.arg1) }
+        }
+
         // SYS_RT_SIGACTION (13) / SYS_RT_SIGPROCMASK (14): per-process
         // signal disposition + per-thread blocked-signal mask.
         oncrix_syscall::number::SYS_RT_SIGACTION => {

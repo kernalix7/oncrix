@@ -108,6 +108,9 @@ const SYS_SETPGID: u64 = 109;
 const SYS_SETSID: u64 = 112;
 const SYS_GETPGID: u64 = 121;
 const SYS_GETSID: u64 = 124;
+const SYS_GETRLIMIT: u64 = 97;
+const SYS_SETRLIMIT: u64 = 160;
+const SYS_PRLIMIT64: u64 = 302;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -1018,6 +1021,60 @@ pub fn setsid() -> i64 {
 pub unsafe fn getsid(pid: i32) -> i64 {
     // SAFETY: scalar-only syscall.
     unsafe { syscall1(SYS_GETSID, pid as i64 as u64) }
+}
+
+/// `struct rlimit` — soft (`rlim_cur`) and hard (`rlim_max`) resource limit.
+#[repr(C)]
+pub struct Rlimit {
+    /// Soft limit (enforced value).
+    pub rlim_cur: u64,
+    /// Hard limit (ceiling for `rlim_cur`).
+    pub rlim_max: u64,
+}
+
+/// `RLIM_INFINITY` — sentinel meaning "no limit".
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// `getrlimit(2)` — read the resource limit for `resource` into `rlim`.
+/// Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `rlim` must point to a writable [`Rlimit`].
+pub unsafe fn getrlimit(resource: i32, rlim: *mut Rlimit) -> i64 {
+    // SAFETY: caller guarantees `rlim` validity.
+    unsafe { syscall2(SYS_GETRLIMIT, resource as i64 as u64, rlim as u64) }
+}
+
+/// `setrlimit(2)` — set the resource limit for `resource` from `rlim`.
+/// Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `rlim` must point to a valid [`Rlimit`].
+pub unsafe fn setrlimit(resource: i32, rlim: *const Rlimit) -> i64 {
+    // SAFETY: caller guarantees `rlim` validity.
+    unsafe { syscall2(SYS_SETRLIMIT, resource as i64 as u64, rlim as u64) }
+}
+
+/// `prlimit64(2)` — get and/or set the resource limit of `pid` (0 = self).
+/// Writes the old value to `old` (if non-null), then applies `new` (if
+/// non-null). Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `new`/`old`, when non-null, must reference a valid [`Rlimit`].
+pub unsafe fn prlimit64(pid: i32, resource: i32, new: *const Rlimit, old: *mut Rlimit) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_PRLIMIT64,
+            pid as i64 as u64,
+            resource as i64 as u64,
+            new as u64,
+            old as u64,
+        )
+    }
 }
 
 /// `access(2)` — check file accessibility.
