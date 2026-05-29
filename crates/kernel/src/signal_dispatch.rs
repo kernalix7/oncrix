@@ -90,6 +90,14 @@ pub struct UserSignalFrame {
     pub saved_rsp: u64,
     /// Saved user RFLAGS at the moment the signal was delivered.
     pub saved_rflags: u64,
+    /// Saved per-thread blocked-signal mask at the moment of delivery.
+    ///
+    /// `do_sigreturn` restores this so that any signals auto-masked under
+    /// `!SA_NODEFER` are unblocked again — and an explicit `sigprocmask`
+    /// state in effect before delivery is reinstated unchanged.
+    pub saved_mask: u32,
+    /// Padding — keep the struct size a multiple of 8.
+    pub _pad2: u32,
 }
 
 const FRAME_SIZE: usize = core::mem::size_of::<UserSignalFrame>();
@@ -133,6 +141,12 @@ pub unsafe fn deliver_pending_signals(args: *mut SyscallArgs) {
             Some(e) => e,
             None => return,
         };
+        // Capture the current blocked-signal mask so the user-frame can
+        // record it for `do_sigreturn` to restore (POSIX: a handler runs
+        // with the disposition's `sa_mask` added — and, absent
+        // `SA_NODEFER`, with the delivered signal itself blocked — and
+        // sigreturn must reinstate the pre-delivery mask).
+        let current_mask = entry.signals.mask.as_u32();
         let mut snap: [(Signal, SignalAction); Signal::MAX as usize] =
             [(Signal(0), SignalAction::Default); Signal::MAX as usize];
         let mut count = 0usize;
@@ -147,9 +161,9 @@ pub unsafe fn deliver_pending_signals(args: *mut SyscallArgs) {
         if count == 0 {
             return;
         }
-        (snap, count)
+        (snap, count, current_mask)
     };
-    let (snap, count) = snapshot;
+    let (snap, count, current_mask) = snapshot;
 
     for entry in snap.iter().take(count) {
         let (sig, action) = *entry;
@@ -165,11 +179,34 @@ pub unsafe fn deliver_pending_signals(args: *mut SyscallArgs) {
                 }
                 // SAFETY: same single-CPU context; the saved-user atomics and
                 // user backing region are the only resources mutated.
-                if unsafe { deliver_user_handler(sig, handler_rip, args) }.is_err() {
+                if unsafe { deliver_user_handler(sig, handler_rip, args, current_mask) }.is_err() {
                     // Handler delivery failed (couldn't write the user
                     // frame). Fall back to the default action so we
                     // still make progress on the bit.
                     apply_default_action(sig);
+                } else {
+                    // Handler delivery succeeded. Apply the per-disposition
+                    // side effects:
+                    //   - `SA_NODEFER` absent  → auto-mask `sig` for the
+                    //     handler's lifetime; `do_sigreturn` restores the
+                    //     pre-delivery mask from the frame.
+                    //   - `SA_RESETHAND`       → reset disposition to
+                    //     `SignalAction::Default` so the next instance of
+                    //     `sig` raises the default action.
+                    // SAFETY: same single-CPU SYSCALL context — exclusive
+                    // process-table access; borrow released at scope end.
+                    unsafe {
+                        let table = crate::fork_dispatch::process_table_mut();
+                        if let Some(entry) = table.get_mut(pid) {
+                            let flags = entry.signals.get_flags(sig);
+                            if flags & oncrix_process::signal::SA_NODEFER == 0 {
+                                entry.signals.mask.block(sig);
+                            }
+                            if flags & oncrix_process::signal::SA_RESETHAND != 0 {
+                                let _ = entry.signals.set_action(sig, SignalAction::Default);
+                            }
+                        }
+                    }
                 }
                 // Only one handler-style signal per syscall epilogue —
                 // additional pending bits stay queued (already cleared
@@ -205,6 +242,7 @@ unsafe fn deliver_user_handler(
     sig: Signal,
     handler_rip: u64,
     args: *mut SyscallArgs,
+    current_mask: u32,
 ) -> Result<()> {
     use core::sync::atomic::Ordering;
 
@@ -249,6 +287,8 @@ unsafe fn deliver_user_handler(
             saved_rip,
             saved_rsp,
             saved_rflags,
+            saved_mask: current_mask,
+            _pad2: 0,
         });
         let pretcode_ptr = pretcode_va as *mut u64;
         pretcode_ptr.write_volatile(SIGRETURN_TRAMPOLINE_VA);
@@ -312,6 +352,20 @@ pub unsafe fn do_sigreturn(frame_va: u64) -> i64 {
     SYSCALL_SAVED_USER_RIP.store(frame.saved_rip, Ordering::Relaxed);
     SYSCALL_SAVED_USER_RSP.store(frame.saved_rsp, Ordering::Relaxed);
     SYSCALL_SAVED_USER_RFLAGS.store(frame.saved_rflags, Ordering::Relaxed);
+
+    // Restore the per-thread blocked-signal mask. Under `!SA_NODEFER`
+    // (POSIX default) the kernel auto-masked the delivered signal for
+    // the handler's lifetime; reinstating the captured mask here both
+    // clears that and reinstates any explicit `sigprocmask` state.
+    // SAFETY: SYSCALL context — exclusive process-table access.
+    unsafe {
+        if let Some(pid) = crate::current::current_pid() {
+            let table = crate::fork_dispatch::process_table_mut();
+            if let Some(entry) = table.get_mut(pid) {
+                entry.signals.mask = oncrix_process::signal::SignalMask::from_u32(frame.saved_mask);
+            }
+        }
+    }
 
     // Returning 0 is fine — the value lands in RAX but the SYSRET
     // epilogue's RIP/RSP overwrite from the atomics takes precedence;
