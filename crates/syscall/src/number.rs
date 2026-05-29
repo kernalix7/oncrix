@@ -104,6 +104,9 @@ pub const SYS_LSTAT: SyscallNumber = 6;
 pub const SYS_LSEEK: SyscallNumber = 8;
 /// `dup2(oldfd, newfd)` — Duplicate a file descriptor.
 pub const SYS_DUP2: SyscallNumber = 33;
+/// `dup3(oldfd, newfd, flags)` — Duplicate a fd, optionally setting
+/// `O_CLOEXEC` on the new descriptor.
+pub const SYS_DUP3: SyscallNumber = 292;
 /// `pipe(pipefd)` — Create a pipe.
 pub const SYS_PIPE: SyscallNumber = 22;
 /// `pipe2(pipefd, flags)` — Create a pipe with flags.

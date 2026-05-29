@@ -51,6 +51,7 @@ const SYS_RT_SIGACTION: u64 = 13;
 const SYS_ACCESS: u64 = 21;
 const SYS_FSYNC: u64 = 74;
 const SYS_DUP2: u64 = 33;
+const SYS_DUP3: u64 = 292;
 const SYS_GETPID: u64 = 39;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
@@ -1222,6 +1223,19 @@ pub unsafe fn getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
 /// # Safety
 ///
 /// Both `oldfd` and `newfd` must be valid file descriptor values (>= 0).
+/// `dup3(2)` — duplicate `oldfd` onto `newfd`, optionally setting
+/// `O_CLOEXEC` (the only accepted `flags` bit). `oldfd == newfd` is
+/// rejected with `-EINVAL` (unlike `dup2`). Returns `newfd` or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn dup3(oldfd: i32, newfd: i32, flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_DUP3, oldfd as u64, newfd as u64, flags as i64 as u64) }
+}
+
 pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i64 {
     // SAFETY: The caller guarantees both fd arguments are non-negative integers.
     unsafe { syscall2(SYS_DUP2, oldfd as u64, newfd as u64) }

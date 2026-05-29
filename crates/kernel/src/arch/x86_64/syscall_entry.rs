@@ -791,6 +791,15 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fd_table::fd_dup2(args.arg0 as usize, args.arg1 as usize) }
         }
 
+        // SYS_DUP3 (292): like dup2 but takes an O_CLOEXEC flag and rejects
+        // oldfd==newfd with EINVAL. POSIX.1-2024 dup3(2).
+        oncrix_syscall::number::SYS_DUP3 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_dup3(args.arg0 as usize, args.arg1 as usize, args.arg2 as u32)
+            }
+        }
+
         // ── Working directory syscalls ────────────────────────────
 
         // SYS_GETCWD (79): copy current working directory to user buffer.

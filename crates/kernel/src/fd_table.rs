@@ -1682,6 +1682,48 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
     }
 }
 
+/// Kernel handler for `SYS_DUP3` (Linux number 292).
+///
+/// POSIX `dup3(2)` differs from [`fd_dup2`] in two ways:
+/// - `oldfd == newfd` is an error (`-EINVAL`), not a no-op.
+/// - The only accepted flag is `O_CLOEXEC` (`0o2000000`); when set, the new
+///   descriptor has `FD_CLOEXEC` enabled. Any other flag bit yields
+///   `-EINVAL`.
+///
+/// On success returns `newfd`; on error a negative errno.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn sys_dup3(oldfd: usize, newfd: usize, flags: u32) -> i64 {
+    /// `O_CLOEXEC` flag bit (octal 02000000), matching `dup3(2)`.
+    const O_CLOEXEC: u32 = 0o2000000;
+
+    if oldfd == newfd {
+        return -22; // EINVAL — POSIX explicitly disallows the no-op case
+    }
+    if flags & !O_CLOEXEC != 0 {
+        return -22; // EINVAL — unknown flag bits
+    }
+
+    // SAFETY: dup2 handles the bulk of the work (refcount + close newfd).
+    let rc = unsafe { fd_dup2(oldfd, newfd) };
+    if rc < 0 {
+        return rc;
+    }
+    if flags & O_CLOEXEC != 0 {
+        // SAFETY: single-CPU SYSCALL context.
+        unsafe {
+            if let Some(t) = crate::current::current_thread_mut()
+                && let Some(h) = t.fd_table.get_mut(newfd)
+            {
+                h.flags.0 |= HandleFlags::FD_CLOEXEC_BIT;
+            }
+        }
+    }
+    rc
+}
+
 /// Install the standard I/O fds (0/1/2 = console) in the current
 /// thread's fd table.
 ///
