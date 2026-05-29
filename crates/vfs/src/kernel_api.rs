@@ -374,6 +374,21 @@ impl KernelVfs {
         self.ramfs.set_mode(inode.ino, FileMode(mode as u16))
     }
 
+    /// Change the permission bits of the file identified by `ino`.
+    ///
+    /// The fd-keyed counterpart of [`chmod_path`], for `fchmod(2)`.
+    pub fn chmod_ino(&mut self, ino: InodeNumber, mode: u32) -> Result<()> {
+        self.ramfs.set_mode(ino, FileMode(mode as u16))
+    }
+
+    /// Change the owner/group of the file identified by `ino`.
+    ///
+    /// The fd-keyed counterpart of [`chown_path`], for `fchown(2)`.
+    /// `u32::MAX` leaves the corresponding id unchanged.
+    pub fn chown_ino(&mut self, ino: InodeNumber, uid: u32, gid: u32) -> Result<()> {
+        self.ramfs.set_owner(ino, uid, gid)
+    }
+
     /// List the contents of the directory at `path`.
     ///
     /// Returns a `Vec<DirEntry>` with one element per child entry.

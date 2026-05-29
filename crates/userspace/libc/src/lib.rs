@@ -60,8 +60,10 @@ const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_RENAME: u64 = 82;
 const SYS_CHMOD: u64 = 90;
+const SYS_FCHMOD: u64 = 91;
 const SYS_LINK: u64 = 86;
 const SYS_CHOWN: u64 = 92;
+const SYS_FCHOWN: u64 = 93;
 const SYS_SYNC: u64 = 162;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
@@ -473,6 +475,18 @@ pub unsafe fn chmod(path: *const u8, mode: u32) -> i64 {
     unsafe { syscall2(SYS_CHMOD, path as u64, mode as u64) }
 }
 
+/// `fchmod(2)` — change permission bits of the file referenced by `fd`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn fchmod(fd: i32, mode: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_FCHMOD, fd as u64, mode as u64) }
+}
+
 /// `link(2)` — create a hard link.
 ///
 /// Returns 0 on success, or a negative errno value.
@@ -496,6 +510,19 @@ pub unsafe fn link(oldpath: *const u8, newpath: *const u8) -> i64 {
 pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
     // SAFETY: The caller guarantees `path` is null-terminated.
     unsafe { syscall3(SYS_CHOWN, path as u64, uid as u64, gid as u64) }
+}
+
+/// `fchown(2)` — change owner/group of the file referenced by `fd`.
+///
+/// A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`) leaves that id unchanged.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn fchown(fd: i32, uid: u32, gid: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) }
 }
 
 /// `getpriority(2)` — get the scheduling priority (nice value).

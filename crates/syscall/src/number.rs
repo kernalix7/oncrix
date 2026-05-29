@@ -121,10 +121,14 @@ pub const SYS_UNLINK: SyscallNumber = 87;
 pub const SYS_RENAME: SyscallNumber = 82;
 /// `chmod(pathname, mode)` — Change file permission bits.
 pub const SYS_CHMOD: SyscallNumber = 90;
+/// `fchmod(fd, mode)` — Change file permission bits by descriptor.
+pub const SYS_FCHMOD: SyscallNumber = 91;
 /// `link(oldpath, newpath)` — Create a hard link.
 pub const SYS_LINK: SyscallNumber = 86;
 /// `chown(pathname, uid, gid)` — Change file owner/group.
 pub const SYS_CHOWN: SyscallNumber = 92;
+/// `fchown(fd, uid, gid)` — Change file owner/group by descriptor.
+pub const SYS_FCHOWN: SyscallNumber = 93;
 /// `access(pathname, mode)` — Check file accessibility.
 pub const SYS_ACCESS: SyscallNumber = 21;
 /// `sync()` — Flush filesystem buffers to backing store.

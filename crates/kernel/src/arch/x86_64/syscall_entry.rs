@@ -808,6 +808,18 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_ftruncate(args.arg0, args.arg1) }
         }
 
+        // SYS_FCHMOD (91) / SYS_FCHOWN (93): chmod/chown by descriptor.
+        oncrix_syscall::number::SYS_FCHMOD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_fchmod(args.arg0 as i32, args.arg1 as u32) }
+        }
+        oncrix_syscall::number::SYS_FCHOWN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_fchown(args.arg0 as i32, args.arg1 as u32, args.arg2 as u32)
+            }
+        }
+
         // SYS_DUP3 (292): like dup2 but takes an O_CLOEXEC flag and rejects
         // oldfd==newfd with EINVAL. POSIX.1-2024 dup3(2).
         oncrix_syscall::number::SYS_DUP3 => {

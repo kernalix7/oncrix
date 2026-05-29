@@ -718,6 +718,79 @@ pub unsafe fn sys_ftruncate(fd: u64, length: u64) -> i64 {
     }
 }
 
+// ── sys_fchmod / sys_fchown ───────────────────────────────────────
+
+/// Resolve `fd` to its ramfs inode number, or a negative errno.
+///
+/// Shared by [`sys_fchmod`] and [`sys_fchown`]. `-EBADF` if `fd` is not
+/// open; `-EINVAL` if the backend is not a `RamfsFile` (the console, pipes,
+/// eventfds, etc. have no mutable inode mode/owner).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+unsafe fn fd_ramfs_ino(fd: i32) -> core::result::Result<oncrix_vfs::inode::InodeNumber, i64> {
+    // SAFETY: single-CPU SYSCALL context.
+    let handle = unsafe {
+        match crate::fd_table::fd_get(fd as usize) {
+            Some(h) => h,
+            None => return Err(-9), // EBADF
+        }
+    };
+    match handle.backend {
+        crate::fd_table::FileBackend::RamfsFile { ino } => Ok(ino),
+        _ => Err(-22), // EINVAL — backend has no inode mode/owner
+    }
+}
+
+/// Kernel handler for `SYS_FCHMOD` (number 91).
+///
+/// POSIX `fchmod(fd, mode)`: change the permission bits of the regular file
+/// referenced by `fd`. Returns 0 / `-EBADF` / `-EINVAL` / `-ENOENT` /
+/// `-EIO`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn sys_fchmod(fd: i32, mode: u32) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let ino = match unsafe { fd_ramfs_ino(fd) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let result = crate::state::with_global_mut(|s| s.vfs.chmod_ino(ino, mode));
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
+/// Kernel handler for `SYS_FCHOWN` (number 93).
+///
+/// POSIX `fchown(fd, uid, gid)`: change the owner/group of the regular file
+/// referenced by `fd`. A `uid`/`gid` of `u32::MAX` leaves that id unchanged.
+/// Returns 0 / `-EBADF` / `-EINVAL` / `-ENOENT` / `-EIO`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn sys_fchown(fd: i32, uid: u32, gid: u32) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let ino = match unsafe { fd_ramfs_ino(fd) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let result = crate::state::with_global_mut(|s| s.vfs.chown_ino(ino, uid, gid));
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_chown ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_CHOWN` (number 92).
