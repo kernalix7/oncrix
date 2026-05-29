@@ -466,10 +466,20 @@ pub unsafe fn pipe_dup_read(ring_id: u32) {
 /// # Safety
 ///
 /// Must be called from the SYSCALL dispatch path.
-pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
+pub unsafe fn sys_pipe2(fildes_ptr: u64, flags: u64) -> i64 {
+    /// `O_NONBLOCK` flag bit (octal 04000), matching `pipe2(2)` /
+    /// `oncrix_vfs::file_ops::O_NONBLOCK`.
+    const O_NONBLOCK: u64 = 0o4000;
+    /// `O_CLOEXEC` flag bit (octal 02000000), matching `pipe2(2)`.
+    const O_CLOEXEC: u64 = 0o2000000;
+
     // Validate the user pointer.
     if fildes_ptr == 0 || fildes_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
+    }
+    // Unknown flag bits are rejected per POSIX.1-2024 pipe2(2).
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return -22; // EINVAL
     }
 
     // Allocate a pipe slot.
@@ -481,6 +491,20 @@ pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
         }
     };
 
+    // Translate pipe2 flag bits to handle flags. The access mode is
+    // baked in per end (RDONLY / WRONLY); only the status / descriptor
+    // flag bits are configurable from `flags`.
+    let mut read_flags = crate::fd_table::HandleFlags::RDONLY.0;
+    let mut write_flags = crate::fd_table::HandleFlags::WRONLY.0;
+    if flags & O_NONBLOCK != 0 {
+        read_flags |= crate::fd_table::HandleFlags::NONBLOCK;
+        write_flags |= crate::fd_table::HandleFlags::NONBLOCK;
+    }
+    if flags & O_CLOEXEC != 0 {
+        read_flags |= crate::fd_table::HandleFlags::FD_CLOEXEC_BIT;
+        write_flags |= crate::fd_table::HandleFlags::FD_CLOEXEC_BIT;
+    }
+
     // Build FileHandles for the read and write ends.
     let read_handle = crate::fd_table::FileHandle {
         backend: crate::fd_table::FileBackend::Pipe {
@@ -488,7 +512,7 @@ pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
             is_write_end: false,
         },
         offset: 0,
-        flags: crate::fd_table::HandleFlags::RDONLY,
+        flags: crate::fd_table::HandleFlags(read_flags),
     };
     let write_handle = crate::fd_table::FileHandle {
         backend: crate::fd_table::FileBackend::Pipe {
@@ -496,7 +520,7 @@ pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
             is_write_end: true,
         },
         offset: 0,
-        flags: crate::fd_table::HandleFlags::WRONLY,
+        flags: crate::fd_table::HandleFlags(write_flags),
     };
 
     // Install both fds (lowest-available order).
