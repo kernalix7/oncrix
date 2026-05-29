@@ -681,6 +681,43 @@ pub unsafe fn sys_truncate(pathname_ptr: u64, length: u64) -> i64 {
     }
 }
 
+// ── sys_ftruncate ─────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_FTRUNCATE` (Linux number 77).
+///
+/// POSIX `ftruncate(fd, length)`: resize the regular file referenced by
+/// `fd` to exactly `length` bytes. Backed by the ramfs `truncate` op via
+/// [`crate::state`]; the fd backend must be `RamfsFile`. Other backends
+/// (pipes, sockets, eventfds, etc.) yield `-EINVAL`.
+///
+/// Returns 0 / `-EBADF` / `-EINVAL` / `-ENOENT` / `-EFBIG` / `-EIO`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn sys_ftruncate(fd: u64, length: u64) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let ino = unsafe {
+        match crate::fd_table::fd_get(fd as usize) {
+            Some(h) => match h.backend {
+                oncrix_process::fd_table::FileBackend::RamfsFile { ino } => ino,
+                _ => return -22, // EINVAL — backend has no truncate op
+            },
+            None => return -9, // EBADF
+        }
+    };
+
+    let result = crate::state::with_global_mut(|s| s.vfs.truncate_ino(ino, length));
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL — not a regular file
+        Some(Err(oncrix_lib::Error::OutOfMemory)) => -27, // EFBIG
+        Some(Err(_)) => -22,
+        None => -5, // EIO
+    }
+}
+
 // ── sys_chown ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_CHOWN` (number 92).

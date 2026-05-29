@@ -309,6 +309,16 @@ impl KernelVfs {
         self.ramfs.truncate(&inode, length)
     }
 
+    /// Truncate the regular file identified by `ino` to `length` bytes.
+    ///
+    /// The fd-keyed counterpart of [`truncate_path`], for `ftruncate(2)`.
+    /// Returns `NotFound` if no inode with that number exists,
+    /// `InvalidArgument` if the inode is not a regular file.
+    pub fn truncate_ino(&mut self, ino: InodeNumber, length: u64) -> Result<()> {
+        let inode = self.ramfs.inode_by_number(ino).ok_or(Error::NotFound)?;
+        self.ramfs.truncate(&inode, length)
+    }
+
     /// Create a symbolic link at `link_path` whose target is `target`.
     ///
     /// POSIX.1-2024 `symlink(2)` (ramfs subset). The target is stored

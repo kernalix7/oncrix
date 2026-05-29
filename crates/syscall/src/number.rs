@@ -137,6 +137,8 @@ pub const SYS_SYMLINK: SyscallNumber = 88;
 pub const SYS_READLINK: SyscallNumber = 89;
 /// `truncate(pathname, length)` — Set file length.
 pub const SYS_TRUNCATE: SyscallNumber = 76;
+/// `ftruncate(fd, length)` — Set file length by descriptor.
+pub const SYS_FTRUNCATE: SyscallNumber = 77;
 /// `mknod(pathname, mode, dev)` — Create a special file (FIFO subset).
 pub const SYS_MKNOD: SyscallNumber = 133;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.

@@ -797,6 +797,12 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::sched_syscalls::sys_umask(args.arg0) }
         }
 
+        // SYS_FTRUNCATE (77): truncate the regular file referenced by fd.
+        oncrix_syscall::number::SYS_FTRUNCATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_ftruncate(args.arg0, args.arg1) }
+        }
+
         // SYS_DUP3 (292): like dup2 but takes an O_CLOEXEC flag and rejects
         // oldfd==newfd with EINVAL. POSIX.1-2024 dup3(2).
         oncrix_syscall::number::SYS_DUP3 => {

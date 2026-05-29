@@ -66,6 +66,7 @@ const SYS_SYNC: u64 = 162;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
 const SYS_TRUNCATE: u64 = 76;
+const SYS_FTRUNCATE: u64 = 77;
 const SYS_RMDIR: u64 = 84;
 const SYS_MKNOD: u64 = 133;
 const SYS_FORK: u64 = 57;
@@ -1224,6 +1225,17 @@ pub unsafe fn getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
 /// # Safety
 ///
 /// Both `oldfd` and `newfd` must be valid file descriptor values (>= 0).
+/// `ftruncate(2)` — resize the regular file referenced by `fd` to exactly
+/// `length` bytes. Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn ftruncate(fd: i32, length: u64) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_FTRUNCATE, fd as u64, length) }
+}
+
 /// `umask(2)` — replace the calling process's file-mode creation mask
 /// with `(mask & 0o777)` and return the previous mask.
 ///
