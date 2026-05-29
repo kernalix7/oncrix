@@ -1278,3 +1278,37 @@ pub unsafe fn sys_setrlimit(resource: u64, rlim: u64) -> i64 {
     // SAFETY: apply new value from `rlim`, report no old value.
     unsafe { rlimit_op(0, resource, rlim, 0) }
 }
+
+// ── umask ────────────────────────────────────────────────────────
+
+/// `umask(2)` — atomically replace the calling process's file-mode
+/// creation mask with `(mask & 0o777)` and return the previous mask.
+///
+/// Bits set in the umask are CLEARED from the mode of newly created files
+/// (`open`/`creat`/`mkdir`). Stored on the [`ProcessEntry`]; enforcement
+/// at file-creation sites is documented as a follow-up — storage and
+/// retrieval are the deliverable here. Never fails when the calling
+/// process exists; `-ESRCH` if it does not.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn sys_umask(mask: u64) -> i64 {
+    let new = (mask as u32) & 0o777;
+    let pid = match current_pid() {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    // SAFETY: SYSCALL context — exclusive process-table access.
+    unsafe {
+        let table = crate::fork_dispatch::process_table_mut();
+        match table.get_mut(pid) {
+            Some(entry) => {
+                let old = entry.umask;
+                entry.umask = new;
+                old as i64
+            }
+            None => -3, // ESRCH
+        }
+    }
+}

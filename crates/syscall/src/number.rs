@@ -318,6 +318,9 @@ pub const SYS_GETRANDOM: SyscallNumber = 318;
 /// `prctl(option, arg2, arg3, arg4, arg5)` — Process control.
 pub const SYS_PRCTL: SyscallNumber = 157;
 
+/// `umask(mask)` — Set the file mode creation mask.
+pub const SYS_UMASK: SyscallNumber = 95;
+
 // ── Architecture ────────────────────────────────────────────────
 
 /// `arch_prctl(code, addr)` — Set/get architecture-specific state (x86_64 TLS).

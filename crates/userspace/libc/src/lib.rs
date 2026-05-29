@@ -52,6 +52,7 @@ const SYS_ACCESS: u64 = 21;
 const SYS_FSYNC: u64 = 74;
 const SYS_DUP2: u64 = 33;
 const SYS_DUP3: u64 = 292;
+const SYS_UMASK: u64 = 95;
 const SYS_GETPID: u64 = 39;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
@@ -1223,6 +1224,17 @@ pub unsafe fn getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
 /// # Safety
 ///
 /// Both `oldfd` and `newfd` must be valid file descriptor values (>= 0).
+/// `umask(2)` — replace the calling process's file-mode creation mask
+/// with `(mask & 0o777)` and return the previous mask.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn umask(mask: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_UMASK, mask as u64) }
+}
+
 /// `dup3(2)` — duplicate `oldfd` onto `newfd`, optionally setting
 /// `O_CLOEXEC` (the only accepted `flags` bit). `oldfd == newfd` is
 /// rejected with `-EINVAL` (unlike `dup2`). Returns `newfd` or a negative

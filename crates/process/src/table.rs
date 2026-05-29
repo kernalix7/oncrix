@@ -172,6 +172,10 @@ pub struct ProcessEntry {
     /// [`RLIM_INFINITY`] except `RLIMIT_NOFILE`. Stored for query/retrieval;
     /// enforcement is not yet wired into the allocators.
     pub rlimits: [Rlimit; RLIMIT_NLIMITS],
+    /// `umask(2)` — file-mode creation mask. Bits set here are CLEARED on
+    /// newly created files (`open`/`creat`/`mkdir`). Standard default is
+    /// `0o022` (group / others write bits are stripped).
+    pub umask: u32,
 }
 
 impl ProcessEntry {
@@ -202,6 +206,7 @@ impl ProcessEntry {
                 };
                 limits
             },
+            umask: 0o022,
         }
     }
 
