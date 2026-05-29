@@ -73,6 +73,7 @@ const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
+const SYS_WAITID: u64 = 247;
 const SYS_KILL: u64 = 62;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_PIPE2: u64 = 293;
@@ -375,6 +376,39 @@ pub unsafe fn waitpid(pid: i64, status: *mut i32, options: i32) -> i64 {
             status as u64,
             options as u64,
             0, // rusage = NULL
+        )
+    }
+}
+
+/// `waitid(2)` idtype: any child.
+pub const P_ALL: i32 = 0;
+/// `waitid(2)` idtype: the child whose PID == `id`.
+pub const P_PID: i32 = 1;
+/// `waitid(2)` idtype: any child in process group `id`.
+pub const P_PGID: i32 = 2;
+/// `waitid(2)` option: report terminated children (mandatory).
+pub const WEXITED: i32 = 4;
+/// `waitid(2)` option: leave the child waitable (do not reap).
+pub const WNOWAIT: i32 = 0x0100_0000;
+
+/// `waitid(2)` — wait for a child by `idtype`/`id`, filling a `siginfo_t`
+/// (128 bytes) at `infop`. `options` must include [`WEXITED`].
+///
+/// Returns 0 on success (the reaped child's details land in `*infop`), or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// `infop` must point to 128 writable bytes when non-null.
+pub unsafe fn waitid(idtype: i32, id: u32, infop: *mut u8, options: i32) -> i64 {
+    // SAFETY: caller guarantees `infop` validity.
+    unsafe {
+        syscall4(
+            SYS_WAITID,
+            idtype as i64 as u64,
+            id as u64,
+            infop as u64,
+            options as i64 as u64,
         )
     }
 }

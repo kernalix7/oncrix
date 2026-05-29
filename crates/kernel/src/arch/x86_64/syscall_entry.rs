@@ -556,6 +556,11 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             // SAFETY: see SYS_FORK above.
             unsafe { crate::fork_dispatch::sys_wait4(args.arg0, args.arg1, args.arg2, args.arg3) }
         }
+        // SYS_WAITID (247): wait for a child by idtype/id, fill siginfo_t.
+        oncrix_syscall::number::SYS_WAITID => {
+            // SAFETY: see SYS_FORK above.
+            unsafe { crate::fork_dispatch::sys_waitid(args.arg0, args.arg1, args.arg2, args.arg3) }
+        }
         oncrix_syscall::number::SYS_EXECVE => {
             // SAFETY: see SYS_FORK above.
             unsafe { crate::fork_dispatch::sys_execve(args.arg0, args.arg1, args.arg2) }
