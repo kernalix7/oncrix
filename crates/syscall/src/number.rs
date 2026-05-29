@@ -135,6 +135,8 @@ pub const SYS_ACCESS: SyscallNumber = 21;
 pub const SYS_SYNC: SyscallNumber = 162;
 /// `fsync(fd)` — Synchronize file state with backing store.
 pub const SYS_FSYNC: SyscallNumber = 74;
+/// `fdatasync(fd)` — Synchronize file data (not metadata) with backing store.
+pub const SYS_FDATASYNC: SyscallNumber = 75;
 /// `symlink(target, linkpath)` — Create a symbolic link.
 pub const SYS_SYMLINK: SyscallNumber = 88;
 /// `readlink(pathname, buf, bufsiz)` — Read a symbolic link target.

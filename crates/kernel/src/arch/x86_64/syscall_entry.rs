@@ -715,10 +715,10 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_access(args.arg0, args.arg1) }
         }
 
-        // SYS_FSYNC (74): synchronize file state with backing store.
-        // POSIX.1-2024 fsync(3p). ramfs is in-memory — nothing to flush;
-        // return success immediately (mirrors SYS_SYNC).
-        oncrix_syscall::number::SYS_FSYNC => 0,
+        // SYS_FSYNC (74) / SYS_FDATASYNC (75): synchronize file state with
+        // backing store. POSIX.1-2024 fsync(3p) / fdatasync(3p). ramfs is
+        // in-memory — nothing to flush; return success (mirrors SYS_SYNC).
+        oncrix_syscall::number::SYS_FSYNC | oncrix_syscall::number::SYS_FDATASYNC => 0,
 
         // SYS_SYNC (162): flush filesystem buffers.
         // POSIX.1-2024 sync(3p). ramfs is in-memory, so there is nothing

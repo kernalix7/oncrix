@@ -50,6 +50,7 @@ const SYS_MMAP: u64 = 9;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_ACCESS: u64 = 21;
 const SYS_FSYNC: u64 = 74;
+const SYS_FDATASYNC: u64 = 75;
 const SYS_DUP2: u64 = 33;
 const SYS_DUP3: u64 = 292;
 const SYS_UMASK: u64 = 95;
@@ -1193,6 +1194,15 @@ pub unsafe fn access(path: *const u8, mode: i32) -> i64 {
 pub fn fsync(fd: i32) -> i64 {
     // SAFETY: SYS_FSYNC is idempotent on ramfs; no user pointers involved.
     unsafe { syscall1(SYS_FSYNC, fd as u64) }
+}
+
+/// `fdatasync(2)` — synchronize file data with backing store.
+///
+/// On ONCRIX's in-memory ramfs this always succeeds immediately.
+/// Returns 0.
+pub fn fdatasync(fd: i32) -> i64 {
+    // SAFETY: SYS_FDATASYNC is idempotent on ramfs; no user pointers involved.
+    unsafe { syscall1(SYS_FDATASYNC, fd as u64) }
 }
 
 /// `sync(2)` — flush filesystem buffers.
