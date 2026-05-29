@@ -111,6 +111,7 @@ const SYS_GETSID: u64 = 124;
 const SYS_GETRLIMIT: u64 = 97;
 const SYS_SETRLIMIT: u64 = 160;
 const SYS_PRLIMIT64: u64 = 302;
+const SYS_SOCKETPAIR: u64 = 53;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -1073,6 +1074,36 @@ pub unsafe fn prlimit64(pid: i32, resource: i32, new: *const Rlimit, old: *mut R
             resource as i64 as u64,
             new as u64,
             old as u64,
+        )
+    }
+}
+
+/// `socket(2)`/`socketpair(2)` domain: local (Unix-domain) communication.
+pub const AF_UNIX: i32 = 1;
+/// Socket type: sequenced, reliable, bidirectional byte stream.
+pub const SOCK_STREAM: i32 = 1;
+/// `socketpair`/`socket` type flag: set the new fds non-blocking.
+pub const SOCK_NONBLOCK: i32 = 0o4000;
+/// `socketpair`/`socket` type flag: set `FD_CLOEXEC` on the new fds.
+pub const SOCK_CLOEXEC: i32 = 0o2000000;
+
+/// `socketpair(2)` — create a connected pair of `AF_UNIX` sockets.
+///
+/// On success writes the two descriptors to `sv` (a `[i32; 2]`) and returns
+/// 0; otherwise returns a negative errno value.
+///
+/// # Safety
+///
+/// `sv` must point to two writable `i32`s.
+pub unsafe fn socketpair(domain: i32, type_: i32, protocol: i32, sv: *mut i32) -> i64 {
+    // SAFETY: caller guarantees `sv` points to two writable i32s.
+    unsafe {
+        syscall4(
+            SYS_SOCKETPAIR,
+            domain as i64 as u64,
+            type_ as i64 as u64,
+            protocol as i64 as u64,
+            sv as u64,
         )
     }
 }

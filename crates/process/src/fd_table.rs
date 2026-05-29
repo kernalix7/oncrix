@@ -80,6 +80,16 @@ pub enum FileBackend {
         handle_id: u32,
     },
 
+    /// One end of a `socketpair(2)` AF_UNIX/SOCK_STREAM connection,
+    /// backed by two pipe rings: this end reads from `read_ring` and
+    /// writes to `write_ring` (the peer's rings are swapped).
+    SocketPair {
+        /// Pipe ring this end reads from.
+        read_ring: u32,
+        /// Pipe ring this end writes to.
+        write_ring: u32,
+    },
+
     /// A synthetic device file (`/dev/null` or `/dev/zero`).
     DevFile {
         /// Which synthetic device this handle targets.

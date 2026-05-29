@@ -989,6 +989,19 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fd_table::sys_eventfd2(args.arg0, args.arg1 as u32) }
         }
 
+        // SYS_SOCKETPAIR (53): connected AF_UNIX descriptor pair.
+        oncrix_syscall::number::SYS_SOCKETPAIR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_socketpair(
+                    args.arg0 as i64,
+                    args.arg1 as i64,
+                    args.arg2 as i64,
+                    args.arg3,
+                )
+            }
+        }
+
         // SYS_SIGNALFD4 (289): pollable signal file descriptor.
         oncrix_syscall::number::SYS_SIGNALFD4 => {
             // SAFETY: Single-CPU SYSCALL dispatch path.

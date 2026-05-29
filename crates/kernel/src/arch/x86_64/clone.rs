@@ -191,6 +191,19 @@ pub fn arch_clone_thread(parent: &Thread, snapshot: &ForkSnapshot) -> Result<Thr
                 }
             }
         }
+        // Bump both ring refcounts for a socketpair end so close on either
+        // thread decrements correctly.
+        if let oncrix_process::fd_table::FileBackend::SocketPair {
+            read_ring,
+            write_ring,
+        } = handle.backend
+        {
+            // SAFETY: single-CPU SYSCALL context; sole accessor of pipe table.
+            unsafe {
+                crate::pipe::pipe_dup_read(read_ring);
+                crate::pipe::pipe_dup_write(write_ring);
+            }
+        }
         // Bump eventfd refcount so close on either thread decrements correctly.
         if let oncrix_process::fd_table::FileBackend::EventFd { id } = handle.backend {
             // SAFETY: single-CPU SYSCALL context; sole accessor of eventfd table.

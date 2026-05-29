@@ -227,6 +227,125 @@ pub unsafe fn sys_eventfd2(initval: u64, flags: u32) -> i64 {
     }
 }
 
+// ── socketpair ────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_SOCKETPAIR` (Linux number 53).
+///
+/// Creates a connected pair of `AF_UNIX`/`SOCK_STREAM` descriptors backed by
+/// two pipe rings (one per direction). `sv[0]` reads from ring A / writes to
+/// ring B; `sv[1]` reads from ring B / writes to ring A. The flag bits
+/// `SOCK_NONBLOCK`/`SOCK_CLOEXEC` may be OR'd into `type_`.
+///
+/// Returns 0 on success and writes the two fds to `sv_ptr`, or a negative
+/// errno: `-EAFNOSUPPORT`(97) for a non-`AF_UNIX` domain, `-EINVAL`(22) for a
+/// non-`SOCK_STREAM` type, `-EFAULT`(14) for a bad `sv` pointer, `-ENFILE`(23)
+/// if pipe rings are exhausted, `-EMFILE`(24) if the fd table is full.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn sys_socketpair(domain: i64, type_: i64, _protocol: i64, sv_ptr: u64) -> i64 {
+    const AF_UNIX: i64 = 1;
+    const SOCK_STREAM: i64 = 1;
+    const SOCK_NONBLOCK: i64 = 0o4000;
+    const SOCK_CLOEXEC: i64 = 0o2000000;
+
+    if domain != AF_UNIX {
+        return -97; // EAFNOSUPPORT
+    }
+    let flag_bits = type_ & (SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != SOCK_STREAM {
+        return -22; // EINVAL — only SOCK_STREAM is supported
+    }
+    if sv_ptr == 0 || sv_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Allocate the two direction rings. Each ring starts with one reader
+    // and one writer ref (pipe_alloc), exactly matching the two endpoints.
+    // SAFETY: single-CPU SYSCALL context.
+    let ring_a = unsafe {
+        match crate::pipe::pipe_alloc() {
+            Some(id) => id,
+            None => return -23, // ENFILE
+        }
+    };
+    // SAFETY: single-CPU SYSCALL context.
+    let ring_b = unsafe {
+        match crate::pipe::pipe_alloc() {
+            Some(id) => id,
+            None => {
+                crate::pipe::pipe_close_read(ring_a);
+                crate::pipe::pipe_close_write(ring_a);
+                return -23; // ENFILE
+            }
+        }
+    };
+
+    let mut hflags = HandleFlags::RDWR.0;
+    if flag_bits & SOCK_NONBLOCK != 0 {
+        hflags |= HandleFlags::NONBLOCK;
+    }
+    if flag_bits & SOCK_CLOEXEC != 0 {
+        hflags |= HandleFlags::FD_CLOEXEC_BIT;
+    }
+
+    let h0 = FileHandle {
+        backend: FileBackend::SocketPair {
+            read_ring: ring_a,
+            write_ring: ring_b,
+        },
+        offset: 0,
+        flags: HandleFlags(hflags),
+    };
+    let h1 = FileHandle {
+        backend: FileBackend::SocketPair {
+            read_ring: ring_b,
+            write_ring: ring_a,
+        },
+        offset: 0,
+        flags: HandleFlags(hflags),
+    };
+
+    // SAFETY: single-CPU SYSCALL context.
+    let fd0 = unsafe {
+        match fd_install(h0) {
+            Ok(fd) => fd,
+            Err(_) => {
+                // Release all four ring ends.
+                crate::pipe::pipe_close_read(ring_a);
+                crate::pipe::pipe_close_write(ring_b);
+                crate::pipe::pipe_close_read(ring_b);
+                crate::pipe::pipe_close_write(ring_a);
+                return -24; // EMFILE
+            }
+        }
+    };
+    // SAFETY: single-CPU SYSCALL context.
+    let fd1 = unsafe {
+        match fd_install(h1) {
+            Ok(fd) => fd,
+            Err(_) => {
+                // fd_close(fd0) releases ring_a-read + ring_b-write; the ends
+                // h1 would have owned (ring_b-read, ring_a-write) are released
+                // manually so both rings free.
+                let _ = fd_close(fd0);
+                crate::pipe::pipe_close_read(ring_b);
+                crate::pipe::pipe_close_write(ring_a);
+                return -24; // EMFILE
+            }
+        }
+    };
+
+    // SAFETY: `sv_ptr` validated above; writing two i32 (8 bytes).
+    unsafe {
+        let arr = sv_ptr as *mut i32;
+        arr.write_volatile(fd0 as i32);
+        arr.add(1).write_volatile(fd1 as i32);
+    }
+    0
+}
+
 // ── epoll backing store ───────────────────────────────────────────
 
 /// Maximum number of simultaneously open epoll instances.
@@ -1434,6 +1553,16 @@ pub unsafe fn fd_close(fd: usize) -> Result<()> {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { crate::socket::socket_close(handle_id) }
         }
+        FileBackend::SocketPair {
+            read_ring,
+            write_ring,
+        } => {
+            // SAFETY: single-CPU SYSCALL context; pipe table owned here.
+            unsafe {
+                crate::pipe::pipe_close_read(read_ring);
+                crate::pipe::pipe_close_write(write_ring);
+            }
+        }
         FileBackend::EventFd { id } => {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { eventfd_close(id) }
@@ -1504,6 +1633,16 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
                 } else {
                     crate::pipe::pipe_dup_read(ring_id);
                 }
+            }
+        }
+        FileBackend::SocketPair {
+            read_ring,
+            write_ring,
+        } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe {
+                crate::pipe::pipe_dup_read(read_ring);
+                crate::pipe::pipe_dup_write(write_ring);
             }
         }
         FileBackend::EventFd { id } => {
@@ -1766,6 +1905,16 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                     // SAFETY: single-CPU SYSCALL context.
                     unsafe { signalfd_dup(id) }
                 }
+                FileBackend::SocketPair {
+                    read_ring,
+                    write_ring,
+                } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe {
+                        crate::pipe::pipe_dup_read(read_ring);
+                        crate::pipe::pipe_dup_write(write_ring);
+                    }
+                }
                 FileBackend::Console
                 | FileBackend::RamfsFile { .. }
                 | FileBackend::Socket { .. }
@@ -1823,6 +1972,16 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                         FileBackend::SignalFd { id } => {
                             // SAFETY: single-CPU SYSCALL context.
                             unsafe { signalfd_close(id) }
+                        }
+                        FileBackend::SocketPair {
+                            read_ring,
+                            write_ring,
+                        } => {
+                            // SAFETY: single-CPU SYSCALL context.
+                            unsafe {
+                                crate::pipe::pipe_close_read(read_ring);
+                                crate::pipe::pipe_close_write(write_ring);
+                            }
                         }
                         _ => {}
                     }
@@ -1935,6 +2094,18 @@ unsafe fn fd_readiness(fd: usize) -> Option<(bool, bool, bool)> {
         FileBackend::Pipe { ring_id, .. } => {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { crate::pipe::pipe_poll(ring_id) }
+        }
+        FileBackend::SocketPair {
+            read_ring,
+            write_ring,
+        } => {
+            // Readable from our read ring; writable into our write ring;
+            // hangup when the peer closed our read ring's write end.
+            // SAFETY: single-CPU SYSCALL context.
+            let (readable, _, hup) = unsafe { crate::pipe::pipe_poll(read_ring) };
+            // SAFETY: single-CPU SYSCALL context.
+            let (_, writable, _) = unsafe { crate::pipe::pipe_poll(write_ring) };
+            (readable, writable, hup)
         }
         FileBackend::Console => {
             // SAFETY: single-CPU SYSCALL context.
@@ -2448,6 +2619,46 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
         }
+        FileBackend::SocketPair { write_ring, .. } => {
+            // Write into our write ring (the peer reads from it). Mirrors the
+            // pipe write end: EPIPE if the peer closed its read end.
+            let mut kbuf = [0u8; 4096];
+            // SAFETY: `buf_ptr` validated above.
+            unsafe {
+                let ptr = buf_ptr as *const u8;
+                for (i, b) in kbuf[..count].iter_mut().enumerate() {
+                    *b = ptr.add(i).read_volatile();
+                }
+            }
+            let nonblock = handle.flags.is_nonblock();
+            let mut written = 0usize;
+            loop {
+                // SAFETY: Single-CPU SYSCALL context.
+                let ring = unsafe {
+                    match crate::pipe::pipe_get_mut(write_ring) {
+                        Some(r) => r,
+                        None => return -32, // EPIPE — slot gone
+                    }
+                };
+                if !ring.read_open {
+                    return -32; // EPIPE — peer closed its read end
+                }
+                written += ring.push(&kbuf[written..count]);
+                if written >= count {
+                    return written as i64;
+                }
+                if nonblock {
+                    if written > 0 {
+                        return written as i64;
+                    }
+                    return -11; // EAGAIN
+                }
+                // SAFETY: SYSCALL context; cooperative yield.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
+        }
         FileBackend::Socket { handle_id } => {
             let mut kbuf = [0u8; 4096];
             // SAFETY: `buf_ptr` validated above.
@@ -2646,6 +2857,42 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                 }
                 // Buffer is empty but writers remain. With O_NONBLOCK return
                 // -EAGAIN rather than blocking; otherwise yield and retry.
+                if nonblock {
+                    return -11; // EAGAIN
+                }
+                // SAFETY: SYSCALL context.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
+        }
+        FileBackend::SocketPair { read_ring, .. } => {
+            // Read from our read ring (the peer writes into it). Mirrors the
+            // pipe read end: EOF when the peer closed its write end.
+            let nonblock = handle.flags.is_nonblock();
+            let user_ptr = buf_ptr as *mut u8;
+            loop {
+                // SAFETY: Single-CPU SYSCALL context.
+                let ring = unsafe {
+                    match crate::pipe::pipe_get_mut(read_ring) {
+                        Some(r) => r,
+                        None => return -9, // slot gone
+                    }
+                };
+                let mut kbuf = [0u8; 4096];
+                let n = ring.pop(&mut kbuf[..count]);
+                if n > 0 {
+                    // SAFETY: `buf_ptr` validated above.
+                    unsafe {
+                        for (i, &byte) in kbuf.iter().take(n).enumerate() {
+                            user_ptr.add(i).write_volatile(byte);
+                        }
+                    }
+                    return n as i64;
+                }
+                if !ring.write_open {
+                    return 0; // POSIX EOF — peer closed its write end
+                }
                 if nonblock {
                     return -11; // EAGAIN
                 }
@@ -2882,6 +3129,7 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
     match handle.backend {
         FileBackend::Console => -29,              // ESPIPE
         FileBackend::Pipe { .. } => -29,          // ESPIPE
+        FileBackend::SocketPair { .. } => -29,    // ESPIPE
         FileBackend::Socket { .. } => -29,        // ESPIPE
         FileBackend::DevFile { .. } => -29,       // ESPIPE
         FileBackend::ProcFile { .. } => -29,      // ESPIPE
