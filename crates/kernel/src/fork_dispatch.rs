@@ -281,6 +281,13 @@ pub unsafe fn sys_fork() -> i64 {
 pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u64) -> i64 {
     let mut serial = Uart16550::new(COM1);
 
+    // Validate the status pointer BEFORE reaping any zombie. A bad pointer
+    // must fail with -EFAULT without consuming the child (otherwise the
+    // status is lost irrecoverably). `0` means "no status wanted".
+    if wstatus_ptr != 0 && wstatus_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
     // Determine the caller's PID (for child-of check).
     let caller_pid = match crate::current::current_thread() {
         Some(t) => t.pid(),

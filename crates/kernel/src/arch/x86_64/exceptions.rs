@@ -80,16 +80,61 @@ pub extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, e
 }
 
 /// #GP — General Protection Fault (vector 13), with error code.
+/// #GP — General Protection Fault (vector 13), with error code.
+///
+/// Splits on the originating privilege level, mirroring
+/// [`page_fault_handler`]:
+///
+/// * **Ring 3** (`frame.cs & 0x3 == 0x3`) — the user process performed an
+///   illegal operation, most commonly dereferencing a **non-canonical**
+///   address (a pointer in the `0x0000_8000_0000_0000 ..= 0xFFFF_7FFF_FFFF_FFFF`
+///   hole, which a syscall's high-half-only bounds check lets through).
+///   Such an access raises `#GP`, not `#PF`. POSIX maps this to `SIGSEGV`
+///   on the offending process — without this split a user task could halt
+///   the whole kernel with `clock_gettime(0, 0x0000_8000_0000_0000)`.
+/// * **Ring 0** (`frame.cs & 0x3 == 0x0`) — the kernel itself faulted: a
+///   real bug. Print diagnostics and `halt()`.
 pub extern "x86-interrupt" fn general_protection_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    serial_print("\n!!! EXCEPTION: General Protection Fault (#GP) !!!\n");
-    serial_print("  Error code: ");
-    serial_print_hex(error_code);
-    serial_print("\n");
-    print_stack_frame(&frame);
-    halt();
+    if frame.cs & 0x3 == 0x3 {
+        // Ring 3 fault: convert to SIGSEGV on the current process.
+        serial_print("[#GP] ring 3 fault → SIGSEGV (rip=");
+        serial_print_hex(frame.rip);
+        serial_print(", err=");
+        serial_print_hex(error_code);
+        serial_print(")\n");
+
+        // SAFETY: interrupt-gate entry guarantees IF=0; single-CPU build
+        // means no concurrent access to the process table or signal state.
+        // The borrow is dropped before `deliver_pending_signals` runs.
+        unsafe {
+            if let Some(pid) = crate::current::current_pid()
+                && let Some(entry) = crate::fork_dispatch::process_table_mut().get_mut(pid)
+            {
+                entry
+                    .signals
+                    .pending
+                    .raise(oncrix_process::signal::Signal::SIGSEGV);
+            }
+        }
+
+        // Apply the kernel-default Terminate action; never returns.
+        // SAFETY: same single-CPU + IF=0 contract as the #PF handler.
+        unsafe { crate::signal_dispatch::deliver_pending_signals(core::ptr::null_mut()) };
+
+        serial_print("[#GP] deliver_pending_signals returned unexpectedly — halting\n");
+        halt();
+    } else {
+        // Ring 0 fault: kernel bug. Diagnose and stop.
+        serial_print("\n!!! EXCEPTION: General Protection Fault (#GP) !!!\n");
+        serial_print("  Error code: ");
+        serial_print_hex(error_code);
+        serial_print("\n");
+        print_stack_frame(&frame);
+        halt();
+    }
 }
 
 /// #PF — Page Fault (vector 14), with error code.

@@ -85,7 +85,13 @@ fn resolve_path_abs(path: &[u8], abs_buf: &mut [u8; PATH_BUF_LEN]) -> Result<usi
         return Err(-2); // ENOENT
     }
     if path[0] == b'/' {
-        let len = path.len().min(MAX_PATH);
+        // Reject rather than silently truncate an over-long absolute path: a
+        // truncated path can resolve to a *different* existing file, so
+        // unlink/rename/chmod could operate on the wrong target.
+        if path.len() > MAX_PATH {
+            return Err(-36); // ENAMETOOLONG
+        }
+        let len = path.len();
         abs_buf[..len].copy_from_slice(&path[..len]);
         abs_buf[len] = 0;
         return Ok(len);
@@ -107,12 +113,15 @@ fn resolve_path_abs(path: &[u8], abs_buf: &mut [u8; PATH_BUF_LEN]) -> Result<usi
         abs_buf[out] = b'/';
         out += 1;
     }
-    let copy_path = path.len().min(MAX_PATH - out);
-    abs_buf[out..out + copy_path].copy_from_slice(&path[..copy_path]);
-    out += copy_path;
-    if out > MAX_PATH {
+    // Reject when cwd + '/' + path would overflow, instead of clamping
+    // copy_path (which made the `out > MAX_PATH` guard below dead code and
+    // silently truncated the tail). Compute the full required length first.
+    let need = out.saturating_add(path.len());
+    if need > MAX_PATH {
         return Err(-36); // ENAMETOOLONG
     }
+    abs_buf[out..out + path.len()].copy_from_slice(path);
+    out += path.len();
     abs_buf[out] = 0;
     Ok(out)
 }
