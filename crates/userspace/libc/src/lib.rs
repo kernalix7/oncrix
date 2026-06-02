@@ -93,6 +93,13 @@ const SYS_RT_SIGQUEUEINFO: u64 = 129;
 const SYS_SIGALTSTACK: u64 = 131;
 const SYS_SCHED_RR_GET_INTERVAL: u64 = 148;
 const SYS_GETDENTS64: u64 = 217;
+const SYS_MEMFD_CREATE: u64 = 319;
+// sched_attr / time-misc
+const SYS_SCHED_SETATTR: u64 = 314;
+const SYS_SCHED_GETATTR: u64 = 315;
+const SYS_ADJTIMEX: u64 = 159;
+const SYS_CLOCK_SETTIME: u64 = 227;
+const SYS_CLOCK_ADJTIME: u64 = 305;
 // fd-ops / xattr / copy
 const SYS_DUP: u64 = 32;
 const SYS_CLOSE_RANGE: u64 = 436;
@@ -3034,4 +3041,207 @@ pub unsafe fn copy_file_range(
             flags as u64,
         )
     }
+}
+
+
+// ── sched_setattr/getattr / clock_settime / adjtimex / clock_adjtime ─
+
+/// Argument structure for `sched_setattr(2)` and `sched_getattr(2)`.
+///
+/// Matches `struct sched_attr` from the Linux UAPI
+/// (`include/uapi/linux/sched/types.h`), version 0 (48 bytes).
+/// ONCRIX only uses `size`, `sched_policy`, `sched_nice`, and
+/// `sched_priority`; deadline and flags fields are accepted on input
+/// and zeroed on output.
+#[repr(C)]
+pub struct SchedAttr {
+    /// Structure size in bytes; caller sets this to `size_of::<SchedAttr>()`
+    /// for `sched_setattr`; kernel sets it to `48` on `sched_getattr`.
+    pub size: u32,
+    /// Scheduling policy: `SCHED_OTHER`=0 / `SCHED_FIFO`=1 / `SCHED_RR`=2.
+    pub sched_policy: u32,
+    /// Scheduling flags (combination of `SCHED_FLAG_*`); must be 0 on ONCRIX.
+    pub sched_flags: u64,
+    /// Nice value for `SCHED_OTHER` (`[-20, 19]`); clamped by the kernel.
+    pub sched_nice: i32,
+    /// Static priority for `SCHED_FIFO`/`SCHED_RR` (`[1, 99]`).
+    /// ONCRIX maps this via nice; set `0` when using `sched_nice`.
+    pub sched_priority: u32,
+    /// `SCHED_DEADLINE`: runtime budget per period (nanoseconds); `0` on ONCRIX.
+    pub sched_runtime: u64,
+    /// `SCHED_DEADLINE`: absolute deadline (nanoseconds); `0` on ONCRIX.
+    pub sched_deadline: u64,
+    /// `SCHED_DEADLINE`: period (nanoseconds); `0` on ONCRIX.
+    pub sched_period: u64,
+}
+
+/// `sched_setattr(2)` — set extended scheduling attributes.
+///
+/// Sets the calling thread's scheduling policy and nice value from `*attr`.
+/// `flags` must be `0`. `pid` of `0` targets the calling thread.
+///
+/// Returns `0` on success or a negative errno value:
+/// - `-14` (`EFAULT`): `attr` is null or non-canonical.
+/// - `-22` (`EINVAL`): unknown policy, non-zero `flags`, or `sched_flags != 0`.
+///
+/// # Safety
+///
+/// `attr` must point to a readable, validly-aligned `SchedAttr` for the
+/// duration of the call. The kernel copies out of user space; the caller
+/// is responsible for ensuring the pointer lifetime and alignment.
+pub unsafe fn sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> i64 {
+    // SAFETY: caller guarantees `attr` is a valid readable pointer.
+    unsafe { syscall3(SYS_SCHED_SETATTR, pid as u64, attr as u64, flags as u64) }
+}
+
+/// `sched_getattr(2)` — get extended scheduling attributes.
+///
+/// Writes the calling thread's current policy and nice into `*attr`.
+/// `size` is the size of the caller's buffer (must be `>= 48`). `flags`
+/// must be `0`. `pid` of `0` targets the calling thread.
+///
+/// Returns `0` on success or a negative errno value:
+/// - `-14` (`EFAULT`): `attr` is null or non-canonical.
+/// - `-22` (`EINVAL`): `size < 48` or non-zero `flags`.
+///
+/// # Safety
+///
+/// `attr` must point to a writable `SchedAttr`-sized buffer for the
+/// duration of the call. The kernel writes 48 bytes into user space.
+pub unsafe fn sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) -> i64 {
+    // SAFETY: caller guarantees `attr` is a valid writable pointer.
+    unsafe {
+        syscall4(
+            SYS_SCHED_GETATTR,
+            pid as u64,
+            attr as u64,
+            size as u64,
+            flags as u64,
+        )
+    }
+}
+
+/// `struct timex` — kernel clock adjustment parameters (NTP interface).
+///
+/// Passed to [`adjtimex`] and [`clock_adjtime`].  On ONCRIX no fields are
+/// read or written by the kernel; the struct is defined purely for ABI
+/// compatibility with POSIX / Linux callers.
+///
+/// Fields follow the Linux `timex` layout (`<sys/timex.h>`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Timex {
+    /// Mode selector / adjustment flags (`ADJ_*` bits).
+    pub modes: u32,
+    /// Time offset (nanoseconds when `STA_NANO` set, else microseconds).
+    pub offset: i64,
+    /// Frequency offset (scaled ppm).
+    pub freq: i64,
+    /// Maximum time error (microseconds).
+    pub maxerror: i64,
+    /// Estimated time error (microseconds).
+    pub esterror: i64,
+    /// Clock status bits (`STA_*`).
+    pub status: i32,
+    /// PLL time constant.
+    pub constant: i64,
+    /// Clock precision (read-only, microseconds or nanoseconds).
+    pub precision: i64,
+    /// Clock frequency tolerance (read-only, scaled ppm).
+    pub tolerance: i64,
+    /// Current time (read-only).
+    pub time_tv_sec: i64,
+    /// Current time fractional part (read-only).
+    pub time_tv_usec: i64,
+    /// Tick value in microseconds (read-only).
+    pub tick: i64,
+    /// PPS frequency (read-only).
+    pub ppsfreq: i64,
+    /// PPS jitter (read-only).
+    pub jitter: i64,
+    /// PPS interval duration (read-only).
+    pub shift: i32,
+    /// PPS stability (read-only).
+    pub stabil: i64,
+    /// PPS jitter count (read-only).
+    pub jitcnt: i64,
+    /// PPS calibration intervals (read-only).
+    pub calcnt: i64,
+    /// PPS error counter (read-only).
+    pub errcnt: i64,
+    /// PPS stability count (read-only).
+    pub stbcnt: i64,
+    /// TAI offset set by `adjtimex` (read-only).
+    pub tai: i32,
+    /// Reserved padding.
+    pub _pad: [i32; 11],
+}
+
+/// `clock_settime(clk_id, tp)` — attempt to set a POSIX clock.
+///
+/// ONCRIX has no settable clock source.  For a recognised `clk_id`
+/// (`CLOCK_REALTIME` = 0, `CLOCK_MONOTONIC` = 1) this always returns `-1`
+/// (`-EPERM`).  An unknown `clk_id` returns `-22` (`-EINVAL`) and a bad
+/// `tp` pointer returns `-14` (`-EFAULT`).
+///
+/// # Safety
+///
+/// `tp` must be a valid `*const Timespec` in the calling process's address
+/// space.  The kernel validates the pointer but does not dereference it on
+/// ONCRIX.
+pub unsafe fn clock_settime(clk_id: i32, tp: *const Timespec) -> i64 {
+    // SAFETY: caller upholds the pointer contract; kernel validates only.
+    unsafe { syscall2(SYS_CLOCK_SETTIME, clk_id as u64, tp as u64) }
+}
+
+/// `adjtimex(buf)` — query or adjust kernel clock parameters.
+///
+/// ONCRIX performs no NTP clock discipline.  The call always returns
+/// `0` (`TIME_OK`) without modifying `*buf`.  Provided for ABI
+/// compatibility with POSIX / Linux programs that call `adjtimex`.
+///
+/// # Safety
+///
+/// `buf` must be a valid `*mut Timex` in the calling process's address
+/// space.  The kernel validates the pointer but does not read or write
+/// it on ONCRIX.
+pub unsafe fn adjtimex(buf: *mut Timex) -> i64 {
+    // SAFETY: caller upholds the pointer contract; kernel validates only.
+    unsafe { syscall1(SYS_ADJTIMEX, buf as u64) }
+}
+
+/// `clock_adjtime(clk_id, buf)` — adjust the time of a specific POSIX clock.
+///
+/// ONCRIX performs no NTP clock discipline.  The call always returns
+/// `0` (`TIME_OK`) without modifying `*buf`.  Provided for ABI
+/// compatibility with Linux programs that call `clock_adjtime`.
+///
+/// # Safety
+///
+/// `buf` must be a valid `*mut Timex` in the calling process's address
+/// space.  The kernel validates the pointer but does not read or write
+/// it on ONCRIX.
+pub unsafe fn clock_adjtime(clk_id: i32, buf: *mut Timex) -> i64 {
+    // SAFETY: caller upholds the pointer contract; kernel validates only.
+    unsafe { syscall2(SYS_CLOCK_ADJTIME, clk_id as u64, buf as u64) }
+}
+
+// ── memfd_create ───────────────────────────────────────────────────
+
+/// `memfd_create` flag: set `FD_CLOEXEC` on the new descriptor.
+pub const MFD_CLOEXEC: u32 = 1;
+/// `memfd_create` flag: permit file seals (accepted, ignored on ONCRIX).
+pub const MFD_ALLOW_SEALING: u32 = 2;
+
+/// `memfd_create(2)` — create an anonymous in-memory file and return an fd.
+///
+/// On ONCRIX the file is backed by a synthetic ramfs path; the `name` is for
+/// diagnostics only. Returns the new fd or a negative errno value.
+///
+/// # Safety
+///
+/// `name` must be a valid NUL-terminated string pointer.
+pub unsafe fn memfd_create(name: *const u8, flags: u32) -> i64 {
+    // SAFETY: caller guarantees `name` is NUL-terminated.
+    unsafe { syscall2(SYS_MEMFD_CREATE, name as u64, flags as u64) }
 }

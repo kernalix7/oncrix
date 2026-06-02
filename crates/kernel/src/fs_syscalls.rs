@@ -2588,3 +2588,97 @@ pub unsafe fn sys_copy_file_range(
 
     total_copied as i64
 }
+
+// ── memfd_create ──────────────────────────────────────────────────
+
+/// Monotonic counter for anonymous `memfd_create` backing paths.
+static mut MEMFD_COUNTER: u32 = 0;
+
+/// Kernel handler for `SYS_MEMFD_CREATE` (Linux number 319).
+///
+/// Creates an anonymous in-memory file and returns a new file descriptor
+/// backed by a ramfs regular file. ONCRIX has no true anonymous inodes, so
+/// a unique synthetic path `"/.memfd-<n>"` is created in the ramfs and the
+/// fd is installed pointing at it.
+///
+/// `flags`: `MFD_CLOEXEC` (1) sets `FD_CLOEXEC`; `MFD_ALLOW_SEALING` (2) is
+/// accepted and ignored; any other bit yields `-EINVAL`. The user `name`
+/// argument is validated but only used for diagnostics (the backing path
+/// uses the counter for uniqueness).
+///
+/// Returns the new fd, or `-EINVAL` / `-EFAULT` / `-ENFILE` / `-EMFILE`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `name` must be
+/// a NUL-terminated user string.
+pub unsafe fn sys_memfd_create(name: u64, flags: u32) -> i64 {
+    /// `MFD_CLOEXEC` — set `FD_CLOEXEC` on the new fd.
+    const MFD_CLOEXEC: u32 = 1;
+    /// `MFD_ALLOW_SEALING` — permit file seals (accepted, ignored).
+    const MFD_ALLOW_SEALING: u32 = 2;
+
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        return -22; // EINVAL — unknown flag bits
+    }
+    if name == 0 || name >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Build a unique backing path "/.memfd-<n>".
+    let mut path = [0u8; 32];
+    let prefix = b"/.memfd-";
+    let mut len = prefix.len();
+    path[..len].copy_from_slice(prefix);
+    // SAFETY: single-CPU SYSCALL context; MEMFD_COUNTER not concurrently used.
+    let n = unsafe {
+        let p = &raw mut MEMFD_COUNTER;
+        *p = (*p).wrapping_add(1);
+        *p
+    };
+    // Append the decimal counter.
+    let mut digits = [0u8; 10];
+    let mut dlen = 0;
+    let mut v = n;
+    if v == 0 {
+        digits[dlen] = b'0';
+        dlen += 1;
+    }
+    while v > 0 {
+        digits[dlen] = b'0' + (v % 10) as u8;
+        dlen += 1;
+        v /= 10;
+    }
+    for i in 0..dlen {
+        path[len] = digits[dlen - 1 - i];
+        len += 1;
+    }
+
+    // Create the backing ramfs file and resolve its inode.
+    let ino = crate::state::with_global_mut(|s| {
+        s.vfs.create_file(&path[..len], b"")?;
+        s.vfs.lookup_path(&path[..len]).map(|inode| inode.ino)
+    });
+    let ino = match ino {
+        Some(Ok(i)) => i,
+        Some(Err(oncrix_lib::Error::OutOfMemory)) => return -23, // ENFILE
+        Some(Err(_)) => return -22,                              // EINVAL
+        None => return -5,                                       // EIO
+    };
+
+    // Build a RDWR RamfsFile handle, honouring MFD_CLOEXEC.
+    let mut hflags = crate::fd_table::HandleFlags::RDWR.0;
+    if flags & MFD_CLOEXEC != 0 {
+        hflags |= crate::fd_table::HandleFlags::FD_CLOEXEC_BIT;
+    }
+    let handle = crate::fd_table::FileHandle {
+        backend: crate::fd_table::FileBackend::RamfsFile { ino },
+        offset: 0,
+        flags: crate::fd_table::HandleFlags(hflags),
+    };
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { crate::fd_table::fd_install(handle) } {
+        Ok(fd) => fd as i64,
+        Err(_) => -24, // EMFILE
+    }
+}

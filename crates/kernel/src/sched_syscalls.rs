@@ -1442,3 +1442,147 @@ pub unsafe fn sys_sched_rr_get_interval(pid: u64, tp: u64) -> i64 {
     let _ = pid; // pid accepted per POSIX; ignored on single-scheduler.
     0
 }
+
+// ── sched_setattr(2) / sched_getattr(2) ──────────────────────────────────────
+
+/// Wire layout of `struct sched_attr` (Linux UAPI, version 0, 48 bytes).
+///
+/// Fields beyond `sched_period` (version 1: util_min/util_max) are not read
+/// or written by ONCRIX — the struct is always reported as 48 bytes and only
+/// the version-0 fields are meaningful.
+///
+/// Byte offsets on LP64:
+///   0  u32 size
+///   4  u32 sched_policy
+///   8  u64 sched_flags
+///  16  i32 sched_nice
+///  20  u32 sched_priority
+///  24  u64 sched_runtime
+///  32  u64 sched_deadline
+///  40  u64 sched_period
+///  total: 48 bytes
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawSchedAttr {
+    size: u32,
+    sched_policy: u32,
+    sched_flags: u64,
+    sched_nice: i32,
+    sched_priority: u32,
+    sched_runtime: u64,
+    sched_deadline: u64,
+    sched_period: u64,
+}
+
+/// Minimum accepted `size` field / read-length for `sched_attr` (version 0).
+const SCHED_ATTR_SIZE_V0: u32 = 48;
+
+/// `sched_setattr(pid, attr, flags)` — set extended scheduling attributes.
+///
+/// Reads a `struct sched_attr` from the user pointer `attr`, applies the
+/// policy (`sched_policy`, 0=Other/1=FIFO/2=RR) and nice value
+/// (`sched_nice`, clamped to `[-20, 19]`) to the calling thread.
+///
+/// `flags` must be `0`; any other value returns `-22` (`EINVAL`).
+/// `pid` must be `0` or the calling thread's own PID; ONCRIX has no
+/// cross-thread scheduling control yet (documented divergence).
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for bad policy/flags,
+/// `-14` (`EFAULT`) for a non-canonical `attr`, `-3` (`ESRCH`) if
+/// there is no current thread.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path with
+/// interrupts effectively disabled (FMASK clears IF), so the mutable
+/// scheduler borrow taken via [`current_thread_mut`] is exclusive.
+/// `attr` is a raw user-space pointer; non-canonical addresses are
+/// rejected and unmapped-canonical accesses fault into the user handler.
+pub unsafe fn sys_sched_setattr(_pid: i64, attr: u64, flags: i64) -> i64 {
+    if flags != 0 {
+        return -22; // EINVAL
+    }
+    if bad_user_ptr(attr) {
+        return -14; // EFAULT
+    }
+
+    // SAFETY: `attr` is canonical user space (checked above).  We read
+    // exactly 48 bytes (version-0 sched_attr); an unmapped page faults
+    // into the user handler (SIGSEGV) rather than corrupting the kernel.
+    let raw: RawSchedAttr = unsafe { core::ptr::read_unaligned(attr as *const RawSchedAttr) };
+
+    // `flags` field inside the struct must be 0 for ONCRIX.
+    if raw.sched_flags != 0 {
+        return -22; // EINVAL
+    }
+
+    // Only ONCRIX-supported policies: Other=0, Fifo=1, RoundRobin=2.
+    let Some(pol) = SchedPolicy::from_raw(raw.sched_policy as i32) else {
+        return -22; // EINVAL
+    };
+
+    let nice = clamp_nice(raw.sched_nice);
+
+    // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
+    match unsafe { current_thread_mut() } {
+        Some(t) => {
+            t.set_policy(pol);
+            t.set_priority(Priority::from_nice(nice));
+            0
+        }
+        None => -3, // ESRCH
+    }
+}
+
+/// `sched_getattr(pid, attr, size, flags)` — get extended scheduling attributes.
+///
+/// Writes a zero-filled `struct sched_attr` (48 bytes, version 0) to the
+/// user pointer `attr`, then sets `size=48`, `sched_policy` to the calling
+/// thread's current policy, `sched_nice` to the current nice value, and
+/// `sched_priority=0` (ONCRIX maps priority into the nice/level axis only).
+///
+/// `size` must be `>= 48` (version-0 minimum); `flags` must be `0`.
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for bad `size`/`flags`,
+/// `-14` (`EFAULT`) for a non-canonical `attr`, `-3` (`ESRCH`) if
+/// there is no current thread.
+///
+/// # Safety
+///
+/// See [`sys_sched_setattr`] regarding the pointer and dispatch invariants.
+pub unsafe fn sys_sched_getattr(_pid: i64, attr: u64, size: u64, flags: i64) -> i64 {
+    if flags != 0 {
+        return -22; // EINVAL
+    }
+    if size < SCHED_ATTR_SIZE_V0 as u64 {
+        return -22; // EINVAL
+    }
+    if bad_user_ptr(attr) {
+        return -14; // EFAULT
+    }
+
+    // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
+    let (pol, nice) = match unsafe { current_thread_mut() } {
+        Some(t) => (t.policy().as_raw() as u32, t.priority().to_nice()),
+        None => return -3, // ESRCH
+    };
+
+    let out = RawSchedAttr {
+        size: SCHED_ATTR_SIZE_V0,
+        sched_policy: pol,
+        sched_flags: 0,
+        sched_nice: nice,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+    };
+
+    // SAFETY: `attr` is canonical user space (checked above).  We write
+    // 48 bytes (version-0 sched_attr); an unmapped page faults into the
+    // user handler (SIGSEGV).
+    unsafe {
+        core::ptr::write_unaligned(attr as *mut RawSchedAttr, out);
+    }
+    0
+}

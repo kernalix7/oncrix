@@ -435,3 +435,91 @@ pub unsafe fn sys_clock_getres(clk_id: u32, res_ptr: u64) -> i64 {
     }
     0
 }
+
+// ── clock_settime / adjtimex / clock_adjtime ──────────────────────
+
+/// `clock_settime(clk_id, tp)` — attempt to set a POSIX clock.
+///
+/// ONCRIX has no settable clock source.  The syscall validates both
+/// arguments for correctness and always returns `-EPERM` (-1) for a
+/// recognised clock ID, matching the behaviour of `settimeofday(2)` on
+/// this platform.
+///
+/// Validation order (mirrors POSIX.1-2024 `clock_settime(3p)`):
+/// 1. `clk_id` — only `CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1) are
+///    known; any other value returns `-EINVAL` (-22).
+/// 2. `tp_ptr` — must be non-null and below the kernel/user split
+///    (`0xFFFF_8000_0000_0000`); otherwise `-EFAULT` (-14).
+/// 3. All checks pass → `-EPERM` (-1): the clock exists but cannot be set.
+///
+/// POSIX.1-2024 reference: `functions/clock_settime.html`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.  `tp_ptr` is
+/// validated user-canonical before any access attempt; the kernel page-fault
+/// handler converts an unmapped user address to `SIGSEGV` without panicking.
+pub unsafe fn sys_clock_settime(clk_id: u32, tp_ptr: u64) -> i64 {
+    // Only CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1) are recognised.
+    if clk_id > 1 {
+        return -22; // EINVAL
+    }
+    // tp must be a valid user-space pointer (non-null, not kernel-space).
+    if tp_ptr == 0 || tp_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // ONCRIX has no settable clock source — always EPERM for a known clock.
+    -1 // EPERM
+}
+
+/// `adjtimex(buf)` — query or adjust kernel clock parameters.
+///
+/// ONCRIX performs no NTP clock discipline.  The syscall validates the
+/// `buf` pointer and returns `TIME_OK` (0) without reading or writing the
+/// `struct timex` payload, indicating that the clock is considered
+/// synchronised (the only state ONCRIX can truthfully report).
+///
+/// Returns `0` (`TIME_OK`) on a valid pointer, `-EFAULT` (-14) for a
+/// null or kernel-space pointer.
+///
+/// POSIX.1-2024 / Linux reference: `adjtimex(2)`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.  `buf_ptr` is
+/// validated user-canonical; no dereference is performed by this function.
+pub unsafe fn sys_adjtimex(buf_ptr: u64) -> i64 {
+    // Reject null and kernel-space addresses without touching the pointer.
+    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // No adjustment performed; report TIME_OK (0).
+    0
+}
+
+/// `clock_adjtime(clk_id, buf)` — adjust the time of a specific POSIX clock.
+///
+/// ONCRIX performs no NTP clock discipline.  Like [`sys_adjtimex`], this
+/// validates the `buf` pointer and returns `TIME_OK` (0) without modifying
+/// any state.  `clk_id` is accepted for any value (unknown clocks are also
+/// harmlessly no-oped) because POSIX leaves the behaviour for unsupported
+/// clocks implementation-defined and returning EINVAL here would break
+/// programs that probe clock adjustability.
+///
+/// Returns `0` (`TIME_OK`) on a valid pointer, `-EFAULT` (-14) for a
+/// null or kernel-space pointer.
+///
+/// POSIX.1-2024 / Linux reference: `clock_adjtime(2)`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.  `buf_ptr` is
+/// validated user-canonical; no dereference is performed by this function.
+pub unsafe fn sys_clock_adjtime(_clk_id: u32, buf_ptr: u64) -> i64 {
+    // Reject null and kernel-space addresses without touching the pointer.
+    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // No adjustment performed; report TIME_OK (0).
+    0
+}

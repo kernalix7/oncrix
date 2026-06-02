@@ -1018,6 +1018,12 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_getdents64(args.arg0 as usize, args.arg1, args.arg2) }
         }
 
+        // SYS_MEMFD_CREATE (319): create an anonymous in-memory file fd.
+        oncrix_syscall::number::SYS_MEMFD_CREATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_memfd_create(args.arg0, args.arg1 as u32) }
+        }
+
         // SYS_DUP (32): duplicate `oldfd` to the lowest available fd.
         // POSIX.1-2024 dup(3p). New descriptor does not inherit FD_CLOEXEC.
         oncrix_syscall::number::SYS_DUP => {
@@ -1238,6 +1244,56 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         oncrix_syscall::number::SYS_CLOCK_GETTIME => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::time_syscalls::sys_clock_gettime(args.arg0 as u32, args.arg1) }
+        }
+
+        // SYS_SCHED_SETATTR (314) / SYS_SCHED_GETATTR (315): extended
+        // scheduling attribute interface (Linux 3.14+). ONCRIX supports
+        // Other/FIFO/RR policies and nice values; pid is treated as the
+        // calling thread (no cross-thread lookup yet — documented).
+        oncrix_syscall::number::SYS_SCHED_SETATTR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_setattr(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2 as i64,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_SCHED_GETATTR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_getattr(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as i64,
+                )
+            }
+        }
+
+        // SYS_ADJTIMEX (159): query/adjust kernel clock parameters (NTP).
+        // ONCRIX has no NTP discipline; validates buf pointer and returns TIME_OK (0).
+        // POSIX.1-2024 / Linux adjtimex(2).
+        oncrix_syscall::number::SYS_ADJTIMEX => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_adjtimex(args.arg0) }
+        }
+
+        // SYS_CLOCK_SETTIME (227): set a POSIX clock — always EPERM on ONCRIX.
+        // ONCRIX has no settable clock source. Validates clk_id and tp pointer
+        // before returning -EPERM. POSIX.1-2024 clock_settime(3p).
+        oncrix_syscall::number::SYS_CLOCK_SETTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_clock_settime(args.arg0 as u32, args.arg1) }
+        }
+
+        // SYS_CLOCK_ADJTIME (305): adjust a specific POSIX clock (NTP-style).
+        // ONCRIX has no NTP discipline; validates buf pointer and returns TIME_OK (0).
+        // Linux clock_adjtime(2).
+        oncrix_syscall::number::SYS_CLOCK_ADJTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_clock_adjtime(args.arg0 as u32, args.arg1) }
         }
 
         // SYS_UNAME (63): fill struct utsname with system identification.

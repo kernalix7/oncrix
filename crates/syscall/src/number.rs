@@ -415,6 +415,30 @@ pub const SYS_SETITIMER: SyscallNumber = 38;
 /// `time(tloc)` — Seconds since the Epoch (or boot, on systems without RTC).
 pub const SYS_TIME: SyscallNumber = 201;
 
+/// `sched_setattr(pid, attr, flags)` — Set extended scheduling attributes.
+pub const SYS_SCHED_SETATTR: SyscallNumber = 314;
+/// `sched_getattr(pid, attr, size, flags)` — Get extended scheduling attributes.
+pub const SYS_SCHED_GETATTR: SyscallNumber = 315;
+
+/// `adjtimex(buf)` — query or adjust kernel clock parameters (NTP).
+///
+/// ONCRIX performs no NTP discipline; the call validates the pointer and
+/// returns `TIME_OK` (0) without modifying any state.
+pub const SYS_ADJTIMEX: SyscallNumber = 159;
+
+/// `clock_settime(clk_id, tp)` — set the time of a POSIX clock.
+///
+/// ONCRIX has no settable clock source; always returns `-EPERM` (-1) for a
+/// known `clk_id` (`CLOCK_REALTIME` = 0, `CLOCK_MONOTONIC` = 1) after
+/// validating both arguments, and `-EINVAL` (-22) for an unknown clock ID.
+pub const SYS_CLOCK_SETTIME: SyscallNumber = 227;
+
+/// `clock_adjtime(clk_id, buf)` — adjust the time of a specific POSIX clock.
+///
+/// ONCRIX performs no NTP discipline; the call validates the pointer and
+/// returns `TIME_OK` (0) without modifying any state.
+pub const SYS_CLOCK_ADJTIME: SyscallNumber = 305;
+
 /// `uname(buf)` — fill `struct utsname` with system identification.
 pub const SYS_UNAME: SyscallNumber = 63;
 /// `sethostname(name, len)` — set the system hostname.
