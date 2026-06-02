@@ -1312,3 +1312,88 @@ pub unsafe fn sys_umask(mask: u64) -> i64 {
         }
     }
 }
+
+// ── getcpu / sched_get_priority_max|min ───────────────────────────
+
+/// `getcpu(cpu_ptr, node_ptr, tcache_ptr)` — report the calling thread's
+/// current CPU index and NUMA node index.
+///
+/// ONCRIX is a single-CPU, single-node system. If `cpu_ptr` is non-null
+/// and canonical, `0u32` is written to `*cpu_ptr`. If `node_ptr` is
+/// non-null and canonical, `0u32` is written to `*node_ptr`. `tcache_ptr`
+/// is accepted and ignored (the `getcpu_cache` struct is a Linux-specific
+/// optimisation; POSIX does not define it).
+///
+/// Returns `0` on success, `-14` (`EFAULT`) if either non-null pointer is
+/// non-canonical.
+///
+/// # Safety
+///
+/// Called from the single-CPU SYSCALL dispatch path with interrupts
+/// effectively disabled (FMASK cleared IF). `cpu` and `node` are raw
+/// user-space pointers; we reject non-canonical addresses and write only
+/// 4 bytes each, relying on the user page-fault handler to convert an
+/// unmapped-but-canonical access into a `SIGSEGV`.
+pub unsafe fn sys_getcpu(cpu: u64, node: u64, _tcache: u64) -> i64 {
+    // Validate cpu_ptr when non-null.
+    if cpu != 0 {
+        if cpu >= 0xFFFF_8000_0000_0000 {
+            return -14; // EFAULT
+        }
+        // SAFETY: `cpu` is a canonical user-space address (checked above).
+        // We write exactly 4 bytes (u32). An unmapped page faults to the
+        // user fault handler (SIGSEGV) rather than corrupting the kernel.
+        unsafe { core::ptr::write_unaligned(cpu as *mut u32, 0u32) };
+    }
+
+    // Validate node_ptr when non-null.
+    if node != 0 {
+        if node >= 0xFFFF_8000_0000_0000 {
+            return -14; // EFAULT
+        }
+        // SAFETY: same reasoning as cpu_ptr write above.
+        unsafe { core::ptr::write_unaligned(node as *mut u32, 0u32) };
+    }
+
+    0
+}
+
+/// `sched_get_priority_max(policy)` — return the maximum real-time
+/// priority for the given scheduling policy.
+///
+/// Per POSIX.1-2024 (`sched_get_priority_max(3p)`):
+/// - `SCHED_FIFO` (1) and `SCHED_RR` (2): returns `99`.
+/// - `SCHED_OTHER` (0): returns `0`.
+/// - Any other value: returns `-22` (`EINVAL`).
+///
+/// # Safety
+///
+/// Called from the single-CPU SYSCALL dispatch path. No pointers are
+/// dereferenced; the argument is a plain scalar policy number.
+pub unsafe fn sys_sched_get_priority_max(policy: i64) -> i64 {
+    match policy as i32 {
+        0 => 0,      // SCHED_OTHER
+        1 | 2 => 99, // SCHED_FIFO | SCHED_RR
+        _ => -22,    // EINVAL
+    }
+}
+
+/// `sched_get_priority_min(policy)` — return the minimum real-time
+/// priority for the given scheduling policy.
+///
+/// Per POSIX.1-2024 (`sched_get_priority_min(3p)`):
+/// - `SCHED_FIFO` (1) and `SCHED_RR` (2): returns `1`.
+/// - `SCHED_OTHER` (0): returns `0`.
+/// - Any other value: returns `-22` (`EINVAL`).
+///
+/// # Safety
+///
+/// Called from the single-CPU SYSCALL dispatch path. No pointers are
+/// dereferenced; the argument is a plain scalar policy number.
+pub unsafe fn sys_sched_get_priority_min(policy: i64) -> i64 {
+    match policy as i32 {
+        0 => 0,     // SCHED_OTHER
+        1 | 2 => 1, // SCHED_FIFO | SCHED_RR
+        _ => -22,   // EINVAL
+    }
+}

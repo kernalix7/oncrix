@@ -875,6 +875,107 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         // to flush — return success immediately.
         oncrix_syscall::number::SYS_SYNC => 0,
 
+        // SYS_FLOCK (73): advisory whole-file lock. Single-user in-memory VFS;
+        // always succeeds after validating that `fd` is open (EBADF check).
+        // POSIX.1-2024 / Linux flock(2).
+        oncrix_syscall::number::SYS_FLOCK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_flock(args.arg0 as i32, args.arg1 as i32) }
+        }
+
+        // SYS_MSYNC (26): sync memory mapping with backing store.
+        // ramfs has no backing store; always succeed. POSIX.1-2024 msync(3p).
+        oncrix_syscall::number::SYS_MSYNC => 0,
+
+        // SYS_MADVISE (28): advise the kernel on memory-use patterns.
+        // No page cache or VM on ONCRIX; advice is accepted and ignored.
+        // POSIX.1-2024 madvise(3p).
+        oncrix_syscall::number::SYS_MADVISE => 0,
+
+        // SYS_MLOCK (149) / SYS_MUNLOCK (150): lock/unlock pages in memory.
+        // ONCRIX does not swap pages out, so these are always no-ops.
+        oncrix_syscall::number::SYS_MLOCK => 0,
+        oncrix_syscall::number::SYS_MUNLOCK => 0,
+
+        // SYS_MLOCKALL (151) / SYS_MUNLOCKALL (152): lock/unlock all process
+        // pages. No-op on ONCRIX (no page-out, no swap). POSIX.1-2024.
+        oncrix_syscall::number::SYS_MLOCKALL => 0,
+        oncrix_syscall::number::SYS_MUNLOCKALL => 0,
+
+        // SYS_GETPGRP (111): equivalent to getpgid(0) per POSIX.1-2024.
+        oncrix_syscall::number::SYS_GETPGRP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getpgid(0) }
+        }
+
+        // SYS_GETCPU (309): query current CPU + NUMA node (always 0 on ONCRIX).
+        oncrix_syscall::number::SYS_GETCPU => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getcpu(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_SCHED_GET_PRIORITY_MAX (146) / SYS_SCHED_GET_PRIORITY_MIN (147):
+        // POSIX.1-2024 sched_get_priority_max(3p) / sched_get_priority_min(3p).
+        oncrix_syscall::number::SYS_SCHED_GET_PRIORITY_MAX => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_get_priority_max(args.arg0 as i64) }
+        }
+        oncrix_syscall::number::SYS_SCHED_GET_PRIORITY_MIN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_get_priority_min(args.arg0 as i64) }
+        }
+
+        // SYS_FADVISE64 (221): posix_fadvise — access-pattern hint; no backing store
+        // to tune on ramfs; validate fd and return 0.
+        oncrix_syscall::number::SYS_FADVISE64 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_fadvise64(
+                    args.arg0 as i32,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as i32,
+                )
+            }
+        }
+
+        // SYS_READAHEAD (187): initiate read-ahead; ramfs is always resident,
+        // so validate fd and return 0.
+        oncrix_syscall::number::SYS_READAHEAD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_readahead(args.arg0 as i32, args.arg1, args.arg2 as usize)
+            }
+        }
+
+        // SYS_SYNC_FILE_RANGE (277): sync a file segment to backing store;
+        // ramfs has no backing store — validate fd and return 0.
+        oncrix_syscall::number::SYS_SYNC_FILE_RANGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_sync_file_range(
+                    args.arg0 as i32,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as u32,
+                )
+            }
+        }
+
+        // SYS_FALLOCATE (285): pre-allocate / extend file space.
+        // mode==0 extends the file to offset+len; non-zero mode is a no-op on ramfs.
+        oncrix_syscall::number::SYS_FALLOCATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_fallocate(
+                    args.arg0 as i32,
+                    args.arg1 as i32,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+
         // SYS_SYMLINK (88): create a symbolic link.
         // POSIX.1-2024 symlink(3p).
         oncrix_syscall::number::SYS_SYMLINK => {

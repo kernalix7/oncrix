@@ -35,6 +35,34 @@ pub const SYS_BRK: SyscallNumber = 12;
 pub const SYS_MSYNC: SyscallNumber = 26;
 /// `madvise(addr, length, advice)` — Advise on memory usage.
 pub const SYS_MADVISE: SyscallNumber = 28;
+/// `mlock(addr, len)` — Lock pages in memory (no-op; ONCRIX does not page out).
+pub const SYS_MLOCK: SyscallNumber = 149;
+/// `munlock(addr, len)` — Unlock pages (no-op).
+pub const SYS_MUNLOCK: SyscallNumber = 150;
+/// `mlockall(flags)` — Lock all current/future pages (no-op).
+pub const SYS_MLOCKALL: SyscallNumber = 151;
+/// `munlockall()` — Unlock all pages (no-op).
+pub const SYS_MUNLOCKALL: SyscallNumber = 152;
+
+// ── Scheduler / CPU queries ──────────────────────────────────────
+
+/// `sched_get_priority_max(policy)` — Max static priority for a policy.
+pub const SYS_SCHED_GET_PRIORITY_MAX: SyscallNumber = 146;
+/// `sched_get_priority_min(policy)` — Min static priority for a policy.
+pub const SYS_SCHED_GET_PRIORITY_MIN: SyscallNumber = 147;
+/// `getcpu(cpu, node, tcache)` — Query current CPU + NUMA node.
+pub const SYS_GETCPU: SyscallNumber = 309;
+
+// ── I/O advisory / allocation ────────────────────────────────────
+
+/// `readahead(fd, offset, count)` — Initiate file read-ahead (no-op on ramfs).
+pub const SYS_READAHEAD: SyscallNumber = 187;
+/// `posix_fadvise64(fd, offset, len, advice)` — Access-pattern hint.
+pub const SYS_FADVISE64: SyscallNumber = 221;
+/// `sync_file_range(fd, offset, nbytes, flags)` — Sync a file segment.
+pub const SYS_SYNC_FILE_RANGE: SyscallNumber = 277;
+/// `fallocate(fd, mode, offset, len)` — Manipulate file space allocation.
+pub const SYS_FALLOCATE: SyscallNumber = 285;
 
 /// `memfd_create(name, flags)` — Create anonymous memory file.
 pub const SYS_MEMFD_CREATE: SyscallNumber = 319;

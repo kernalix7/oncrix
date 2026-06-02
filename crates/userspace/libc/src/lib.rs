@@ -87,6 +87,22 @@ const SYS_WAIT4: u64 = 61;
 const SYS_WAITID: u64 = 247;
 const SYS_KILL: u64 = 62;
 const SYS_GETDENTS64: u64 = 217;
+// misc / advisory
+const SYS_FLOCK: u64 = 73;
+const SYS_MSYNC: u64 = 26;
+const SYS_MADVISE: u64 = 28;
+const SYS_MLOCK: u64 = 149;
+const SYS_MUNLOCK: u64 = 150;
+const SYS_MLOCKALL: u64 = 151;
+const SYS_MUNLOCKALL: u64 = 152;
+const SYS_GETPGRP: u64 = 111;
+const SYS_GETCPU: u64 = 309;
+const SYS_SCHED_GET_PRIORITY_MAX: u64 = 146;
+const SYS_SCHED_GET_PRIORITY_MIN: u64 = 147;
+const SYS_READAHEAD: u64 = 187;
+const SYS_FADVISE64: u64 = 221;
+const SYS_SYNC_FILE_RANGE: u64 = 277;
+const SYS_FALLOCATE: u64 = 285;
 // *at family
 const SYS_FACCESSAT: u64 = 269;
 const SYS_FCHMODAT: u64 = 268;
@@ -2135,3 +2151,213 @@ pub const GRND_NONBLOCK: u32 = 1;
 
 /// `GRND_RANDOM` — draw from the blocking `/dev/random` pool (accepted, ignored).
 pub const GRND_RANDOM: u32 = 2;
+
+
+// ── flock / mem+io advisory / sched queries ────────────────────────
+
+/// `flock(2)` — apply or remove an advisory lock on an open file.
+///
+/// On ONCRIX the lock table is not implemented; the call always succeeds
+/// once `fd` is validated as open (`-9` EBADF if the descriptor is closed).
+/// `op` is one of `LOCK_SH` (1), `LOCK_EX` (2), `LOCK_UN` (8), optionally
+/// OR'd with `LOCK_NB` (4).
+///
+/// Returns 0 on success, or a negative errno value.
+pub fn flock(fd: i32, op: i32) -> i64 {
+    // SAFETY: scalar-only syscall; no user pointers involved.
+    unsafe { syscall2(SYS_FLOCK, fd as u64, op as u64) }
+}
+
+/// `madvise(2)` — advise the kernel on memory-usage patterns.
+///
+/// All advice values are accepted and silently ignored on ONCRIX
+/// (no backing VM / page cache). Returns 0.
+///
+/// # Safety
+///
+/// `addr` must be a page-aligned pointer into a live mapping; `len` must
+/// not cause the range to overflow user address space. These are not
+/// validated by the kernel on ONCRIX but callers should still satisfy
+/// the POSIX preconditions for portability.
+pub unsafe fn madvise(addr: *mut u8, len: usize, advice: i32) -> i64 {
+    // SAFETY: no-op kernel side; the caller asserts the pointer preconditions.
+    unsafe { syscall3(SYS_MADVISE, addr as u64, len as u64, advice as u64) }
+}
+
+/// `msync(2)` — synchronize a memory mapping with its backing storage.
+///
+/// ramfs has no backing store; always returns 0 on ONCRIX.
+///
+/// # Safety
+///
+/// `addr` must be page-aligned and within an active mapping; `len` must
+/// not overflow the mapping. Not validated kernel-side on ONCRIX.
+pub unsafe fn msync(addr: *mut u8, len: usize, flags: i32) -> i64 {
+    // SAFETY: no-op kernel side; the caller asserts pointer validity.
+    unsafe { syscall3(SYS_MSYNC, addr as u64, len as u64, flags as u64) }
+}
+
+/// `mlock(2)` — lock pages in memory to prevent paging.
+///
+/// ONCRIX does not page memory out; this call is always a no-op
+/// that returns 0 immediately.
+///
+/// # Safety
+///
+/// `addr` must be page-aligned and `len` must not overflow user address
+/// space. Not validated kernel-side on ONCRIX.
+pub unsafe fn mlock(addr: *const u8, len: usize) -> i64 {
+    // SAFETY: no-op kernel side.
+    unsafe { syscall2(SYS_MLOCK, addr as u64, len as u64) }
+}
+
+/// `munlock(2)` — unlock previously locked pages.
+///
+/// No-op on ONCRIX (no pages are ever locked). Returns 0.
+///
+/// # Safety
+///
+/// `addr` must be page-aligned and within the calling process's address
+/// space. Not validated kernel-side on ONCRIX.
+pub unsafe fn munlock(addr: *const u8, len: usize) -> i64 {
+    // SAFETY: no-op kernel side.
+    unsafe { syscall2(SYS_MUNLOCK, addr as u64, len as u64) }
+}
+
+/// `mlockall(2)` — lock all of the calling process's virtual pages.
+///
+/// No-op on ONCRIX. `flags` is `MCL_CURRENT` (1), `MCL_FUTURE` (2), or
+/// their combination; accepted and ignored. Returns 0.
+pub fn mlockall(flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall; no user pointers.
+    unsafe { syscall1(SYS_MLOCKALL, flags as u64) }
+}
+
+/// `munlockall(2)` — unlock all of the calling process's virtual pages.
+///
+/// No-op on ONCRIX. Returns 0.
+pub fn munlockall() -> i64 {
+    // SAFETY: no arguments; always safe.
+    unsafe { syscall1(SYS_MUNLOCKALL, 0) }
+}
+
+/// `getpgrp(2)` — return the process group ID of the calling process.
+///
+/// Equivalent to `getpgid(0)`. Always succeeds.
+pub fn getpgrp() -> i64 {
+    // SAFETY: no arguments, no memory access.
+    unsafe { syscall1(SYS_GETPGRP, 0) }
+}
+
+/// `getcpu(2)` — query the CPU index and NUMA node of the calling thread.
+///
+/// Writes `0` to `*cpu` (if non-null) and `0` to `*node` (if non-null)
+/// on ONCRIX's single-CPU system. `tcache` is accepted and ignored.
+/// Returns `0` on success, or `-14` (`EFAULT`) for a bad pointer.
+///
+/// # Safety
+///
+/// `cpu` and `node`, when non-null, must each point to a writable `u32`
+/// that remains valid for the duration of the call.
+pub unsafe fn getcpu(cpu: *mut u32, node: *mut u32, tcache: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall3(SYS_GETCPU, cpu as u64, node as u64, tcache as u64)
+    }
+}
+
+/// `sched_get_priority_max(2)` — return the maximum static priority for
+/// `policy` (`SCHED_OTHER`=0, `SCHED_FIFO`=1, `SCHED_RR`=2).
+///
+/// Returns `99` for `SCHED_FIFO`/`SCHED_RR`, `0` for `SCHED_OTHER`,
+/// or `-22` (`EINVAL`) for an unknown policy.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn sched_get_priority_max(policy: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_SCHED_GET_PRIORITY_MAX, policy as u64) }
+}
+
+/// `sched_get_priority_min(2)` — return the minimum static priority for
+/// `policy` (`SCHED_OTHER`=0, `SCHED_FIFO`=1, `SCHED_RR`=2).
+///
+/// Returns `1` for `SCHED_FIFO`/`SCHED_RR`, `0` for `SCHED_OTHER`,
+/// or `-22` (`EINVAL`) for an unknown policy.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn sched_get_priority_min(policy: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_SCHED_GET_PRIORITY_MIN, policy as u64) }
+}
+
+/// `posix_fadvise(2)` — advise the kernel of the expected access pattern for
+/// the byte range `[offset, offset+len)` of the file `fd`.
+///
+/// On ONCRIX this is a hint only; the kernel validates `fd` and returns 0.
+/// A non-open `fd` returns `-EBADF`.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe {
+        syscall4(SYS_FADVISE64, fd as u64, offset as u64, len as u64, advice as u64)
+    }
+}
+
+/// `readahead(2)` — initiate read-ahead of `count` bytes at `offset` in `fd`.
+///
+/// On ONCRIX's in-memory ramfs all data is resident; this validates `fd` and
+/// returns 0. A non-open `fd` returns `-EBADF`.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn readahead(fd: i32, offset: i64, count: usize) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_READAHEAD, fd as u64, offset as u64, count as u64) }
+}
+
+/// `sync_file_range(2)` — sync the byte range `[offset, offset+nbytes)` of
+/// `fd` to backing store.
+///
+/// On ONCRIX's in-memory ramfs there is no backing store; this validates `fd`
+/// and returns 0. A non-open `fd` returns `-EBADF`.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe {
+        syscall4(
+            SYS_SYNC_FILE_RANGE,
+            fd as u64,
+            offset as u64,
+            nbytes as u64,
+            flags as u64,
+        )
+    }
+}
+
+/// `fallocate(2)` — manipulate file space allocation for `fd`.
+///
+/// `mode == 0`: ensures the file is at least `offset + len` bytes long,
+/// extending (zero-filling) if necessary. `mode != 0` (e.g.
+/// `FALLOC_FL_KEEP_SIZE`) is accepted silently on ramfs. Returns 0 or a
+/// negative errno value (`-EBADF`, `-EINVAL`, `-EFBIG`).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe {
+        syscall4(SYS_FALLOCATE, fd as u64, mode as u64, offset as u64, len as u64)
+    }
+}

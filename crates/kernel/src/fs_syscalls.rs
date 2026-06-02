@@ -1933,3 +1933,158 @@ pub unsafe fn sys_sysinfo(info: u64) -> i64 {
     }
     0
 }
+
+// ── flock / I/O advisory / fallocate ──────────────────────────────
+
+// (anywhere in the file is fine; suggested placement: after sys_fchown).
+
+/// Kernel handler for `SYS_FLOCK` (number 73).
+///
+/// POSIX / Linux `flock(2)`: apply or remove an advisory whole-file lock.
+/// ONCRIX is single-user with an in-memory VFS — no lock table exists, so
+/// the operation always succeeds. The only validation performed is an
+/// `EBADF` check: if `fd` is not present in the current fd table the call
+/// returns `-9` (EBADF), matching Linux semantics for a closed descriptor.
+///
+/// Advisory locks are **not** recorded; a subsequent `flock` with
+/// `LOCK_UN` on the same fd also returns 0.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU context).
+pub unsafe fn sys_flock(fd: i32, _op: i32) -> i64 {
+    // SAFETY: single-CPU SYSCALL context; fd_table is exclusively owned here.
+    let handle = unsafe { crate::fd_table::fd_get(fd as usize) };
+    if handle.is_none() {
+        return -9; // EBADF
+    }
+    0
+}
+
+// ── sys_fadvise64 ─────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_FADVISE64` (Linux number 221).
+///
+/// POSIX `posix_fadvise(fd, offset, len, advice)`: hints the kernel about the
+/// expected access pattern for the byte range `[offset, offset+len)` of the
+/// file referenced by `fd`. On ONCRIX's in-memory ramfs there is no page cache
+/// to tune, so the advice is silently accepted and success is returned.
+///
+/// Returns 0 on success, or `-EBADF` if `fd` is not open.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_fadvise64(fd: i32, _offset: u64, _len: u64, _advice: i32) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { crate::fd_table::fd_get(fd as usize) } {
+        Some(_) => 0,
+        None => -9, // EBADF
+    }
+}
+
+// ── sys_readahead ─────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_READAHEAD` (Linux number 187).
+///
+/// `readahead(fd, offset, count)`: initiates read-ahead of `count` bytes
+/// starting at `offset` in the file referenced by `fd`. On ONCRIX's in-memory
+/// ramfs all data is always resident, so this is a validated no-op.
+///
+/// Returns 0 on success, or `-EBADF` if `fd` is not open.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_readahead(fd: i32, _offset: u64, _count: usize) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { crate::fd_table::fd_get(fd as usize) } {
+        Some(_) => 0,
+        None => -9, // EBADF
+    }
+}
+
+// ── sys_sync_file_range ───────────────────────────────────────────
+
+/// Kernel handler for `SYS_SYNC_FILE_RANGE` (Linux number 277).
+///
+/// `sync_file_range(fd, offset, nbytes, flags)`: writes a segment of a file's
+/// dirty page-cache pages to backing store. ONCRIX ramfs has no backing store,
+/// so this is a validated no-op that returns success.
+///
+/// Returns 0 on success, or `-EBADF` if `fd` is not open.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_sync_file_range(fd: i32, _offset: u64, _nbytes: u64, _flags: u32) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    match unsafe { crate::fd_table::fd_get(fd as usize) } {
+        Some(_) => 0,
+        None => -9, // EBADF
+    }
+}
+
+// ── sys_fallocate ─────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_FALLOCATE` (Linux number 285).
+///
+/// `fallocate(fd, mode, offset, len)`: manipulates file space allocation.
+///
+/// For `mode == 0` (plain pre-allocation / hole-punching disabled): ensures the
+/// file is at least `offset + len` bytes long by extending it via
+/// [`crate::state::with_global_mut`] → `truncate_ino`. If the file is already
+/// at least that size, it is left untouched.
+///
+/// For any non-zero `mode` flag (e.g. `FALLOC_FL_KEEP_SIZE = 1`,
+/// `FALLOC_FL_PUNCH_HOLE = 2`): ramfs has no sparse-file or discard
+/// semantics, so non-zero modes are accepted silently and success is returned
+/// (the file is not modified).
+///
+/// Returns 0 / `-EBADF` / `-EINVAL` / `-ENOENT` / `-EFBIG` / `-EIO`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_fallocate(fd: i32, mode: i32, offset: u64, len: u64) -> i64 {
+    // Validate the fd first regardless of mode.
+    // SAFETY: single-CPU SYSCALL context.
+    let ino = match unsafe { crate::fd_table::fd_get(fd as usize) } {
+        Some(h) => match h.backend {
+            oncrix_process::fd_table::FileBackend::RamfsFile { ino } => ino,
+            _ => return -22, // EINVAL — backend has no file-allocation op
+        },
+        None => return -9, // EBADF
+    };
+
+    // Non-zero mode: advisory / modifier flags that ramfs cannot honour.
+    // Accept silently — callers that set FALLOC_FL_KEEP_SIZE etc. expect
+    // no visible change to the file anyway.
+    if mode != 0 {
+        return 0;
+    }
+
+    // mode == 0: ensure the file reaches at least offset+len bytes.
+    let required = match offset.checked_add(len) {
+        Some(v) => v,
+        None => return -22, // EINVAL — overflow
+    };
+
+    // Read current file size; skip the extend if already large enough.
+    let current_size = crate::state::with_global_mut(|s| s.vfs.inode_size(ino)).flatten();
+    if let Some(sz) = current_size {
+        if sz >= required {
+            return 0;
+        }
+    }
+
+    let result = crate::state::with_global_mut(|s| s.vfs.truncate_ino(ino, required));
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL
+        Some(Err(oncrix_lib::Error::OutOfMemory)) => -27, // EFBIG
+        Some(Err(_)) => -22,
+        None => -5, // EIO
+    }
+}
