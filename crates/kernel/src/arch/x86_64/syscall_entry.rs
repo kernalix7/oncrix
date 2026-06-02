@@ -549,6 +549,101 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fd_table::dispatch_writev(args.arg0 as usize, args.arg1, args.arg2) }
         }
 
+        // SYS_FACCESSAT (269): check file accessibility relative to a directory fd.
+        // POSIX.1-2024 faccessat(3p). Only AT_FDCWD is modelled; arbitrary dirfds
+        // return EBADF. flags (arg3) are accepted but ignored on ramfs.
+        oncrix_syscall::number::SYS_FACCESSAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_faccessat(args.arg0 as i64, args.arg1, args.arg2, args.arg3)
+            }
+        }
+
+        // SYS_FCHMODAT (268): fchmodat(dirfd, pathname, mode, flags) — chmod relative to dir fd.
+        // POSIX.1-2024 fchmodat(3p).
+        oncrix_syscall::number::SYS_FCHMODAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1 is a user-space path pointer.
+            unsafe {
+                crate::fs_syscalls::sys_fchmodat(args.arg0 as i64, args.arg1, args.arg2, args.arg3)
+            }
+        }
+
+        // SYS_FCHOWNAT (260): fchownat(dirfd, pathname, uid, gid, flags).
+        // POSIX.1-2024 fchownat(3p). Only AT_FDCWD is supported; other dirfd
+        // values return -EBADF until dirfd-relative path resolution is modelled.
+        oncrix_syscall::number::SYS_FCHOWNAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1 is a user-space
+            // pointer to a NUL-terminated pathname forwarded unchanged to sys_chown.
+            unsafe {
+                crate::fs_syscalls::sys_fchownat(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                    args.arg4,
+                )
+            }
+        }
+
+        oncrix_syscall::number::SYS_MKDIRAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_mkdirat(args.arg0 as i64, args.arg1, args.arg2) }
+        }
+
+        // SYS_UNLINKAT (263): remove a directory entry relative to a directory fd.
+        // POSIX.1-2024 unlinkat(3p). AT_FDCWD only; cross-dir not yet implemented.
+        oncrix_syscall::number::SYS_UNLINKAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1 is the user pathname pointer.
+            unsafe { crate::fs_syscalls::sys_unlinkat(args.arg0 as i64, args.arg1, args.arg2) }
+        }
+
+        oncrix_syscall::number::SYS_RENAMEAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1/arg3 are NUL-terminated
+            // user-space path pointers, arg0/arg2 are dirfds (AT_FDCWD or open fds).
+            unsafe {
+                crate::fs_syscalls::sys_renameat(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2 as i64,
+                    args.arg3,
+                )
+            }
+        }
+
+        // SYS_READLINKAT (267): read symlink target relative to a directory fd.
+        // Delegates to sys_readlinkat which enforces AT_FDCWD-only semantics.
+        oncrix_syscall::number::SYS_READLINKAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; pointer validation is
+            // performed inside sys_readlinkat / sys_readlink.
+            unsafe {
+                crate::fs_syscalls::sys_readlinkat(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+
+        oncrix_syscall::number::SYS_SYMLINKAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg0 = target ptr (u64),
+            // arg1 = newdirfd (i64), arg2 = linkpath ptr (u64).
+            unsafe { crate::fs_syscalls::sys_symlinkat(args.arg0, args.arg1 as i64, args.arg2) }
+        }
+
+        oncrix_syscall::number::SYS_NEWFSTATAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg0=dirfd (i64), arg1=pathname,
+            // arg2=statbuf, arg3=flags.  sys_newfstatat validates all pointers internally.
+            unsafe {
+                crate::fs_syscalls::sys_newfstatat(
+                    args.arg0 as i64, // dirfd
+                    args.arg1,        // pathname ptr
+                    args.arg2,        // statbuf ptr
+                    args.arg3,        // flags
+                )
+            }
+        }
+
         // ── Process management syscalls ──────────────────────────
 
         // SYS_EXIT / SYS_EXIT_GROUP: mark process as exited and reschedule.

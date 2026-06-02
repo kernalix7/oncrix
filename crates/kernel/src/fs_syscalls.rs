@@ -1271,3 +1271,346 @@ pub unsafe fn sys_access(pathname_ptr: u64, _mode: u64) -> i64 {
         None => -5,                                   // EIO
     }
 }
+
+// ── *at family (AT_FDCWD delegation) ──────────────────────────────
+
+/// Kernel handler for `SYS_FACCESSAT` (number 269).
+///
+/// POSIX.1-2024 `faccessat(3p)`: check whether the calling process can access
+/// the file at `pathname`, interpreted relative to the open directory descriptor
+/// `dirfd`.  On ONCRIX the VFS has no per-directory `chdir`-style root anchoring
+/// for arbitrary fds yet, so only `AT_FDCWD` (-100) is supported.  When `dirfd`
+/// is `AT_FDCWD` the call is a thin wrapper around [`sys_access`], which checks
+/// path existence on the ramfs (permission-bit enforcement is deferred).
+///
+/// `_flags` (`AT_EACCESS`, `AT_SYMLINK_NOFOLLOW`) are accepted and silently
+/// ignored — ONCRIX ramfs has no permission distinction between real/effective
+/// uid and no symlink semantics to alter.
+///
+/// # Errors
+///
+/// Returns `-9` (EBADF) when `dirfd` is not `AT_FDCWD`.  All other errors are
+/// propagated from `sys_access`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.  `pathname` must
+/// reference a NUL-terminated path in user space.
+pub unsafe fn sys_faccessat(dirfd: i64, pathname: u64, mode: u64, _flags: u64) -> i64 {
+    const AT_FDCWD: i64 = -100;
+
+    // Cross-directory `*at` semantics (arbitrary open-dir fd as base) are not
+    // modelled in ONCRIX yet.  Only AT_FDCWD, which is equivalent to the plain
+    // access(2) call, is supported.  Any other dirfd is rejected with EBADF.
+    if dirfd != AT_FDCWD {
+        return -9; // EBADF
+    }
+
+    // SAFETY: caller guarantees single-CPU SYSCALL context and that `pathname`
+    // is a valid NUL-terminated user-space pointer — same contract as sys_access.
+    unsafe { sys_access(pathname, mode) }
+}
+
+/// Kernel handler for `SYS_FCHMODAT` (number 268).
+///
+/// POSIX.1-2024 `fchmodat(2)` (ramfs subset): changes the permission bits of the file at
+/// `pathname`. When `dirfd` is `AT_FDCWD` and `pathname` is absolute, this is identical to
+/// `chmod(2)`. Cross-directory `*at` resolution (relative paths with a real `dirfd`) is not
+/// yet modelled by the ONCRIX VFS — any `dirfd` other than `AT_FDCWD` returns `-EBADF` until
+/// that support is added.
+///
+/// The `flags` argument is accepted but ignored. Once `AT_SYMLINK_NOFOLLOW` support is
+/// added the handler will need to be revisited.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname` must reference a
+/// NUL-terminated path in user space that remains valid for the duration of the call.
+pub unsafe fn sys_fchmodat(dirfd: i64, pathname: u64, mode: u64, _flags: u64) -> i64 {
+    /// Sentinel value for "use the current working directory" as the base descriptor.
+    const AT_FDCWD: i64 = -100;
+
+    if dirfd != AT_FDCWD {
+        // Cross-directory *at resolution with a real dirfd is not yet implemented.
+        // Return -EBADF until VFS gains full openat-style directory traversal.
+        return -9; // EBADF
+    }
+
+    // SAFETY: `pathname` is a valid user-space pointer (same guarantee that the caller
+    // gives us); we forward it unchanged to sys_chmod which performs the actual copy
+    // from user space and NUL-terminated length check.
+    unsafe { sys_chmod(pathname, mode) }
+}
+
+/// Kernel handler for `SYS_FCHOWNAT` (number 260).
+///
+/// POSIX.1-2024 `fchownat(2)`: change the owner and/or group of the file named
+/// by `pathname`. When `dirfd` is `AT_FDCWD` the call is equivalent to
+/// `chown(pathname, uid, gid)` and delegates directly to [`sys_chown`].
+///
+/// Cross-directory `*at` semantics (dirfd pointing at an open directory other
+/// than `AT_FDCWD`) are **not yet modelled** in the ramfs VFS layer. Any such
+/// call returns `-EBADF` (`-9`) until proper dirfd-relative path resolution is
+/// implemented.
+///
+/// The `flags` argument is accepted but ignored; `AT_SYMLINK_NOFOLLOW` support
+/// will be added together with full symlink resolution.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname` must
+/// reference a NUL-terminated path string in user space.
+pub unsafe fn sys_fchownat(dirfd: i64, pathname: u64, uid: u64, gid: u64, _flags: u64) -> i64 {
+    // AT_FDCWD (-100): the pathname is interpreted relative to the calling
+    // process's current working directory, identical to plain chown(2).
+    const AT_FDCWD: i64 = -100;
+
+    if dirfd != AT_FDCWD {
+        // Cross-directory *at resolution is not yet implemented.
+        // EBADF (-9): dirfd does not refer to an open directory fd that this
+        // kernel can resolve paths against.
+        return -9;
+    }
+
+    // SAFETY: `pathname` is a user-space pointer to a NUL-terminated path;
+    // the caller (single-CPU SYSCALL path) guarantees this invariant, which
+    // sys_chown enforces via copy_user_path.
+    unsafe { sys_chown(pathname, uid, gid) }
+}
+
+/// Kernel handler for `SYS_MKDIRAT` (number 258).
+///
+/// POSIX.1-2024 `mkdirat(3p)` — creates a new directory, interpreting a
+/// relative `pathname` with respect to the open directory `dirfd`.
+///
+/// # Limitations
+///
+/// Cross-directory `*at` path resolution (dirfd pointing at an arbitrary open
+/// directory) is not yet modelled in ONCRIX's VFS layer. Only `AT_FDCWD`
+/// (-100) is accepted as `dirfd`; any other value causes an immediate `-9`
+/// (EBADF) return. Callers that need true relative-directory semantics must
+/// wait for a future VFS update that tracks per-process working-directory
+/// file handles.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-9`  EBADF  — `dirfd` is not `AT_FDCWD`.
+/// - `-2`  ENOENT — parent directory does not exist.
+/// - `-17` EEXIST — path already exists.
+/// - `-12` ENOMEM — ramfs inode table full.
+/// - `-22` EINVAL — path is non-absolute or otherwise invalid.
+/// - `-14` EFAULT — bad user pointer.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+/// `pathname` must be a valid user-space pointer to a null-terminated path
+/// string; it is validated by the delegated `sys_mkdir` handler.
+pub unsafe fn sys_mkdirat(dirfd: i64, pathname: u64, mode: u64) -> i64 {
+    // AT_FDCWD is the Linux/POSIX sentinel meaning "relative to cwd".
+    // ONCRIX does not yet model arbitrary open-directory fds for *at calls.
+    const AT_FDCWD: i64 = -100;
+
+    if dirfd != AT_FDCWD {
+        // Cross-directory mkdirat is not yet implemented; only AT_FDCWD is
+        // supported. Return EBADF to signal an unsupported dirfd.
+        return -9; // EBADF
+    }
+
+    // SAFETY: caller is the single-CPU SYSCALL dispatch path; `pathname` and
+    // `mode` are forwarded unchanged to sys_mkdir, which performs its own
+    // pointer validation via copy_user_path().
+    unsafe { sys_mkdir(pathname, mode) }
+}
+
+/// Kernel handler for `SYS_UNLINKAT` (number 263).
+///
+/// POSIX.1-2024 `unlinkat(3p)` — remove a directory entry, relative to a
+/// directory file descriptor.
+///
+/// # Behaviour
+///
+/// * If `dirfd` ≠ `AT_FDCWD` (-100) this implementation returns `-9` (EBADF).
+///   Relative-to-directory-fd semantics are not yet modelled; all paths must
+///   be absolute or resolved from the process working directory via `AT_FDCWD`.
+/// * If `flags & AT_REMOVEDIR` (0x200) is set, delegates to [`sys_rmdir`].
+/// * Otherwise delegates to [`sys_unlink`].
+///
+/// All other `flags` bits are silently ignored (Linux-compatible).
+///
+/// # Errors (returned as negative errno)
+///
+/// * `-9`  EBADF   — `dirfd` is not `AT_FDCWD` (cross-dir not implemented).
+/// * `-22` EINVAL  — `pathname` is non-absolute or malformed.
+/// * `-14` EFAULT  — `pathname` is an invalid user pointer.
+/// * `-2`  ENOENT  — file or directory does not exist.
+/// * `-39` ENOTEMPTY — directory is not empty (rmdir path only).
+/// * `-1`  EPERM   — path names a directory (unlink path only).
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+/// `pathname` must be a NUL-terminated pointer into user address space.
+pub unsafe fn sys_unlinkat(dirfd: i64, pathname: u64, flags: u64) -> i64 {
+    const AT_FDCWD: i64 = -100;
+    const AT_REMOVEDIR: u64 = 0x200;
+
+    if dirfd != AT_FDCWD {
+        // Cross-directory unlinkat (dirfd pointing to an open directory
+        // other than the process CWD) is not yet implemented.
+        return -9; // EBADF
+    }
+
+    if flags & AT_REMOVEDIR != 0 {
+        // SAFETY: We are on the single-CPU SYSCALL path; `pathname` is the
+        // user-supplied pointer, which `sys_rmdir` validates internally.
+        unsafe { sys_rmdir(pathname) }
+    } else {
+        // SAFETY: We are on the single-CPU SYSCALL path; `pathname` is the
+        // user-supplied pointer, which `sys_unlink` validates internally.
+        unsafe { sys_unlink(pathname) }
+    }
+}
+
+/// Kernel handler for `SYS_RENAMEAT` (number 264).
+///
+/// POSIX.1-2024 `renameat(2)`: renames `oldpath` to `newpath`, where each path is interpreted
+/// relative to the directory referred to by the corresponding directory file descriptor.
+///
+/// # Current Limitations
+///
+/// Cross-directory `*at` operations (where a dirfd refers to an actual open directory rather than
+/// `AT_FDCWD`) are not yet modelled in the VFS layer. When either `olddirfd` or `newdirfd` is not
+/// `AT_FDCWD`, this function returns `-EBADF` (-9). Both descriptors must be `AT_FDCWD` for the
+/// call to succeed; in that case it delegates directly to [`sys_rename`].
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `oldpath` and `newpath` must
+/// reference NUL-terminated path strings in user space. Both `olddirfd` and `newdirfd` must
+/// either be `AT_FDCWD` or valid open directory file descriptors (the latter returns `-EBADF`
+/// until cross-directory support is implemented).
+pub unsafe fn sys_renameat(olddirfd: i64, oldpath: u64, newdirfd: i64, newpath: u64) -> i64 {
+    /// Sentinel value meaning "relative to the process's current working directory".
+    const AT_FDCWD: i64 = -100;
+
+    if olddirfd != AT_FDCWD || newdirfd != AT_FDCWD {
+        // Cross-directory *at operations are not yet implemented in the VFS layer.
+        // Return -EBADF (-9) for any dirfd that is not AT_FDCWD.
+        return -9; // EBADF
+    }
+
+    // SAFETY: Both dirfds are AT_FDCWD, so this is semantically identical to rename(2).
+    // The caller guarantees `oldpath` and `newpath` are valid NUL-terminated user-space pointers,
+    // and we are on the single-CPU SYSCALL dispatch path.
+    unsafe { sys_rename(oldpath, newpath) }
+}
+
+/// `readlinkat(2)` — read the target of a symbolic link, interpreting `pathname`
+/// relative to the directory file descriptor `dirfd`.
+///
+/// This implementation supports only `AT_FDCWD` (-100) as `dirfd`. Any other
+/// value causes an immediate return of `-EBADF` (-9). Relative-directory
+/// resolution via an open directory descriptor is not yet modelled in the VFS
+/// layer and will be added in a future revision.
+///
+/// On success the target bytes (without a NUL terminator, per POSIX) are
+/// written into `buf[..bufsiz]` and the byte count is returned. On failure a
+/// negative errno value is returned.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+/// `pathname` must be a valid, NUL-terminated user-space string pointer.
+/// `buf..buf+bufsiz` must be a writable user-space memory region.
+pub unsafe fn sys_readlinkat(dirfd: i64, pathname: u64, buf: u64, bufsiz: u64) -> i64 {
+    const AT_FDCWD: i64 = -100;
+
+    if dirfd != AT_FDCWD {
+        // Only AT_FDCWD is supported; cross-directory *at resolution is not
+        // yet implemented. Return EBADF to signal the unsupported dirfd.
+        return -9; // EBADF
+    }
+
+    // SAFETY: dirfd == AT_FDCWD, so `pathname` is a cwd-relative (or absolute)
+    // path identical to what sys_readlink expects. Caller guarantees the
+    // pointer and buffer validity required by that function.
+    unsafe { sys_readlink(pathname, buf, bufsiz) }
+}
+
+/// Kernel handler for `SYS_SYMLINKAT` (number 266).
+///
+/// POSIX.1-2024 `symlinkat(2)`: creates `linkpath` as a symbolic link with literal
+/// contents `target`, where `linkpath` is interpreted relative to the directory
+/// referred to by `newdirfd`. When `newdirfd` is `AT_FDCWD`, the call is equivalent
+/// to `symlink(target, linkpath)` and is delegated directly to [`sys_symlink`].
+///
+/// # Limitations
+///
+/// Cross-directory `*at` resolution (i.e. `newdirfd` pointing to an open directory
+/// other than `AT_FDCWD`) is not yet modelled by the VFS layer. Any `newdirfd`
+/// value other than `AT_FDCWD` causes an immediate `-EBADF` return. This will be
+/// lifted once `UnifiedFdTable` exposes directory-fd path anchoring.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `target_ptr` and
+/// `linkpath_ptr` must reference valid NUL-terminated strings in user space.
+pub unsafe fn sys_symlinkat(target_ptr: u64, newdirfd: i64, linkpath_ptr: u64) -> i64 {
+    // AT_FDCWD (-100): the standard sentinel meaning "relative to CWD", which
+    // is the only mode the current VFS path resolver supports.
+    const AT_FDCWD: i64 = -100;
+
+    if newdirfd != AT_FDCWD {
+        // SAFETY: no memory access; pure integer comparison.
+        return -9; // EBADF — non-CWD directory fds not yet supported
+    }
+
+    // SAFETY: caller guarantees this is the single-CPU SYSCALL dispatch path and
+    // that both pointers reference NUL-terminated user-space strings, satisfying
+    // the preconditions of sys_symlink.
+    unsafe { sys_symlink(target_ptr, linkpath_ptr) }
+}
+
+/// Kernel handler for `SYS_NEWFSTATAT` (number 262).
+///
+/// POSIX.1-2024 `fstatat(3p)`: obtains file status for `pathname`, optionally not
+/// following a terminal symbolic link.  When `flags & AT_SYMLINK_NOFOLLOW` is set this
+/// is equivalent to `lstat(2)`; otherwise it is equivalent to `stat(2)`.
+///
+/// # Current limitation
+///
+/// Only `dirfd == AT_FDCWD` is supported.  Any other value causes an immediate return
+/// of `-9` (`EBADF`).  Full cross-directory resolution requires VFS-level support that
+/// has not yet been implemented; this stub documents the gap and keeps the ABI slot
+/// occupied so user-space code that always passes `AT_FDCWD` works correctly.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.  `pathname` must be a
+/// valid null-terminated user-space string pointer.  `statbuf` must point to at least
+/// 144 writable bytes in user space (kernel `struct stat` ABI size).
+pub unsafe fn sys_newfstatat(dirfd: i64, pathname: u64, statbuf: u64, flags: u64) -> i64 {
+    /// Only `AT_FDCWD` is accepted for `dirfd`; all other values return `EBADF`.
+    const AT_FDCWD: i64 = -100;
+    /// When set in `flags`, the call delegates to `lstat` instead of `stat`.
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+
+    if dirfd != AT_FDCWD {
+        // Cross-directory fstatat is not yet implemented.  Return EBADF to signal
+        // that only the AT_FDCWD sentinel is supported at this time.
+        return -9; // EBADF
+    }
+
+    if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        // SAFETY: caller guarantees pathname and statbuf are valid user pointers;
+        // we are on the single-CPU SYSCALL dispatch path; sys_lstat upholds the
+        // same invariants.
+        unsafe { sys_lstat(pathname, statbuf) }
+    } else {
+        // SAFETY: same as above; sys_stat upholds the same invariants.
+        unsafe { sys_stat(pathname, statbuf) }
+    }
+}

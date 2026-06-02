@@ -83,6 +83,16 @@ const SYS_WAIT4: u64 = 61;
 const SYS_WAITID: u64 = 247;
 const SYS_KILL: u64 = 62;
 const SYS_GETDENTS64: u64 = 217;
+// *at family
+const SYS_FACCESSAT: u64 = 269;
+const SYS_FCHMODAT: u64 = 268;
+const SYS_FCHOWNAT: u64 = 260;
+const SYS_MKDIRAT: u64 = 258;
+const SYS_UNLINKAT: u64 = 263;
+const SYS_RENAMEAT: u64 = 264;
+const SYS_READLINKAT: u64 = 267;
+const SYS_SYMLINKAT: u64 = 266;
+const SYS_NEWFSTATAT: u64 = 262;
 const SYS_PIPE2: u64 = 293;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_CLOCK_GETTIME: u64 = 228;
@@ -1761,4 +1771,225 @@ pub const fn wtermsig(status: i32) -> i32 {
 pub unsafe fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
     // SAFETY: caller upholds the pointer contracts.
     unsafe { syscall2(SYS_NANOSLEEP, req as u64, rem as u64) }
+}
+
+
+// ── *at family (AT_FDCWD delegation) ───────────────────────────────
+
+/// `faccessat(2)` — check file accessibility relative to a directory fd.
+///
+/// Passes `dirfd`, `path`, `mode`, and `flags` to the kernel.  On ONCRIX only
+/// `AT_FDCWD` (-100) is supported as `dirfd`; any other value causes the kernel
+/// to return `-9` (EBADF).  The `flags` argument (`AT_EACCESS`,
+/// `AT_SYMLINK_NOFOLLOW`) is forwarded but currently ignored by the kernel —
+/// ramfs has no permission enforcement and no symlink semantics.
+///
+/// Returns 0 on success, or a negative errno value on error.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer valid for the duration
+/// of the call.
+pub unsafe fn faccessat(dirfd: i32, path: *const u8, mode: i32, flags: i32) -> i64 {
+    // SAFETY: The caller guarantees `path` is a valid NUL-terminated pointer.
+    unsafe { syscall4(SYS_FACCESSAT, dirfd as i64 as u64, path as u64, mode as u64, flags as u64) }
+}
+
+/// `fchmodat(2)` — change file permission bits relative to a directory file descriptor.
+///
+/// When `dirfd` is `AT_FDCWD` (`-100`) the call is equivalent to `chmod(path, mode)`.
+/// `flags` may be `0` or `AT_SYMLINK_NOFOLLOW` (currently ignored by the kernel).
+///
+/// Returns 0 on success, or a negative errno value on failure (`-9` / `EBADF` when
+/// `dirfd` is not `AT_FDCWD` and cross-directory resolution is unsupported).
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer that remains live for the
+/// duration of the call.
+pub unsafe fn fchmodat(dirfd: i32, path: *const u8, mode: u32, flags: i32) -> i64 {
+    // SAFETY: The caller guarantees `path` is a valid null-terminated pointer.
+    unsafe {
+        syscall4(
+            SYS_FCHMODAT,
+            dirfd as i64 as u64,
+            path as u64,
+            mode as u64,
+            flags as i64 as u64,
+        )
+    }
+}
+
+/// `fchownat(2)` — change file owner/group relative to a directory file descriptor.
+///
+/// When `dirfd` is `AT_FDCWD` (`-100`) and `flags` is `0`, this is equivalent
+/// to `chown(pathname, uid, gid)`. A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`)
+/// leaves that id unchanged.
+///
+/// Returns 0 on success, or a negative errno value (`-EBADF` if `dirfd` is not
+/// `AT_FDCWD`, `-ENOENT` if the path does not exist, etc.).
+///
+/// # Safety
+///
+/// `pathname` must be a valid null-terminated string pointer valid for the
+/// duration of the call.
+pub unsafe fn fchownat(
+    dirfd: i32,
+    pathname: *const u8,
+    uid: u32,
+    gid: u32,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `pathname` is a valid NUL-terminated
+    // pointer; all other arguments are scalars.
+    unsafe {
+        syscall6(
+            SYS_FCHOWNAT,
+            dirfd as i64 as u64,
+            pathname as u64,
+            uid as u64,
+            gid as u64,
+            flags as i64 as u64,
+            0,
+        )
+    }
+}
+
+/// `mkdirat(2)` — create a directory relative to a directory file descriptor.
+///
+/// Creates the directory named by `path`. When `dirfd` is `AT_FDCWD` (-100)
+/// the call is equivalent to `mkdir(path, mode)`. Any other value of `dirfd`
+/// currently returns `-9` (EBADF) because cross-directory `*at` resolution is
+/// not yet modelled in the ONCRIX VFS layer.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `path` must be a valid pointer to a null-terminated UTF-8 path string that
+/// remains valid for the duration of the system call. `dirfd` must be either
+/// `AT_FDCWD` or a valid open directory file descriptor (only `AT_FDCWD` is
+/// currently accepted by the kernel).
+pub unsafe fn mkdirat(dirfd: i32, path: *const u8, mode: u32) -> i64 {
+    // SAFETY: SYS_MKDIRAT takes one scalar (dirfd) and one pointer (path)
+    // plus a scalar (mode). The caller guarantees `path` is null-terminated.
+    unsafe { syscall3(SYS_MKDIRAT, dirfd as i64 as u64, path as u64, mode as u64) }
+}
+
+/// `unlinkat(2)` — remove a directory entry relative to a directory fd.
+///
+/// When `dirfd` is `AT_FDCWD` (-100) and `flags` contains `AT_REMOVEDIR`
+/// (0x200), this call is equivalent to `rmdir(pathname)`.  Otherwise it is
+/// equivalent to `unlink(pathname)`.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `pathname` must be a valid, NUL-terminated string pointer in the caller's
+/// address space for the duration of the call.
+pub unsafe fn unlinkat(dirfd: i32, pathname: *const u8, flags: i32) -> i64 {
+    // SAFETY: The caller guarantees `pathname` is a valid NUL-terminated pointer.
+    unsafe { syscall3(SYS_UNLINKAT, dirfd as i64 as u64, pathname as u64, flags as i64 as u64) }
+}
+
+/// `renameat(2)` — rename/move a filesystem name relative to directory file descriptors.
+///
+/// Both `olddirfd` and `newdirfd` must currently be `AT_FDCWD` (-100); passing any other
+/// file descriptor returns `-EBADF` (-9) because cross-directory `*at` resolution is not
+/// yet implemented in the kernel VFS layer.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `oldpath` and `newpath` must be valid null-terminated string pointers for the duration
+/// of the call. `olddirfd` and `newdirfd` must be `AT_FDCWD` or valid open directory
+/// file descriptors.
+pub unsafe fn renameat(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+) -> i64 {
+    // SAFETY: The caller guarantees both path pointers are valid null-terminated strings.
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            olddirfd as i64 as u64,
+            oldpath as u64,
+            newdirfd as i64 as u64,
+            newpath as u64,
+        )
+    }
+}
+
+/// `readlinkat(2)` — read the target of symbolic link `pathname`, interpreting
+/// it relative to the directory file descriptor `dirfd`.
+///
+/// Pass `AT_FDCWD` (-100) as `dirfd` to use the current working directory,
+/// which is the only value currently supported by the kernel. Copies up to
+/// `bufsiz` bytes (no NUL terminator) into `buf`. Returns the byte count on
+/// success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `pathname` must be a valid NUL-terminated string pointer.
+/// `buf` must be writable for at least `bufsiz` bytes.
+/// `dirfd` must be `AT_FDCWD` (-100) or a valid open directory descriptor
+/// (the kernel currently rejects any value other than `AT_FDCWD` with
+/// `-EBADF`).
+pub unsafe fn readlinkat(dirfd: i32, pathname: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    // SAFETY: caller guarantees pathname is NUL-terminated and buf is writable
+    // for bufsiz bytes.
+    unsafe {
+        syscall4(SYS_READLINKAT, dirfd as i64 as u64, pathname as u64, buf as u64, bufsiz as u64)
+    }
+}
+
+/// `symlinkat(2)` — create a symbolic link `linkpath` relative to a directory fd.
+///
+/// When `newdirfd` is `AT_FDCWD` (-100), the call is equivalent to
+/// `symlink(target, linkpath)`. Any other `newdirfd` value is not yet
+/// supported by the kernel and returns `-EBADF`.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `target` and `linkpath` must be valid null-terminated string pointers for
+/// the duration of this call.
+pub unsafe fn symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> i64 {
+    // SAFETY: caller guarantees both string pointers are valid and NUL-terminated.
+    unsafe { syscall3(SYS_SYMLINKAT, target as u64, newdirfd as u64, linkpath as u64) }
+}
+
+/// `newfstatat(2)` — get file status for a path relative to a directory fd.
+///
+/// When `flags & AT_SYMLINK_NOFOLLOW` (0x100) is set the call behaves like
+/// `lstat(2)` and does **not** follow a terminal symbolic link.  Otherwise it
+/// behaves like `stat(2)`.
+///
+/// Pass `AT_FDCWD` (-100 cast to `i32`) as `dirfd` to interpret `path` relative
+/// to the current working directory.  The kernel currently rejects any other
+/// `dirfd` value with `-9` (`EBADF`).
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string in the caller's address space.
+/// `buf` must be a valid pointer to a writable [`Stat`].
+pub unsafe fn newfstatat(dirfd: i32, path: *const u8, buf: *mut Stat, flags: i32) -> i64 {
+    // SAFETY: caller guarantees `path` and `buf` are valid; dirfd and flags are
+    // plain integers forwarded verbatim to the kernel ABI.
+    unsafe {
+        syscall4(
+            SYS_NEWFSTATAT,
+            dirfd as i64 as u64,
+            path as u64,
+            buf as u64,
+            flags as u64,
+        )
+    }
 }

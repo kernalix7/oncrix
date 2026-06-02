@@ -159,6 +159,27 @@ pub const SYS_FTRUNCATE: SyscallNumber = 77;
 pub const SYS_MKNOD: SyscallNumber = 133;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.
 pub const SYS_OPENAT: SyscallNumber = 257;
+
+// ── *at family (AT_FDCWD delegation to path handlers) ────────────
+
+/// `mkdirat(dirfd, pathname, mode)` — Create a directory relative to a directory fd.
+pub const SYS_MKDIRAT: SyscallNumber = 258;
+/// `fchownat(dirfd, pathname, uid, gid, flags)` — Change owner/group relative to a directory fd.
+pub const SYS_FCHOWNAT: SyscallNumber = 260;
+/// `newfstatat(dirfd, pathname, statbuf, flags)` — Get file status relative to a directory fd.
+pub const SYS_NEWFSTATAT: SyscallNumber = 262;
+/// `unlinkat(dirfd, pathname, flags)` — Remove a directory entry relative to a directory fd.
+pub const SYS_UNLINKAT: SyscallNumber = 263;
+/// `renameat(olddirfd, oldpath, newdirfd, newpath)` — Rename relative to directory fds.
+pub const SYS_RENAMEAT: SyscallNumber = 264;
+/// `symlinkat(target, newdirfd, linkpath)` — Create a symbolic link relative to a directory fd.
+pub const SYS_SYMLINKAT: SyscallNumber = 266;
+/// `readlinkat(dirfd, pathname, buf, bufsiz)` — Read a symlink target relative to a directory fd.
+pub const SYS_READLINKAT: SyscallNumber = 267;
+/// `fchmodat(dirfd, pathname, mode, flags)` — Change permission bits relative to a directory fd.
+pub const SYS_FCHMODAT: SyscallNumber = 268;
+/// `faccessat(dirfd, pathname, mode, flags)` — Check accessibility relative to a directory fd.
+pub const SYS_FACCESSAT: SyscallNumber = 269;
 /// `getdents64(fd, dirp, count)` — Read directory entries.
 pub const SYS_GETDENTS64: SyscallNumber = 217;
 /// `getcwd(buf, size)` — Get current working directory.
