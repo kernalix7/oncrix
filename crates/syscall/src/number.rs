@@ -102,6 +102,12 @@ pub const SYS_FSTAT: SyscallNumber = 5;
 pub const SYS_LSTAT: SyscallNumber = 6;
 /// `lseek(fd, offset, whence)` — Reposition file offset.
 pub const SYS_LSEEK: SyscallNumber = 8;
+/// `pread64(fd, buf, count, offset)` — Read at an offset without moving
+/// the file position.
+pub const SYS_PREAD64: SyscallNumber = 17;
+/// `pwrite64(fd, buf, count, offset)` — Write at an offset without moving
+/// the file position.
+pub const SYS_PWRITE64: SyscallNumber = 18;
 /// `dup2(oldfd, newfd)` — Duplicate a file descriptor.
 pub const SYS_DUP2: SyscallNumber = 33;
 /// `dup3(oldfd, newfd, flags)` — Duplicate a fd, optionally setting

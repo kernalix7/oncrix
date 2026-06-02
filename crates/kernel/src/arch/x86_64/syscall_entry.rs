@@ -520,6 +520,25 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
                 )
             }
         }
+        // SYS_PREAD64 (17) / SYS_PWRITE64 (18): positional I/O — read/write
+        // at an offset without moving the file position.
+        oncrix_syscall::number::SYS_PREAD64 => {
+            // SAFETY: see SYS_READ above.
+            unsafe {
+                crate::fd_table::dispatch_pread(args.arg0 as usize, args.arg1, args.arg2, args.arg3)
+            }
+        }
+        oncrix_syscall::number::SYS_PWRITE64 => {
+            // SAFETY: see SYS_READ above.
+            unsafe {
+                crate::fd_table::dispatch_pwrite(
+                    args.arg0 as usize,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
 
         // ── Process management syscalls ──────────────────────────
 

@@ -41,6 +41,8 @@ pub const ENOSYS: i64 = 38;
 
 const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
+const SYS_PREAD64: u64 = 17;
+const SYS_PWRITE64: u64 = 18;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_STAT: u64 = 4;
@@ -294,6 +296,32 @@ pub unsafe fn write(fd: i32, buf: *const u8, count: usize) -> i64 {
 pub unsafe fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     // SAFETY: The caller guarantees `buf` is valid for `count` writable bytes.
     unsafe { syscall3(SYS_READ, fd as u64, buf as u64, count as u64) }
+}
+
+/// `pread(2)` — read `count` bytes from `fd` at `offset` without moving the
+/// file position. Only seekable files are supported (others -> `-ESPIPE`).
+///
+/// Returns the number of bytes read, 0 on EOF, or a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to at least `count` writable bytes.
+pub unsafe fn pread(fd: i32, buf: *mut u8, count: usize, offset: u64) -> i64 {
+    // SAFETY: caller guarantees `buf` is valid for `count` writable bytes.
+    unsafe { syscall4(SYS_PREAD64, fd as u64, buf as u64, count as u64, offset) }
+}
+
+/// `pwrite(2)` — write `count` bytes to `fd` at `offset` without moving the
+/// file position. Only seekable files are supported (others -> `-ESPIPE`).
+///
+/// Returns the number of bytes written, or a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to at least `count` readable bytes.
+pub unsafe fn pwrite(fd: i32, buf: *const u8, count: usize, offset: u64) -> i64 {
+    // SAFETY: caller guarantees `buf` is valid for `count` bytes.
+    unsafe { syscall4(SYS_PWRITE64, fd as u64, buf as u64, count as u64, offset) }
 }
 
 /// `open(2)` — open a file.

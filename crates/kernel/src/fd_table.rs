@@ -2777,12 +2777,90 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
     }
 }
 
-/// Read up to `count` bytes from fd `fd` into user-space buffer `buf_ptr`.
+/// Set the file offset of `fd` in the current thread's table.
 ///
 /// # Safety
 ///
-/// Must be called from the SYSCALL dispatch path. `buf_ptr` must be
-/// a non-null user-space address writable for at least `count` bytes.
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+unsafe fn set_fd_offset(fd: usize, offset: u64) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        if let Some(t) = crate::current::current_thread_mut()
+            && let Some(h) = t.fd_table.get_mut(fd)
+        {
+            h.offset = offset;
+        }
+    }
+}
+
+/// Kernel handler for `SYS_PREAD64` (Linux number 17).
+///
+/// POSIX `pread(fd, buf, count, offset)`: read `count` bytes at `offset`
+/// without changing the file's current position. Only seekable backends
+/// (`RamfsFile`) are supported; pipes / sockets / fifos return `-ESPIPE`.
+///
+/// Implemented by temporarily setting the handle offset to `offset`,
+/// delegating to [`dispatch_read`], then restoring the saved offset.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn dispatch_pread(fd: usize, buf_ptr: u64, count: u64, offset: u64) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let saved = unsafe {
+        match fd_get(fd) {
+            Some(h) => match h.backend {
+                FileBackend::RamfsFile { .. } => h.offset,
+                _ => return -29, // ESPIPE — not seekable
+            },
+            None => return -9, // EBADF
+        }
+    };
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe { set_fd_offset(fd, offset) };
+    // SAFETY: same context; dispatch_read reads at the handle offset.
+    let n = unsafe { dispatch_read(fd, buf_ptr, count) };
+    // SAFETY: restore the pre-pread file position regardless of outcome.
+    unsafe { set_fd_offset(fd, saved) };
+    n
+}
+
+/// Kernel handler for `SYS_PWRITE64` (Linux number 18).
+///
+/// POSIX `pwrite(fd, buf, count, offset)`: write `count` bytes at `offset`
+/// without changing the file's current position. Only seekable backends
+/// (`RamfsFile`) are supported; others return `-ESPIPE`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn dispatch_pwrite(fd: usize, buf_ptr: u64, count: u64, offset: u64) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let saved = unsafe {
+        match fd_get(fd) {
+            Some(h) => match h.backend {
+                FileBackend::RamfsFile { .. } => h.offset,
+                _ => return -29, // ESPIPE — not seekable
+            },
+            None => return -9, // EBADF
+        }
+    };
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe { set_fd_offset(fd, offset) };
+    // SAFETY: same context; dispatch_write writes at the handle offset.
+    let n = unsafe { dispatch_write(fd, buf_ptr, count) };
+    // SAFETY: restore the pre-pwrite file position regardless of outcome.
+    unsafe { set_fd_offset(fd, saved) };
+    n
+}
+
+/// POSIX `read(2)` — read up to `count` bytes from `fd` at its current file
+/// position, advancing the position by the number of bytes read.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU). `buf_ptr`
+/// must reference `count` writable user bytes.
 pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
     if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
