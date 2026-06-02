@@ -111,6 +111,13 @@ pub struct SocketRegistry {
     ///
     /// `id_map[local_id] = Some(unix_registry_id)` when the slot is in use.
     id_map: [Option<u64>; MAX_SOCKETS],
+    /// Reference count per slot: number of open fds aliasing this socket.
+    ///
+    /// Incremented by `dup`/`dup2`/`fcntl(F_DUPFD)`/`fork`, decremented by
+    /// `close`; the underlying Unix socket is freed only when it reaches 0.
+    /// Without this, a duplicated socket fd would free the socket on the
+    /// first close, leaving the alias dangling (use-after-free).
+    refs: [u32; MAX_SOCKETS],
 }
 
 impl Default for SocketRegistry {
@@ -126,6 +133,16 @@ impl SocketRegistry {
         Self {
             unix: UnixSocketRegistry::new(),
             id_map: [NONE; MAX_SOCKETS],
+            refs: [0; MAX_SOCKETS],
+        }
+    }
+
+    /// Increment the reference count for an open socket slot (fd alias).
+    ///
+    /// Called when a socket fd is duplicated (`dup`/`dup2`/`fcntl`/`fork`).
+    pub fn dup(&mut self, id: usize) {
+        if id < MAX_SOCKETS && self.id_map[id].is_some() {
+            self.refs[id] = self.refs[id].saturating_add(1);
         }
     }
 
@@ -163,6 +180,7 @@ impl SocketRegistry {
         let slot = self.alloc_slot()?;
         let unix_id = self.unix.create(sock_type.to_ipc())?;
         self.id_map[slot] = Some(unix_id);
+        self.refs[slot] = 1;
         Ok(slot)
     }
 
@@ -225,6 +243,7 @@ impl SocketRegistry {
         // Allocate a local slot for the new server socket.
         let slot = self.alloc_slot()?;
         self.id_map[slot] = Some(server_unix_id);
+        self.refs[slot] = 1;
         Ok(slot)
     }
 
@@ -282,12 +301,19 @@ impl SocketRegistry {
     /// The socket is marked as closed and removed from the registry.
     pub fn close(&mut self, id: usize) -> Result<()> {
         let unix_id = self.resolve(id)?;
+        // Decrement the alias refcount; only free the underlying Unix socket
+        // and release the slot when the last fd is closed.
+        if id < MAX_SOCKETS && self.refs[id] > 1 {
+            self.refs[id] -= 1;
+            return Ok(());
+        }
         {
             let sock = self.unix.get_mut(unix_id).ok_or(Error::NotFound)?;
             sock.close();
         }
         self.unix.remove(unix_id)?;
         self.id_map[id] = None;
+        self.refs[id] = 0;
         Ok(())
     }
 
@@ -300,6 +326,7 @@ impl SocketRegistry {
         let slot_a = self.alloc_slot()?;
         let unix_id_a = self.unix.create(sock_type.to_ipc())?;
         self.id_map[slot_a] = Some(unix_id_a);
+        self.refs[slot_a] = 1;
 
         let slot_b = match self.alloc_slot() {
             Ok(s) => s,
@@ -320,6 +347,7 @@ impl SocketRegistry {
             }
         };
         self.id_map[slot_b] = Some(unix_id_b);
+        self.refs[slot_b] = 1;
 
         // Connect A → B.
         if let Err(e) = self
@@ -419,6 +447,23 @@ pub unsafe fn socket_close(handle_id: u32) {
     unsafe {
         #[allow(static_mut_refs)]
         let _ = SOCKET_TABLE.close(handle_id as usize);
+    }
+}
+
+/// Bump the reference count of an open socket handle (fd alias).
+///
+/// Must be called whenever a `FileBackend::Socket` fd is duplicated
+/// (`dup`/`dup2`/`fcntl(F_DUPFD)`/`fork`) so the matching `socket_close`
+/// does not free the socket while another fd still references it.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU).
+pub unsafe fn socket_dup(handle_id: u32) {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        SOCKET_TABLE.dup(handle_id as usize);
     }
 }
 

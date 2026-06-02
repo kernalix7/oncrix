@@ -224,8 +224,12 @@ pub fn arch_clone_thread(parent: &Thread, snapshot: &ForkSnapshot) -> Result<Thr
             // SAFETY: single-CPU SYSCALL context; sole accessor of signalfd table.
             unsafe { crate::fd_table::signalfd_dup(id) }
         }
+        // Bump socket refcount so close on either thread decrements correctly.
+        if let oncrix_process::fd_table::FileBackend::Socket { handle_id } = handle.backend {
+            // SAFETY: single-CPU SYSCALL context; sole accessor of socket table.
+            unsafe { crate::socket::socket_dup(handle_id) }
+        }
         // Console, RamfsFile, DevFile, ProcFile: trivial copy, no refcount.
-        // Socket: documented limitation — no socket_dup yet.
         let _ = child.fd_table.install_at(fd_idx, *handle);
     }
 
