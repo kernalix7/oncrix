@@ -593,8 +593,9 @@ mod tests {
         store.set(b"user.a", b"1", 0).unwrap();
         store.set(b"user.b", b"2", 0).unwrap();
         let required = store.list(&mut []).unwrap();
-        let mut buf = vec![0u8; required];
-        store.list(&mut buf).unwrap();
+        let mut buf = [0u8; 64];
+        let buf = &mut buf[..required];
+        store.list(buf).unwrap();
         // Should contain "user.a\0user.b\0".
         assert!(buf.windows(7).any(|w| w == b"user.a\0"));
         assert!(buf.windows(7).any(|w| w == b"user.b\0"));

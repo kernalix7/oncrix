@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-killall"
+description = "ONCRIX - /bin/killall utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "killall"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true

@@ -98,6 +98,8 @@ pub const SYS_SETGROUPS: SyscallNumber = 116;
 pub const SYS_STAT: SyscallNumber = 4;
 /// `fstat(fd, statbuf)` — Get file status by fd.
 pub const SYS_FSTAT: SyscallNumber = 5;
+/// `lstat(pathname, statbuf)` — Get file status, not following symlinks.
+pub const SYS_LSTAT: SyscallNumber = 6;
 /// `lseek(fd, offset, whence)` — Reposition file offset.
 pub const SYS_LSEEK: SyscallNumber = 8;
 /// `dup2(oldfd, newfd)` — Duplicate a file descriptor.
@@ -112,6 +114,28 @@ pub const SYS_MKDIR: SyscallNumber = 83;
 pub const SYS_RMDIR: SyscallNumber = 84;
 /// `unlink(pathname)` — Delete a name from the filesystem.
 pub const SYS_UNLINK: SyscallNumber = 87;
+/// `rename(oldpath, newpath)` — Rename/move a filesystem name.
+pub const SYS_RENAME: SyscallNumber = 82;
+/// `chmod(pathname, mode)` — Change file permission bits.
+pub const SYS_CHMOD: SyscallNumber = 90;
+/// `link(oldpath, newpath)` — Create a hard link.
+pub const SYS_LINK: SyscallNumber = 86;
+/// `chown(pathname, uid, gid)` — Change file owner/group.
+pub const SYS_CHOWN: SyscallNumber = 92;
+/// `access(pathname, mode)` — Check file accessibility.
+pub const SYS_ACCESS: SyscallNumber = 21;
+/// `sync()` — Flush filesystem buffers to backing store.
+pub const SYS_SYNC: SyscallNumber = 162;
+/// `fsync(fd)` — Synchronize file state with backing store.
+pub const SYS_FSYNC: SyscallNumber = 74;
+/// `symlink(target, linkpath)` — Create a symbolic link.
+pub const SYS_SYMLINK: SyscallNumber = 88;
+/// `readlink(pathname, buf, bufsiz)` — Read a symbolic link target.
+pub const SYS_READLINK: SyscallNumber = 89;
+/// `truncate(pathname, length)` — Set file length.
+pub const SYS_TRUNCATE: SyscallNumber = 76;
+/// `mknod(pathname, mode, dev)` — Create a special file (FIFO subset).
+pub const SYS_MKNOD: SyscallNumber = 133;
 /// `openat(dirfd, pathname, flags, mode)` — Open a file relative to a directory fd.
 pub const SYS_OPENAT: SyscallNumber = 257;
 /// `getdents64(fd, dirp, count)` — Read directory entries.

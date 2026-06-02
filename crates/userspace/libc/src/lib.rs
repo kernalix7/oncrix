@@ -44,19 +44,33 @@ const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_STAT: u64 = 4;
+const SYS_LSTAT: u64 = 6;
 const SYS_FSTAT: u64 = 5;
 const SYS_MMAP: u64 = 9;
 const SYS_RT_SIGACTION: u64 = 13;
+const SYS_ACCESS: u64 = 21;
+const SYS_FSYNC: u64 = 74;
 const SYS_DUP2: u64 = 33;
 const SYS_GETPID: u64 = 39;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
 const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
+const SYS_RENAME: u64 = 82;
+const SYS_CHMOD: u64 = 90;
+const SYS_LINK: u64 = 86;
+const SYS_CHOWN: u64 = 92;
+const SYS_SYNC: u64 = 162;
+const SYS_SYMLINK: u64 = 88;
+const SYS_READLINK: u64 = 89;
+const SYS_TRUNCATE: u64 = 76;
+const SYS_RMDIR: u64 = 84;
+const SYS_MKNOD: u64 = 133;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
+const SYS_KILL: u64 = 62;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_PIPE2: u64 = 293;
 const SYS_NANOSLEEP: u64 = 35;
@@ -67,6 +81,16 @@ const SYS_TIME: u64 = 201;
 // Signal numbers
 // ---------------------------------------------------------------------------
 
+/// `SIGHUP` — hangup detected on controlling terminal.
+pub const SIGHUP: i32 = 1;
+/// `SIGINT` — interrupt from keyboard (Ctrl-C).
+pub const SIGINT: i32 = 2;
+/// `SIGQUIT` — quit from keyboard (Ctrl-\).
+pub const SIGQUIT: i32 = 3;
+/// `SIGKILL` — sure kill, cannot be caught or ignored.
+pub const SIGKILL: i32 = 9;
+/// `SIGTERM` — termination request.
+pub const SIGTERM: i32 = 15;
 /// `SIGCHLD` — child process status change.
 pub const SIGCHLD: i32 = 17;
 
@@ -316,6 +340,18 @@ pub unsafe fn waitpid(pid: i64, status: *mut i32, options: i32) -> i64 {
     }
 }
 
+/// `kill(2)` — send a signal to a process.
+///
+/// Returns 0 on success, or a negative errno value:
+/// - `-3` (`ESRCH`) — no such process.
+/// - `-22` (`EINVAL`) — invalid signal number.
+///
+/// `sig == 0` performs an existence check without delivering a signal.
+pub fn kill(pid: i64, sig: i32) -> i64 {
+    // SAFETY: SYS_KILL takes scalar arguments only; no pointers.
+    unsafe { syscall2(SYS_KILL, pid as u64, sig as u64) }
+}
+
 /// `mkdir(2)` — create a directory.
 ///
 /// Returns 0 on success, or a negative errno value.
@@ -338,6 +374,149 @@ pub unsafe fn mkdir(path: *const u8, mode: u32) -> i64 {
 pub unsafe fn unlink(path: *const u8) -> i64 {
     // SAFETY: The caller guarantees `path` is null-terminated.
     unsafe { syscall1(SYS_UNLINK, path as u64) }
+}
+
+/// `rename(2)` — rename/move a filesystem name.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `oldpath` and `newpath` must be valid null-terminated string pointers.
+pub unsafe fn rename(oldpath: *const u8, newpath: *const u8) -> i64 {
+    // SAFETY: The caller guarantees both paths are null-terminated.
+    unsafe { syscall2(SYS_RENAME, oldpath as u64, newpath as u64) }
+}
+
+/// `chmod(2)` — change file permission bits.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn chmod(path: *const u8, mode: u32) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall2(SYS_CHMOD, path as u64, mode as u64) }
+}
+
+/// `link(2)` — create a hard link.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `oldpath` and `newpath` must be valid null-terminated string pointers.
+pub unsafe fn link(oldpath: *const u8, newpath: *const u8) -> i64 {
+    // SAFETY: The caller guarantees both paths are null-terminated.
+    unsafe { syscall2(SYS_LINK, oldpath as u64, newpath as u64) }
+}
+
+/// `chown(2)` — change file owner/group.
+///
+/// A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`) leaves that id unchanged.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall3(SYS_CHOWN, path as u64, uid as u64, gid as u64) }
+}
+
+/// `access(2)` — check file accessibility.
+///
+/// POSIX.1-2024 `access(3p)`. On ONCRIX ramfs, only existence is checked;
+/// permission bits (R_OK / W_OK / X_OK) are accepted but not enforced.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn access(path: *const u8, mode: i32) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall2(SYS_ACCESS, path as u64, mode as u64) }
+}
+
+/// `fsync(2)` — synchronize file state with backing store.
+///
+/// On ONCRIX's in-memory ramfs this always succeeds immediately.
+/// Returns 0.
+pub fn fsync(fd: i32) -> i64 {
+    // SAFETY: SYS_FSYNC is idempotent on ramfs; no user pointers involved.
+    unsafe { syscall1(SYS_FSYNC, fd as u64) }
+}
+
+/// `sync(2)` — flush filesystem buffers.
+///
+/// On ONCRIX's in-memory ramfs this always succeeds immediately.
+/// Returns 0.
+pub fn sync() -> i64 {
+    // SAFETY: SYS_SYNC takes no arguments; the kernel ignores the dummy.
+    unsafe { syscall1(SYS_SYNC, 0) }
+}
+
+/// `symlink(2)` — create a symbolic link `linkpath` with value `target`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `target` and `linkpath` must be valid null-terminated string pointers.
+pub unsafe fn symlink(target: *const u8, linkpath: *const u8) -> i64 {
+    // SAFETY: The caller guarantees both strings are null-terminated.
+    unsafe { syscall2(SYS_SYMLINK, target as u64, linkpath as u64) }
+}
+
+/// `readlink(2)` — read the target of symbolic link `path`.
+///
+/// Copies up to `bufsiz` bytes (no NUL terminator) into `buf`. Returns
+/// the byte count on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be null-terminated; `buf` must be writable for `bufsiz` bytes.
+pub unsafe fn readlink(path: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    // SAFETY: caller guarantees the buffer and path validity.
+    unsafe { syscall3(SYS_READLINK, path as u64, buf as u64, bufsiz as u64) }
+}
+
+/// `truncate(2)` — set the length of the file at `path` to `length`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn truncate(path: *const u8, length: u64) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall2(SYS_TRUNCATE, path as u64, length) }
+}
+
+/// `rmdir(2)` — remove the empty directory at `path`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn rmdir(path: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` is null-terminated.
+    unsafe { syscall1(SYS_RMDIR, path as u64) }
+}
+
+/// `mkfifo(3)` — create a named pipe (FIFO) at `path` with `mode`.
+///
+/// Implemented via `mknod(2)` (`SYS_MKNOD`) with the FIFO type bit set.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+pub unsafe fn mkfifo(path: *const u8, mode: u32) -> i64 {
+    // SAFETY: `path` is null-terminated; SYS_MKNOD creates a FIFO node.
+    unsafe { syscall2(SYS_MKNOD, path as u64, (mode | S_IFIFO) as u64) }
 }
 
 /// `getdents64(2)` — get directory entries.
@@ -550,6 +729,16 @@ pub const fn s_isreg(mode: u32) -> bool {
     (mode & S_IFMT) == S_IFREG
 }
 
+/// Returns `true` if `mode` describes a symbolic link.
+pub const fn s_islnk(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFLNK
+}
+
+/// Returns `true` if `mode` describes a FIFO (named pipe).
+pub const fn s_isfifo(mode: u32) -> bool {
+    (mode & S_IFMT) == S_IFIFO
+}
+
 /// `stat(2)` — get file status by pathname.
 ///
 /// Returns 0 on success, or a negative errno value.
@@ -561,6 +750,19 @@ pub const fn s_isreg(mode: u32) -> bool {
 pub unsafe fn stat(path: *const u8, buf: *mut Stat) -> i64 {
     // SAFETY: caller guarantees both pointers are valid.
     unsafe { syscall2(SYS_STAT, path as u64, buf as u64) }
+}
+
+/// `lstat(2)` — get file status without following a terminal symlink.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer.
+/// `buf` must be a valid pointer to a writable [`Stat`].
+pub unsafe fn lstat(path: *const u8, buf: *mut Stat) -> i64 {
+    // SAFETY: caller guarantees both pointers are valid.
+    unsafe { syscall2(SYS_LSTAT, path as u64, buf as u64) }
 }
 
 /// `fstat(2)` — get file status by file descriptor.
@@ -659,6 +861,35 @@ pub unsafe fn time(tloc: *mut i64) -> i64 {
 pub unsafe fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i64 {
     // SAFETY: caller upholds the pointer contract.
     unsafe { syscall2(SYS_CLOCK_GETTIME, clk_id as u64, tp as u64) }
+}
+
+// ---------------------------------------------------------------------------
+// Wait status decoding (POSIX §sys/wait.h)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the child terminated normally (not via a signal).
+pub const fn wifexited(status: i32) -> bool {
+    (status & 0x7f) == 0
+}
+
+/// Extract the exit code from a normally-terminated child status.
+///
+/// Only meaningful when [`wifexited`] returns `true`.
+pub const fn wexitstatus(status: i32) -> i32 {
+    (status >> 8) & 0xff
+}
+
+/// Returns `true` if the child was terminated by a signal.
+pub const fn wifsignaled(status: i32) -> bool {
+    let term = status & 0x7f;
+    term != 0 && ((term + 1) >> 1) > 0
+}
+
+/// Extract the signal number that terminated the child.
+///
+/// Only meaningful when [`wifsignaled`] returns `true`.
+pub const fn wtermsig(status: i32) -> i32 {
+    status & 0x7f
 }
 
 /// `nanosleep(req, rem)` — block the calling thread for at least

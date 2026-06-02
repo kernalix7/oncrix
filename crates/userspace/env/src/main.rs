@@ -4,7 +4,10 @@
 //! ONCRIX `/bin/env` — POSIX.1-2024 `env` utility (print-only subset).
 //!
 //! With no arguments: walks `envp` from the initial System V AMD64 stack
-//! layout and writes each `VAR=value` string followed by a newline.
+//! layout and writes each `VAR=value` string followed by a newline. The
+//! `-i` (or `--ignore-environment`) flag suppresses that walk so the
+//! inherited environment is dropped — a no-op today since ONCRIX execve
+//! always passes an empty envp, but accepted so portable scripts work.
 //!
 //! Per the System V AMD64 ABI the initial stack is:
 //! ```text
@@ -59,20 +62,86 @@ pub extern "C" fn _start() -> ! {
 // env logic (POSIX.1-2024)
 // ---------------------------------------------------------------------------
 
-extern "C" fn env_main(_argc: usize, _argv: *const *const u8, envp: *const *const u8) -> ! {
-    // Walk envp until NULL.
-    let mut i = 0usize;
-    loop {
-        // SAFETY: envp is a NULL-terminated array of pointers from the kernel stack.
-        let ptr = unsafe { envp.add(i).read() };
+extern "C" fn env_main(argc: usize, argv: *const *const u8, envp: *const *const u8) -> ! {
+    // Parse the leading `-i` flag. POSIX.1-2024 `env -i` means "ignore the
+    // inherited environment". ONCRIX's execve currently passes an empty
+    // envp array, so the flag is structurally a no-op today — but we still
+    // accept and recognise it so portably-written scripts do not fail. The
+    // long form `--ignore-environment` is also accepted as a GNU
+    // compatibility nicety; unknown leading `-…` arguments are reported on
+    // stderr and the utility exits with status 125 (the GNU env convention
+    // for "the env utility itself failed", distinct from the launched
+    // command's exit status).
+    let mut idx = 1usize;
+    let mut ignore_env = false;
+    while idx < argc {
+        // SAFETY: idx < argc; argv is a kernel-supplied valid pointer array.
+        let ptr = unsafe { argv.add(idx).read() };
         if ptr.is_null() {
             break;
         }
-        write_str(1, ptr);
-        write_all(1, b"\n");
-        i += 1;
+        // SAFETY: argv entries are NUL-terminated C strings.
+        let arg = unsafe { cstr(ptr) };
+        if arg == b"-i" || arg == b"--ignore-environment" {
+            ignore_env = true;
+            idx += 1;
+            continue;
+        }
+        if arg == b"--" {
+            idx += 1;
+            break;
+        }
+        if !arg.is_empty() && arg[0] == b'-' {
+            // Unknown option — POSIX treats this as an error.
+            write_all(2, b"env: unrecognised option: ");
+            write_all(2, arg);
+            write_all(2, b"\n");
+            libc::exit(125);
+        }
+        // First non-flag argument: positional command, leave for fallthrough.
+        break;
     }
+
+    // Walk envp unless `-i` was given (which strips the inherited
+    // environment from the print). On a system whose envp is already
+    // empty this is observationally identical, but the codepath is
+    // distinct so future support for inherited env will work.
+    if !ignore_env {
+        let mut i = 0usize;
+        loop {
+            // SAFETY: envp is a NULL-terminated array of pointers from the kernel stack.
+            let ptr = unsafe { envp.add(i).read() };
+            if ptr.is_null() {
+                break;
+            }
+            write_str(1, ptr);
+            write_all(1, b"\n");
+            i += 1;
+        }
+    }
+
+    // ONCRIX does not yet support invoking an arbitrary utility via env.
+    // When extra positional arguments follow the flag list, we exit 0
+    // silently; a real POSIX env would `execve(argv[idx])` here. sh
+    // already provides direct execve, so we keep this utility print-only.
     libc::exit(0)
+}
+
+/// Read a C string up to a 4 KiB safety bound.
+///
+/// SAFETY: `p` must point to a NUL-terminated byte sequence; the safety
+/// bound caps runaway scans at 4096 bytes.
+unsafe fn cstr(p: *const u8) -> &'static [u8] {
+    unsafe {
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+            if len > 4096 {
+                break;
+            }
+        }
+        core::slice::from_raw_parts(p, len)
+    }
 }
 
 // ---------------------------------------------------------------------------

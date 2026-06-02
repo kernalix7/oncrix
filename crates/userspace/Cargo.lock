@@ -3,7 +3,203 @@
 version = 4
 
 [[package]]
+name = "oncrix-apropos"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-arch"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-arp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-at"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-base32"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-base64"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-basename"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-batch"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-blkid"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-cal"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-cat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chacl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chattr"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chgrp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chmod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chown"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chrt"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-chsh"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-cksum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-clear"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-cmp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-comm"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-cp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-crontab"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-cut"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-date"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-dd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-df"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-dirname"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -24,7 +220,112 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-expand"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-expr"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-factor"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-false"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-file"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-finger"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-fold"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-free"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-getent"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-getfacl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-grep"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-groupadd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-groupdel"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-groupmod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-groups"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-halt"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -38,7 +339,154 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-hostid"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-hostname"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-hostnamectl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-iconv"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-id"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ifconfig"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-init"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-install"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ionice"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-iostat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ip"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ipcs"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-kill"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-killall"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-last"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ldconfig"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ldd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ln"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-locale"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-localectl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-login"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-logname"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -52,7 +500,238 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-lsattr"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsblk"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lscpu"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsipc"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsmod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lspci"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-lsusb"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-md5sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mesg"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mkdir"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mkfifo"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-mmaptest"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mount"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mountpoint"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mpstat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-mv"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-netstat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-newgrp"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-nice"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-nl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-nohup"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-nproc"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-od"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-passwd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-paste"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pathchk"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pgrep"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pidof"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pidstat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pkill"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-pmap"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-printenv"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-printf"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ps"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -66,7 +745,119 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-readlink"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-realpath"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-reboot"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-reset"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-rev"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-rm"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-rmdir"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-route"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-seq"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-setfacl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-sh"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sha1sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sha224sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sha256sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sha384sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sha512sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-shutdown"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -87,7 +878,161 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-sort"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-split"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-ss"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-stat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-strings"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-su"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sudo"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sum"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-swapon"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-sync"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tabs"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tac"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-tail"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-talk"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-taskset"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tee"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-test"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-timedatectl"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-timeout"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-top"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-touch"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tput"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tr"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",
@@ -101,8 +1046,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-truncate"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-tty"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-ulibc"
 version = "0.1.0"
+
+[[package]]
+name = "oncrix-ulimit"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
 
 [[package]]
 name = "oncrix-uname"
@@ -112,7 +1078,133 @@ dependencies = [
 ]
 
 [[package]]
+name = "oncrix-unexpand"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-uniq"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-uptime"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-useradd"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-userdel"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-usermod"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-users"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-vmstat"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-wall"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-watch"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
 name = "oncrix-wc"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-whatis"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-whereis"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-which"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-who"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-whoami"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-write"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-xargs"
+version = "0.1.0"
+dependencies = [
+ "oncrix-ulibc",
+]
+
+[[package]]
+name = "oncrix-yes"
 version = "0.1.0"
 dependencies = [
  "oncrix-ulibc",

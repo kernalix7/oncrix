@@ -338,32 +338,45 @@ pub extern "C" fn syscall_entry() {
             "pop r12",
             "pop rbp",
             "pop rbx",
+            // Discard the two stacked copies of RCX/R11 (we read the
+            // authoritative values from the atomics below). After this
+            // the kernel-stack frame is fully unwound.
+            "add rsp, 16",
             // Restore user RFLAGS and RIP. Read from atomics rather
             // than from the stack so that exec-style handlers can
             // redirect return-to-user by updating the atomics.
             "mov rcx, [{saved_user_rip}]",
-            "mov r11, [{saved_user_rflags}]",
-            // Pop the stacked copies (values now superseded by the
-            // atomic reads above; we just need RSP to move past them).
-            "add rsp, 16",
-            // Sanitize R11 (RFLAGS): clear IOPL, NT, TF, and
-            // force IF=1 + reserved bit 1=1.
-            "and r11, 0x3C7FD7",
-            "or  r11, 0x202",
-            // Restore user RSP before returning.
-            "mov rsp, [{saved_user_rsp}]",
-            // Validate RCX: must be canonical user-space address.
-            // User-space canonical max = 0x00007FFFFFFFFFFF.
-            "mov r10, 0x00007FFFFFFFFFFF",
-            "cmp rcx, r10",
+            // Validate RCX: must be a canonical user-space address
+            // (<= 0x00007FFFFFFFFFFF). r11 is still free here — it has
+            // NOT yet been loaded with the user RFLAGS — so use it as the
+            // scratch for the 64-bit compare and branch IMMEDIATELY, before
+            // any flag-modifying instruction runs. Using r10 as the scratch
+            // (as a previous revision did) clobbered the user r10 already
+            // restored by `pop r10` above; a program that keeps a live
+            // value in r10 across the `syscall` (e.g. /bin/rmdir's argv
+            // loop counter) then read garbage and faulted #GP on the next
+            // r10-indexed access.
+            "mov r11, 0x00007FFFFFFFFFFF",
+            "cmp rcx, r11",
             "ja  2f",
             // --- Normal SYSRET path ---
+            // Load and sanitize the user RFLAGS into r11: clear IOPL, NT,
+            // TF, force IF=1 + reserved bit 1=1. Restore user RSP last.
+            "mov r11, [{saved_user_rflags}]",
+            "and r11, 0x3C7FD7",
+            "or  r11, 0x202",
+            "mov rsp, [{saved_user_rsp}]",
             "swapgs",
             "sysretq",
             // --- IRETQ fallback for non-canonical RCX ---
-            // Construct an interrupt return frame on the stack
-            // and use IRETQ which validates the target RIP safely.
+            // Construct an interrupt return frame on the stack and use
+            // IRETQ which validates the target RIP safely. RFLAGS is
+            // sanitized identically to the SYSRET path.
             "2:",
+            "mov r11, [{saved_user_rflags}]",
+            "and r11, 0x3C7FD7",
+            "or  r11, 0x202",
+            "mov rsp, [{saved_user_rsp}]",
             "swapgs",
             "push {user_ss}",   // SS
             "push rsp",         // RSP (user stack, placeholder)
@@ -486,6 +499,13 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         oncrix_syscall::number::SYS_FSTAT => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::fs_syscalls::sys_fstat(args.arg0 as i32, args.arg1) }
+        }
+
+        // SYS_LSTAT (6): get file status without following symlinks.
+        // POSIX.1-2024 lstat(3p).
+        oncrix_syscall::number::SYS_LSTAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_lstat(args.arg0, args.arg1) }
         }
 
         // SYS_LSEEK (8): reposition the file offset.
@@ -652,6 +672,87 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         oncrix_syscall::number::SYS_UNLINK => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::fs_syscalls::sys_unlink(args.arg0) }
+        }
+
+        // SYS_RENAME (82): rename/move a filesystem name.
+        // POSIX.1-2024 rename(3p).
+        oncrix_syscall::number::SYS_RENAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_rename(args.arg0, args.arg1) }
+        }
+
+        // SYS_CHMOD (90): change file permission bits.
+        // POSIX.1-2024 chmod(3p).
+        oncrix_syscall::number::SYS_CHMOD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_chmod(args.arg0, args.arg1) }
+        }
+
+        // SYS_LINK (86): create a hard link.
+        // POSIX.1-2024 link(3p).
+        oncrix_syscall::number::SYS_LINK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_link(args.arg0, args.arg1) }
+        }
+
+        // SYS_CHOWN (92): change file owner/group.
+        // POSIX.1-2024 chown(3p).
+        oncrix_syscall::number::SYS_CHOWN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_chown(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_ACCESS (21): check file accessibility.
+        // POSIX.1-2024 access(3p). ramfs has no permission enforcement;
+        // the handler checks existence only.
+        oncrix_syscall::number::SYS_ACCESS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_access(args.arg0, args.arg1) }
+        }
+
+        // SYS_FSYNC (74): synchronize file state with backing store.
+        // POSIX.1-2024 fsync(3p). ramfs is in-memory — nothing to flush;
+        // return success immediately (mirrors SYS_SYNC).
+        oncrix_syscall::number::SYS_FSYNC => 0,
+
+        // SYS_SYNC (162): flush filesystem buffers.
+        // POSIX.1-2024 sync(3p). ramfs is in-memory, so there is nothing
+        // to flush — return success immediately.
+        oncrix_syscall::number::SYS_SYNC => 0,
+
+        // SYS_SYMLINK (88): create a symbolic link.
+        // POSIX.1-2024 symlink(3p).
+        oncrix_syscall::number::SYS_SYMLINK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_symlink(args.arg0, args.arg1) }
+        }
+
+        // SYS_READLINK (89): read a symbolic link target.
+        // POSIX.1-2024 readlink(3p).
+        oncrix_syscall::number::SYS_READLINK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_readlink(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_TRUNCATE (76): set file length.
+        // POSIX.1-2024 truncate(3p).
+        oncrix_syscall::number::SYS_TRUNCATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_truncate(args.arg0, args.arg1) }
+        }
+
+        // SYS_RMDIR (84): remove an empty directory.
+        // POSIX.1-2024 rmdir(3p).
+        oncrix_syscall::number::SYS_RMDIR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_rmdir(args.arg0) }
+        }
+
+        // SYS_MKNOD (133): create a FIFO node (mkfifo subset).
+        // POSIX.1-2024 mkfifo(3p).
+        oncrix_syscall::number::SYS_MKNOD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_mknod(args.arg0, args.arg1) }
         }
 
         // SYS_GETDENTS64 (217): read directory entries.

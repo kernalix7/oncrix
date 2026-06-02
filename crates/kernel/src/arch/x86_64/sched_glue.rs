@@ -153,8 +153,7 @@ pub unsafe fn sched_yield_once(sched: &mut RoundRobinScheduler) -> bool {
 
     // Step 3: perform the callee-saved register swap.
     // SAFETY: Both pointers are valid CpuContext instances owned
-    // by threads in the scheduler, as documented on
-    // `switch_context`.
+    // by threads in the scheduler, as documented on `switch_context`.
     unsafe {
         switch_context(prev_ctx, next_ctx);
     }

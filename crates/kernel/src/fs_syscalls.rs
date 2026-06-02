@@ -226,6 +226,507 @@ pub unsafe fn sys_unlink(pathname_ptr: u64) -> i64 {
     }
 }
 
+// ── sys_rename ────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_RENAME` (number 82).
+///
+/// POSIX.1-2024 `rename(2)` (ramfs subset): moves `oldpath` to `newpath`,
+/// overwriting an existing `newpath`. The underlying inode is preserved.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. Both
+/// pointers must reference NUL-terminated paths in user space.
+pub unsafe fn sys_rename(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
+    static mut OLD_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut OLD_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut NEW_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut NEW_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // Copy + absolutise the source path.
+    // SAFETY: single-CPU SYSCALL context; OLD_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let old_len = unsafe {
+        match copy_user_path(oldpath_ptr, &mut OLD_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: OLD_PATH[..old_len] written above; OLD_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let old_abs_len = unsafe {
+        match resolve_path_abs(&OLD_PATH[..old_len], &mut OLD_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // Copy + absolutise the destination path.
+    // SAFETY: single-CPU SYSCALL context; NEW_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let new_len = unsafe {
+        match copy_user_path(newpath_ptr, &mut NEW_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: NEW_PATH[..new_len] written above; NEW_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let new_abs_len = unsafe {
+        match resolve_path_abs(&NEW_PATH[..new_len], &mut NEW_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: both abs buffers written to the returned lengths above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let old = &OLD_ABS[..old_abs_len];
+        let new = &NEW_ABS[..new_abs_len];
+        crate::state::with_global_mut(|s| s.vfs.rename_path(old, new))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
+// ── sys_link ──────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_LINK` (number 86).
+///
+/// POSIX.1-2024 `link(2)` (ramfs subset): creates `newpath` as a hard
+/// link to the existing `oldpath`, bumping the inode link count.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. Both
+/// pointers must reference NUL-terminated paths in user space.
+pub unsafe fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
+    static mut L_OLD_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut L_OLD_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut L_NEW_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut L_NEW_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // SAFETY: single-CPU SYSCALL context; L_OLD_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let old_len = unsafe {
+        match copy_user_path(oldpath_ptr, &mut L_OLD_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: L_OLD_PATH[..old_len] written above; L_OLD_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let old_abs_len = unsafe {
+        match resolve_path_abs(&L_OLD_PATH[..old_len], &mut L_OLD_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: single-CPU SYSCALL context; L_NEW_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let new_len = unsafe {
+        match copy_user_path(newpath_ptr, &mut L_NEW_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: L_NEW_PATH[..new_len] written above; L_NEW_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let new_abs_len = unsafe {
+        match resolve_path_abs(&L_NEW_PATH[..new_len], &mut L_NEW_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: both abs buffers written to the returned lengths above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let old = &L_OLD_ABS[..old_abs_len];
+        let new = &L_NEW_ABS[..new_abs_len];
+        crate::state::with_global_mut(|s| s.vfs.link_path(old, new))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::AlreadyExists)) => -17, // EEXIST
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL (e.g. dir)
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
+// ── sys_chmod ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_CHMOD` (number 90).
+///
+/// POSIX.1-2024 `chmod(2)` (ramfs subset): updates the inode permission
+/// bits of the file at `pathname`. ONCRIX does not enforce permissions
+/// yet, so the change is observable via `stat` but has no access effect.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_chmod(pathname_ptr: u64, mode: u64) -> i64 {
+    static mut PATH_BUF3: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut ABS_BUF3: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF3 not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut PATH_BUF3) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: PATH_BUF3[..path_len] written above; ABS_BUF3 exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&PATH_BUF3[..path_len], &mut ABS_BUF3) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: ABS_BUF3[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &ABS_BUF3[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.chmod_path(abs, mode as u32))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
+// ── sys_symlink ───────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_SYMLINK` (number 88).
+///
+/// POSIX.1-2024 `symlink(2)` (ramfs subset): creates `linkpath` as a
+/// symbolic link with literal contents `target`. The link is not yet
+/// followed by path resolution.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. Both
+/// pointers must reference NUL-terminated strings in user space.
+pub unsafe fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> i64 {
+    static mut SL_TARGET: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut SL_LINK: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut SL_LINK_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // Copy the target verbatim (stored as-is, not resolved).
+    // SAFETY: single-CPU SYSCALL context; SL_TARGET not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let tgt_len = unsafe {
+        match copy_user_path(target_ptr, &mut SL_TARGET) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // Copy + absolutise the link path.
+    // SAFETY: single-CPU SYSCALL context; SL_LINK not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let link_len = unsafe {
+        match copy_user_path(linkpath_ptr, &mut SL_LINK) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: SL_LINK[..link_len] written above; SL_LINK_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let link_abs_len = unsafe {
+        match resolve_path_abs(&SL_LINK[..link_len], &mut SL_LINK_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // SAFETY: SL_TARGET[..tgt_len] and SL_LINK_ABS[..link_abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let target = &SL_TARGET[..tgt_len];
+        let link = &SL_LINK_ABS[..link_abs_len];
+        crate::state::with_global_mut(|s| s.vfs.symlink_path(target, link))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::AlreadyExists)) => -17, // EEXIST
+        Some(Err(oncrix_lib::Error::NotFound)) => -2,       // ENOENT
+        Some(Err(_)) => -22,                                // EINVAL
+        None => -5,                                         // EIO
+    }
+}
+
+// ── sys_readlink ──────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_READLINK` (number 89).
+///
+/// POSIX.1-2024 `readlink(2)`: copies up to `bufsiz` bytes of the
+/// symlink target at `pathname` into the user buffer. Does NOT
+/// NUL-terminate (per POSIX). Returns the byte count, or a negative
+/// errno.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must be a NUL-terminated path; `buf_ptr..buf_ptr+bufsiz` must be
+/// writable user memory.
+pub unsafe fn sys_readlink(pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
+    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    static mut RL_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut RL_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut RL_OUT: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+
+    // SAFETY: single-CPU SYSCALL context; RL_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut RL_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: RL_PATH[..path_len] written above; RL_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&RL_PATH[..path_len], &mut RL_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+
+    // Read the link target into a kernel staging buffer.
+    let cap = (bufsiz as usize).min(PATH_BUF_LEN);
+    // SAFETY: RL_ABS[..abs_len] written above; RL_OUT exclusively owned.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &RL_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.readlink_path(abs, &mut RL_OUT[..cap]))
+    };
+
+    let n = match result {
+        Some(Ok(n)) => n,
+        Some(Err(oncrix_lib::Error::NotFound)) => return -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => return -22, // EINVAL (not a symlink)
+        Some(Err(_)) => return -22,
+        None => return -5,
+    };
+
+    // Copy out to user (no NUL terminator, per POSIX).
+    // SAFETY: buf_ptr validated non-null user address; n <= cap <= bufsiz.
+    unsafe {
+        let dst = buf_ptr as *mut u8;
+        #[allow(static_mut_refs)]
+        for (i, &b) in RL_OUT[..n].iter().enumerate() {
+            dst.add(i).write_volatile(b);
+        }
+    }
+    n as i64
+}
+
+// ── sys_mknod ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_MKNOD` (number 133).
+///
+/// POSIX.1-2024 `mkfifo(2)` subset: creates a named pipe (FIFO) at
+/// `pathname`. Only the FIFO node type is supported (the `mode`'s
+/// file-type bits are ignored; any invocation creates a FIFO). The FIFO
+/// is not yet connected to a pipe ring.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_mknod(pathname_ptr: u64, mode: u64) -> i64 {
+    static mut MN_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut MN_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; MN_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut MN_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: MN_PATH[..path_len] written above; MN_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&MN_PATH[..path_len], &mut MN_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: MN_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &MN_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.mkfifo_path(abs, mode as u32 & 0o7777))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::AlreadyExists)) => -17, // EEXIST
+        Some(Err(oncrix_lib::Error::NotFound)) => -2,       // ENOENT
+        Some(Err(_)) => -22,                                // EINVAL
+        None => -5,
+    }
+}
+
+// ── sys_rmdir ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_RMDIR` (number 84).
+///
+/// POSIX.1-2024 `rmdir(2)`: removes the empty directory at `pathname`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_rmdir(pathname_ptr: u64) -> i64 {
+    static mut RD_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut RD_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; RD_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut RD_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: RD_PATH[..path_len] written above; RD_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&RD_PATH[..path_len], &mut RD_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: RD_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &RD_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.rmdir_path(abs))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -39, // ENOTEMPTY / ENOTDIR
+        Some(Err(_)) => -22,
+        None => -5,
+    }
+}
+
+// ── sys_truncate ──────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_TRUNCATE` (number 76).
+///
+/// POSIX.1-2024 `truncate(2)` (ramfs subset): sets the length of the
+/// file at `pathname`. Shrinking discards the tail; growing zero-fills.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_truncate(pathname_ptr: u64, length: u64) -> i64 {
+    static mut TR_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut TR_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; TR_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut TR_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: TR_PATH[..path_len] written above; TR_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&TR_PATH[..path_len], &mut TR_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: TR_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &TR_ABS[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.truncate_path(abs, length))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(oncrix_lib::Error::InvalidArgument)) => -22, // EINVAL (not a regular file)
+        Some(Err(oncrix_lib::Error::OutOfMemory)) => -27, // EFBIG (exceeds ramfs file cap)
+        Some(Err(_)) => -22,
+        None => -5, // EIO
+    }
+}
+
+// ── sys_chown ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_CHOWN` (number 92).
+///
+/// POSIX.1-2024 `chown(2)` (ramfs subset): sets the owner/group of the
+/// file at `pathname`. A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`) leaves
+/// that id unchanged. Metadata-only; ownership is not enforced.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_chown(pathname_ptr: u64, uid: u64, gid: u64) -> i64 {
+    static mut PATH_BUF4: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut ABS_BUF4: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; PATH_BUF4 not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut PATH_BUF4) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: PATH_BUF4[..path_len] written above; ABS_BUF4 exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&PATH_BUF4[..path_len], &mut ABS_BUF4) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: ABS_BUF4[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &ABS_BUF4[..abs_len];
+        crate::state::with_global_mut(|s| s.vfs.chown_path(abs, uid as u32, gid as u32))
+    };
+
+    match result {
+        Some(Ok(())) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_getdents64 ────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_GETDENTS64` (number 217).
@@ -503,6 +1004,59 @@ pub unsafe fn sys_stat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
     }
 }
 
+// ── sys_lstat ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_LSTAT` (number 6).
+///
+/// POSIX.1-2024 `lstat(2)`: like `stat`, but does NOT follow a terminal
+/// symbolic link — reports the link itself (S_IFLNK) rather than its
+/// target.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `statbuf_ptr`
+/// must point to >= 144 writable user bytes.
+pub unsafe fn sys_lstat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
+    if statbuf_ptr == 0 || statbuf_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    static mut LSTAT_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut LSTAT_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; buffers exclusively owned here.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(path_ptr, &mut LSTAT_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: LSTAT_PATH[..path_len] written above; LSTAT_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&LSTAT_PATH[..path_len], &mut LSTAT_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: LSTAT_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        let abs = &LSTAT_ABS[..abs_len];
+        crate::state::with_global(|s| s.vfs.lookup_path_nofollow(abs))
+    };
+
+    match result {
+        Some(Ok(inode)) => {
+            // SAFETY: statbuf_ptr validated; fill_stat_buf writes STAT_SIZE bytes.
+            unsafe { fill_stat_buf(statbuf_ptr as *mut u8, &inode) };
+            0
+        }
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
+    }
+}
+
 // ── sys_fstat ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_FSTAT` (number 5).
@@ -557,5 +1111,53 @@ pub unsafe fn sys_fstat(fd: i32, statbuf_ptr: u64) -> i64 {
             0
         }
         None => -9, // EBADF
+    }
+}
+
+// ── sys_access ─────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_ACCESS` (number 21).
+///
+/// POSIX.1-2024 `access(3p)`: check whether the calling process can access
+/// the file at `pathname`. ONCRIX's single-user ramfs has no permission
+/// enforcement, so this handler only checks for existence — a path that
+/// resolves via VFS returns 0, otherwise ENOENT. The `mode` argument
+/// (F_OK / R_OK / W_OK / X_OK) is accepted but not enforced.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path. `pathname_ptr`
+/// must reference a NUL-terminated path in user space.
+pub unsafe fn sys_access(pathname_ptr: u64, _mode: u64) -> i64 {
+    static mut AC_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    static mut AC_ABS: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
+    // SAFETY: single-CPU SYSCALL context; AC_PATH not concurrently accessed.
+    #[allow(static_mut_refs)]
+    let path_len = unsafe {
+        match copy_user_path(pathname_ptr, &mut AC_PATH) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: AC_PATH[..path_len] written above; AC_ABS exclusively owned.
+    #[allow(static_mut_refs)]
+    let abs_len = unsafe {
+        match resolve_path_abs(&AC_PATH[..path_len], &mut AC_ABS) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    // SAFETY: AC_ABS[..abs_len] written above.
+    #[allow(static_mut_refs)]
+    let result = unsafe {
+        // SAFETY: AC_ABS slice is valid for abs_len bytes written above.
+        crate::state::with_global(|s| s.vfs.lookup_path(&AC_ABS[..abs_len]))
+    };
+
+    match result {
+        Some(Ok(_)) => 0,
+        Some(Err(oncrix_lib::Error::NotFound)) => -2, // ENOENT
+        Some(Err(_)) => -22,                          // EINVAL
+        None => -5,                                   // EIO
     }
 }

@@ -205,6 +205,165 @@ impl KernelVfs {
         self.ramfs.unlink_entry(&parent_inode, name)
     }
 
+    /// Rename `old_path` to `new_path`.
+    ///
+    /// POSIX.1-2024 `rename(2)` (ramfs subset). Both paths are resolved
+    /// to (parent dir, final name); the source name is moved to the
+    /// destination, overwriting any existing destination entry. The
+    /// underlying inode is preserved.
+    ///
+    /// Returns `NotFound` if `old_path` does not exist, `InvalidArgument`
+    /// for malformed paths.
+    pub fn rename_path(&mut self, old_path: &[u8], new_path: &[u8]) -> Result<()> {
+        let (old_parent_ino, old_name_bytes) = self.resolve_parent_and_name(old_path)?;
+        let (new_parent_ino, new_name_bytes) = self.resolve_parent_and_name(new_path)?;
+        let old_parent = self
+            .ramfs
+            .inode_by_number(old_parent_ino)
+            .ok_or(Error::NotFound)?;
+        let new_parent = self
+            .ramfs
+            .inode_by_number(new_parent_ino)
+            .ok_or(Error::NotFound)?;
+        let old_name = core::str::from_utf8(old_name_bytes).map_err(|_| Error::InvalidArgument)?;
+        let new_name = core::str::from_utf8(new_name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs
+            .rename(&old_parent, old_name, &new_parent, new_name)
+    }
+
+    /// Create a hard link `new_path` pointing at the existing `old_path`.
+    ///
+    /// POSIX.1-2024 `link(2)` (ramfs subset). Returns `NotFound` if
+    /// `old_path` does not exist, `AlreadyExists` if `new_path` does,
+    /// `InvalidArgument` for malformed paths or a directory target.
+    pub fn link_path(&mut self, old_path: &[u8], new_path: &[u8]) -> Result<()> {
+        let target = self.lookup_path(old_path)?;
+        let (new_parent_ino, new_name_bytes) = self.resolve_parent_and_name(new_path)?;
+        let new_parent = self
+            .ramfs
+            .inode_by_number(new_parent_ino)
+            .ok_or(Error::NotFound)?;
+        let new_name = core::str::from_utf8(new_name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.link(&target, &new_parent, new_name)
+    }
+
+    /// Resolve `path` to its inode WITHOUT following a terminal symlink.
+    ///
+    /// Intermediate components are resolved normally (following), but the
+    /// final component is returned as-is — so a symlink yields the link
+    /// inode itself. Backs `lstat(2)`. Returns `NotFound` if absent.
+    pub fn lookup_path_nofollow(&self, path: &[u8]) -> Result<Inode> {
+        // Root has no parent/name; return it directly.
+        if path == b"/" {
+            return Ok(self.root_inode());
+        }
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.lookup(&parent, name)
+    }
+
+    /// Create a named pipe (FIFO) at `path`.
+    ///
+    /// POSIX.1-2024 `mkfifo(2)` (ramfs subset, create-only). Returns
+    /// `AlreadyExists` if the path exists, `NotFound` if the parent does
+    /// not, `InvalidArgument` for a malformed path.
+    pub fn mkfifo_path(&mut self, path: &[u8], mode: u32) -> Result<()> {
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs
+            .mknod_fifo(&parent, name, FileMode(mode as u16))
+            .map(|_| ())
+    }
+
+    /// Remove the empty directory at `path`.
+    ///
+    /// POSIX.1-2024 `rmdir(2)`: fails with `InvalidArgument` if `path`
+    /// is not a directory or is non-empty, `NotFound` if it does not
+    /// exist.
+    pub fn rmdir_path(&mut self, path: &[u8]) -> Result<()> {
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.rmdir(&parent, name)
+    }
+
+    /// Set the length of the file at `path` to `length` bytes.
+    ///
+    /// POSIX.1-2024 `truncate(2)` (ramfs subset): shrinking discards the
+    /// tail, growing zero-fills. Follows symlinks (resolves `path`).
+    /// Returns `NotFound` if the path does not exist, `InvalidArgument`
+    /// if it is not a regular file.
+    pub fn truncate_path(&mut self, path: &[u8], length: u64) -> Result<()> {
+        let inode = self.lookup_path(path)?;
+        self.ramfs.truncate(&inode, length)
+    }
+
+    /// Create a symbolic link at `link_path` whose target is `target`.
+    ///
+    /// POSIX.1-2024 `symlink(2)` (ramfs subset). The target is stored
+    /// verbatim and not yet followed by path resolution. Returns
+    /// `AlreadyExists` if `link_path` exists, `InvalidArgument` for a
+    /// malformed path or an over-long target.
+    pub fn symlink_path(&mut self, target: &[u8], link_path: &[u8]) -> Result<()> {
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(link_path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        self.ramfs.symlink(&parent, name, target).map(|_| ())
+    }
+
+    /// Read the target of the symbolic link at `path` into `buf`.
+    ///
+    /// Resolves `path` WITHOUT following its final component (so the
+    /// symlink itself is returned, not its target), then reads the link.
+    /// Returns the number of bytes copied. `InvalidArgument` if `path`
+    /// is not a symlink, `NotFound` if it does not exist.
+    pub fn readlink_path(&self, path: &[u8], buf: &mut [u8]) -> Result<usize> {
+        // Resolve parent + final name and look up the final component
+        // directly (`lookup` does not follow symlinks, unlike the
+        // symlink-following `lookup_path`).
+        let (parent_ino, name_bytes) = self.resolve_parent_and_name(path)?;
+        let parent = self
+            .ramfs
+            .inode_by_number(parent_ino)
+            .ok_or(Error::NotFound)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| Error::InvalidArgument)?;
+        let inode = self.ramfs.lookup(&parent, name)?;
+        self.ramfs.read_link(inode.ino, buf)
+    }
+
+    /// Change the owner/group of the file at `path`.
+    ///
+    /// POSIX.1-2024 `chown(2)` (ramfs subset): `u32::MAX` leaves the
+    /// corresponding id unchanged. Returns `NotFound` if the path does
+    /// not exist.
+    pub fn chown_path(&mut self, path: &[u8], uid: u32, gid: u32) -> Result<()> {
+        let inode = self.lookup_path(path)?;
+        self.ramfs.set_owner(inode.ino, uid, gid)
+    }
+
+    /// Change the permission bits of the file at `path`.
+    ///
+    /// POSIX.1-2024 `chmod(2)` (ramfs subset): updates the inode mode
+    /// bits only. Returns `NotFound` if the path does not exist.
+    pub fn chmod_path(&mut self, path: &[u8], mode: u32) -> Result<()> {
+        let inode = self.lookup_path(path)?;
+        self.ramfs.set_mode(inode.ino, FileMode(mode as u16))
+    }
+
     /// List the contents of the directory at `path`.
     ///
     /// Returns a `Vec<DirEntry>` with one element per child entry.

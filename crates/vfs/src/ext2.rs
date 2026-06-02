@@ -652,3 +652,275 @@ fn read_u32(buf: &[u8], offset: usize) -> u32 {
         buf[offset + 3],
     ])
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Synthetic blob builder
+    //
+    // Layout (1 KiB blocks, 8 KiB image = 8 blocks):
+    //
+    //   Block 0   (0x0000): boot / unused
+    //   Block 1   (0x0400): superblock
+    //   Block 2   (0x0800): block group descriptor table
+    //   Block 3   (0x0C00): block bitmap
+    //   Block 4   (0x1000): inode bitmap
+    //   Block 5   (0x1400): inode table (inodes 1-16, 128 bytes each)
+    //   Block 6   (0x1800): root directory data (inode 2)
+    //   Block 7   (0x1C00): hello.txt file data (inode 3)
+    //
+    // Inode numbering (1-based):
+    //   Inode 1 — reserved (bad blocks)
+    //   Inode 2 — root directory
+    //   Inode 3 — hello.txt regular file
+    // -----------------------------------------------------------------------
+
+    const BLOCK_SIZE: usize = 1024;
+    const IMAGE_BLOCKS: usize = 8;
+    const IMAGE_SIZE: usize = IMAGE_BLOCKS * BLOCK_SIZE;
+    const INODES_PER_GROUP: u32 = 16;
+    const BLOCKS_PER_GROUP: u32 = IMAGE_BLOCKS as u32;
+    const INODE_TABLE_BLOCK: u32 = 5;
+    const ROOT_DIR_BLOCK: u32 = 6;
+    const HELLO_DATA_BLOCK: u32 = 7;
+    const HELLO_CONTENT: &[u8] = b"ext2 root\n";
+
+    /// Write a little-endian u16 into a buffer.
+    fn w16(buf: &mut [u8], off: usize, v: u16) {
+        let b = v.to_le_bytes();
+        buf[off] = b[0];
+        buf[off + 1] = b[1];
+    }
+
+    /// Write a little-endian u32 into a buffer.
+    fn w32(buf: &mut [u8], off: usize, v: u32) {
+        let b = v.to_le_bytes();
+        buf[off] = b[0];
+        buf[off + 1] = b[1];
+        buf[off + 2] = b[2];
+        buf[off + 3] = b[3];
+    }
+
+    /// Build a synthetic 8 KiB ext2 image on the stack.
+    fn build_image() -> [u8; IMAGE_SIZE] {
+        let mut img = [0u8; IMAGE_SIZE];
+
+        // ── Superblock at offset 1024 (block 1) ────────────────────────────
+        let sb = &mut img[1024..2048];
+        w32(sb, 0, 16); // s_inodes_count
+        w32(sb, 4, BLOCKS_PER_GROUP); // s_blocks_count
+        w32(sb, 8, 0); // s_r_blocks_count
+        w32(sb, 12, BLOCKS_PER_GROUP - 8); // s_free_blocks_count
+        w32(sb, 16, INODES_PER_GROUP - 3); // s_free_inodes_count
+        w32(sb, 20, 1); // s_first_data_block (1 for 1K blocks)
+        w32(sb, 24, 0); // s_log_block_size = 0 → 1024 bytes
+        w32(sb, 28, 0); // s_log_frag_size
+        w32(sb, 32, BLOCKS_PER_GROUP); // s_blocks_per_group
+        w32(sb, 36, BLOCKS_PER_GROUP); // s_frags_per_group
+        w32(sb, 40, INODES_PER_GROUP); // s_inodes_per_group
+        w32(sb, 76, 0); // s_rev_level = 0 (inode size = 128)
+        w16(sb, 56, 0xEF53); // s_magic
+
+        // ── Block group descriptor at block 2 (offset 2048) ─────────────
+        let bgd = &mut img[2048..2048 + 32];
+        w32(bgd, 0, 3); // bg_block_bitmap → block 3
+        w32(bgd, 4, 4); // bg_inode_bitmap → block 4
+        w32(bgd, 8, INODE_TABLE_BLOCK); // bg_inode_table → block 5
+        w16(bgd, 12, (BLOCKS_PER_GROUP - 8) as u16); // bg_free_blocks_count
+        w16(bgd, 14, (INODES_PER_GROUP - 3) as u16); // bg_free_inodes_count
+        w16(bgd, 16, 1); // bg_used_dirs_count
+
+        // ── Inode table at block 5 (offset 5120) ────────────────────────
+        // Each inode is 128 bytes; inode N is at local index N-1.
+        let it_base = INODE_TABLE_BLOCK as usize * BLOCK_SIZE;
+
+        // Inode 2 — root directory (type=dir, mode=0o40755)
+        {
+            let ino = &mut img[it_base + 128..it_base + 256]; // local index 1
+            w16(ino, 0, 0x4000 | 0o755); // i_mode: directory + rwxr-xr-x
+            w16(ino, 2, 0); // i_uid
+            w32(ino, 4, BLOCK_SIZE as u32); // i_size = 1 block
+            w32(ino, 8, 0); // i_atime
+            w32(ino, 12, 0); // i_ctime
+            w32(ino, 16, 0); // i_mtime
+            w16(ino, 26, 2); // i_links_count
+            w32(ino, 28, 2); // i_blocks (512-byte units)
+            w32(ino, 40, ROOT_DIR_BLOCK); // i_block[0] = block 6
+        }
+
+        // Inode 3 — hello.txt regular file (type=reg, mode=0o100644)
+        {
+            let ino = &mut img[it_base + 256..it_base + 384]; // local index 2
+            w16(ino, 0, 0x8000 | 0o644); // i_mode: regular + rw-r--r--
+            w16(ino, 2, 0); // i_uid
+            w32(ino, 4, HELLO_CONTENT.len() as u32); // i_size
+            w32(ino, 8, 0); // i_atime
+            w32(ino, 12, 0); // i_ctime
+            w32(ino, 16, 0); // i_mtime
+            w16(ino, 26, 1); // i_links_count
+            w32(ino, 28, 2); // i_blocks (512-byte units)
+            w32(ino, 40, HELLO_DATA_BLOCK); // i_block[0] = block 7
+        }
+
+        // ── Root directory block at block 6 (offset 6144) ───────────────
+        // Two entries: "." (inode 2) and "hello.txt" (inode 3).
+        {
+            let dir = &mut img[ROOT_DIR_BLOCK as usize * BLOCK_SIZE..];
+
+            // Entry 0: "." → inode 2
+            // Layout: inode(4) + rec_len(2) + name_len(1) + file_type(1) + name
+            w32(dir, 0, 2); // inode = 2 (root)
+            w16(dir, 4, 12); // rec_len = 12 (4+2+1+1 + 1 byte name padded to 4)
+            dir[6] = 1; // name_len = 1
+            dir[7] = 2; // file_type = DIR
+            dir[8] = b'.';
+
+            // Entry 1: "hello.txt" → inode 3
+            let off1 = 12;
+            let name = b"hello.txt";
+            let name_len = name.len() as u8; // 9
+            // rec_len must be rounded to 4-byte boundary:
+            // 8 (hdr) + 9 (name) = 17 → rounded up to 20
+            let rec_len = ((8 + name_len as usize + 3) & !3) as u16;
+            w32(dir, off1, 3); // inode = 3
+            w16(dir, off1 + 4, rec_len);
+            dir[off1 + 6] = name_len;
+            dir[off1 + 7] = 1; // file_type = REG
+            dir[off1 + 8..off1 + 8 + name.len()].copy_from_slice(name);
+
+            // Terminal entry: rec_len fills rest of block
+            let off2 = off1 + rec_len as usize;
+            let remaining = BLOCK_SIZE - off2;
+            w32(dir, off2, 0); // inode = 0 (unused)
+            w16(dir, off2 + 4, remaining as u16);
+        }
+
+        // ── hello.txt data block at block 7 (offset 7168) ───────────────
+        {
+            let data_off = HELLO_DATA_BLOCK as usize * BLOCK_SIZE;
+            img[data_off..data_off + HELLO_CONTENT.len()].copy_from_slice(HELLO_CONTENT);
+        }
+
+        img
+    }
+
+    /// A `BlockReader` backed by a slice reference.
+    struct SliceReader<'a>(&'a [u8]);
+
+    impl<'a> BlockReader for SliceReader<'a> {
+        fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > self.0.len() {
+                return Err(Error::InvalidArgument);
+            }
+            buf.copy_from_slice(&self.0[start..end]);
+            Ok(())
+        }
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ext2_superblock_parsed_correctly() {
+        let img = build_image();
+        let fs = Ext2Fs::mount(SliceReader(&img)).expect("mount failed");
+        let sb = fs.superblock();
+        assert_eq!(sb.s_magic, 0xEF53, "magic mismatch");
+        assert_eq!(sb.s_inodes_count, 16);
+        assert_eq!(sb.s_blocks_count, BLOCKS_PER_GROUP);
+        assert_eq!(sb.s_log_block_size, 0);
+        assert_eq!(sb.block_size(), 1024);
+        assert_eq!(sb.s_inodes_per_group, INODES_PER_GROUP);
+        assert_eq!(sb.s_inode_size, 128);
+        assert_eq!(sb.s_first_data_block, 1);
+    }
+
+    #[test]
+    fn ext2_block_group_descriptor_parsed() {
+        let img = build_image();
+        let fs = Ext2Fs::mount(SliceReader(&img)).expect("mount failed");
+        // bg_count must be 1 for a 1 MiB / 1 block group image
+        assert_eq!(fs.bg_count, 1);
+        let bgd = fs.bgd[0].as_ref().expect("BGD 0 missing");
+        assert_eq!(bgd.bg_block_bitmap, 3);
+        assert_eq!(bgd.bg_inode_bitmap, 4);
+        assert_eq!(bgd.bg_inode_table, INODE_TABLE_BLOCK);
+    }
+
+    #[test]
+    fn ext2_root_inode_is_directory() {
+        let img = build_image();
+        let fs = Ext2Fs::mount(SliceReader(&img)).expect("mount failed");
+        let root = fs.root_inode().expect("root inode");
+        assert_eq!(
+            root.file_type(),
+            Some(crate::inode::FileType::Directory),
+            "root inode must be a directory"
+        );
+        assert_eq!(root.size(), BLOCK_SIZE as u64);
+    }
+
+    #[test]
+    fn ext2_hello_txt_found_in_root_dir() {
+        let img = build_image();
+        let fs = Ext2Fs::mount(SliceReader(&img)).expect("mount failed");
+        let root = fs.root_inode().expect("root inode");
+        let entries = fs.read_dir(&root).expect("read_dir");
+
+        let hello = entries.entries[..entries.count]
+            .iter()
+            .flatten()
+            .find(|e| e.name() == b"hello.txt")
+            .expect("hello.txt entry not found in root directory");
+
+        assert_eq!(hello.inode, 3, "hello.txt inode number");
+    }
+
+    #[test]
+    fn ext2_hello_txt_data_matches_expected() {
+        let img = build_image();
+        let fs = Ext2Fs::mount(SliceReader(&img)).expect("mount failed");
+        let inode = fs.read_inode(3).expect("read inode 3");
+        assert_eq!(
+            inode.file_type(),
+            Some(crate::inode::FileType::Regular),
+            "hello.txt must be a regular file"
+        );
+        assert_eq!(inode.size(), HELLO_CONTENT.len() as u64);
+
+        let mut buf = [0u8; 16];
+        let n = fs
+            .read_file(&inode, 0, &mut buf[..HELLO_CONTENT.len()])
+            .expect("read_file");
+        assert_eq!(n, HELLO_CONTENT.len());
+        assert_eq!(&buf[..n], HELLO_CONTENT, "file content mismatch");
+    }
+
+    #[test]
+    fn ext2_invalid_magic_rejected() {
+        let mut img = build_image();
+        // Corrupt the magic bytes in the superblock.
+        img[1024 + 56] = 0xDE;
+        img[1024 + 57] = 0xAD;
+        assert!(
+            Ext2Fs::mount(SliceReader(&img)).is_err(),
+            "mount must fail on bad magic"
+        );
+    }
+
+    #[test]
+    fn ext2_resolve_path_hello_txt() {
+        let img = build_image();
+        let fs = Ext2Fs::mount(SliceReader(&img)).expect("mount failed");
+        let inode = fs.resolve_path(b"/hello.txt").expect("resolve /hello.txt");
+        assert_eq!(inode.file_type(), Some(crate::inode::FileType::Regular));
+        assert_eq!(inode.size(), HELLO_CONTENT.len() as u64);
+    }
+}

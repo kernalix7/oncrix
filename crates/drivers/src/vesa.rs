@@ -60,7 +60,7 @@ pub const VBE_MODE_1024X768X24: u16 = 0x118;
 pub const VBE_MODE_1280X1024X24: u16 = 0x11B;
 
 /// VBE signature bytes: `VESA` in ASCII.
-pub const VBE_SIGNATURE: [u8; 4] = [b'V', b'E', b'S', b'A'];
+pub const VBE_SIGNATURE: [u8; 4] = *b"VESA";
 
 /// Maximum number of mode entries we track in [`VbeInfoBlock`].
 const MAX_VIDEO_MODES: usize = 64;

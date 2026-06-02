@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-sha256sum"
+description = "ONCRIX - /bin/sha256sum utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sha256sum"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true

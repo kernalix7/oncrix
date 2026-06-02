@@ -61,7 +61,9 @@ jobs:
         run: cargo build -p oncrix-kernel --target x86_64-unknown-none
 
       - name: Build boot test harness
-        run: cargo build --manifest-path tests/boot_tests/Cargo.toml
+        # cd into the subdirectory so Cargo picks up tests/boot_tests/.cargo/config.toml
+        # (target = x86_64-unknown-linux-gnu), not the repo-root config (target = x86_64-unknown-none).
+        run: cd tests/boot_tests && cargo build
 
       - name: Run QEMU boot integration tests
         env:

@@ -1,0 +1,16 @@
+[package]
+name = "oncrix-lspci"
+description = "ONCRIX - /bin/lspci utility"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lspci"
+path = "src/main.rs"
+
+[dependencies]
+oncrix-ulibc.workspace = true

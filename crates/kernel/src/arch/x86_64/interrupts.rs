@@ -99,10 +99,32 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
             }
             let raw = oncrix_hal::arch::x86_64::io::inb(0x3F8);
             let byte = if raw == 0x0D { 0x0A } else { raw };
+            if raise_sigint_if_etx(byte) {
+                continue;
+            }
             crate::console::console_push_byte(byte);
             // Echo back to TX so the user sees what they typed.
             let mut serial = Uart16550::new(COM1);
             let _ = serial.write_byte(byte);
+        }
+    }
+
+    // Log overflow events at debounce thresholds (16 / 64 / 256 / 1024).
+    //
+    // SAFETY: IRQ 0 context, IF=0, single CPU. LAST_LOGGED_OVERFLOW is
+    // only accessed from this handler, so no concurrent mutation occurs.
+    unsafe {
+        use core::sync::atomic::Ordering;
+        let count = crate::console::OVERFLOW_COUNT.load(Ordering::Relaxed);
+        #[allow(static_mut_refs)]
+        let last = &mut crate::console::LAST_LOGGED_OVERFLOW;
+        let threshold = next_overflow_threshold(*last);
+        if count >= threshold {
+            *last = count;
+            let mut serial = Uart16550::new(COM1);
+            let _ = serial.write_str("[uart] stdin overflow: ");
+            print_u64(&mut serial, count as u64);
+            let _ = serial.write_str("\n");
         }
     }
 }
@@ -150,34 +172,42 @@ pub extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
 
 /// IRQ 4 -- COM1 UART receive interrupt.
 ///
-/// Reads all available bytes from the UART RBR while LSR indicates
+/// Drains all available bytes from the UART RBR while LSR indicates
 /// Data Ready, pushes each byte into STDIN_BUF, echoes it back to
 /// TX, and translates CR (0x0D) to LF (0x0A) so Enter produces a
 /// newline in the shell's read_line loop.
+///
+/// The full-FIFO drain loop ensures that a burst of bytes delivered
+/// before the interrupt fires is not partially lost.
 pub extern "x86-interrupt" fn uart_handler(_frame: InterruptStackFrame) {
     // SAFETY: Accessing UART I/O ports in Ring 0 with IF=0 (interrupt gate).
     unsafe {
-        let lsr = oncrix_hal::arch::x86_64::io::inb(0x3FD);
-        if lsr & 0x01 == 0 {
-            // No data ready; send EOI and return.
-            let pic_ptr = &raw mut PIC;
-            let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET + 4));
-            return;
-        }
-        let raw_byte = oncrix_hal::arch::x86_64::io::inb(0x3F8);
-
-        // SAFETY: Raw pointer to `static mut PIC`; single-CPU IF=0 context.
+        // Send EOI before draining so the PIC can service the next IRQ
+        // while we process the current batch.
         let pic_ptr = &raw mut PIC;
         let _ = (*pic_ptr).acknowledge(InterruptVector(PIC_MASTER_OFFSET + 4));
 
-        let byte = if raw_byte == 0x0D { 0x0A } else { raw_byte };
+        // Drain the full UART FIFO — not just one byte — to avoid losing
+        // bytes during long IF=0 windows.
+        loop {
+            let lsr = oncrix_hal::arch::x86_64::io::inb(0x3FD);
+            if lsr & 0x01 == 0 {
+                break;
+            }
+            let raw_byte = oncrix_hal::arch::x86_64::io::inb(0x3F8);
+            let byte = if raw_byte == 0x0D { 0x0A } else { raw_byte };
 
-        // SAFETY: IRQ 4 context, IF=0, single CPU — same invariant as console_push_byte.
-        crate::console::console_push_byte(byte);
+            if raise_sigint_if_etx(byte) {
+                continue;
+            }
 
-        // Echo the byte back to UART TX.
-        let mut serial = Uart16550::new(COM1);
-        let _ = serial.write_byte(byte);
+            // SAFETY: IRQ 4 context, IF=0, single CPU — same invariant as console_push_byte.
+            crate::console::console_push_byte(byte);
+
+            // Echo the byte back to UART TX.
+            let mut serial = Uart16550::new(COM1);
+            let _ = serial.write_byte(byte);
+        }
     }
 }
 
@@ -247,6 +277,67 @@ pub fn print_tick_count() {
     let _ = serial.write_str("[ONCRIX] PIT ticks: ");
     print_u64(&mut serial, ticks);
     let _ = serial.write_str("\n");
+}
+
+/// If `byte` is ETX (0x03, Ctrl-C), raise `SIGINT` on the currently
+/// running thread's process and return `true`. Otherwise return `false`.
+///
+/// Mirrors the kernel-default Ctrl-C semantics POSIX-1.2024 ascribes to
+/// the controlling terminal's line discipline: instead of pushing the
+/// 0x03 byte into the stdin ring buffer, the kernel marks the
+/// foreground process for `SIGINT` delivery. The pending bit will be
+/// drained by `signal_dispatch::deliver_pending_signals` on the
+/// interrupted thread's next syscall return — we deliberately do NOT
+/// invoke delivery from interrupt context here, because the
+/// `SyscallArgs` slot only exists when the thread was already inside
+/// a SYSCALL frame; if it was running pure user code, there is no
+/// frame to mutate, and waiting for the next syscall return is the
+/// correct deferred-delivery point.
+///
+/// Returns `true` if the caller should skip the normal stdin push +
+/// echo for this byte (i.e. ETX is consumed silently).
+///
+/// # Safety
+///
+/// Must only be called from an interrupt-gate handler (IF=0) on the
+/// single-CPU build, where the process table is not concurrently
+/// mutated. `current_pid` may legitimately return `None` (e.g. early
+/// boot or the idle thread); in that case we simply drop the signal,
+/// matching the page-fault handler's contract.
+fn raise_sigint_if_etx(byte: u8) -> bool {
+    if byte != 0x03 {
+        return false;
+    }
+    // SAFETY: IRQ context, IF=0, single CPU — same invariant as the
+    // page_fault_handler's SIGSEGV path. The borrow is dropped before
+    // we return, and we never call back into the scheduler.
+    unsafe {
+        if let Some(pid) = crate::current::current_pid()
+            && let Some(entry) = crate::fork_dispatch::process_table_mut().get_mut(pid)
+        {
+            entry
+                .signals
+                .pending
+                .raise(oncrix_process::signal::Signal::SIGINT);
+        }
+    }
+    true
+}
+
+/// Return the next debounce threshold above `last_logged` for overflow logging.
+///
+/// Thresholds are 16, 64, 256, 1024, then doubling. Once `last_logged` is
+/// already at or above 1024 the function returns `last_logged + 1024` so
+/// logging continues at coarse intervals rather than going silent.
+fn next_overflow_threshold(last_logged: u32) -> u32 {
+    match last_logged {
+        0 => 16,
+        1..=15 => 16,
+        16..=63 => 64,
+        64..=255 => 256,
+        256..=1023 => 1024,
+        n => n + 1024,
+    }
 }
 
 /// Write a u64 as decimal to serial.

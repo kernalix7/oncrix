@@ -15,7 +15,7 @@
 //!
 //! What remains here is the build-time embedding of the userspace ELF
 //! binaries. `kernel/build.rs` exports `ONCRIX_INIT_BIN`,
-//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME}_BIN`;
+//! `ONCRIX_SH_BIN`, and `ONCRIX_{ECHO,CAT,TRUE,FALSE,WC,HEAD,TAIL,PWD,ENV,UNAME,YES,CLEAR,WHOAMI,KILL,BASENAME,DIRNAME,SEQ,TEST,TEE,TR,CUT,UNIQ,GREP,PRINTF,SORT,OD,EXPR,TOUCH,CP,RM,MKDIR,CMP,DATE,COMM,PASTE,NL,REV,TAC,XARGS,CKSUM,FOLD,REALPATH,CAL,STAT,WHICH,SUM,UPTIME,FACTOR,EXPAND,UNEXPAND,SPLIT,BASE64,MD5SUM,SHA256SUM,SHA1SUM,SHA512SUM,BASE32,SHA224SUM,SHA384SUM,ID,DD,HOSTNAME,TTY,STRINGS,FILE,FREE,INSTALL,TIMEOUT,LOGNAME}_BIN`;
 //! this module includes the bytes and exposes [`embedded_init_elf`] /
 //! [`embedded_sh_elf`] for the boot path and [`embedded_lookup`] for
 //! `sys_execve` to resolve `/bin/<name>` paths against.
@@ -95,6 +95,630 @@ static EMBEDDED_MMAPTEST: &[u8] = include_bytes!(env!("ONCRIX_MMAPTEST_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_SLEEP: &[u8] = include_bytes!(env!("ONCRIX_SLEEP_BIN"));
 
+/// The embedded `/bin/yes` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_YES: &[u8] = include_bytes!(env!("ONCRIX_YES_BIN"));
+
+/// The embedded `/bin/clear` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CLEAR: &[u8] = include_bytes!(env!("ONCRIX_CLEAR_BIN"));
+
+/// The embedded `/bin/whoami` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHOAMI: &[u8] = include_bytes!(env!("ONCRIX_WHOAMI_BIN"));
+
+/// The embedded `/bin/kill` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_KILL: &[u8] = include_bytes!(env!("ONCRIX_KILL_BIN"));
+
+/// The embedded `/bin/basename` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BASENAME: &[u8] = include_bytes!(env!("ONCRIX_BASENAME_BIN"));
+
+/// The embedded `/bin/dirname` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_DIRNAME: &[u8] = include_bytes!(env!("ONCRIX_DIRNAME_BIN"));
+
+/// The embedded `/bin/seq` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SEQ: &[u8] = include_bytes!(env!("ONCRIX_SEQ_BIN"));
+
+/// The embedded `/bin/test` ELF binary (also resolvable as `[`).
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TEST: &[u8] = include_bytes!(env!("ONCRIX_TEST_BIN"));
+
+/// The embedded `/bin/tee` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TEE: &[u8] = include_bytes!(env!("ONCRIX_TEE_BIN"));
+
+/// The embedded `/bin/tr` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TR: &[u8] = include_bytes!(env!("ONCRIX_TR_BIN"));
+
+/// The embedded `/bin/cut` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CUT: &[u8] = include_bytes!(env!("ONCRIX_CUT_BIN"));
+
+/// The embedded `/bin/uniq` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_UNIQ: &[u8] = include_bytes!(env!("ONCRIX_UNIQ_BIN"));
+
+/// The embedded `/bin/grep` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GREP: &[u8] = include_bytes!(env!("ONCRIX_GREP_BIN"));
+
+/// The embedded `/bin/printf` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PRINTF: &[u8] = include_bytes!(env!("ONCRIX_PRINTF_BIN"));
+
+/// The embedded `/bin/sort` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SORT: &[u8] = include_bytes!(env!("ONCRIX_SORT_BIN"));
+
+/// The embedded `/bin/od` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_OD: &[u8] = include_bytes!(env!("ONCRIX_OD_BIN"));
+
+/// The embedded `/bin/expr` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_EXPR: &[u8] = include_bytes!(env!("ONCRIX_EXPR_BIN"));
+
+/// The embedded `/bin/touch` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TOUCH: &[u8] = include_bytes!(env!("ONCRIX_TOUCH_BIN"));
+
+/// The embedded `/bin/cp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CP: &[u8] = include_bytes!(env!("ONCRIX_CP_BIN"));
+
+/// The embedded `/bin/rm` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_RM: &[u8] = include_bytes!(env!("ONCRIX_RM_BIN"));
+
+/// The embedded `/bin/mkdir` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MKDIR: &[u8] = include_bytes!(env!("ONCRIX_MKDIR_BIN"));
+
+/// The embedded `/bin/cmp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CMP: &[u8] = include_bytes!(env!("ONCRIX_CMP_BIN"));
+
+/// The embedded `/bin/date` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_DATE: &[u8] = include_bytes!(env!("ONCRIX_DATE_BIN"));
+
+/// The embedded `/bin/comm` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_COMM: &[u8] = include_bytes!(env!("ONCRIX_COMM_BIN"));
+
+/// The embedded `/bin/paste` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PASTE: &[u8] = include_bytes!(env!("ONCRIX_PASTE_BIN"));
+
+/// The embedded `/bin/nl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NL: &[u8] = include_bytes!(env!("ONCRIX_NL_BIN"));
+
+/// The embedded `/bin/rev` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_REV: &[u8] = include_bytes!(env!("ONCRIX_REV_BIN"));
+
+/// The embedded `/bin/tac` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TAC: &[u8] = include_bytes!(env!("ONCRIX_TAC_BIN"));
+
+/// The embedded `/bin/xargs` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_XARGS: &[u8] = include_bytes!(env!("ONCRIX_XARGS_BIN"));
+
+/// The embedded `/bin/cksum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CKSUM: &[u8] = include_bytes!(env!("ONCRIX_CKSUM_BIN"));
+
+/// The embedded `/bin/fold` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FOLD: &[u8] = include_bytes!(env!("ONCRIX_FOLD_BIN"));
+
+/// The embedded `/bin/realpath` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_REALPATH: &[u8] = include_bytes!(env!("ONCRIX_REALPATH_BIN"));
+
+/// The embedded `/bin/cal` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CAL: &[u8] = include_bytes!(env!("ONCRIX_CAL_BIN"));
+
+/// The embedded `/bin/stat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_STAT: &[u8] = include_bytes!(env!("ONCRIX_STAT_BIN"));
+
+/// The embedded `/bin/which` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHICH: &[u8] = include_bytes!(env!("ONCRIX_WHICH_BIN"));
+
+/// The embedded `/bin/sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SUM: &[u8] = include_bytes!(env!("ONCRIX_SUM_BIN"));
+
+/// The embedded `/bin/uptime` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_UPTIME: &[u8] = include_bytes!(env!("ONCRIX_UPTIME_BIN"));
+
+/// The embedded `/bin/factor` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FACTOR: &[u8] = include_bytes!(env!("ONCRIX_FACTOR_BIN"));
+
+/// The embedded `/bin/expand` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_EXPAND: &[u8] = include_bytes!(env!("ONCRIX_EXPAND_BIN"));
+
+/// The embedded `/bin/unexpand` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_UNEXPAND: &[u8] = include_bytes!(env!("ONCRIX_UNEXPAND_BIN"));
+
+/// The embedded `/bin/split` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SPLIT: &[u8] = include_bytes!(env!("ONCRIX_SPLIT_BIN"));
+
+/// The embedded `/bin/base64` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BASE64: &[u8] = include_bytes!(env!("ONCRIX_BASE64_BIN"));
+
+/// The embedded `/bin/md5sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MD5SUM: &[u8] = include_bytes!(env!("ONCRIX_MD5SUM_BIN"));
+
+/// The embedded `/bin/sha256sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHA256SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA256SUM_BIN"));
+
+/// The embedded `/bin/sha1sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHA1SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA1SUM_BIN"));
+
+/// The embedded `/bin/sha512sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHA512SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA512SUM_BIN"));
+
+/// The embedded `/bin/base32` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BASE32: &[u8] = include_bytes!(env!("ONCRIX_BASE32_BIN"));
+
+/// The embedded `/bin/sha224sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHA224SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA224SUM_BIN"));
+
+/// The embedded `/bin/sha384sum` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHA384SUM: &[u8] = include_bytes!(env!("ONCRIX_SHA384SUM_BIN"));
+
+/// The embedded `/bin/id` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ID: &[u8] = include_bytes!(env!("ONCRIX_ID_BIN"));
+
+/// The embedded `/bin/dd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_DD: &[u8] = include_bytes!(env!("ONCRIX_DD_BIN"));
+
+/// The embedded `/bin/hostname` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HOSTNAME: &[u8] = include_bytes!(env!("ONCRIX_HOSTNAME_BIN"));
+
+/// The embedded `/bin/tty` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TTY: &[u8] = include_bytes!(env!("ONCRIX_TTY_BIN"));
+
+/// The embedded `/bin/strings` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_STRINGS: &[u8] = include_bytes!(env!("ONCRIX_STRINGS_BIN"));
+
+/// The embedded `/bin/file` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FILE: &[u8] = include_bytes!(env!("ONCRIX_FILE_BIN"));
+
+/// The embedded `/bin/free` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FREE: &[u8] = include_bytes!(env!("ONCRIX_FREE_BIN"));
+
+/// The embedded `/bin/install` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_INSTALL: &[u8] = include_bytes!(env!("ONCRIX_INSTALL_BIN"));
+
+/// The embedded `/bin/timeout` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TIMEOUT: &[u8] = include_bytes!(env!("ONCRIX_TIMEOUT_BIN"));
+
+/// The embedded `/bin/logname` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LOGNAME: &[u8] = include_bytes!(env!("ONCRIX_LOGNAME_BIN"));
+
+/// The embedded `/bin/groups` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPS: &[u8] = include_bytes!(env!("ONCRIX_GROUPS_BIN"));
+
+/// The embedded `/bin/users` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERS: &[u8] = include_bytes!(env!("ONCRIX_USERS_BIN"));
+
+/// The embedded `/bin/getent` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GETENT: &[u8] = include_bytes!(env!("ONCRIX_GETENT_BIN"));
+
+/// The embedded `/bin/nproc` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NPROC: &[u8] = include_bytes!(env!("ONCRIX_NPROC_BIN"));
+
+/// The embedded `/bin/arch` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ARCH: &[u8] = include_bytes!(env!("ONCRIX_ARCH_BIN"));
+
+/// The embedded `/bin/pathchk` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PATHCHK: &[u8] = include_bytes!(env!("ONCRIX_PATHCHK_BIN"));
+
+/// The embedded `/bin/printenv` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PRINTENV: &[u8] = include_bytes!(env!("ONCRIX_PRINTENV_BIN"));
+
+/// The embedded `/bin/nohup` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NOHUP: &[u8] = include_bytes!(env!("ONCRIX_NOHUP_BIN"));
+
+/// The embedded `/bin/mesg` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MESG: &[u8] = include_bytes!(env!("ONCRIX_MESG_BIN"));
+
+/// The embedded `/bin/mountpoint` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MOUNTPOINT: &[u8] = include_bytes!(env!("ONCRIX_MOUNTPOINT_BIN"));
+
+/// The embedded `/bin/lsmod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSMOD: &[u8] = include_bytes!(env!("ONCRIX_LSMOD_BIN"));
+
+/// The embedded `/bin/nice` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NICE: &[u8] = include_bytes!(env!("ONCRIX_NICE_BIN"));
+
+/// The embedded `/bin/df` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_DF: &[u8] = include_bytes!(env!("ONCRIX_DF_BIN"));
+
+/// The embedded `/bin/lscpu` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSCPU: &[u8] = include_bytes!(env!("ONCRIX_LSCPU_BIN"));
+
+/// The embedded `/bin/hostid` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HOSTID: &[u8] = include_bytes!(env!("ONCRIX_HOSTID_BIN"));
+
+/// The embedded `/bin/who` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHO: &[u8] = include_bytes!(env!("ONCRIX_WHO_BIN"));
+
+/// The embedded `/bin/last` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LAST: &[u8] = include_bytes!(env!("ONCRIX_LAST_BIN"));
+
+/// The embedded `/bin/lsipc` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSIPC: &[u8] = include_bytes!(env!("ONCRIX_LSIPC_BIN"));
+
+/// The embedded `/bin/ipcs` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IPCS: &[u8] = include_bytes!(env!("ONCRIX_IPCS_BIN"));
+
+/// The embedded `/bin/locale` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LOCALE: &[u8] = include_bytes!(env!("ONCRIX_LOCALE_BIN"));
+
+/// The embedded `/bin/pidof` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PIDOF: &[u8] = include_bytes!(env!("ONCRIX_PIDOF_BIN"));
+
+/// The embedded `/bin/ldd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LDD: &[u8] = include_bytes!(env!("ONCRIX_LDD_BIN"));
+
+/// The embedded `/bin/ldconfig` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LDCONFIG: &[u8] = include_bytes!(env!("ONCRIX_LDCONFIG_BIN"));
+
+/// The embedded `/bin/vmstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_VMSTAT: &[u8] = include_bytes!(env!("ONCRIX_VMSTAT_BIN"));
+
+/// The embedded `/bin/passwd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PASSWD: &[u8] = include_bytes!(env!("ONCRIX_PASSWD_BIN"));
+
+/// The embedded `/bin/chsh` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHSH: &[u8] = include_bytes!(env!("ONCRIX_CHSH_BIN"));
+
+/// The embedded `/bin/ulimit` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ULIMIT: &[u8] = include_bytes!(env!("ONCRIX_ULIMIT_BIN"));
+
+/// The embedded `/bin/mount` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MOUNT: &[u8] = include_bytes!(env!("ONCRIX_MOUNT_BIN"));
+
+/// The embedded `/bin/lspci` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSPCI: &[u8] = include_bytes!(env!("ONCRIX_LSPCI_BIN"));
+
+/// The embedded `/bin/lsusb` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSUSB: &[u8] = include_bytes!(env!("ONCRIX_LSUSB_BIN"));
+
+/// The embedded `/bin/blkid` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BLKID: &[u8] = include_bytes!(env!("ONCRIX_BLKID_BIN"));
+
+/// The embedded `/bin/lsblk` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSBLK: &[u8] = include_bytes!(env!("ONCRIX_LSBLK_BIN"));
+
+/// The embedded `/bin/swapon` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SWAPON: &[u8] = include_bytes!(env!("ONCRIX_SWAPON_BIN"));
+
+/// The embedded `/bin/hostnamectl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HOSTNAMECTL: &[u8] = include_bytes!(env!("ONCRIX_HOSTNAMECTL_BIN"));
+
+/// The embedded `/bin/timedatectl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TIMEDATECTL: &[u8] = include_bytes!(env!("ONCRIX_TIMEDATECTL_BIN"));
+
+/// The embedded `/bin/localectl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LOCALECTL: &[u8] = include_bytes!(env!("ONCRIX_LOCALECTL_BIN"));
+
+/// The embedded `/bin/useradd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERADD: &[u8] = include_bytes!(env!("ONCRIX_USERADD_BIN"));
+
+/// The embedded `/bin/userdel` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERDEL: &[u8] = include_bytes!(env!("ONCRIX_USERDEL_BIN"));
+
+/// The embedded `/bin/usermod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_USERMOD: &[u8] = include_bytes!(env!("ONCRIX_USERMOD_BIN"));
+
+/// The embedded `/bin/groupadd` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPADD: &[u8] = include_bytes!(env!("ONCRIX_GROUPADD_BIN"));
+
+/// The embedded `/bin/groupdel` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPDEL: &[u8] = include_bytes!(env!("ONCRIX_GROUPDEL_BIN"));
+
+/// The embedded `/bin/groupmod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GROUPMOD: &[u8] = include_bytes!(env!("ONCRIX_GROUPMOD_BIN"));
+
+/// The embedded `/bin/tput` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TPUT: &[u8] = include_bytes!(env!("ONCRIX_TPUT_BIN"));
+
+/// The embedded `/bin/reset` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_RESET: &[u8] = include_bytes!(env!("ONCRIX_RESET_BIN"));
+
+/// The embedded `/bin/tabs` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TABS: &[u8] = include_bytes!(env!("ONCRIX_TABS_BIN"));
+
+/// The embedded `/bin/whereis` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHEREIS: &[u8] = include_bytes!(env!("ONCRIX_WHEREIS_BIN"));
+
+/// The embedded `/bin/apropos` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_APROPOS: &[u8] = include_bytes!(env!("ONCRIX_APROPOS_BIN"));
+
+/// The embedded `/bin/whatis` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WHATIS: &[u8] = include_bytes!(env!("ONCRIX_WHATIS_BIN"));
+
+/// The embedded `/bin/lsattr` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LSATTR: &[u8] = include_bytes!(env!("ONCRIX_LSATTR_BIN"));
+
+/// The embedded `/bin/chattr` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHATTR: &[u8] = include_bytes!(env!("ONCRIX_CHATTR_BIN"));
+
+/// The embedded `/bin/getfacl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_GETFACL: &[u8] = include_bytes!(env!("ONCRIX_GETFACL_BIN"));
+
+/// The embedded `/bin/chmod` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHMOD: &[u8] = include_bytes!(env!("ONCRIX_CHMOD_BIN"));
+
+/// The embedded `/bin/chown` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHOWN: &[u8] = include_bytes!(env!("ONCRIX_CHOWN_BIN"));
+
+/// The embedded `/bin/chgrp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHGRP: &[u8] = include_bytes!(env!("ONCRIX_CHGRP_BIN"));
+
+/// The embedded `/bin/ln` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LN: &[u8] = include_bytes!(env!("ONCRIX_LN_BIN"));
+
+/// The embedded `/bin/mv` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MV: &[u8] = include_bytes!(env!("ONCRIX_MV_BIN"));
+
+/// The embedded `/bin/mkfifo` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MKFIFO: &[u8] = include_bytes!(env!("ONCRIX_MKFIFO_BIN"));
+
+/// The embedded `/bin/ifconfig` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IFCONFIG: &[u8] = include_bytes!(env!("ONCRIX_IFCONFIG_BIN"));
+
+/// The embedded `/bin/route` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ROUTE: &[u8] = include_bytes!(env!("ONCRIX_ROUTE_BIN"));
+
+/// The embedded `/bin/netstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NETSTAT: &[u8] = include_bytes!(env!("ONCRIX_NETSTAT_BIN"));
+
+/// The embedded `/bin/arp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ARP: &[u8] = include_bytes!(env!("ONCRIX_ARP_BIN"));
+
+/// The embedded `/bin/ss` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SS: &[u8] = include_bytes!(env!("ONCRIX_SS_BIN"));
+
+/// The embedded `/bin/ip` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IP: &[u8] = include_bytes!(env!("ONCRIX_IP_BIN"));
+
+/// The embedded `/bin/su` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SU: &[u8] = include_bytes!(env!("ONCRIX_SU_BIN"));
+
+/// The embedded `/bin/login` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_LOGIN: &[u8] = include_bytes!(env!("ONCRIX_LOGIN_BIN"));
+
+/// The embedded `/bin/sudo` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SUDO: &[u8] = include_bytes!(env!("ONCRIX_SUDO_BIN"));
+
+/// The embedded `/bin/write` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WRITE: &[u8] = include_bytes!(env!("ONCRIX_WRITE_BIN"));
+
+/// The embedded `/bin/wall` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WALL: &[u8] = include_bytes!(env!("ONCRIX_WALL_BIN"));
+
+/// The embedded `/bin/talk` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TALK: &[u8] = include_bytes!(env!("ONCRIX_TALK_BIN"));
+
+/// The embedded `/bin/crontab` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CRONTAB: &[u8] = include_bytes!(env!("ONCRIX_CRONTAB_BIN"));
+
+/// The embedded `/bin/at` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_AT: &[u8] = include_bytes!(env!("ONCRIX_AT_BIN"));
+
+/// The embedded `/bin/batch` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_BATCH: &[u8] = include_bytes!(env!("ONCRIX_BATCH_BIN"));
+
+/// The embedded `/bin/pgrep` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PGREP: &[u8] = include_bytes!(env!("ONCRIX_PGREP_BIN"));
+
+/// The embedded `/bin/pkill` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PKILL: &[u8] = include_bytes!(env!("ONCRIX_PKILL_BIN"));
+
+/// The embedded `/bin/killall` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_KILLALL: &[u8] = include_bytes!(env!("ONCRIX_KILLALL_BIN"));
+
+/// The embedded `/bin/ps` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PS: &[u8] = include_bytes!(env!("ONCRIX_PS_BIN"));
+
+/// The embedded `/bin/top` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TOP: &[u8] = include_bytes!(env!("ONCRIX_TOP_BIN"));
+
+/// The embedded `/bin/pmap` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PMAP: &[u8] = include_bytes!(env!("ONCRIX_PMAP_BIN"));
+
+/// The embedded `/bin/iostat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IOSTAT: &[u8] = include_bytes!(env!("ONCRIX_IOSTAT_BIN"));
+
+/// The embedded `/bin/mpstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_MPSTAT: &[u8] = include_bytes!(env!("ONCRIX_MPSTAT_BIN"));
+
+/// The embedded `/bin/pidstat` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_PIDSTAT: &[u8] = include_bytes!(env!("ONCRIX_PIDSTAT_BIN"));
+
+/// The embedded `/bin/finger` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_FINGER: &[u8] = include_bytes!(env!("ONCRIX_FINGER_BIN"));
+
+/// The embedded `/bin/newgrp` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_NEWGRP: &[u8] = include_bytes!(env!("ONCRIX_NEWGRP_BIN"));
+
+/// The embedded `/bin/chrt` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHRT: &[u8] = include_bytes!(env!("ONCRIX_CHRT_BIN"));
+
+/// The embedded `/bin/taskset` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TASKSET: &[u8] = include_bytes!(env!("ONCRIX_TASKSET_BIN"));
+
+/// The embedded `/bin/ionice` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_IONICE: &[u8] = include_bytes!(env!("ONCRIX_IONICE_BIN"));
+
+/// The embedded `/bin/watch` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_WATCH: &[u8] = include_bytes!(env!("ONCRIX_WATCH_BIN"));
+
+/// The embedded `/bin/setfacl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SETFACL: &[u8] = include_bytes!(env!("ONCRIX_SETFACL_BIN"));
+
+/// The embedded `/bin/chacl` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_CHACL: &[u8] = include_bytes!(env!("ONCRIX_CHACL_BIN"));
+
+/// The embedded `/bin/iconv` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_ICONV: &[u8] = include_bytes!(env!("ONCRIX_ICONV_BIN"));
+
+/// The embedded `/bin/shutdown` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SHUTDOWN: &[u8] = include_bytes!(env!("ONCRIX_SHUTDOWN_BIN"));
+
+/// The embedded `/bin/reboot` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_REBOOT: &[u8] = include_bytes!(env!("ONCRIX_REBOOT_BIN"));
+
+/// The embedded `/bin/halt` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_HALT: &[u8] = include_bytes!(env!("ONCRIX_HALT_BIN"));
+
+/// The embedded `/bin/sync` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_SYNC: &[u8] = include_bytes!(env!("ONCRIX_SYNC_BIN"));
+
+/// The embedded `/bin/readlink` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_READLINK: &[u8] = include_bytes!(env!("ONCRIX_READLINK_BIN"));
+
+/// The embedded `/bin/truncate` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_TRUNCATE: &[u8] = include_bytes!(env!("ONCRIX_TRUNCATE_BIN"));
+
+/// The embedded `/bin/rmdir` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_RMDIR: &[u8] = include_bytes!(env!("ONCRIX_RMDIR_BIN"));
+
 // ---------------------------------------------------------------------------
 // Signal-return trampoline
 // ---------------------------------------------------------------------------
@@ -172,7 +796,21 @@ pub fn embedded_sh_elf() -> Option<&'static [u8]> {
 ///
 /// Recognised paths: `/bin/sh`, `/bin/echo`, `/bin/cat`, `/bin/true`,
 /// `/bin/false`, `/bin/wc`, `/bin/head`, `/bin/tail`, `/bin/pwd`,
-/// `/bin/env`, `/bin/uname`. Bare names without a leading `/` match the
+/// `/bin/env`, `/bin/uname`, `/bin/yes`, `/bin/clear`, `/bin/whoami`,
+/// `/bin/kill`, `/bin/basename`, `/bin/dirname`, `/bin/seq`,
+/// `/bin/test` (also `/bin/[`), `/bin/tee`, `/bin/tr`, `/bin/cut`,
+/// `/bin/uniq`, `/bin/grep`, `/bin/printf`, `/bin/sort`, `/bin/od`,
+/// `/bin/expr`, `/bin/touch`, `/bin/cp`, `/bin/rm`, `/bin/mkdir`,
+/// `/bin/cmp`, `/bin/date`, `/bin/comm`, `/bin/paste`, `/bin/nl`,
+/// `/bin/rev`, `/bin/tac`, `/bin/xargs`, `/bin/cksum`, `/bin/fold`,
+/// `/bin/realpath`, `/bin/cal`, `/bin/stat`, `/bin/which`, `/bin/sum`,
+/// `/bin/uptime`, `/bin/factor`, `/bin/expand`, `/bin/unexpand`,
+/// `/bin/split`, `/bin/base64`, `/bin/md5sum`, `/bin/sha256sum`,
+/// `/bin/sha1sum`, `/bin/sha512sum`, `/bin/base32`, `/bin/sha224sum`,
+/// `/bin/sha384sum`, `/bin/id`, `/bin/dd`, `/bin/hostname`, `/bin/tty`,
+/// `/bin/strings`, `/bin/file`, `/bin/free`, `/bin/install`,
+/// `/bin/timeout`, `/bin/logname`.
+/// Bare names without a leading `/` match the
 /// same set — a primitive `$PATH=/bin` shortcut so `sh`'s execve from a
 /// builtin's `argv[0] = "echo"` resolves without prefixing.
 ///
@@ -196,6 +834,162 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/sigtest" | b"sigtest" => Some(EMBEDDED_SIGTEST),
         b"/bin/mmaptest" | b"mmaptest" => Some(EMBEDDED_MMAPTEST),
         b"/bin/sleep" | b"sleep" => Some(EMBEDDED_SLEEP),
+        b"/bin/yes" | b"yes" => Some(EMBEDDED_YES),
+        b"/bin/clear" | b"clear" => Some(EMBEDDED_CLEAR),
+        b"/bin/whoami" | b"whoami" => Some(EMBEDDED_WHOAMI),
+        b"/bin/kill" | b"kill" => Some(EMBEDDED_KILL),
+        b"/bin/basename" | b"basename" => Some(EMBEDDED_BASENAME),
+        b"/bin/dirname" | b"dirname" => Some(EMBEDDED_DIRNAME),
+        b"/bin/seq" | b"seq" => Some(EMBEDDED_SEQ),
+        b"/bin/test" | b"test" | b"/bin/[" | b"[" => Some(EMBEDDED_TEST),
+        b"/bin/tee" | b"tee" => Some(EMBEDDED_TEE),
+        b"/bin/tr" | b"tr" => Some(EMBEDDED_TR),
+        b"/bin/cut" | b"cut" => Some(EMBEDDED_CUT),
+        b"/bin/uniq" | b"uniq" => Some(EMBEDDED_UNIQ),
+        b"/bin/grep" | b"grep" => Some(EMBEDDED_GREP),
+        b"/bin/printf" | b"printf" => Some(EMBEDDED_PRINTF),
+        b"/bin/sort" | b"sort" => Some(EMBEDDED_SORT),
+        b"/bin/od" | b"od" => Some(EMBEDDED_OD),
+        b"/bin/expr" | b"expr" => Some(EMBEDDED_EXPR),
+        b"/bin/touch" | b"touch" => Some(EMBEDDED_TOUCH),
+        b"/bin/cp" | b"cp" => Some(EMBEDDED_CP),
+        b"/bin/rm" | b"rm" => Some(EMBEDDED_RM),
+        b"/bin/mkdir" | b"mkdir" => Some(EMBEDDED_MKDIR),
+        b"/bin/cmp" | b"cmp" => Some(EMBEDDED_CMP),
+        b"/bin/date" | b"date" => Some(EMBEDDED_DATE),
+        b"/bin/comm" | b"comm" => Some(EMBEDDED_COMM),
+        b"/bin/paste" | b"paste" => Some(EMBEDDED_PASTE),
+        b"/bin/nl" | b"nl" => Some(EMBEDDED_NL),
+        b"/bin/rev" | b"rev" => Some(EMBEDDED_REV),
+        b"/bin/tac" | b"tac" => Some(EMBEDDED_TAC),
+        b"/bin/xargs" | b"xargs" => Some(EMBEDDED_XARGS),
+        b"/bin/cksum" | b"cksum" => Some(EMBEDDED_CKSUM),
+        b"/bin/fold" | b"fold" => Some(EMBEDDED_FOLD),
+        b"/bin/realpath" | b"realpath" => Some(EMBEDDED_REALPATH),
+        b"/bin/cal" | b"cal" => Some(EMBEDDED_CAL),
+        b"/bin/stat" | b"stat" => Some(EMBEDDED_STAT),
+        b"/bin/which" | b"which" => Some(EMBEDDED_WHICH),
+        b"/bin/sum" | b"sum" => Some(EMBEDDED_SUM),
+        b"/bin/uptime" | b"uptime" => Some(EMBEDDED_UPTIME),
+        b"/bin/factor" | b"factor" => Some(EMBEDDED_FACTOR),
+        b"/bin/expand" | b"expand" => Some(EMBEDDED_EXPAND),
+        b"/bin/unexpand" | b"unexpand" => Some(EMBEDDED_UNEXPAND),
+        b"/bin/split" | b"split" => Some(EMBEDDED_SPLIT),
+        b"/bin/base64" | b"base64" => Some(EMBEDDED_BASE64),
+        b"/bin/md5sum" | b"md5sum" => Some(EMBEDDED_MD5SUM),
+        b"/bin/sha256sum" | b"sha256sum" => Some(EMBEDDED_SHA256SUM),
+        b"/bin/sha1sum" | b"sha1sum" => Some(EMBEDDED_SHA1SUM),
+        b"/bin/sha512sum" | b"sha512sum" => Some(EMBEDDED_SHA512SUM),
+        b"/bin/base32" | b"base32" => Some(EMBEDDED_BASE32),
+        b"/bin/sha224sum" | b"sha224sum" => Some(EMBEDDED_SHA224SUM),
+        b"/bin/sha384sum" | b"sha384sum" => Some(EMBEDDED_SHA384SUM),
+        b"/bin/id" | b"id" => Some(EMBEDDED_ID),
+        b"/bin/dd" | b"dd" => Some(EMBEDDED_DD),
+        b"/bin/hostname" | b"hostname" => Some(EMBEDDED_HOSTNAME),
+        b"/bin/tty" | b"tty" => Some(EMBEDDED_TTY),
+        b"/bin/strings" | b"strings" => Some(EMBEDDED_STRINGS),
+        b"/bin/file" | b"file" => Some(EMBEDDED_FILE),
+        b"/bin/free" | b"free" => Some(EMBEDDED_FREE),
+        b"/bin/install" | b"install" => Some(EMBEDDED_INSTALL),
+        b"/bin/timeout" | b"timeout" => Some(EMBEDDED_TIMEOUT),
+        b"/bin/logname" | b"logname" => Some(EMBEDDED_LOGNAME),
+        b"/bin/groups" | b"groups" => Some(EMBEDDED_GROUPS),
+        b"/bin/users" | b"users" => Some(EMBEDDED_USERS),
+        b"/bin/getent" | b"getent" => Some(EMBEDDED_GETENT),
+        b"/bin/nproc" | b"nproc" => Some(EMBEDDED_NPROC),
+        b"/bin/arch" | b"arch" => Some(EMBEDDED_ARCH),
+        b"/bin/pathchk" | b"pathchk" => Some(EMBEDDED_PATHCHK),
+        b"/bin/printenv" | b"printenv" => Some(EMBEDDED_PRINTENV),
+        b"/bin/nohup" | b"nohup" => Some(EMBEDDED_NOHUP),
+        b"/bin/mesg" | b"mesg" => Some(EMBEDDED_MESG),
+        b"/bin/mountpoint" | b"mountpoint" => Some(EMBEDDED_MOUNTPOINT),
+        b"/bin/lsmod" | b"lsmod" => Some(EMBEDDED_LSMOD),
+        b"/bin/nice" | b"nice" => Some(EMBEDDED_NICE),
+        b"/bin/df" | b"df" => Some(EMBEDDED_DF),
+        b"/bin/lscpu" | b"lscpu" => Some(EMBEDDED_LSCPU),
+        b"/bin/hostid" | b"hostid" => Some(EMBEDDED_HOSTID),
+        b"/bin/who" | b"who" => Some(EMBEDDED_WHO),
+        b"/bin/last" | b"last" => Some(EMBEDDED_LAST),
+        b"/bin/lsipc" | b"lsipc" => Some(EMBEDDED_LSIPC),
+        b"/bin/ipcs" | b"ipcs" => Some(EMBEDDED_IPCS),
+        b"/bin/locale" | b"locale" => Some(EMBEDDED_LOCALE),
+        b"/bin/pidof" | b"pidof" => Some(EMBEDDED_PIDOF),
+        b"/bin/ldd" | b"ldd" => Some(EMBEDDED_LDD),
+        b"/bin/ldconfig" | b"ldconfig" => Some(EMBEDDED_LDCONFIG),
+        b"/bin/vmstat" | b"vmstat" => Some(EMBEDDED_VMSTAT),
+        b"/bin/passwd" | b"passwd" => Some(EMBEDDED_PASSWD),
+        b"/bin/chsh" | b"chsh" => Some(EMBEDDED_CHSH),
+        b"/bin/ulimit" | b"ulimit" => Some(EMBEDDED_ULIMIT),
+        b"/bin/mount" | b"mount" => Some(EMBEDDED_MOUNT),
+        b"/bin/lspci" | b"lspci" => Some(EMBEDDED_LSPCI),
+        b"/bin/lsusb" | b"lsusb" => Some(EMBEDDED_LSUSB),
+        b"/bin/blkid" | b"blkid" => Some(EMBEDDED_BLKID),
+        b"/bin/lsblk" | b"lsblk" => Some(EMBEDDED_LSBLK),
+        b"/bin/swapon" | b"swapon" => Some(EMBEDDED_SWAPON),
+        b"/bin/hostnamectl" | b"hostnamectl" => Some(EMBEDDED_HOSTNAMECTL),
+        b"/bin/timedatectl" | b"timedatectl" => Some(EMBEDDED_TIMEDATECTL),
+        b"/bin/localectl" | b"localectl" => Some(EMBEDDED_LOCALECTL),
+        b"/bin/useradd" | b"useradd" => Some(EMBEDDED_USERADD),
+        b"/bin/userdel" | b"userdel" => Some(EMBEDDED_USERDEL),
+        b"/bin/usermod" | b"usermod" => Some(EMBEDDED_USERMOD),
+        b"/bin/groupadd" | b"groupadd" => Some(EMBEDDED_GROUPADD),
+        b"/bin/groupdel" | b"groupdel" => Some(EMBEDDED_GROUPDEL),
+        b"/bin/groupmod" | b"groupmod" => Some(EMBEDDED_GROUPMOD),
+        b"/bin/tput" | b"tput" => Some(EMBEDDED_TPUT),
+        b"/bin/reset" | b"reset" => Some(EMBEDDED_RESET),
+        b"/bin/tabs" | b"tabs" => Some(EMBEDDED_TABS),
+        b"/bin/whereis" | b"whereis" => Some(EMBEDDED_WHEREIS),
+        b"/bin/apropos" | b"apropos" => Some(EMBEDDED_APROPOS),
+        b"/bin/whatis" | b"whatis" => Some(EMBEDDED_WHATIS),
+        b"/bin/lsattr" | b"lsattr" => Some(EMBEDDED_LSATTR),
+        b"/bin/chattr" | b"chattr" => Some(EMBEDDED_CHATTR),
+        b"/bin/getfacl" | b"getfacl" => Some(EMBEDDED_GETFACL),
+        b"/bin/chmod" | b"chmod" => Some(EMBEDDED_CHMOD),
+        b"/bin/chown" | b"chown" => Some(EMBEDDED_CHOWN),
+        b"/bin/chgrp" | b"chgrp" => Some(EMBEDDED_CHGRP),
+        b"/bin/ln" | b"ln" => Some(EMBEDDED_LN),
+        b"/bin/mv" | b"mv" => Some(EMBEDDED_MV),
+        b"/bin/mkfifo" | b"mkfifo" => Some(EMBEDDED_MKFIFO),
+        b"/bin/ifconfig" | b"ifconfig" => Some(EMBEDDED_IFCONFIG),
+        b"/bin/route" | b"route" => Some(EMBEDDED_ROUTE),
+        b"/bin/netstat" | b"netstat" => Some(EMBEDDED_NETSTAT),
+        b"/bin/arp" | b"arp" => Some(EMBEDDED_ARP),
+        b"/bin/ss" | b"ss" => Some(EMBEDDED_SS),
+        b"/bin/ip" | b"ip" => Some(EMBEDDED_IP),
+        b"/bin/su" | b"su" => Some(EMBEDDED_SU),
+        b"/bin/login" | b"login" => Some(EMBEDDED_LOGIN),
+        b"/bin/sudo" | b"sudo" => Some(EMBEDDED_SUDO),
+        b"/bin/write" | b"write" => Some(EMBEDDED_WRITE),
+        b"/bin/wall" | b"wall" => Some(EMBEDDED_WALL),
+        b"/bin/talk" | b"talk" => Some(EMBEDDED_TALK),
+        b"/bin/crontab" | b"crontab" => Some(EMBEDDED_CRONTAB),
+        b"/bin/at" | b"at" => Some(EMBEDDED_AT),
+        b"/bin/batch" | b"batch" => Some(EMBEDDED_BATCH),
+        b"/bin/pgrep" | b"pgrep" => Some(EMBEDDED_PGREP),
+        b"/bin/pkill" | b"pkill" => Some(EMBEDDED_PKILL),
+        b"/bin/killall" | b"killall" => Some(EMBEDDED_KILLALL),
+        b"/bin/ps" | b"ps" => Some(EMBEDDED_PS),
+        b"/bin/top" | b"top" => Some(EMBEDDED_TOP),
+        b"/bin/pmap" | b"pmap" => Some(EMBEDDED_PMAP),
+        b"/bin/iostat" | b"iostat" => Some(EMBEDDED_IOSTAT),
+        b"/bin/mpstat" | b"mpstat" => Some(EMBEDDED_MPSTAT),
+        b"/bin/pidstat" | b"pidstat" => Some(EMBEDDED_PIDSTAT),
+        b"/bin/finger" | b"finger" => Some(EMBEDDED_FINGER),
+        b"/bin/newgrp" | b"newgrp" => Some(EMBEDDED_NEWGRP),
+        b"/bin/chrt" | b"chrt" => Some(EMBEDDED_CHRT),
+        b"/bin/taskset" | b"taskset" => Some(EMBEDDED_TASKSET),
+        b"/bin/ionice" | b"ionice" => Some(EMBEDDED_IONICE),
+        b"/bin/watch" | b"watch" => Some(EMBEDDED_WATCH),
+        b"/bin/setfacl" | b"setfacl" => Some(EMBEDDED_SETFACL),
+        b"/bin/chacl" | b"chacl" => Some(EMBEDDED_CHACL),
+        b"/bin/iconv" | b"iconv" => Some(EMBEDDED_ICONV),
+        b"/bin/shutdown" | b"shutdown" => Some(EMBEDDED_SHUTDOWN),
+        b"/bin/reboot" | b"reboot" => Some(EMBEDDED_REBOOT),
+        b"/bin/halt" | b"halt" => Some(EMBEDDED_HALT),
+        b"/bin/sync" | b"sync" => Some(EMBEDDED_SYNC),
+        b"/bin/readlink" | b"readlink" => Some(EMBEDDED_READLINK),
+        b"/bin/truncate" | b"truncate" => Some(EMBEDDED_TRUNCATE),
+        b"/bin/rmdir" | b"rmdir" => Some(EMBEDDED_RMDIR),
         _ => None,
     }
 }
