@@ -1126,6 +1126,82 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::time_syscalls::sys_clock_gettime(args.arg0 as u32, args.arg1) }
         }
 
+        // SYS_UNAME (63): fill struct utsname with system identification.
+        // POSIX.1-2024 uname(3p). nodename/domainname reflect the mutable globals.
+        oncrix_syscall::number::SYS_UNAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sysid_syscall::sys_uname(args.arg0) }
+        }
+
+        // SYS_SETHOSTNAME (170): set the system hostname (up to 64 bytes).
+        oncrix_syscall::number::SYS_SETHOSTNAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sysid_syscall::sys_sethostname(args.arg0, args.arg1) }
+        }
+
+        // SYS_SETDOMAINNAME (171): set the NIS/YP domain name (up to 64 bytes).
+        oncrix_syscall::number::SYS_SETDOMAINNAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sysid_syscall::sys_setdomainname(args.arg0, args.arg1) }
+        }
+
+        // SYS_GETTIMEOFDAY (96): write struct timeval from PIT tick counter;
+        // zero-fill optional struct timezone. POSIX.1-2024 gettimeofday(3p)
+        // (marked obsolescent — use clock_gettime instead).
+        oncrix_syscall::number::SYS_GETTIMEOFDAY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_gettimeofday(args.arg0, args.arg1) }
+        }
+
+        // SYS_SETTIMEOFDAY (164): ONCRIX has no settable RTC; always -EPERM.
+        // POSIX.1-2024 settimeofday(3p).
+        oncrix_syscall::number::SYS_SETTIMEOFDAY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; no pointer is dereferenced.
+            unsafe { crate::time_syscalls::sys_settimeofday(args.arg0, args.arg1) }
+        }
+
+        // SYS_CLOCK_GETRES (229): report PIT clock resolution (10 ms / 10_000_000 ns).
+        // POSIX.1-2024 clock_getres(3p).
+        oncrix_syscall::number::SYS_CLOCK_GETRES => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_clock_getres(args.arg0 as u32, args.arg1) }
+        }
+
+        // SYS_CAPGET (125): retrieve capability sets for the calling thread.
+        // ONCRIX has no capability model; data is zero-filled. POSIX.1-2024 / Linux capget(2).
+        oncrix_syscall::number::SYS_CAPGET => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_capget(args.arg0, args.arg1) }
+        }
+
+        // SYS_CAPSET (126): set capability sets for the calling thread.
+        // No-op on ONCRIX (no capability enforcement). Linux capset(2).
+        oncrix_syscall::number::SYS_CAPSET => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_capset(args.arg0, args.arg1) }
+        }
+
+        // SYS_GETGROUPS (115): get supplementary group IDs.
+        // ONCRIX has no supplementary groups; always returns 0. POSIX.1-2024 getgroups(3p).
+        oncrix_syscall::number::SYS_GETGROUPS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_getgroups(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_SETGROUPS (116): set supplementary group IDs.
+        // Refused with EPERM for size>0; size==0 is a no-op. POSIX.1-2024 setgroups(3p).
+        oncrix_syscall::number::SYS_SETGROUPS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_setgroups(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_PERSONALITY (135): query or set execution domain.
+        // ONCRIX supports PER_LINUX only; always returns 0. Linux personality(2).
+        oncrix_syscall::number::SYS_PERSONALITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_personality(args.arg0) }
+        }
+
         // SYS_NANOSLEEP (35): block for the requested duration via
         // cooperative yield_now polling. POSIX.1-2024 nanosleep(3p).
         oncrix_syscall::number::SYS_NANOSLEEP => {

@@ -131,6 +131,7 @@ pub mod state;
 #[allow(dead_code, clippy::all)]
 pub mod suspend;
 pub mod sysctl;
+pub mod sysid_syscall;
 pub mod tc;
 pub mod tc_htb;
 pub mod tc_police;

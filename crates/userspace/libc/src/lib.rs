@@ -87,6 +87,18 @@ const SYS_WAIT4: u64 = 61;
 const SYS_WAITID: u64 = 247;
 const SYS_KILL: u64 = 62;
 const SYS_GETDENTS64: u64 = 217;
+// identity / time / creds
+const SYS_UNAME: u64 = 63;
+const SYS_SETHOSTNAME: u64 = 170;
+const SYS_SETDOMAINNAME: u64 = 171;
+const SYS_GETTIMEOFDAY: u64 = 96;
+const SYS_SETTIMEOFDAY: u64 = 164;
+const SYS_CLOCK_GETRES: u64 = 229;
+const SYS_CAPGET: u64 = 125;
+const SYS_CAPSET: u64 = 126;
+const SYS_GETGROUPS: u64 = 115;
+const SYS_SETGROUPS: u64 = 116;
+const SYS_PERSONALITY: u64 = 135;
 // misc / advisory
 const SYS_FLOCK: u64 = 73;
 const SYS_MSYNC: u64 = 26;
@@ -2360,4 +2372,263 @@ pub unsafe fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
     unsafe {
         syscall4(SYS_FALLOCATE, fd as u64, mode as u64, offset as u64, len as u64)
     }
+}
+
+
+// ── uname / time / creds ───────────────────────────────────────────
+
+/// `struct utsname` — system identification information.
+///
+/// Six fixed-size fields, each 65 bytes (64 usable bytes + NUL terminator),
+/// in the order specified by POSIX.1-2024 `uname(3p)` and the Linux
+/// x86_64 ABI: `sysname`, `nodename`, `release`, `version`, `machine`,
+/// `domainname`.  Total size: 390 bytes.
+#[repr(C)]
+pub struct Utsname {
+    /// Operating system name (e.g., `"ONCRIX"`).
+    pub sysname: [u8; 65],
+    /// Network node hostname.
+    pub nodename: [u8; 65],
+    /// OS release level (e.g., `"0.1.0"`).
+    pub release: [u8; 65],
+    /// OS version string.
+    pub version: [u8; 65],
+    /// Hardware type (e.g., `"x86_64"`).
+    pub machine: [u8; 65],
+    /// NIS or YP domain name.
+    pub domainname: [u8; 65],
+}
+
+impl Utsname {
+    /// Return a zeroed `Utsname` suitable for passing to [`uname`].
+    pub const fn zeroed() -> Self {
+        Self {
+            sysname: [0u8; 65],
+            nodename: [0u8; 65],
+            release: [0u8; 65],
+            version: [0u8; 65],
+            machine: [0u8; 65],
+            domainname: [0u8; 65],
+        }
+    }
+}
+
+/// `uname(buf)` — retrieve system identification strings.
+///
+/// Fills `*buf` with operating-system identity information.
+/// Returns `0` on success.
+///
+/// `gethostname(2)` is emulated by calling `uname` and reading
+/// `buf.nodename`.
+///
+/// # Safety
+///
+/// `buf` must point to a writable, properly aligned `Utsname`.
+pub unsafe fn uname(buf: *mut Utsname) -> i64 {
+    // SAFETY: caller guarantees buf is a valid, writable pointer.
+    unsafe { syscall1(SYS_UNAME, buf as u64) }
+}
+
+/// `sethostname(name, len)` — set the system hostname.
+///
+/// `name` must point to `len` bytes of hostname data (no NUL required).
+/// `len` must be ≤ 64; otherwise `-EINVAL` is returned.
+///
+/// # Safety
+///
+/// `name` must be a valid pointer to at least `len` readable bytes.
+pub unsafe fn sethostname(name: *const u8, len: usize) -> i64 {
+    // SAFETY: caller guarantees name points to len readable bytes.
+    unsafe { syscall2(SYS_SETHOSTNAME, name as u64, len as u64) }
+}
+
+/// `setdomainname(name, len)` — set the NIS/YP domain name.
+///
+/// `name` must point to `len` bytes of domain-name data (no NUL required).
+/// `len` must be ≤ 64; otherwise `-EINVAL` is returned.
+///
+/// # Safety
+///
+/// `name` must be a valid pointer to at least `len` readable bytes.
+pub unsafe fn setdomainname(name: *const u8, len: usize) -> i64 {
+    // SAFETY: caller guarantees name points to len readable bytes.
+    unsafe { syscall2(SYS_SETDOMAINNAME, name as u64, len as u64) }
+}
+
+/// POSIX `struct timeval` — seconds and microseconds.
+///
+/// Layout matches the C ABI: two consecutive `i64` fields (16 bytes on
+/// x86_64).  Used by `gettimeofday(2)`, `select(2)`, `setitimer(2)`, etc.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimeVal {
+    /// Whole seconds.
+    pub tv_sec: i64,
+    /// Microseconds in `[0, 999_999]`.
+    pub tv_usec: i64,
+}
+
+/// `gettimeofday(tv, tz)` — read the current time into `*tv`.
+///
+/// `tv` may be null if only timezone information is wanted (rare; the `tz`
+/// argument is obsolete).  When non-null, `*tv` is filled with the
+/// since-boot time in seconds + microseconds.
+///
+/// `tz` should be null in new code; when non-null it receives a zeroed
+/// `struct timezone` (obsolete per POSIX.1-2024).
+///
+/// Returns 0 on success or a negative errno (`-EFAULT`).
+///
+/// # Safety
+///
+/// `tv` must be null or a valid `*mut TimeVal` in the calling process's
+/// address space.  `tz` must be null or point to at least 8 writable bytes.
+pub unsafe fn gettimeofday(tv: *mut TimeVal, tz: *mut u8) -> i64 {
+    // SAFETY: caller upholds the pointer contracts.
+    unsafe { syscall2(SYS_GETTIMEOFDAY, tv as u64, tz as u64) }
+}
+
+/// `settimeofday(tv, tz)` — attempt to set the system clock.
+///
+/// ONCRIX has no settable RTC source; this call always returns `-1`
+/// (`EPERM`).  Provided for API completeness and to allow code that calls
+/// `settimeofday` to link without changes.
+///
+/// # Safety
+///
+/// `tv` must be null or a valid `*const TimeVal`.  `tz` must be null or a
+/// valid pointer to a `struct timezone` (8 bytes).  Neither pointer is
+/// actually dereferenced by the kernel on ONCRIX.
+pub unsafe fn settimeofday(tv: *const TimeVal, tz: *const u8) -> i64 {
+    // SAFETY: caller upholds the pointer contracts; kernel ignores them.
+    unsafe { syscall2(SYS_SETTIMEOFDAY, tv as u64, tz as u64) }
+}
+
+/// `clock_getres(clk_id, res)` — query the resolution of a POSIX clock.
+///
+/// On ONCRIX, `CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1) are both
+/// backed by the 100 Hz PIT, so the resolution is 10 ms (10_000_000 ns).
+/// `res` may be null if the caller only wants to validate `clk_id`.
+///
+/// Returns 0 on success, `-EINVAL` for an unknown clock, `-EFAULT` for a
+/// bad non-null `res` pointer.
+///
+/// # Safety
+///
+/// `res` must be null or a valid `*mut Timespec` in the calling process's
+/// address space.
+pub unsafe fn clock_getres(clk_id: i32, res: *mut Timespec) -> i64 {
+    // SAFETY: caller upholds the pointer contract.
+    unsafe { syscall2(SYS_CLOCK_GETRES, clk_id as u64, res as u64) }
+}
+
+/// `CapUserHeader` — Linux `cap_user_header_t`.
+///
+/// Passed as the first argument to `capget(2)` and `capset(2)`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapUserHeader {
+    /// Capability ABI version.  Use `_LINUX_CAPABILITY_VERSION_3` (0x2008_0522)
+    /// for 64-bit capability sets.
+    pub version: u32,
+    /// Target thread PID; 0 means the calling thread.
+    pub pid: i32,
+}
+
+/// `CapUserData` — Linux `cap_user_data_t[2]` (version 3, 64-bit sets).
+///
+/// Represents effective, permitted, and inheritable capability sets each
+/// split into a low and high 32-bit word (two `cap_user_data_t` entries
+/// packed contiguously, 24 bytes total).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapUserData {
+    /// Effective capabilities (bits 0–31).
+    pub effective_lo: u32,
+    /// Permitted capabilities (bits 0–31).
+    pub permitted_lo: u32,
+    /// Inheritable capabilities (bits 0–31).
+    pub inheritable_lo: u32,
+    /// Effective capabilities (bits 32–63).
+    pub effective_hi: u32,
+    /// Permitted capabilities (bits 32–63).
+    pub permitted_hi: u32,
+    /// Inheritable capabilities (bits 32–63).
+    pub inheritable_hi: u32,
+}
+
+/// Linux capability ABI version 3 constant (64-bit sets).
+pub const _LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `capget(2)` — get the capability sets of the calling thread.
+///
+/// On ONCRIX the process holds no capabilities; `data` is zero-filled.
+/// Returns 0 on success or a negative errno value.
+///
+/// # Safety
+///
+/// `hdr` and `data` must be valid, writable pointers. `data` may be null
+/// if only the header version is being probed.
+pub unsafe fn capget(hdr: *mut CapUserHeader, data: *mut CapUserData) -> i64 {
+    // SAFETY: caller guarantees hdr is valid.
+    unsafe { syscall2(SYS_CAPGET, hdr as u64, data as u64) }
+}
+
+/// `capset(2)` — set the capability sets of the calling thread.
+///
+/// On ONCRIX this is a no-op; any well-formed call returns 0.
+/// Returns 0 on success or a negative errno value.
+///
+/// # Safety
+///
+/// `hdr` must be a valid pointer. `data` may be null for version-probe calls.
+pub unsafe fn capset(hdr: *const CapUserHeader, data: *const CapUserData) -> i64 {
+    // SAFETY: caller guarantees hdr is valid.
+    unsafe { syscall2(SYS_CAPSET, hdr as u64, data as u64) }
+}
+
+/// `getgroups(2)` — get supplementary group IDs of the calling process.
+///
+/// ONCRIX has no supplementary groups; always returns 0 (empty list).
+/// If `size == 0`, returns the count (0) without touching `list`.
+/// If `size > 0`, validates `list` and returns 0.
+///
+/// Returns the number of supplementary groups (0) or a negative errno value.
+///
+/// # Safety
+///
+/// When `size > 0`, `list` must be a valid pointer to at least `size`
+/// writable `u32` slots.
+pub unsafe fn getgroups(size: i32, list: *mut u32) -> i64 {
+    // SAFETY: caller guarantees list is valid when size > 0.
+    unsafe { syscall2(SYS_GETGROUPS, size as u64, list as u64) }
+}
+
+/// `setgroups(2)` — set supplementary group IDs of the calling process.
+///
+/// ONCRIX returns `-EPERM` for `size > 0`; `size == 0` (clear) succeeds.
+///
+/// Returns 0 on success or a negative errno value (`-EPERM` if `size > 0`).
+///
+/// # Safety
+///
+/// When `size > 0`, `list` must be a valid pointer to at least `size`
+/// readable `u32` slots.
+pub unsafe fn setgroups(size: i32, list: *const u32) -> i64 {
+    // SAFETY: caller guarantees list is valid when size > 0.
+    unsafe { syscall2(SYS_SETGROUPS, size as u64, list as u64) }
+}
+
+/// `personality(2)` — query or set the execution domain.
+///
+/// Pass `0xFFFF_FFFF_u32` as `persona` to query the current personality
+/// without changing it.  ONCRIX supports only `PER_LINUX` (0); all calls
+/// return 0 (the previous personality).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn personality(persona: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_PERSONALITY, persona as u64) }
 }

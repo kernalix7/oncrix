@@ -353,6 +353,25 @@ pub const SYS_SETITIMER: SyscallNumber = 38;
 /// `time(tloc)` — Seconds since the Epoch (or boot, on systems without RTC).
 pub const SYS_TIME: SyscallNumber = 201;
 
+/// `uname(buf)` — fill `struct utsname` with system identification.
+pub const SYS_UNAME: SyscallNumber = 63;
+/// `sethostname(name, len)` — set the system hostname.
+pub const SYS_SETHOSTNAME: SyscallNumber = 170;
+/// `setdomainname(name, len)` — set the NIS/YP domain name.
+pub const SYS_SETDOMAINNAME: SyscallNumber = 171;
+/// `gettimeofday(tv, tz)` — get wall-clock time as `struct timeval`.
+pub const SYS_GETTIMEOFDAY: SyscallNumber = 96;
+/// `settimeofday(tv, tz)` — set wall-clock time (requires privilege).
+pub const SYS_SETTIMEOFDAY: SyscallNumber = 164;
+/// `clock_getres(clk_id, res)` — query clock resolution.
+pub const SYS_CLOCK_GETRES: SyscallNumber = 229;
+/// `capget(header, data)` — get the capability sets of a thread.
+pub const SYS_CAPGET: SyscallNumber = 125;
+/// `capset(header, data)` — set the capability sets of a thread.
+pub const SYS_CAPSET: SyscallNumber = 126;
+/// `personality(persona)` — query or set the execution domain.
+pub const SYS_PERSONALITY: SyscallNumber = 135;
+
 // ── Signal (POSIX) ──────────────────────────────────────────────
 
 /// `rt_sigaction(sig, act, oldact)` — Set signal action.

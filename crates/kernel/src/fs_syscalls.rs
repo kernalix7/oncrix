@@ -2088,3 +2088,170 @@ pub unsafe fn sys_fallocate(fd: i32, mode: i32, offset: u64, len: u64) -> i64 {
         None => -5, // EIO
     }
 }
+
+// ── capget / capset / getgroups / setgroups / personality ─────────
+
+// ── sys_capget ────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_CAPGET` (number 125).
+///
+/// `capget(header, data)` — retrieve the capability sets for the calling
+/// thread.  ONCRIX does not implement a capability model; the process
+/// holds no capabilities.  The handler:
+///
+/// 1. Validates `header_ptr` (non-null, not in kernel-canonical space).
+/// 2. If `data_ptr` is non-null and valid, zero-fills the 24-byte
+///    `cap_user_data_t[2]` structure so the caller sees all-zero
+///    effective / permitted / inheritable capability sets.
+/// 3. Returns 0.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-14` EFAULT — `header_ptr` is null or kernel-canonical.
+/// - `-14` EFAULT — `data_ptr` is non-null but kernel-canonical.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_capget(header_ptr: u64, data_ptr: u64) -> i64 {
+    // Validate the mandatory header pointer.
+    if header_ptr == 0 || header_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // data_ptr may be null (caller only querying the version in the header).
+    // If non-null it must be a valid user address.
+    if data_ptr != 0 && data_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    if data_ptr != 0 {
+        // Zero-fill the two cap_user_data_t entries (6 × u32 = 24 bytes).
+        // SAFETY: validated above; writing within user-accessible address range.
+        unsafe {
+            core::ptr::write_bytes(data_ptr as *mut u8, 0, 24);
+        }
+    }
+
+    0
+}
+
+// ── sys_capset ────────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_CAPSET` (number 126).
+///
+/// `capset(header, data)` — set the capability sets for the calling thread.
+/// ONCRIX does not implement a capability model; any well-formed call
+/// succeeds silently (no-op).  The handler validates the pointer arguments
+/// and returns 0.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-14` EFAULT — `header_ptr` is null or kernel-canonical.
+/// - `-14` EFAULT — `data_ptr` is non-null but kernel-canonical.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_capset(header_ptr: u64, data_ptr: u64) -> i64 {
+    // The header pointer is required by the Linux ABI.
+    if header_ptr == 0 || header_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // data_ptr may be null for version-probe calls; if non-null validate it.
+    if data_ptr != 0 && data_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // No capability enforcement: accept and succeed.
+    0
+}
+
+// ── sys_getgroups ─────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_GETGROUPS` (number 115).
+///
+/// `getgroups(size, list)` — get the supplementary group IDs of the calling
+/// process.  ONCRIX runs a single-user model with no supplementary groups,
+/// so the group list is always empty.
+///
+/// POSIX.1-2024 semantics:
+/// - If `size == 0`, return the number of supplementary groups (0 here).
+/// - If `size > 0` and the list fits, copy group IDs into `list` and return
+///   the count.  Since the count is 0, nothing is written.
+/// - If `size > 0` and `list` is a bad pointer, return `-EFAULT`.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-14` EFAULT — `size > 0` and `list_ptr` is null or kernel-canonical.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_getgroups(size: i64, list_ptr: u64) -> i64 {
+    if size == 0 {
+        // POSIX: return the number of supplementary groups.
+        return 0;
+    }
+    if size < 0 {
+        return -22; // EINVAL
+    }
+    // size > 0: validate the output pointer even though we write nothing.
+    if list_ptr == 0 || list_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // The supplementary group list is empty; return 0 (count written).
+    0
+}
+
+// ── sys_setgroups ─────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_SETGROUPS` (number 116).
+///
+/// `setgroups(size, list)` — set the supplementary group IDs of the calling
+/// process.  ONCRIX is a single-user system without supplementary group
+/// support:
+///
+/// - `size == 0`: clear the supplementary group list (already empty); succeed.
+/// - `size > 0`: return `-EPERM` — the process does not hold `CAP_SETGID`.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-1` EPERM — `size > 0`; changing supplementary groups is not permitted.
+/// - `-22` EINVAL — `size < 0`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_setgroups(size: i64, _list_ptr: u64) -> i64 {
+    if size < 0 {
+        return -22; // EINVAL
+    }
+    if size == 0 {
+        // Clearing the supplementary group list is always accepted.
+        return 0;
+    }
+    // Any attempt to install supplementary groups is refused: ONCRIX has no
+    // supplementary-group support and the calling process holds no CAP_SETGID.
+    -1 // EPERM
+}
+
+// ── sys_personality ───────────────────────────────────────────────
+
+/// Kernel handler for `SYS_PERSONALITY` (number 135).
+///
+/// `personality(persona)` — query or set the execution domain (personality).
+/// ONCRIX supports only `PER_LINUX` (0x0000).  The call always succeeds and
+/// returns 0 regardless of the requested `persona`:
+///
+/// - `persona == 0xFFFF_FFFF`: query; return the current personality (0).
+/// - Any other value: acknowledge the set request; return the previous
+///   personality (0).  No domain switch is performed.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_personality(_persona: u64) -> i64 {
+    // Return the previous personality: PER_LINUX = 0.
+    0
+}

@@ -315,3 +315,123 @@ pub unsafe fn sys_clock_nanosleep(clockid: u32, flags: i32, request: u64, remain
     }
     0
 }
+
+// ── gettimeofday / clock_getres / settimeofday ────────────────────
+
+/// `gettimeofday(tv, tz)` — write the current time as `struct timeval`
+/// (`{tv_sec: i64, tv_usec: i64}`) to `tv_ptr`, and optionally zero-fill
+/// the obsolete `struct timezone` (`{tz_minuteswest: i32, tz_dsttime: i32}`)
+/// at `tz_ptr`.
+///
+/// `tv_ptr` may be null — the call still succeeds (the caller may only want
+/// timezone handling, or may just be testing the syscall).  `tz_ptr` is
+/// always optional; when non-null it is zero-filled because timezone support
+/// is obsolete per POSIX.1-2024.
+///
+/// Both pointers, when non-null, must be user-canonical
+/// (< `0xFFFF_8000_0000_0000`); a kernel-space address returns `-EFAULT` (-14).
+///
+/// POSIX.1-2024 reference: `functions/gettimeofday.html` (obsolescent).
+/// Both clocks map onto the PIT since-boot counter — no RTC is present.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path (interrupts
+/// off via FMASK); no concurrent mutation of `PIT_TIMER` is possible.
+pub unsafe fn sys_gettimeofday(tv_ptr: u64, tz_ptr: u64) -> i64 {
+    // Validate tv_ptr when non-null.
+    if tv_ptr != 0 && tv_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    // Validate tz_ptr when non-null.
+    if tz_ptr != 0 && tz_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    if tv_ptr != 0 {
+        // SAFETY: see module-level note; current_ticks reads PIT only.
+        let ticks = unsafe { current_ticks() };
+        let tv_sec = (ticks / TIMER_HZ) as i64;
+        // tv_usec = (ticks % TIMER_HZ) * 1_000_000 / TIMER_HZ
+        let tv_usec = ((ticks % TIMER_HZ) * 1_000_000 / TIMER_HZ) as i64;
+
+        // SAFETY: tv_ptr is user-canonical; page-fault handler converts
+        // unmapped accesses to SIGSEGV without panicking the kernel.
+        unsafe {
+            let p = tv_ptr as *mut i64;
+            p.write_volatile(tv_sec);
+            p.add(1).write_volatile(tv_usec);
+        }
+    }
+
+    if tz_ptr != 0 {
+        // struct timezone is two i32 fields (8 bytes total).  The spec marks
+        // it obsolete; ONCRIX always returns (0, 0).
+        //
+        // SAFETY: tz_ptr is user-canonical; two consecutive i32 writes cover
+        // the 8-byte struct timezone layout.
+        unsafe {
+            let p = tz_ptr as *mut i32;
+            p.write_volatile(0); // tz_minuteswest
+            p.add(1).write_volatile(0); // tz_dsttime
+        }
+    }
+
+    0
+}
+
+/// `settimeofday(tv, tz)` — ONCRIX does not support setting the system clock
+/// via this interface; there is no writable RTC source.
+///
+/// Returns `-1` (`EPERM`) unconditionally.  This is consistent with POSIX
+/// behaviour for an unprivileged caller and mirrors what Linux does on
+/// systems without a settable clock source.
+///
+/// `tv_ptr` and `tz_ptr` are ignored; no pointer dereferences are performed.
+///
+/// POSIX.1-2024 reference: `functions/settimeofday.html`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_settimeofday(_tv_ptr: u64, _tz_ptr: u64) -> i64 {
+    -1 // EPERM — no settable clock source
+}
+
+/// `clock_getres(clk_id, res)` — query the resolution of a clock.
+///
+/// Supported clock IDs: `CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1).
+/// Both share the 100 Hz PIT, giving a resolution of 10 ms
+/// (10_000_000 ns).  `res_ptr` may be null when the caller only wants to
+/// validate `clk_id`.
+///
+/// Returns `0` on success, `-22` (`EINVAL`) for an unsupported clock,
+/// `-14` (`EFAULT`) for a bogus non-null `res_ptr`.
+///
+/// POSIX.1-2024 reference: `functions/clock_getres.html`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path (same
+/// invariant as the rest of this module).
+pub unsafe fn sys_clock_getres(clk_id: u32, res_ptr: u64) -> i64 {
+    // Only CLOCK_REALTIME (0) and CLOCK_MONOTONIC (1) are backed by the PIT.
+    if clk_id > 1 {
+        return -22; // EINVAL
+    }
+    if res_ptr != 0 {
+        if res_ptr >= 0xFFFF_8000_0000_0000 {
+            return -14; // EFAULT
+        }
+        // PIT resolution: 1/100 s = 10 ms = 10_000_000 ns.
+        //
+        // SAFETY: res_ptr is user-canonical; page-fault handler converts
+        // unmapped writes to SIGSEGV without panicking the kernel.
+        unsafe {
+            let p = res_ptr as *mut i64;
+            p.write_volatile(0); // tv_sec  = 0
+            p.add(1).write_volatile(10_000_000); // tv_nsec = 10 ms
+        }
+    }
+    0
+}
