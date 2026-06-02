@@ -381,6 +381,13 @@ impl KernelVfs {
         self.ramfs.set_mode(ino, FileMode(mode as u16))
     }
 
+    /// Return the number of inode slots currently in use in the ramfs.
+    ///
+    /// Used by the `statfs(2)`/`fstatfs(2)` handlers to compute `f_ffree`.
+    pub fn ramfs_used_inodes(&self) -> usize {
+        self.ramfs.used_inodes()
+    }
+
     /// Change the owner/group of the file identified by `ino`.
     ///
     /// The fd-keyed counterpart of [`chown_path`], for `fchown(2)`.

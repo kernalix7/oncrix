@@ -55,6 +55,10 @@ const SYS_RT_SIGACTION: u64 = 13;
 const SYS_ACCESS: u64 = 21;
 const SYS_FSYNC: u64 = 74;
 const SYS_FDATASYNC: u64 = 75;
+const SYS_STATFS: u64 = 137;
+const SYS_FSTATFS: u64 = 138;
+const SYS_SYSINFO: u64 = 99;
+const SYS_GETRANDOM: u64 = 318;
 const SYS_DUP2: u64 = 33;
 const SYS_DUP3: u64 = 292;
 const SYS_UMASK: u64 = 95;
@@ -1993,3 +1997,141 @@ pub unsafe fn newfstatat(dirfd: i32, path: *const u8, buf: *mut Stat, flags: i32
         )
     }
 }
+
+
+// ── statfs / sysinfo / getrandom ───────────────────────────────────
+
+/// Linux x86_64 `struct statfs` (120 bytes).
+///
+/// Matches the ABI layout used by the kernel `statfs(2)` / `fstatfs(2)` syscalls.
+/// All integer fields are in native (little-endian on x86_64) byte order.
+#[repr(C)]
+pub struct Statfs {
+    /// Filesystem type magic number (e.g. `0x858458f6` for ramfs).
+    pub f_type: i64,
+    /// Optimal transfer block size in bytes.
+    pub f_bsize: i64,
+    /// Total data blocks in the filesystem (in units of `f_bsize`).
+    pub f_blocks: i64,
+    /// Free blocks available to the superuser.
+    pub f_bfree: i64,
+    /// Free blocks available to unprivileged users.
+    pub f_bavail: i64,
+    /// Total file nodes (inodes) in the filesystem.
+    pub f_files: i64,
+    /// Free file nodes.
+    pub f_ffree: i64,
+    /// Filesystem id (`[i32; 2]`, stored as two `i32` values).
+    pub f_fsid: [i32; 2],
+    /// Maximum length of filenames.
+    pub f_namelen: i64,
+    /// Fragment size (equals `f_bsize` on ramfs).
+    pub f_frsize: i64,
+    /// Mount flags.
+    pub f_flags: i64,
+    /// Spare fields (reserved, zero-filled).
+    pub f_spare: [i64; 4],
+}
+
+/// `statfs(2)` — get filesystem statistics for the filesystem containing
+/// `pathname`.
+///
+/// On success `buf` is filled with a [`Statfs`] structure and the function
+/// returns 0. On error it returns a negative errno value.
+///
+/// # Safety
+///
+/// `pathname` must be a valid null-terminated string in user space.
+/// `buf` must point to a valid, writable [`Statfs`]-sized region.
+pub unsafe fn statfs(pathname: *const u8, buf: *mut Statfs) -> i64 {
+    // SAFETY: caller guarantees pathname is null-terminated and buf is valid.
+    unsafe { syscall2(SYS_STATFS, pathname as u64, buf as u64) }
+}
+
+/// `fstatfs(2)` — get filesystem statistics for the filesystem underlying `fd`.
+///
+/// On success `buf` is filled with a [`Statfs`] structure and the function
+/// returns 0. On error it returns a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to a valid, writable [`Statfs`]-sized region.
+pub unsafe fn fstatfs(fd: i32, buf: *mut Statfs) -> i64 {
+    // SAFETY: caller guarantees buf is valid.
+    unsafe { syscall2(SYS_FSTATFS, fd as u64, buf as u64) }
+}
+
+/// `struct sysinfo` — Linux x86_64 ABI, 112 bytes.
+///
+/// All `ram`/`swap`/`high` fields are in units of `mem_unit` bytes
+/// (always 1 in ONCRIX). The `loads` array holds the 1-, 5-, and
+/// 15-minute load averages scaled by `1 << SI_LOAD_SHIFT` (65536);
+/// ONCRIX always returns 0 for these until a scheduler load estimator
+/// is wired up.
+#[repr(C)]
+pub struct Sysinfo {
+    /// Seconds elapsed since boot.
+    pub uptime: i64,
+    /// 1-, 5-, 15-minute load averages (scaled by 65536).
+    pub loads: [u64; 3],
+    /// Total usable main memory (bytes when `mem_unit` == 1).
+    pub totalram: u64,
+    /// Available memory (bytes when `mem_unit` == 1).
+    pub freeram: u64,
+    /// Amount of shared memory (always 0 on ONCRIX).
+    pub sharedram: u64,
+    /// Memory used by buffers (always 0 on ONCRIX).
+    pub bufferram: u64,
+    /// Total swap space (always 0 on ONCRIX — no swap).
+    pub totalswap: u64,
+    /// Free swap space (always 0 on ONCRIX).
+    pub freeswap: u64,
+    /// Number of current processes.
+    pub procs: u16,
+    /// Explicit padding after `procs`.
+    pub pad: u16,
+    _pad2: u32,
+    /// Total high-memory size (always 0 — no high-mem zone).
+    pub totalhigh: u64,
+    /// Available high memory (always 0).
+    pub freehigh: u64,
+    /// Size of a memory unit in bytes (always 1).
+    pub mem_unit: u32,
+    _f: u32,
+}
+
+/// `sysinfo(2)` — retrieve general system statistics.
+///
+/// Fills `*info` with a snapshot of uptime, memory, and process counts.
+/// Returns 0 on success, or a negative errno value on error.
+///
+/// # Safety
+///
+/// `info` must point to a writable `Sysinfo` (112 bytes) in user space.
+pub unsafe fn sysinfo(info: *mut Sysinfo) -> i64 {
+    // SAFETY: caller guarantees `info` is a valid writable pointer.
+    unsafe { syscall1(SYS_SYSINFO, info as u64) }
+}
+
+/// `getrandom(2)` — fill `buf[..buflen]` with kernel pseudo-random bytes.
+///
+/// `flags` may be `GRND_NONBLOCK` (1) or `GRND_RANDOM` (2); both are
+/// accepted and currently ignored by the kernel.
+///
+/// Returns the number of bytes written on success, or a negative errno
+/// value on error (`-14` / `EFAULT` for an invalid buffer pointer).
+///
+/// # Safety
+///
+/// `buf` must point to a writable region of at least `buflen` bytes that
+/// remains valid for the duration of the call.
+pub unsafe fn getrandom(buf: *mut u8, buflen: usize, flags: u32) -> i64 {
+    // SAFETY: The caller guarantees `buf` is valid for `buflen` bytes.
+    unsafe { syscall3(SYS_GETRANDOM, buf as u64, buflen as u64, flags as u64) }
+}
+
+/// `GRND_NONBLOCK` — return `EAGAIN` instead of blocking (accepted, ignored).
+pub const GRND_NONBLOCK: u32 = 1;
+
+/// `GRND_RANDOM` — draw from the blocking `/dev/random` pool (accepted, ignored).
+pub const GRND_RANDOM: u32 = 2;

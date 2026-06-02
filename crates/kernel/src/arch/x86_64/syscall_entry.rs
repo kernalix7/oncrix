@@ -843,6 +843,33 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         // in-memory — nothing to flush; return success (mirrors SYS_SYNC).
         oncrix_syscall::number::SYS_FSYNC | oncrix_syscall::number::SYS_FDATASYNC => 0,
 
+        // SYS_STATFS (137): get filesystem statistics by path.
+        // POSIX.1-2024 statfs(2).
+        oncrix_syscall::number::SYS_STATFS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_statfs(args.arg0, args.arg1) }
+        }
+
+        // SYS_FSTATFS (138): get filesystem statistics by file descriptor.
+        // POSIX.1-2024 fstatfs(2).
+        oncrix_syscall::number::SYS_FSTATFS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_fstatfs(args.arg0 as i32, args.arg1) }
+        }
+
+        // SYS_SYSINFO (99): fill struct sysinfo for the caller.
+        oncrix_syscall::number::SYS_SYSINFO => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_sysinfo(args.arg0) }
+        }
+
+        // SYS_GETRANDOM (318): fill user buffer with pseudo-random bytes.
+        // flags GRND_NONBLOCK/GRND_RANDOM are accepted and ignored.
+        oncrix_syscall::number::SYS_GETRANDOM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::random_syscall::sys_getrandom(args.arg0, args.arg1, args.arg2) }
+        }
+
         // SYS_SYNC (162): flush filesystem buffers.
         // POSIX.1-2024 sync(3p). ramfs is in-memory, so there is nothing
         // to flush — return success immediately.

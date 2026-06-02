@@ -186,6 +186,15 @@ impl Ramfs {
         self.inodes[slot]
     }
 
+    /// Return the number of inode slots currently in use.
+    ///
+    /// Scans the fixed-size `self.inodes` table and counts `Some` entries.
+    /// Used by `statfs(2)`/`fstatfs(2)` to fill `f_ffree`
+    /// (free inodes = `MAX_INODES - used_inodes()`). O(MAX_INODES).
+    pub fn used_inodes(&self) -> usize {
+        self.inodes.iter().filter(|slot| slot.is_some()).count()
+    }
+
     /// Find the slot index for an inode number.
     fn slot_of(&self, ino: InodeNumber) -> Option<usize> {
         self.inodes

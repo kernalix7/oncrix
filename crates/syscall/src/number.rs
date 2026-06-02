@@ -147,6 +147,12 @@ pub const SYS_SYNC: SyscallNumber = 162;
 pub const SYS_FSYNC: SyscallNumber = 74;
 /// `fdatasync(fd)` — Synchronize file data (not metadata) with backing store.
 pub const SYS_FDATASYNC: SyscallNumber = 75;
+/// `statfs(pathname, buf)` — Get filesystem statistics by path.
+pub const SYS_STATFS: SyscallNumber = 137;
+/// `fstatfs(fd, buf)` — Get filesystem statistics by descriptor.
+pub const SYS_FSTATFS: SyscallNumber = 138;
+/// `sysinfo(info)` — Get system + memory statistics.
+pub const SYS_SYSINFO: SyscallNumber = 99;
 /// `symlink(target, linkpath)` — Create a symbolic link.
 pub const SYS_SYMLINK: SyscallNumber = 88;
 /// `readlink(pathname, buf, bufsiz)` — Read a symbolic link target.

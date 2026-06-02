@@ -103,6 +103,7 @@ pub mod printk_ratelimit;
 pub mod procfs_dispatch;
 pub mod quic;
 pub mod random;
+pub mod random_syscall;
 pub mod rcu;
 pub mod rcu_tree;
 pub mod rlimit;
