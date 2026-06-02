@@ -108,6 +108,10 @@ pub const SYS_PREAD64: SyscallNumber = 17;
 /// `pwrite64(fd, buf, count, offset)` — Write at an offset without moving
 /// the file position.
 pub const SYS_PWRITE64: SyscallNumber = 18;
+/// `readv(fd, iov, iovcnt)` — Read into multiple buffers (scatter input).
+pub const SYS_READV: SyscallNumber = 19;
+/// `writev(fd, iov, iovcnt)` — Write from multiple buffers (gather output).
+pub const SYS_WRITEV: SyscallNumber = 20;
 /// `dup2(oldfd, newfd)` — Duplicate a file descriptor.
 pub const SYS_DUP2: SyscallNumber = 33;
 /// `dup3(oldfd, newfd, flags)` — Duplicate a fd, optionally setting

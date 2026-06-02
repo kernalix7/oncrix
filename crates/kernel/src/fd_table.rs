@@ -2777,6 +2777,103 @@ pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
     }
 }
 
+/// Maximum number of `iovec` entries honoured by `readv`/`writev`.
+const IOV_MAX: usize = 1024;
+
+/// Read one `struct iovec { void *iov_base; size_t iov_len; }` (16 bytes)
+/// from the user array at `iov_ptr`, returning `(base, len)`.
+///
+/// # Safety
+///
+/// `iov_ptr` must reference `index + 1` valid `iovec`s in user space.
+unsafe fn read_iovec(iov_ptr: u64, index: usize) -> (u64, u64) {
+    let entry = iov_ptr + (index as u64) * 16;
+    // SAFETY: caller guarantees the array bound.
+    unsafe {
+        let base = (entry as *const u64).read_unaligned();
+        let len = ((entry + 8) as *const u64).read_unaligned();
+        (base, len)
+    }
+}
+
+/// Kernel handler for `SYS_READV` (Linux number 19).
+///
+/// POSIX `readv(fd, iov, iovcnt)`: scatter-read into the `iovcnt` buffers
+/// described by the `iovec` array `iov`, in order, advancing the file
+/// position. Returns the total bytes read, 0 on EOF, or a negative errno;
+/// a partial fill (short read on one buffer) stops the walk and returns the
+/// bytes gathered so far.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU). `iov` must
+/// reference `iovcnt` valid `iovec`s.
+pub unsafe fn dispatch_readv(fd: usize, iov_ptr: u64, iovcnt: u64) -> i64 {
+    if iov_ptr == 0 || iov_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let iovcnt = iovcnt as usize;
+    if iovcnt > IOV_MAX {
+        return -22; // EINVAL
+    }
+    let mut total: i64 = 0;
+    for i in 0..iovcnt {
+        // SAFETY: i < iovcnt and iov_ptr validated above.
+        let (base, len) = unsafe { read_iovec(iov_ptr, i) };
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: single-CPU SYSCALL context; dispatch_read validates base.
+        let n = unsafe { dispatch_read(fd, base, len) };
+        if n < 0 {
+            return if total > 0 { total } else { n };
+        }
+        total += n;
+        if (n as u64) < len {
+            break; // short read — stop gathering
+        }
+    }
+    total
+}
+
+/// Kernel handler for `SYS_WRITEV` (Linux number 20).
+///
+/// POSIX `writev(fd, iov, iovcnt)`: gather-write the `iovcnt` buffers in
+/// order, advancing the file position. Returns the total bytes written, or
+/// a negative errno; a short write stops the walk.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU). `iov` must
+/// reference `iovcnt` valid `iovec`s.
+pub unsafe fn dispatch_writev(fd: usize, iov_ptr: u64, iovcnt: u64) -> i64 {
+    if iov_ptr == 0 || iov_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let iovcnt = iovcnt as usize;
+    if iovcnt > IOV_MAX {
+        return -22; // EINVAL
+    }
+    let mut total: i64 = 0;
+    for i in 0..iovcnt {
+        // SAFETY: i < iovcnt and iov_ptr validated above.
+        let (base, len) = unsafe { read_iovec(iov_ptr, i) };
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: single-CPU SYSCALL context; dispatch_write validates base.
+        let n = unsafe { dispatch_write(fd, base, len) };
+        if n < 0 {
+            return if total > 0 { total } else { n };
+        }
+        total += n;
+        if (n as u64) < len {
+            break; // short write — stop gathering
+        }
+    }
+    total
+}
+
 /// Set the file offset of `fd` in the current thread's table.
 ///
 /// # Safety

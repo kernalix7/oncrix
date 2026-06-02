@@ -43,6 +43,8 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_PREAD64: u64 = 17;
 const SYS_PWRITE64: u64 = 18;
+const SYS_READV: u64 = 19;
+const SYS_WRITEV: u64 = 20;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_STAT: u64 = 4;
@@ -322,6 +324,39 @@ pub unsafe fn pread(fd: i32, buf: *mut u8, count: usize, offset: u64) -> i64 {
 pub unsafe fn pwrite(fd: i32, buf: *const u8, count: usize, offset: u64) -> i64 {
     // SAFETY: caller guarantees `buf` is valid for `count` bytes.
     unsafe { syscall4(SYS_PWRITE64, fd as u64, buf as u64, count as u64, offset) }
+}
+
+/// A scatter/gather buffer descriptor — `struct iovec`.
+#[repr(C)]
+pub struct IoVec {
+    /// Start of the buffer.
+    pub iov_base: *mut u8,
+    /// Length of the buffer in bytes.
+    pub iov_len: usize,
+}
+
+/// `readv(2)` — scatter-read into the `iovcnt` buffers described by `iov`.
+///
+/// Returns the total bytes read, 0 on EOF, or a negative errno value.
+///
+/// # Safety
+///
+/// `iov` must point to `iovcnt` valid `IoVec`s with writable buffers.
+pub unsafe fn readv(fd: i32, iov: *const IoVec, iovcnt: i32) -> i64 {
+    // SAFETY: caller guarantees the iovec array + buffers.
+    unsafe { syscall3(SYS_READV, fd as u64, iov as u64, iovcnt as i64 as u64) }
+}
+
+/// `writev(2)` — gather-write the `iovcnt` buffers described by `iov`.
+///
+/// Returns the total bytes written, or a negative errno value.
+///
+/// # Safety
+///
+/// `iov` must point to `iovcnt` valid `IoVec`s with readable buffers.
+pub unsafe fn writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> i64 {
+    // SAFETY: caller guarantees the iovec array + buffers.
+    unsafe { syscall3(SYS_WRITEV, fd as u64, iov as u64, iovcnt as i64 as u64) }
 }
 
 /// `open(2)` — open a file.

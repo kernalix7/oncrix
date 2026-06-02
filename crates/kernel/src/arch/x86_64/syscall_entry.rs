@@ -539,6 +539,15 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
                 )
             }
         }
+        // SYS_READV (19) / SYS_WRITEV (20): scatter/gather vectored I/O.
+        oncrix_syscall::number::SYS_READV => {
+            // SAFETY: see SYS_READ above.
+            unsafe { crate::fd_table::dispatch_readv(args.arg0 as usize, args.arg1, args.arg2) }
+        }
+        oncrix_syscall::number::SYS_WRITEV => {
+            // SAFETY: see SYS_READ above.
+            unsafe { crate::fd_table::dispatch_writev(args.arg0 as usize, args.arg1, args.arg2) }
+        }
 
         // ── Process management syscalls ──────────────────────────
 
