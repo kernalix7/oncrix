@@ -303,13 +303,19 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
         return -22;
     };
 
-    // Check that the caller actually has children.
+    // Check that the caller has a child matching the request. For a specific
+    // target_pid, that pid must actually be a child of the caller — otherwise
+    // POSIX requires ECHILD, not an indefinite block (which the old "any
+    // child" check caused when the caller had *other* children).
     // SAFETY: single-CPU SYSCALL context.
-    let has_children = unsafe {
+    let has_target = unsafe {
         #[allow(static_mut_refs)]
-        PROCESS_TABLE.children(caller_pid).next().is_some()
+        match target_pid {
+            Some(tp) => PROCESS_TABLE.children(caller_pid).any(|e| e.pid() == tp),
+            None => PROCESS_TABLE.children(caller_pid).next().is_some(),
+        }
     };
-    if !has_children {
+    if !has_target {
         return -10; // ECHILD
     }
 
@@ -486,13 +492,18 @@ pub unsafe fn sys_waitid(idtype: u64, id: u64, infop: u64, options: u64) -> i64 
         _ => return -22, // EINVAL — unknown idtype
     };
 
-    // The caller must have at least one matching child.
+    // The caller must have a matching child. For P_PID, the specific id must
+    // be a child of the caller — otherwise return ECHILD instead of blocking
+    // forever when the caller has other (non-matching) children.
     // SAFETY: single-CPU SYSCALL context.
-    let has_children = unsafe {
+    let has_target = unsafe {
         #[allow(static_mut_refs)]
-        PROCESS_TABLE.children(caller_pid).next().is_some()
+        match target_pid {
+            Some(tp) => PROCESS_TABLE.children(caller_pid).any(|e| e.pid() == tp),
+            None => PROCESS_TABLE.children(caller_pid).next().is_some(),
+        }
     };
-    if !has_children {
+    if !has_target {
         return -10; // ECHILD
     }
 
