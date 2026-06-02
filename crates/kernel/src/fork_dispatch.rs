@@ -937,6 +937,92 @@ pub unsafe fn sys_kill(pid_arg: u64, sig_arg: u64) -> i64 {
     }
 }
 
+// ── sys_rt_sigpending / sys_sigaltstack / sys_rt_sigqueueinfo ─────
+
+/// Kernel handler for `SYS_RT_SIGPENDING` (number 127).
+///
+/// POSIX `rt_sigpending(set, sigsetsize)`: write the calling process's set of
+/// pending signals to the user `u64` sigset at `set_ptr`. ONCRIX models 32
+/// signals in a `u32` bitset (bit `i` ⇒ signal `i + 1`), which maps directly
+/// onto the low 32 bits of the Linux sigset.
+///
+/// Returns 0 on success, `-EINVAL` if `sigsetsize != 8`, `-EFAULT` for a bad
+/// pointer, `-ESRCH` if there is no current process.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
+    if sigsetsize != 8 {
+        return -22; // EINVAL
+    }
+    if set_ptr == 0 || set_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let pid = match crate::current::current_pid() {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    // SAFETY: single-CPU SYSCALL context; exclusive PROCESS_TABLE access.
+    let bits = unsafe {
+        #[allow(static_mut_refs)]
+        match PROCESS_TABLE.get(pid) {
+            Some(e) => e.signals.pending.bits() as u64,
+            None => return -3, // ESRCH
+        }
+    };
+    // SAFETY: set_ptr validated above; writing 8 bytes.
+    unsafe { core::ptr::write_unaligned(set_ptr as *mut u64, bits) };
+    0
+}
+
+/// Kernel handler for `SYS_SIGALTSTACK` (number 131).
+///
+/// POSIX `sigaltstack(ss, old_ss)`: ONCRIX delivers signals on the normal
+/// user stack and does not honour an alternate stack yet. The new `ss` is
+/// accepted and ignored; if `old_ss` is non-null it receives a zeroed
+/// `stack_t` with `ss_flags = SS_DISABLE` (2). Returns 0 / `-EFAULT`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> i64 {
+    /// `SS_DISABLE` — the alternate stack is currently disabled.
+    const SS_DISABLE: i32 = 2;
+    if ss_ptr != 0 && ss_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    if old_ss_ptr != 0 {
+        if old_ss_ptr >= 0xFFFF_8000_0000_0000 {
+            return -14; // EFAULT
+        }
+        // stack_t { ss_sp: u64 @0, ss_flags: i32 @8, _pad: u32 @12, ss_size: u64 @16 }
+        // SAFETY: old_ss_ptr validated; writing 24 bytes.
+        unsafe {
+            let p = old_ss_ptr as *mut u8;
+            for i in 0..24 {
+                p.add(i).write_volatile(0);
+            }
+            core::ptr::write_unaligned((old_ss_ptr + 8) as *mut i32, SS_DISABLE);
+        }
+    }
+    0
+}
+
+/// Kernel handler for `SYS_RT_SIGQUEUEINFO` (number 129).
+///
+/// POSIX `rt_sigqueueinfo(tgid, sig, uinfo)`: queue a signal with an
+/// accompanying `siginfo_t`. ONCRIX has no realtime signal queue, so the
+/// `uinfo` payload is ignored and the signal is delivered like `kill(2)`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_rt_sigqueueinfo(tgid: u64, sig: u64, _uinfo: u64) -> i64 {
+    // SAFETY: delegate to sys_kill under the same SYSCALL context.
+    unsafe { sys_kill(tgid, sig) }
+}
+
 // ── sys_exit ─────────────────────────────────────────────────────
 
 /// Kernel handler for `SYS_EXIT` (Linux number 60) and

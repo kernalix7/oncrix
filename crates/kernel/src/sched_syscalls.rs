@@ -1397,3 +1397,48 @@ pub unsafe fn sys_sched_get_priority_min(policy: i64) -> i64 {
         _ => -22,   // EINVAL
     }
 }
+
+// ── sched_rr_get_interval ─────────────────────────────────────────
+
+/// `sched_rr_get_interval(pid, tp)` — write the round-robin time quantum for
+/// the calling process into the `struct timespec` pointed to by `tp`.
+///
+/// ONCRIX runs a single fixed-period scheduler driven by the 8254 PIT at
+/// 100 Hz.  Every runnable task therefore receives a 10 ms quantum regardless
+/// of `pid`.  The `pid` argument is validated for type only (must fit in i32)
+/// but is otherwise ignored — single-scheduler policy.
+///
+/// On success the value `{tv_sec: 0, tv_nsec: 10_000_000}` is written to
+/// `*tp` and `0` is returned.
+///
+/// # Errors
+///
+/// * `-14` (`EFAULT`) — `tp` is null or falls in the kernel half of the
+///   address space (`>= 0xFFFF_8000_0000_0000`).
+///
+/// # Safety
+///
+/// Called exclusively from the single-CPU SYSCALL dispatch path.
+/// `tp` is a raw user-space pointer; the caller must ensure it is mapped
+/// and writable before invoking this function (enforced here by the
+/// `bad_user_ptr` range check).
+pub unsafe fn sys_sched_rr_get_interval(pid: u64, tp: u64) -> i64 {
+    // Validate the output pointer before any write.
+    if bad_user_ptr(tp) {
+        return -14; // EFAULT
+    }
+
+    // SAFETY: `tp` has passed the canonical-address range check above.
+    // The write is unaligned to tolerate any user-space alignment; the
+    // two i64 fields are written individually so no padding bytes are
+    // assumed.
+    unsafe {
+        // tv_sec  = 0  (quantum is sub-second)
+        core::ptr::write_unaligned(tp as *mut i64, 0i64);
+        // tv_nsec = 10_000_000  (10 ms at 100 Hz PIT)
+        core::ptr::write_unaligned((tp + 8) as *mut i64, 10_000_000i64);
+    }
+
+    let _ = pid; // pid accepted per POSIX; ignored on single-scheduler.
+    0
+}

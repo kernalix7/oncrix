@@ -193,6 +193,13 @@ impl PendingSignals {
     pub fn any(&self) -> bool {
         self.0 != 0
     }
+
+    /// Return the raw pending bitset (bit `i` set ⇒ signal `i + 1` pending).
+    ///
+    /// Used by `rt_sigpending(2)` to copy the pending set to user space.
+    pub const fn bits(&self) -> u32 {
+        self.0
+    }
 }
 
 // ── sa_flags constants (POSIX.1-2024 sigaction(3p)) ───────────────

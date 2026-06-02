@@ -1039,6 +1039,52 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fork_dispatch::sys_kill(args.arg0, args.arg1) }
         }
 
+        // SYS_TKILL (200): send signal to a specific thread.
+        // ONCRIX is single-thread-per-process (tid == pid), so delegate
+        // directly to sys_kill(tid, sig).
+        // SYS_RT_SIGPENDING (127): copy the pending-signal set to user space.
+        oncrix_syscall::number::SYS_RT_SIGPENDING => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_rt_sigpending(args.arg0, args.arg1) }
+        }
+        // SYS_SIGALTSTACK (131): set/query the alternate signal stack (no-op).
+        oncrix_syscall::number::SYS_SIGALTSTACK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_sigaltstack(args.arg0, args.arg1) }
+        }
+        // SYS_RT_SIGQUEUEINFO (129): queue a signal (delegates to kill).
+        oncrix_syscall::number::SYS_RT_SIGQUEUEINFO => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_rt_sigqueueinfo(args.arg0, args.arg1, args.arg2) }
+        }
+
+        oncrix_syscall::number::SYS_TKILL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_kill(args.arg0, args.arg1) }
+        }
+
+        // SYS_TGKILL (234): send signal to thread `tid` in thread group `tgid`.
+        // ONCRIX is single-thread-per-process, so tgid must equal tid.
+        // If tgid != tid there is no matching thread; return -ESRCH (-3).
+        oncrix_syscall::number::SYS_TGKILL => {
+            let tgid = args.arg0;
+            let tid = args.arg1;
+            let sig = args.arg2;
+            if tgid != tid {
+                -3 // ESRCH — no such thread in that group
+            } else {
+                // SAFETY: Single-CPU SYSCALL dispatch path.
+                unsafe { crate::fork_dispatch::sys_kill(tid, sig) }
+            }
+        }
+
+        // SYS_SCHED_RR_GET_INTERVAL (148): POSIX.1-2024 sched_rr_get_interval(3p).
+        // Writes the 10 ms round-robin quantum to the user timespec pointer.
+        oncrix_syscall::number::SYS_SCHED_RR_GET_INTERVAL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_rr_get_interval(args.arg0, args.arg1) }
+        }
+
         // SYS_DUP2 (33): duplicate `oldfd` onto `newfd`, atomically
         // closing `newfd` if it was already open.
         // POSIX.1-2024 dup2(3p).

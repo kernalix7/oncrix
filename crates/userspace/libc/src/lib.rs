@@ -86,6 +86,12 @@ const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
 const SYS_WAITID: u64 = 247;
 const SYS_KILL: u64 = 62;
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
+const SYS_RT_SIGPENDING: u64 = 127;
+const SYS_RT_SIGQUEUEINFO: u64 = 129;
+const SYS_SIGALTSTACK: u64 = 131;
+const SYS_SCHED_RR_GET_INTERVAL: u64 = 148;
 const SYS_GETDENTS64: u64 = 217;
 // identity / time / creds
 const SYS_UNAME: u64 = 63;
@@ -2631,4 +2637,96 @@ pub unsafe fn setgroups(size: i32, list: *const u32) -> i64 {
 pub unsafe fn personality(persona: u32) -> i64 {
     // SAFETY: scalar-only syscall.
     unsafe { syscall1(SYS_PERSONALITY, persona as u64) }
+}
+
+
+// ── tkill / tgkill / sched_rr_get_interval ─────────────────────────
+
+/// `tkill(2)` — send signal `sig` to thread `tid` (legacy; prefer `tgkill`).
+///
+/// On ONCRIX each thread is its own process (tid == pid), so this is
+/// equivalent to `kill(tid, sig)`.
+///
+/// Returns 0 on success, or a negative errno value:
+/// - `-3`  (`ESRCH`)  — no such thread.
+/// - `-22` (`EINVAL`) — signal number out of range.
+///
+/// `sig == 0` performs an existence check without sending a signal.
+pub fn tkill(tid: i32, sig: i32) -> i64 {
+    // SAFETY: SYS_TKILL takes two scalar arguments only; no pointers.
+    unsafe { syscall2(SYS_TKILL, tid as u64, sig as u64) }
+}
+
+/// `tgkill(2)` — send signal `sig` to thread `tid` in thread group `tgid`.
+///
+/// On ONCRIX `tgid == tid == pid` always (single-thread-per-process).
+/// If `tgid != tid` the kernel returns `-3` (`ESRCH`).
+///
+/// Returns 0 on success, or a negative errno value:
+/// - `-3`  (`ESRCH`)  — no such thread / group mismatch.
+/// - `-22` (`EINVAL`) — signal number out of range.
+///
+/// `sig == 0` performs an existence check without sending a signal.
+///
+/// # Safety
+///
+/// No pointer arguments; this function is safe to call from any context
+/// that holds a valid tid and signal number.
+pub fn tgkill(tgid: i32, tid: i32, sig: i32) -> i64 {
+    // SAFETY: SYS_TGKILL takes three scalar arguments only; no pointers.
+    unsafe { syscall3(SYS_TGKILL, tgid as u64, tid as u64, sig as u64) }
+}
+
+/// `sched_rr_get_interval(2)` — write the round-robin time quantum for `pid`
+/// into `*tp`.
+///
+/// On ONCRIX the PIT runs at 100 Hz and every task receives a fixed 10 ms
+/// quantum; `pid` is accepted but ignored.  On success `*tp` is set to
+/// `{tv_sec: 0, tv_nsec: 10_000_000}` and `0` is returned.  Returns `-14`
+/// (`EFAULT`) if `tp` is null or unmapped.
+///
+/// # Safety
+///
+/// `tp` must be a valid `*mut Timespec` in the calling process's address
+/// space and must remain valid for the duration of the call.
+pub unsafe fn sched_rr_get_interval(pid: i32, tp: *mut Timespec) -> i64 {
+    // SAFETY: caller guarantees `tp` is a valid writable pointer.
+    unsafe { syscall2(SYS_SCHED_RR_GET_INTERVAL, pid as u64, tp as u64) }
+}
+
+// ── rt_sigpending / sigaltstack / rt_sigqueueinfo ──────────────────
+
+/// `rt_sigpending(2)` — get the set of pending signals into `*set` (a `u64`
+/// sigset). `sigsetsize` must be 8. Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `set` must point to a writable `u64`.
+pub unsafe fn rt_sigpending(set: *mut u64, sigsetsize: usize) -> i64 {
+    // SAFETY: caller guarantees `set` validity.
+    unsafe { syscall2(SYS_RT_SIGPENDING, set as u64, sigsetsize as u64) }
+}
+
+/// `sigaltstack(2)` — set/get the alternate signal stack. ONCRIX does not
+/// honour an alternate stack; the call accepts `ss` and reports `old_ss`
+/// disabled. `ss`/`old_ss` are `stack_t*` (may be NULL). Returns 0 or errno.
+///
+/// # Safety
+///
+/// `ss`/`old_ss`, when non-null, must reference a valid `stack_t` (24 bytes).
+pub unsafe fn sigaltstack(ss: *const u8, old_ss: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe { syscall2(SYS_SIGALTSTACK, ss as u64, old_ss as u64) }
+}
+
+/// `rt_sigqueueinfo(2)` — queue signal `sig` to `tgid` with siginfo `uinfo`.
+/// On ONCRIX the siginfo payload is ignored (delivered like `kill`).
+/// Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `uinfo` must point to a valid `siginfo_t` (128 bytes) when non-null.
+pub unsafe fn rt_sigqueueinfo(tgid: i32, sig: i32, uinfo: *const u8) -> i64 {
+    // SAFETY: caller guarantees `uinfo` validity.
+    unsafe { syscall3(SYS_RT_SIGQUEUEINFO, tgid as u64, sig as u64, uinfo as u64) }
 }

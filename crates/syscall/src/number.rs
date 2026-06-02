@@ -81,6 +81,28 @@ pub const SYS_EXIT: SyscallNumber = 60;
 pub const SYS_WAIT4: SyscallNumber = 61;
 /// `kill(pid, sig)` — Send signal to a process.
 pub const SYS_KILL: SyscallNumber = 62;
+
+/// `tkill(tid, sig)` — send signal to a specific thread (Linux 200).
+///
+/// In ONCRIX each thread is its own process (tid == pid), so this is
+/// equivalent to `kill(tid, sig)`.  Deprecated in favour of `tgkill`.
+pub const SYS_TKILL: SyscallNumber = 200;
+
+/// `tgkill(tgid, tid, sig)` — send signal to a thread within a thread group (Linux 234).
+///
+/// ONCRIX is single-thread-per-process, so `tgid == tid == pid` always.
+/// If `tgid != tid` the call returns `-ESRCH`; otherwise delegates to
+/// `kill(tid, sig)`.
+pub const SYS_TGKILL: SyscallNumber = 234;
+/// `rt_sigpending(set, sigsetsize)` — Get the set of pending signals.
+pub const SYS_RT_SIGPENDING: SyscallNumber = 127;
+/// `rt_sigqueueinfo(tgid, sig, uinfo)` — Queue a signal with siginfo.
+pub const SYS_RT_SIGQUEUEINFO: SyscallNumber = 129;
+/// `sigaltstack(ss, old_ss)` — Set/get the alternate signal stack.
+pub const SYS_SIGALTSTACK: SyscallNumber = 131;
+
+/// `sched_rr_get_interval(pid, tp)` — write the round-robin time quantum into `*tp`.
+pub const SYS_SCHED_RR_GET_INTERVAL: SyscallNumber = 148;
 /// `waitid(idtype, id, infop, options)` — Wait for a child process (extended).
 pub const SYS_WAITID: SyscallNumber = 247;
 /// `execveat(dirfd, pathname, argv, envp, flags)` — Execute a program relative to a dirfd.
