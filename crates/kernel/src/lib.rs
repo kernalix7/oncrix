@@ -103,6 +103,7 @@ pub mod printk_ratelimit;
 pub mod procfs_dispatch;
 pub mod quic;
 pub mod random;
+pub mod random_syscall;
 pub mod rcu;
 pub mod rcu_tree;
 pub mod rlimit;
@@ -111,6 +112,8 @@ pub mod rseq;
 #[allow(dead_code, clippy::all)]
 pub mod safesetid;
 pub mod sched;
+#[allow(dead_code, clippy::all)]
+pub mod sched_syscalls;
 pub mod sctp;
 pub mod seccomp;
 pub mod seccomp_filter;
@@ -128,6 +131,7 @@ pub mod state;
 #[allow(dead_code, clippy::all)]
 pub mod suspend;
 pub mod sysctl;
+pub mod sysid_syscall;
 pub mod tc;
 pub mod tc_htb;
 pub mod tc_police;

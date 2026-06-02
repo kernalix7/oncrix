@@ -23,6 +23,46 @@ pub enum ThreadState {
     Exited,
 }
 
+/// POSIX scheduling policy (`SCHED_*`).
+///
+/// Values match the conventional Linux ABI so the syscall layer can
+/// pass them through unchanged: `SCHED_OTHER = 0`, `SCHED_FIFO = 1`,
+/// `SCHED_RR = 2`. ONCRIX currently records the policy per thread but
+/// its credit/aging picker behaves identically across policies; the
+/// stored value lets a future real-time picker honour `FIFO`/`RR`
+/// without an ABI change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum SchedPolicy {
+    /// Standard time-sharing policy (the default).
+    #[default]
+    Other = 0,
+    /// First-in-first-out real-time policy.
+    Fifo = 1,
+    /// Round-robin real-time policy.
+    RoundRobin = 2,
+}
+
+impl SchedPolicy {
+    /// Convert a raw `SCHED_*` integer to a [`SchedPolicy`].
+    ///
+    /// Returns `None` for unrecognised values so the caller can map it
+    /// to `EINVAL`.
+    pub const fn from_raw(raw: i32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Other),
+            1 => Some(Self::Fifo),
+            2 => Some(Self::RoundRobin),
+            _ => None,
+        }
+    }
+
+    /// Return the raw `SCHED_*` integer for this policy.
+    pub const fn as_raw(self) -> i32 {
+        self as i32
+    }
+}
+
 /// Thread priority level (0 = highest, 255 = lowest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -44,6 +84,53 @@ impl Priority {
     /// Return the raw priority value.
     pub const fn as_u8(self) -> u8 {
         self.0
+    }
+
+    /// Convert a POSIX nice value (`[-20, 19]`) to a kernel [`Priority`].
+    ///
+    /// POSIX nice runs from `-20` (most favourable, highest priority) to
+    /// `+19` (least favourable, lowest priority). The kernel priority axis
+    /// is inverted: `0` is highest, `255` is lowest. We map the 40-step
+    /// nice range linearly onto `[0, 255]`, keeping nice `0` near
+    /// [`Priority::NORMAL`].
+    ///
+    /// Mapping: `level = (nice + 20) * 255 / 39`, with `nice` clamped to
+    /// `[-20, 19]` first. So `-20 → 0` (HIGHEST), `+19 → 255` (IDLE), and
+    /// `0 → 130` (just below NORMAL).
+    pub const fn from_nice(nice: i32) -> Self {
+        let clamped = if nice < -20 {
+            -20
+        } else if nice > 19 {
+            19
+        } else {
+            nice
+        };
+        // (clamped + 20) is in [0, 39]; scale to [0, 255].
+        let level = ((clamped + 20) * 255 / 39) as u8;
+        Self(level)
+    }
+
+    /// Scheduling weight derived from this priority.
+    ///
+    /// Higher-priority threads (lower raw level) get a larger weight so
+    /// the priority-aware picker grants them credit faster. The mapping
+    /// is the linear inverse of the raw level: `weight = 256 - level`,
+    /// giving `HIGHEST (0) → 256`, `NORMAL (128) → 128`, and
+    /// `IDLE (255) → 1`. The minimum weight is `1`, never `0`, so even
+    /// the lowest-priority thread keeps accruing credit and cannot
+    /// starve (see the scheduler's aging loop).
+    pub const fn weight(self) -> u32 {
+        256 - self.0 as u32
+    }
+
+    /// Convert this kernel [`Priority`] back to a POSIX nice value.
+    ///
+    /// Inverse of [`from_nice`](Self::from_nice): `nice = level * 39 / 255
+    /// - 20`, yielding a value in `[-20, 19]`. The round-trip is not exact
+    /// for every raw level (the 256→40 quantisation is lossy), but it is
+    /// stable for any nice the kernel itself produced via `from_nice`.
+    pub const fn to_nice(self) -> i32 {
+        (self.0 as i32) * 39 / 255 - 20
     }
 }
 
@@ -72,6 +159,40 @@ pub struct Thread {
     state: ThreadState,
     /// Scheduling priority.
     priority: Priority,
+    /// POSIX scheduling policy (`SCHED_*`). Stored per thread; the
+    /// credit/aging picker is policy-agnostic today, so this only
+    /// affects what `sched_getscheduler(2)` reports back.
+    policy: SchedPolicy,
+    /// Accumulated scheduling credit for the priority-aware picker.
+    ///
+    /// Ready threads gain credit equal to their [`Priority::weight`] on
+    /// each pick pass; the thread with the most credit is chosen and has
+    /// its credit reset. Because every weight is `>= 1`, low-priority
+    /// threads keep accruing and are eventually selected — this is the
+    /// anti-starvation (aging) mechanism. Saturating arithmetic bounds
+    /// the value so a long-blocked low-priority thread cannot overflow.
+    sched_credit: u32,
+    /// CPU ticks charged to user-mode execution for this thread.
+    ///
+    /// Incremented once per PIT timer tick while this thread is the
+    /// current (running) thread. ONCRIX does not yet distinguish the
+    /// trap-from-ring-3 vs trap-from-ring-0 case at the timer, so *all*
+    /// charged ticks land in this user bucket; `stime` stays `0` until a
+    /// finer split is added. Consumed by `times(2)` / `getrusage(2)`.
+    utime_ticks: u64,
+    /// CPU ticks charged to kernel-mode execution for this thread.
+    ///
+    /// Reserved for a future user/system split; currently always `0`
+    /// (see [`utime_ticks`](Self::utime_ticks)).
+    stime_ticks: u64,
+    /// CPU affinity mask (`sched_setaffinity(2)`).
+    ///
+    /// Bit `n` set means the thread may run on CPU `n`. ONCRIX is
+    /// single-CPU, so the only valid runnable CPU is `0`; the mask is
+    /// initialised to `1` (CPU 0 only) and any `setaffinity` mask must
+    /// keep bit 0 set. Stored for fidelity / future SMP — it does not
+    /// change placement on a single CPU.
+    cpu_mask: u64,
     /// Stack pointer (legacy field, still used by the kthread path).
     stack_pointer: u64,
     /// Thread-local storage base address (FS base on x86_64).
@@ -174,6 +295,11 @@ impl Thread {
             pid,
             state: ThreadState::Ready,
             priority,
+            policy: SchedPolicy::Other,
+            sched_credit: 0,
+            utime_ticks: 0,
+            stime_ticks: 0,
+            cpu_mask: 1,
             stack_pointer: 0,
             tls_base: 0,
             cpu_context: CpuContext::empty(),
@@ -237,6 +363,78 @@ impl Thread {
     /// Return the scheduling priority.
     pub const fn priority(&self) -> Priority {
         self.priority
+    }
+
+    /// Set the scheduling priority.
+    pub fn set_priority(&mut self, priority: Priority) {
+        self.priority = priority;
+    }
+
+    /// Return the scheduling policy (`SCHED_*`).
+    pub const fn policy(&self) -> SchedPolicy {
+        self.policy
+    }
+
+    /// Set the scheduling policy (`SCHED_*`).
+    pub fn set_policy(&mut self, policy: SchedPolicy) {
+        self.policy = policy;
+    }
+
+    /// Return the user-mode CPU ticks charged to this thread.
+    pub const fn utime_ticks(&self) -> u64 {
+        self.utime_ticks
+    }
+
+    /// Return the kernel-mode CPU ticks charged to this thread.
+    ///
+    /// Always `0` today (coarse accounting charges everything to
+    /// [`utime_ticks`](Self::utime_ticks)).
+    pub const fn stime_ticks(&self) -> u64 {
+        self.stime_ticks
+    }
+
+    /// Charge one PIT tick of CPU time to this thread (user bucket).
+    ///
+    /// Called from the timer interrupt for the currently running thread.
+    /// Uses saturating arithmetic so a long-lived thread cannot overflow
+    /// the counter.
+    pub fn charge_tick(&mut self) {
+        self.utime_ticks = self.utime_ticks.saturating_add(1);
+    }
+
+    /// Return the CPU affinity mask (`sched_getaffinity(2)`).
+    pub const fn cpu_mask(&self) -> u64 {
+        self.cpu_mask
+    }
+
+    /// Set the CPU affinity mask (`sched_setaffinity(2)`).
+    ///
+    /// The caller is responsible for validating that the mask includes a
+    /// runnable CPU (bit 0 on this single-CPU build); this setter stores
+    /// the value verbatim.
+    pub fn set_cpu_mask(&mut self, mask: u64) {
+        self.cpu_mask = mask;
+    }
+
+    /// Return the accumulated scheduling credit (priority-aware picker).
+    pub const fn sched_credit(&self) -> u32 {
+        self.sched_credit
+    }
+
+    /// Add `amount` to the scheduling credit (saturating).
+    ///
+    /// Called by the scheduler's aging pass on every Ready thread that
+    /// was *not* picked, so waiting threads gradually rise to the top.
+    pub fn add_sched_credit(&mut self, amount: u32) {
+        self.sched_credit = self.sched_credit.saturating_add(amount);
+    }
+
+    /// Reset the scheduling credit to zero.
+    ///
+    /// Called when a thread is picked to run, so it must re-earn its
+    /// way to the front against the others' accumulated credit.
+    pub fn reset_sched_credit(&mut self) {
+        self.sched_credit = 0;
     }
 
     /// Set the thread state.

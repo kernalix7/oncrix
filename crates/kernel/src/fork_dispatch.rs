@@ -243,7 +243,18 @@ pub unsafe fn sys_fork() -> i64 {
 
     // Register child in the process table so wait4 can find it.
     let child_process = Process::new(child_pid);
-    let child_entry = ProcessEntry::new(child_process, parent_pid);
+    let mut child_entry = ProcessEntry::new(child_process, parent_pid);
+    // POSIX.1-2024: a forked child inherits the parent's process group
+    // and session, not its own PID. Without this, setpgid's same-session
+    // check would mis-treat every child as its own session leader.
+    // SAFETY: single-CPU SYSCALL context; no aliased access.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(parent_entry) = PROCESS_TABLE.get(parent_pid) {
+            child_entry.pgid = parent_entry.pgid;
+            child_entry.sid = parent_entry.sid;
+        }
+    }
     // SAFETY: single-CPU SYSCALL context.
     unsafe { register_process(child_entry) };
 
@@ -313,50 +324,9 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
                 }
             }
 
-            // Reap the zombie: remove from process table, and free
-            // the child thread's per-process UserAddressSpace +
-            // remove the thread from the scheduler so the 96 MiB
-            // frame pool isn't leaked one fork's worth (2 MiB) at a
-            // time.
-            //
+            // Reap the zombie (free its address space + scheduler slot).
             // SAFETY: single-CPU SYSCALL context.
-            unsafe {
-                #[allow(static_mut_refs)]
-                PROCESS_TABLE.remove(zombie_pid);
-            }
-            // SAFETY: same as above; SCHEDULER is exclusively owned
-            // here.
-            let zombie_tid = unsafe {
-                #[allow(static_mut_refs)]
-                let sched = &mut crate::arch::x86_64::init::SCHEDULER;
-                // Find the (single) thread whose owning PID matches
-                // the zombie PID. The Phase 13 process model is
-                // single-threaded-per-process, so there is at most
-                // one such thread.
-                let mut tid_opt: Option<oncrix_process::pid::Tid> = None;
-                for slot in sched.threads_iter_mut() {
-                    if let Some(t) = slot
-                        && t.pid() == zombie_pid
-                    {
-                        // Take and release the UAS frames before the
-                        // Thread is dropped.
-                        if let Some(uas) = t.user_address_space.take() {
-                            let alloc = crate::frame_alloc::frame_alloc();
-                            uas.release(alloc);
-                        }
-                        tid_opt = Some(t.tid());
-                        break;
-                    }
-                }
-                tid_opt
-            };
-            if let Some(tid) = zombie_tid {
-                // SAFETY: same single-CPU context.
-                unsafe {
-                    #[allow(static_mut_refs)]
-                    let _ = crate::arch::x86_64::init::SCHEDULER.remove(tid);
-                }
-            }
+            unsafe { reap_zombie(zombie_pid) };
 
             let _ = serial.write_str("[wait4] reaped child\n");
             return zombie_pid.as_u64() as i64;
@@ -394,6 +364,186 @@ fn find_zombie_child(table: &ProcessTable, parent: Pid, target: Option<Pid>) -> 
         let code = entry.exit_status.map(|s| s.raw()).unwrap_or(0);
         Some((entry.pid(), code))
     })
+}
+
+/// Reap a zombie process: remove it from the process table, release its
+/// per-process [`UserAddressSpace`] frames back to the global pool, and
+/// drop its thread from the scheduler.
+///
+/// Shared by [`sys_wait4`] and [`sys_waitid`]. The Phase 13 process model
+/// is single-threaded-per-process, so at most one scheduler thread matches
+/// the zombie PID.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU); the global
+/// `PROCESS_TABLE` and `SCHEDULER` are exclusively owned here.
+unsafe fn reap_zombie(zombie_pid: Pid) {
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        PROCESS_TABLE.remove(zombie_pid);
+    }
+    // SAFETY: same context; SCHEDULER exclusively owned here.
+    let zombie_tid = unsafe {
+        #[allow(static_mut_refs)]
+        let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+        let mut tid_opt: Option<oncrix_process::pid::Tid> = None;
+        for slot in sched.threads_iter_mut() {
+            if let Some(t) = slot
+                && t.pid() == zombie_pid
+            {
+                // Take and release the UAS frames before the Thread drops.
+                if let Some(uas) = t.user_address_space.take() {
+                    let alloc = crate::frame_alloc::frame_alloc();
+                    uas.release(alloc);
+                }
+                tid_opt = Some(t.tid());
+                break;
+            }
+        }
+        tid_opt
+    };
+    if let Some(tid) = zombie_tid {
+        // SAFETY: same single-CPU context.
+        unsafe {
+            #[allow(static_mut_refs)]
+            let _ = crate::arch::x86_64::init::SCHEDULER.remove(tid);
+        }
+    }
+}
+
+// ── sys_waitid ───────────────────────────────────────────────────
+
+/// `waitid(2)` idtype: wait for any child.
+const P_ALL: u64 = 0;
+/// `waitid(2)` idtype: wait for the child with PID == `id`.
+const P_PID: u64 = 1;
+/// `waitid(2)` idtype: wait for any child in process group `id`.
+const P_PGID: u64 = 2;
+
+/// `waitid(2)` option: report children that have terminated.
+const WEXITED: u64 = 4;
+/// `waitid(2)` option: leave the child in a waitable state (do not reap).
+const WNOWAIT: u64 = 0x0100_0000;
+
+/// `siginfo_t` is 128 bytes on x86_64. `waitid` fills `si_signo`(0),
+/// `si_code`(8), `si_pid`(16), `si_uid`(20) and `si_status`(24).
+const SIGINFO_SIZE: usize = 128;
+/// `si_code` value: child exited normally (`CLD_EXITED`).
+const CLD_EXITED: i32 = 1;
+
+/// Kernel handler for `SYS_WAITID` (number 247).
+///
+/// POSIX.1-2024 `waitid(3p)` subset:
+/// - `idtype` = `P_ALL` (any child), `P_PID` (PID == `id`), `P_PGID`
+///   (process group `id`).
+/// - `options` must include `WEXITED` (the only reportable state here —
+///   stop/continue are not modelled); `WNOHANG` returns 0 with a zeroed
+///   `si_pid` if no child is waitable; `WNOWAIT` leaves the zombie unreaped.
+/// - On success writes a `siginfo_t` (`si_signo=SIGCHLD`,
+///   `si_code=CLD_EXITED`, `si_pid`, `si_status`) to `infop` and returns 0.
+///
+/// Returns `-ECHILD`(10) if the caller has no matching child, `-EINVAL`(22)
+/// for a bad `idtype`/`options`, `-EFAULT`(14) for a bad `infop`.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU). `infop`, if
+/// non-null, must reference 128 writable user bytes.
+pub unsafe fn sys_waitid(idtype: u64, id: u64, infop: u64, options: u64) -> i64 {
+    // WEXITED is mandatory; stop/continue states are not modelled, so an
+    // options word lacking WEXITED has nothing to report.
+    if options & WEXITED == 0 {
+        return -22; // EINVAL
+    }
+    if infop != 0 && infop >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    let caller_pid = match crate::current::current_thread() {
+        Some(t) => t.pid(),
+        None => return -10, // ECHILD
+    };
+
+    // Map idtype/id to the same target filter sys_wait4 uses.
+    let target_pid: Option<Pid> = match idtype {
+        P_ALL => None,
+        P_PID => Some(Pid::new(id)),
+        // Process groups are tracked but waitid pgrp filtering is not yet
+        // modelled; treat P_PGID like "any child" for now (documented).
+        P_PGID => None,
+        _ => return -22, // EINVAL — unknown idtype
+    };
+
+    // The caller must have at least one matching child.
+    // SAFETY: single-CPU SYSCALL context.
+    let has_children = unsafe {
+        #[allow(static_mut_refs)]
+        PROCESS_TABLE.children(caller_pid).next().is_some()
+    };
+    if !has_children {
+        return -10; // ECHILD
+    }
+
+    loop {
+        // SAFETY: single-CPU SYSCALL context.
+        let found = unsafe {
+            #[allow(static_mut_refs)]
+            find_zombie_child(&PROCESS_TABLE, caller_pid, target_pid)
+        };
+
+        if let Some((zombie_pid, exit_code)) = found {
+            // Fill the siginfo_t for the caller.
+            if infop != 0 {
+                // SAFETY: infop validated above; writing 128 bytes.
+                unsafe {
+                    let p = infop as *mut u8;
+                    for i in 0..SIGINFO_SIZE {
+                        p.add(i).write_volatile(0);
+                    }
+                    let w32 = |off: usize, v: i32| {
+                        (p.add(off) as *mut i32).write_volatile(v);
+                    };
+                    w32(0, Signal::SIGCHLD.0 as i32); // si_signo
+                    w32(8, CLD_EXITED); // si_code
+                    w32(16, zombie_pid.as_u64() as i32); // si_pid
+                    w32(20, 0); // si_uid
+                    w32(24, exit_code); // si_status
+                }
+            }
+
+            // WNOWAIT leaves the child in a waitable (zombie) state.
+            if options & WNOWAIT == 0 {
+                // SAFETY: single-CPU SYSCALL context.
+                unsafe { reap_zombie(zombie_pid) };
+            }
+            return 0;
+        }
+
+        // WNOHANG: si_pid stays zero (already memset by the caller's buffer
+        // not being written) and we return 0 immediately.
+        if options & WNOHANG != 0 {
+            if infop != 0 {
+                // SAFETY: infop validated above; zero the 128-byte siginfo
+                // so si_signo == 0 signals "no child waitable" per POSIX.
+                unsafe {
+                    let p = infop as *mut u8;
+                    for i in 0..SIGINFO_SIZE {
+                        p.add(i).write_volatile(0);
+                    }
+                }
+            }
+            return 0;
+        }
+
+        // Blocking path: yield and retry.
+        // SAFETY: single-CPU, interrupts-off context.
+        let switched = unsafe { crate::current::yield_now() };
+        if !switched {
+            return 0; // nothing else runnable — behave like WNOHANG
+        }
+    }
 }
 
 // ── sys_execve ───────────────────────────────────────────────────
@@ -785,6 +935,92 @@ pub unsafe fn sys_kill(pid_arg: u64, sig_arg: u64) -> i64 {
             }
         }
     }
+}
+
+// ── sys_rt_sigpending / sys_sigaltstack / sys_rt_sigqueueinfo ─────
+
+/// Kernel handler for `SYS_RT_SIGPENDING` (number 127).
+///
+/// POSIX `rt_sigpending(set, sigsetsize)`: write the calling process's set of
+/// pending signals to the user `u64` sigset at `set_ptr`. ONCRIX models 32
+/// signals in a `u32` bitset (bit `i` ⇒ signal `i + 1`), which maps directly
+/// onto the low 32 bits of the Linux sigset.
+///
+/// Returns 0 on success, `-EINVAL` if `sigsetsize != 8`, `-EFAULT` for a bad
+/// pointer, `-ESRCH` if there is no current process.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
+    if sigsetsize != 8 {
+        return -22; // EINVAL
+    }
+    if set_ptr == 0 || set_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    let pid = match crate::current::current_pid() {
+        Some(p) => p,
+        None => return -3, // ESRCH
+    };
+    // SAFETY: single-CPU SYSCALL context; exclusive PROCESS_TABLE access.
+    let bits = unsafe {
+        #[allow(static_mut_refs)]
+        match PROCESS_TABLE.get(pid) {
+            Some(e) => e.signals.pending.bits() as u64,
+            None => return -3, // ESRCH
+        }
+    };
+    // SAFETY: set_ptr validated above; writing 8 bytes.
+    unsafe { core::ptr::write_unaligned(set_ptr as *mut u64, bits) };
+    0
+}
+
+/// Kernel handler for `SYS_SIGALTSTACK` (number 131).
+///
+/// POSIX `sigaltstack(ss, old_ss)`: ONCRIX delivers signals on the normal
+/// user stack and does not honour an alternate stack yet. The new `ss` is
+/// accepted and ignored; if `old_ss` is non-null it receives a zeroed
+/// `stack_t` with `ss_flags = SS_DISABLE` (2). Returns 0 / `-EFAULT`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> i64 {
+    /// `SS_DISABLE` — the alternate stack is currently disabled.
+    const SS_DISABLE: i32 = 2;
+    if ss_ptr != 0 && ss_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    if old_ss_ptr != 0 {
+        if old_ss_ptr >= 0xFFFF_8000_0000_0000 {
+            return -14; // EFAULT
+        }
+        // stack_t { ss_sp: u64 @0, ss_flags: i32 @8, _pad: u32 @12, ss_size: u64 @16 }
+        // SAFETY: old_ss_ptr validated; writing 24 bytes.
+        unsafe {
+            let p = old_ss_ptr as *mut u8;
+            for i in 0..24 {
+                p.add(i).write_volatile(0);
+            }
+            core::ptr::write_unaligned((old_ss_ptr + 8) as *mut i32, SS_DISABLE);
+        }
+    }
+    0
+}
+
+/// Kernel handler for `SYS_RT_SIGQUEUEINFO` (number 129).
+///
+/// POSIX `rt_sigqueueinfo(tgid, sig, uinfo)`: queue a signal with an
+/// accompanying `siginfo_t`. ONCRIX has no realtime signal queue, so the
+/// `uinfo` payload is ignored and the signal is delivered like `kill(2)`.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_rt_sigqueueinfo(tgid: u64, sig: u64, _uinfo: u64) -> i64 {
+    // SAFETY: delegate to sys_kill under the same SYSCALL context.
+    unsafe { sys_kill(tgid, sig) }
 }
 
 // ── sys_exit ─────────────────────────────────────────────────────

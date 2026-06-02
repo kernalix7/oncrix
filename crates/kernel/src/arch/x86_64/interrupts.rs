@@ -48,6 +48,34 @@ pub extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
         (*pit_ptr).tick();
     }
 
+    // Charge one tick of CPU time to the currently running thread for
+    // times(2)/getrusage(2) accounting. Done before the switch so the
+    // tick lands on the thread that actually consumed this slice.
+    // SAFETY: single-CPU + IF=0 (interrupt gate) — the scheduler is not
+    // concurrently mutated, so the &mut current borrow is exclusive and
+    // is dropped before sched_yield_once below takes its own borrow.
+    unsafe {
+        #[allow(static_mut_refs)]
+        let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+        if let Some(t) = sched.current_mut() {
+            t.charge_tick();
+        }
+    }
+
+    // Advance per-process ITIMER_REAL timers; raise SIGALRM on expiry.
+    // SAFETY: timer IRQ context (single-CPU, IF=0); tick_itimers takes
+    // and releases its own process-table borrow within the call.
+    unsafe {
+        crate::sched_syscalls::tick_itimers();
+    }
+
+    // Advance armed timerfds and accumulate their expiration counts.
+    // SAFETY: timer IRQ context (single-CPU, IF=0); the timerfd table is
+    // only mutated with IF=0 (here and from the SYSCALL dispatch path).
+    unsafe {
+        crate::fd_table::tick_timerfds();
+    }
+
     // Acknowledge IRQ 0 via PIC *before* running the scheduler.
     // Sending EOI first allows higher-priority interrupts to be
     // serviced if the scheduler re-enables interrupts.

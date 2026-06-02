@@ -41,6 +41,10 @@ pub const ENOSYS: i64 = 38;
 
 const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
+const SYS_PREAD64: u64 = 17;
+const SYS_PWRITE64: u64 = 18;
+const SYS_READV: u64 = 19;
+const SYS_WRITEV: u64 = 20;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_STAT: u64 = 4;
@@ -50,7 +54,14 @@ const SYS_MMAP: u64 = 9;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_ACCESS: u64 = 21;
 const SYS_FSYNC: u64 = 74;
+const SYS_FDATASYNC: u64 = 75;
+const SYS_STATFS: u64 = 137;
+const SYS_FSTATFS: u64 = 138;
+const SYS_SYSINFO: u64 = 99;
+const SYS_GETRANDOM: u64 = 318;
 const SYS_DUP2: u64 = 33;
+const SYS_DUP3: u64 = 292;
+const SYS_UMASK: u64 = 95;
 const SYS_GETPID: u64 = 39;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
@@ -58,24 +69,132 @@ const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_RENAME: u64 = 82;
 const SYS_CHMOD: u64 = 90;
+const SYS_FCHMOD: u64 = 91;
 const SYS_LINK: u64 = 86;
 const SYS_CHOWN: u64 = 92;
+const SYS_FCHOWN: u64 = 93;
 const SYS_SYNC: u64 = 162;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
 const SYS_TRUNCATE: u64 = 76;
+const SYS_FTRUNCATE: u64 = 77;
 const SYS_RMDIR: u64 = 84;
 const SYS_MKNOD: u64 = 133;
 const SYS_FORK: u64 = 57;
 const SYS_EXECVE: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_WAIT4: u64 = 61;
+const SYS_WAITID: u64 = 247;
 const SYS_KILL: u64 = 62;
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
+const SYS_RT_SIGPENDING: u64 = 127;
+const SYS_RT_SIGQUEUEINFO: u64 = 129;
+const SYS_SIGALTSTACK: u64 = 131;
+const SYS_SCHED_RR_GET_INTERVAL: u64 = 148;
 const SYS_GETDENTS64: u64 = 217;
+const SYS_MEMFD_CREATE: u64 = 319;
+// sched_attr / time-misc
+const SYS_SCHED_SETATTR: u64 = 314;
+const SYS_SCHED_GETATTR: u64 = 315;
+const SYS_ADJTIMEX: u64 = 159;
+const SYS_CLOCK_SETTIME: u64 = 227;
+const SYS_CLOCK_ADJTIME: u64 = 305;
+// fd-ops / xattr / copy
+const SYS_DUP: u64 = 32;
+const SYS_CLOSE_RANGE: u64 = 436;
+const SYS_SETXATTR: u64 = 188;
+const SYS_LSETXATTR: u64 = 189;
+const SYS_FSETXATTR: u64 = 190;
+const SYS_GETXATTR: u64 = 191;
+const SYS_LGETXATTR: u64 = 192;
+const SYS_FGETXATTR: u64 = 193;
+const SYS_LISTXATTR: u64 = 194;
+const SYS_LLISTXATTR: u64 = 195;
+const SYS_FLISTXATTR: u64 = 196;
+const SYS_REMOVEXATTR: u64 = 197;
+const SYS_LREMOVEXATTR: u64 = 198;
+const SYS_FREMOVEXATTR: u64 = 199;
+const SYS_SENDFILE: u64 = 40;
+const SYS_COPY_FILE_RANGE: u64 = 326;
+// identity / time / creds
+const SYS_UNAME: u64 = 63;
+const SYS_SETHOSTNAME: u64 = 170;
+const SYS_SETDOMAINNAME: u64 = 171;
+const SYS_GETTIMEOFDAY: u64 = 96;
+const SYS_SETTIMEOFDAY: u64 = 164;
+const SYS_CLOCK_GETRES: u64 = 229;
+const SYS_CAPGET: u64 = 125;
+const SYS_CAPSET: u64 = 126;
+const SYS_GETGROUPS: u64 = 115;
+const SYS_SETGROUPS: u64 = 116;
+const SYS_PERSONALITY: u64 = 135;
+// misc / advisory
+const SYS_FLOCK: u64 = 73;
+const SYS_MSYNC: u64 = 26;
+const SYS_MADVISE: u64 = 28;
+const SYS_MLOCK: u64 = 149;
+const SYS_MUNLOCK: u64 = 150;
+const SYS_MLOCKALL: u64 = 151;
+const SYS_MUNLOCKALL: u64 = 152;
+const SYS_GETPGRP: u64 = 111;
+const SYS_GETCPU: u64 = 309;
+const SYS_SCHED_GET_PRIORITY_MAX: u64 = 146;
+const SYS_SCHED_GET_PRIORITY_MIN: u64 = 147;
+const SYS_READAHEAD: u64 = 187;
+const SYS_FADVISE64: u64 = 221;
+const SYS_SYNC_FILE_RANGE: u64 = 277;
+const SYS_FALLOCATE: u64 = 285;
+// *at family
+const SYS_FACCESSAT: u64 = 269;
+const SYS_FCHMODAT: u64 = 268;
+const SYS_FCHOWNAT: u64 = 260;
+const SYS_MKDIRAT: u64 = 258;
+const SYS_UNLINKAT: u64 = 263;
+const SYS_RENAMEAT: u64 = 264;
+const SYS_READLINKAT: u64 = 267;
+const SYS_SYMLINKAT: u64 = 266;
+const SYS_NEWFSTATAT: u64 = 262;
 const SYS_PIPE2: u64 = 293;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_CLOCK_GETTIME: u64 = 228;
+const SYS_CLOCK_NANOSLEEP: u64 = 230;
 const SYS_TIME: u64 = 201;
+const SYS_GETPRIORITY: u64 = 140;
+const SYS_SETPRIORITY: u64 = 141;
+const SYS_NICE: u64 = 34;
+const SYS_FCNTL: u64 = 72;
+const SYS_SCHED_YIELD: u64 = 24;
+const SYS_SCHED_SETPARAM: u64 = 142;
+const SYS_SCHED_GETPARAM: u64 = 143;
+const SYS_SCHED_SETSCHEDULER: u64 = 144;
+const SYS_SCHED_GETSCHEDULER: u64 = 145;
+const SYS_POLL: u64 = 7;
+const SYS_SELECT: u64 = 23;
+const SYS_TIMES: u64 = 100;
+const SYS_GETRUSAGE: u64 = 98;
+const SYS_SCHED_SETAFFINITY: u64 = 203;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_EVENTFD2: u64 = 290;
+const SYS_TIMERFD_CREATE: u64 = 283;
+const SYS_TIMERFD_SETTIME: u64 = 286;
+const SYS_TIMERFD_GETTIME: u64 = 287;
+const SYS_SIGNALFD4: u64 = 289;
+const SYS_EPOLL_WAIT: u64 = 232;
+const SYS_EPOLL_CTL: u64 = 233;
+const SYS_EPOLL_CREATE1: u64 = 291;
+const SYS_GETITIMER: u64 = 36;
+const SYS_ALARM: u64 = 37;
+const SYS_SETITIMER: u64 = 38;
+const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_SETPGID: u64 = 109;
+const SYS_SETSID: u64 = 112;
+const SYS_GETPGID: u64 = 121;
+const SYS_GETSID: u64 = 124;
+const SYS_GETRLIMIT: u64 = 97;
+const SYS_SETRLIMIT: u64 = 160;
+const SYS_PRLIMIT64: u64 = 302;
+const SYS_SOCKETPAIR: u64 = 53;
 
 // ---------------------------------------------------------------------------
 // Signal numbers
@@ -253,6 +372,65 @@ pub unsafe fn read(fd: i32, buf: *mut u8, count: usize) -> i64 {
     unsafe { syscall3(SYS_READ, fd as u64, buf as u64, count as u64) }
 }
 
+/// `pread(2)` — read `count` bytes from `fd` at `offset` without moving the
+/// file position. Only seekable files are supported (others -> `-ESPIPE`).
+///
+/// Returns the number of bytes read, 0 on EOF, or a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to at least `count` writable bytes.
+pub unsafe fn pread(fd: i32, buf: *mut u8, count: usize, offset: u64) -> i64 {
+    // SAFETY: caller guarantees `buf` is valid for `count` writable bytes.
+    unsafe { syscall4(SYS_PREAD64, fd as u64, buf as u64, count as u64, offset) }
+}
+
+/// `pwrite(2)` — write `count` bytes to `fd` at `offset` without moving the
+/// file position. Only seekable files are supported (others -> `-ESPIPE`).
+///
+/// Returns the number of bytes written, or a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to at least `count` readable bytes.
+pub unsafe fn pwrite(fd: i32, buf: *const u8, count: usize, offset: u64) -> i64 {
+    // SAFETY: caller guarantees `buf` is valid for `count` bytes.
+    unsafe { syscall4(SYS_PWRITE64, fd as u64, buf as u64, count as u64, offset) }
+}
+
+/// A scatter/gather buffer descriptor — `struct iovec`.
+#[repr(C)]
+pub struct IoVec {
+    /// Start of the buffer.
+    pub iov_base: *mut u8,
+    /// Length of the buffer in bytes.
+    pub iov_len: usize,
+}
+
+/// `readv(2)` — scatter-read into the `iovcnt` buffers described by `iov`.
+///
+/// Returns the total bytes read, 0 on EOF, or a negative errno value.
+///
+/// # Safety
+///
+/// `iov` must point to `iovcnt` valid `IoVec`s with writable buffers.
+pub unsafe fn readv(fd: i32, iov: *const IoVec, iovcnt: i32) -> i64 {
+    // SAFETY: caller guarantees the iovec array + buffers.
+    unsafe { syscall3(SYS_READV, fd as u64, iov as u64, iovcnt as i64 as u64) }
+}
+
+/// `writev(2)` — gather-write the `iovcnt` buffers described by `iov`.
+///
+/// Returns the total bytes written, or a negative errno value.
+///
+/// # Safety
+///
+/// `iov` must point to `iovcnt` valid `IoVec`s with readable buffers.
+pub unsafe fn writev(fd: i32, iov: *const IoVec, iovcnt: i32) -> i64 {
+    // SAFETY: caller guarantees the iovec array + buffers.
+    unsafe { syscall3(SYS_WRITEV, fd as u64, iov as u64, iovcnt as i64 as u64) }
+}
+
 /// `open(2)` — open a file.
 ///
 /// `path` must be a null-terminated C string.
@@ -340,6 +518,39 @@ pub unsafe fn waitpid(pid: i64, status: *mut i32, options: i32) -> i64 {
     }
 }
 
+/// `waitid(2)` idtype: any child.
+pub const P_ALL: i32 = 0;
+/// `waitid(2)` idtype: the child whose PID == `id`.
+pub const P_PID: i32 = 1;
+/// `waitid(2)` idtype: any child in process group `id`.
+pub const P_PGID: i32 = 2;
+/// `waitid(2)` option: report terminated children (mandatory).
+pub const WEXITED: i32 = 4;
+/// `waitid(2)` option: leave the child waitable (do not reap).
+pub const WNOWAIT: i32 = 0x0100_0000;
+
+/// `waitid(2)` — wait for a child by `idtype`/`id`, filling a `siginfo_t`
+/// (128 bytes) at `infop`. `options` must include [`WEXITED`].
+///
+/// Returns 0 on success (the reaped child's details land in `*infop`), or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// `infop` must point to 128 writable bytes when non-null.
+pub unsafe fn waitid(idtype: i32, id: u32, infop: *mut u8, options: i32) -> i64 {
+    // SAFETY: caller guarantees `infop` validity.
+    unsafe {
+        syscall4(
+            SYS_WAITID,
+            idtype as i64 as u64,
+            id as u64,
+            infop as u64,
+            options as i64 as u64,
+        )
+    }
+}
+
 /// `kill(2)` — send a signal to a process.
 ///
 /// Returns 0 on success, or a negative errno value:
@@ -400,6 +611,18 @@ pub unsafe fn chmod(path: *const u8, mode: u32) -> i64 {
     unsafe { syscall2(SYS_CHMOD, path as u64, mode as u64) }
 }
 
+/// `fchmod(2)` — change permission bits of the file referenced by `fd`.
+///
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn fchmod(fd: i32, mode: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_FCHMOD, fd as u64, mode as u64) }
+}
+
 /// `link(2)` — create a hard link.
 ///
 /// Returns 0 on success, or a negative errno value.
@@ -425,6 +648,666 @@ pub unsafe fn chown(path: *const u8, uid: u32, gid: u32) -> i64 {
     unsafe { syscall3(SYS_CHOWN, path as u64, uid as u64, gid as u64) }
 }
 
+/// `fchown(2)` — change owner/group of the file referenced by `fd`.
+///
+/// A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`) leaves that id unchanged.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn fchown(fd: i32, uid: u32, gid: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) }
+}
+
+/// `getpriority(2)` — get the scheduling priority (nice value).
+///
+/// `which` selects the target class (0 = `PRIO_PROCESS`); `who` is the id
+/// (0 = the calling process). Returns the nice value in `[-20, 19]`, or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn getpriority(which: i32, who: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_GETPRIORITY, which as u64, who as u64) }
+}
+
+/// `setpriority(2)` — set the scheduling priority (nice value).
+///
+/// `which` selects the target class (0 = `PRIO_PROCESS`); `who` is the id
+/// (0 = the calling process); `prio` is the new nice value in `[-20, 19]`.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn setpriority(which: i32, who: i32, prio: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_SETPRIORITY, which as u64, who as u64, prio as u64) }
+}
+
+/// `nice(2)` — add `inc` to the calling thread's nice value.
+///
+/// Returns the new nice value, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn nice(inc: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_NICE, inc as u64) }
+}
+
+/// `fcntl(2)` — file/descriptor control.
+///
+/// Supports `F_DUPFD`(0)/`F_DUPFD_CLOEXEC`(1030), `F_GETFD`(1)/`F_SETFD`(2)
+/// for `FD_CLOEXEC`, and `F_GETFL`(3)/`F_SETFL`(4) for the file-status flags
+/// (`O_NONBLOCK`/`O_APPEND`). Returns a command-specific value, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn fcntl(fd: i32, cmd: i32, arg: u64) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_FCNTL, fd as u64, cmd as u64, arg) }
+}
+
+/// `sched_yield(2)` — yield the processor to another runnable thread.
+///
+/// Always returns 0.
+pub fn sched_yield() -> i64 {
+    // SAFETY: no arguments, no memory access.
+    unsafe { syscall1(SYS_SCHED_YIELD, 0) }
+}
+
+/// `sched_setscheduler(2)` — set scheduling policy and parameters.
+///
+/// `pid` of 0 targets the calling thread; `policy` is `SCHED_OTHER`(0) /
+/// `SCHED_FIFO`(1) / `SCHED_RR`(2); `param` points to a `struct sched_param`.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `param` must point to a valid `sched_param` for the call's duration.
+pub unsafe fn sched_setscheduler(pid: i32, policy: i32, param: *const u8) -> i64 {
+    // SAFETY: caller guarantees `param` validity.
+    unsafe { syscall3(SYS_SCHED_SETSCHEDULER, pid as u64, policy as u64, param as u64) }
+}
+
+/// `sched_getscheduler(2)` — return the scheduling policy (`SCHED_*`).
+///
+/// `pid` of 0 targets the calling thread. Returns the policy, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn sched_getscheduler(pid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_SCHED_GETSCHEDULER, pid as u64) }
+}
+
+/// `sched_getparam(2)` — read scheduling parameters into `param`.
+///
+/// # Safety
+///
+/// `param` must point to a writable `sched_param`.
+pub unsafe fn sched_getparam(pid: i32, param: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `param` validity.
+    unsafe { syscall2(SYS_SCHED_GETPARAM, pid as u64, param as u64) }
+}
+
+/// `sched_setparam(2)` — set scheduling parameters from `param`.
+///
+/// # Safety
+///
+/// `param` must point to a valid `sched_param`.
+pub unsafe fn sched_setparam(pid: i32, param: *const u8) -> i64 {
+    // SAFETY: caller guarantees `param` validity.
+    unsafe { syscall2(SYS_SCHED_SETPARAM, pid as u64, param as u64) }
+}
+
+/// A single `poll(2)` file-descriptor request/result entry (8 bytes).
+#[repr(C)]
+pub struct PollFd {
+    /// File descriptor to watch (negative = ignored, `revents` set 0).
+    pub fd: i32,
+    /// Requested events bitmask (`POLLIN`/`POLLOUT`).
+    pub events: i16,
+    /// Returned events bitmask, written by the kernel.
+    pub revents: i16,
+}
+
+/// `poll` event: data available to read.
+pub const POLLIN: i16 = 0x0001;
+/// `poll` event: writing will not block.
+pub const POLLOUT: i16 = 0x0004;
+/// `poll` event: error condition (output only).
+pub const POLLERR: i16 = 0x0008;
+/// `poll` event: hang-up — peer closed (output only).
+pub const POLLHUP: i16 = 0x0010;
+/// `poll` event: fd not open (output only).
+pub const POLLNVAL: i16 = 0x0020;
+
+/// `poll(2)` — wait for events on a set of file descriptors.
+///
+/// `timeout_ms` < 0 blocks indefinitely, 0 polls once without blocking,
+/// > 0 waits up to that many milliseconds. Returns the number of fds with
+/// non-zero `revents`, 0 on timeout, or a negative errno value.
+///
+/// # Safety
+///
+/// `fds` must point to `nfds` writable `PollFd` entries.
+pub unsafe fn poll(fds: *mut PollFd, nfds: u64, timeout_ms: i32) -> i64 {
+    // SAFETY: caller guarantees `fds`/`nfds` validity.
+    unsafe { syscall3(SYS_POLL, fds as u64, nfds, timeout_ms as i64 as u64) }
+}
+
+/// `select(2)` — synchronous I/O multiplexing.
+///
+/// Each of `readfds`/`writefds`/`exceptfds` (may be NULL) is a `fd_set`
+/// bitmap of up to `FD_SETSIZE` bits; the kernel rewrites them in place to
+/// the ready set. `timeout` (may be NULL = block forever) is a `timeval`.
+/// Returns the number of ready descriptors, 0 on timeout, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Any non-null `fd_set`/`timeval` pointer must reference valid storage.
+pub unsafe fn select(
+    nfds: i32,
+    readfds: *mut u8,
+    writefds: *mut u8,
+    exceptfds: *mut u8,
+    timeout: *mut u8,
+) -> i64 {
+    // SAFETY: caller guarantees pointer validity. select takes 5 args; the
+    // 6th register is unused (passed 0).
+    unsafe {
+        syscall6(
+            SYS_SELECT,
+            nfds as u64,
+            readfds as u64,
+            writefds as u64,
+            exceptfds as u64,
+            timeout as u64,
+            0,
+        )
+    }
+}
+
+/// `times(2)` — process times. `buf` is a `struct tms` (4 × `i64`:
+/// utime, stime, cutime, cstime). Returns elapsed ticks since boot, or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to a writable `tms` (32 bytes).
+pub unsafe fn times(buf: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `buf` validity.
+    unsafe { syscall1(SYS_TIMES, buf as u64) }
+}
+
+/// `getrusage(2)` — resource usage. `who` is `RUSAGE_SELF`(0) or
+/// `RUSAGE_CHILDREN`(-1); `usage` is a `struct rusage` whose leading fields
+/// `ru_utime`/`ru_stime` are `timeval`s. Returns 0, or a negative errno.
+///
+/// # Safety
+///
+/// `usage` must point to a writable `rusage` (144 bytes).
+pub unsafe fn getrusage(who: i32, usage: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `usage` validity.
+    unsafe { syscall2(SYS_GETRUSAGE, who as u64, usage as u64) }
+}
+
+/// `sched_getaffinity(2)` — read the CPU affinity mask into `mask`.
+///
+/// `pid` of 0 targets the calling thread. On this single-CPU system the
+/// returned mask always has bit 0 set. Returns `cpusetsize` on success, or
+/// a negative errno value.
+///
+/// # Safety
+///
+/// `mask` must point to `cpusetsize` writable bytes.
+pub unsafe fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `mask`/`cpusetsize` validity.
+    unsafe { syscall3(SYS_SCHED_GETAFFINITY, pid as u64, cpusetsize as u64, mask as u64) }
+}
+
+/// `sched_setaffinity(2)` — set the CPU affinity mask from `mask`.
+///
+/// `pid` of 0 targets the calling thread. The mask must include CPU 0 (the
+/// only CPU) or `-EINVAL` is returned. Returns 0 on success, or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// `mask` must point to `cpusetsize` readable bytes.
+pub unsafe fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i64 {
+    // SAFETY: caller guarantees `mask`/`cpusetsize` validity.
+    unsafe { syscall3(SYS_SCHED_SETAFFINITY, pid as u64, cpusetsize as u64, mask as u64) }
+}
+
+/// `clock_nanosleep(2)` — high-resolution sleep against a clock.
+///
+/// `clockid` is `CLOCK_REALTIME`(0)/`CLOCK_MONOTONIC`(1); `flags` is 0
+/// (relative) or `TIMER_ABSTIME`(1). `request`/`remain` are `timespec`
+/// (`[i64;2]` = tv_sec, tv_nsec); `remain` may be NULL. Returns 0, or a
+/// negative errno value.
+///
+/// # Safety
+///
+/// `request` must point to a valid `timespec`; `remain`, if non-null, must
+/// be writable.
+pub unsafe fn clock_nanosleep(clockid: i32, flags: i32, request: *const u8, remain: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_CLOCK_NANOSLEEP,
+            clockid as u64,
+            flags as u64,
+            request as u64,
+            remain as u64,
+        )
+    }
+}
+
+/// `eventfd` flag: each `read` decrements the counter by 1 (semaphore mode).
+pub const EFD_SEMAPHORE: i32 = 1;
+/// `eventfd` flag: set the descriptor non-blocking.
+pub const EFD_NONBLOCK: i32 = 0o4000;
+/// `eventfd` flag: set `FD_CLOEXEC` on the new descriptor.
+pub const EFD_CLOEXEC: i32 = 0o2000000;
+
+/// `eventfd(2)` — create a file descriptor backed by a `u64` counter.
+///
+/// `read` returns (and clears, or decrements in `EFD_SEMAPHORE` mode) the
+/// counter; `write` adds to it. The fd is pollable via [`poll`]/[`select`].
+/// Returns the new fd, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with scalar arguments; always safe to call.
+pub unsafe fn eventfd(initval: u32, flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_EVENTFD2, initval as u64, flags as i64 as u64) }
+}
+
+/// `timespec` — seconds + nanoseconds.
+#[repr(C)]
+pub struct TimeSpec {
+    /// Whole seconds.
+    pub tv_sec: i64,
+    /// Nanoseconds, in `[0, 1e9)`.
+    pub tv_nsec: i64,
+}
+
+/// `itimerspec` — interval + initial expiration `timespec`s.
+#[repr(C)]
+pub struct ITimerSpec {
+    /// Reload interval (zero = one-shot).
+    pub it_interval: TimeSpec,
+    /// Initial expiration (zero = disarmed).
+    pub it_value: TimeSpec,
+}
+
+/// `clock_gettime`/`timerfd` clock id: monotonic incl. suspend.
+/// (`CLOCK_REALTIME`/`CLOCK_MONOTONIC` are defined once with the other
+/// clock-id constants below.)
+pub const CLOCK_BOOTTIME: i32 = 7;
+/// `timerfd_create` flag: set the descriptor non-blocking.
+pub const TFD_NONBLOCK: i32 = 0o4000;
+/// `timerfd_create` flag: set `FD_CLOEXEC`.
+pub const TFD_CLOEXEC: i32 = 0o2000000;
+/// `timerfd_settime` flag: `it_value` is an absolute time on `clockid`.
+pub const TFD_TIMER_ABSTIME: i32 = 1;
+
+/// `timerfd_create(2)` — create a pollable timer fd. Returns the fd or errno.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn timerfd_create(clockid: i32, flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_TIMERFD_CREATE, clockid as i64 as u64, flags as i64 as u64) }
+}
+
+/// `timerfd_settime(2)` — arm/disarm the timer.
+///
+/// # Safety
+///
+/// `new_value` must point to a valid [`ITimerSpec`]; `old_value`, if
+/// non-null, must be writable.
+pub unsafe fn timerfd_settime(
+    fd: i32,
+    flags: i32,
+    new_value: *const ITimerSpec,
+    old_value: *mut ITimerSpec,
+) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_TIMERFD_SETTIME,
+            fd as u64,
+            flags as i64 as u64,
+            new_value as u64,
+            old_value as u64,
+        )
+    }
+}
+
+/// `timerfd_gettime(2)` — read the current timer setting.
+///
+/// # Safety
+///
+/// `curr_value` must point to a writable [`ITimerSpec`].
+pub unsafe fn timerfd_gettime(fd: i32, curr_value: *mut ITimerSpec) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe { syscall2(SYS_TIMERFD_GETTIME, fd as u64, curr_value as u64) }
+}
+
+/// `signalfd` flag: set the descriptor non-blocking.
+pub const SFD_NONBLOCK: i32 = 0o4000;
+/// `signalfd` flag: set `FD_CLOEXEC`.
+pub const SFD_CLOEXEC: i32 = 0o2000000;
+
+/// `struct signalfd_siginfo` — 128-byte ABI record returned by reads on a
+/// signalfd. Only `ssi_signo`/`ssi_errno`/`ssi_code` are populated; the
+/// remaining 116 bytes are zero-padded.
+#[repr(C)]
+pub struct SignalfdSiginfo {
+    /// Signal number that delivered.
+    pub ssi_signo: u32,
+    /// Reserved; always 0.
+    pub ssi_errno: i32,
+    /// Signal code (`SI_KERNEL`/`SI_USER`/…).
+    pub ssi_code: i32,
+    /// Padding to the 128-byte ABI size.
+    pub _pad: [u8; 116],
+}
+
+/// `signalfd4(2)` — create or update a pollable signal file descriptor.
+///
+/// `fd` of -1 creates a new fd; otherwise the existing signalfd's mask is
+/// replaced. `mask` is a `u64` sigset (sigsetsize implicit = 8). Returns the
+/// fd or a negative errno value.
+///
+/// # Safety
+///
+/// `mask` must point to a valid `u64`.
+pub unsafe fn signalfd(fd: i32, mask: *const u64, flags: i32) -> i64 {
+    // SAFETY: caller guarantees `mask` validity.
+    unsafe { syscall4(SYS_SIGNALFD4, fd as i64 as u64, mask as u64, 8, flags as i64 as u64) }
+}
+
+/// A single epoll interest/event record (packed: `events` then `data`).
+#[repr(C, packed)]
+pub struct EpollEvent {
+    /// Event bitmask (`EPOLLIN`/`EPOLLOUT`/`EPOLLHUP`).
+    pub events: u32,
+    /// Opaque user data echoed back by `epoll_wait`.
+    pub data: u64,
+}
+
+/// `epoll` event: data available to read.
+pub const EPOLLIN: u32 = 0x0001;
+/// `epoll` event: writing will not block.
+pub const EPOLLOUT: u32 = 0x0004;
+/// `epoll` event: hang-up (output only).
+pub const EPOLLHUP: u32 = 0x0010;
+/// `epoll_create1` flag: set `FD_CLOEXEC`.
+pub const EPOLL_CLOEXEC: i32 = 0o2000000;
+/// `epoll_ctl` op: register a new fd.
+pub const EPOLL_CTL_ADD: i32 = 1;
+/// `epoll_ctl` op: deregister an fd.
+pub const EPOLL_CTL_DEL: i32 = 2;
+/// `epoll_ctl` op: modify a registered fd's interest.
+pub const EPOLL_CTL_MOD: i32 = 3;
+
+/// `epoll_create1(2)` — create an epoll instance. Returns the fd or errno.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn epoll_create1(flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_EPOLL_CREATE1, flags as i64 as u64) }
+}
+
+/// `epoll_ctl(2)` — add/modify/remove an fd in an epoll instance.
+///
+/// # Safety
+///
+/// For ADD/MOD, `ev` must point to a valid [`EpollEvent`].
+pub unsafe fn epoll_ctl(epfd: i32, op: i32, fd: i32, ev: *mut EpollEvent) -> i64 {
+    // SAFETY: caller guarantees `ev` validity for ADD/MOD.
+    unsafe { syscall4(SYS_EPOLL_CTL, epfd as u64, op as u64, fd as u64, ev as u64) }
+}
+
+/// `epoll_wait(2)` — wait for events. Returns the number of ready fds, 0 on
+/// timeout, or a negative errno value.
+///
+/// # Safety
+///
+/// `events` must point to `maxevents` writable [`EpollEvent`]s.
+pub unsafe fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i64 {
+    // SAFETY: caller guarantees `events`/`maxevents` validity.
+    unsafe {
+        syscall4(
+            SYS_EPOLL_WAIT,
+            epfd as u64,
+            events as u64,
+            maxevents as i64 as u64,
+            timeout as i64 as u64,
+        )
+    }
+}
+
+/// `alarm(2)` — schedule a one-shot `SIGALRM` after `seconds`.
+///
+/// Returns the number of seconds remaining on any previously set alarm.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn alarm(seconds: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_ALARM, seconds as u64) }
+}
+
+/// `setitimer(2)` — arm an interval timer. `which` is `ITIMER_REAL`(0);
+/// `new`/`old` are `struct itimerval` (`[i64;4]`: it_interval{sec,usec},
+/// it_value{sec,usec}). Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `new` must point to a valid `itimerval`; `old`, if non-null, writable.
+pub unsafe fn setitimer(which: i32, new: *const u8, old: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe { syscall3(SYS_SETITIMER, which as u64, new as u64, old as u64) }
+}
+
+/// `getitimer(2)` — read the current value of an interval timer.
+///
+/// # Safety
+///
+/// `curr` must point to a writable `itimerval`.
+pub unsafe fn getitimer(which: i32, curr: *mut u8) -> i64 {
+    // SAFETY: caller guarantees `curr` validity.
+    unsafe { syscall2(SYS_GETITIMER, which as u64, curr as u64) }
+}
+
+/// `rt_sigaction(2)` — examine/change a signal disposition.
+///
+/// `sig` is the signal number; `act`/`oact` point to `struct sigaction`
+/// (`[u64;4]` = handler, flags, restorer, mask). `sigsetsize` must be 8.
+/// Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `act`/`oact`, if non-null, must reference valid `sigaction` storage.
+pub unsafe fn rt_sigaction(sig: i32, act: *const u8, oact: *mut u8, sigsetsize: usize) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_RT_SIGACTION,
+            sig as u64,
+            act as u64,
+            oact as u64,
+            sigsetsize as u64,
+        )
+    }
+}
+
+/// `rt_sigprocmask(2)` — examine/change the blocked-signal mask.
+///
+/// `how` is `SIG_BLOCK`(0) / `SIG_UNBLOCK`(1) / `SIG_SETMASK`(2); `set`
+/// (may be NULL = read-only) and `oldset` (may be NULL) are `u64` sigsets.
+/// `sigsetsize` must be 8. Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// `set`/`oldset`, if non-null, must reference valid `u64` storage.
+pub unsafe fn rt_sigprocmask(how: i32, set: *const u8, oldset: *mut u8, sigsetsize: usize) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_RT_SIGPROCMASK,
+            how as u64,
+            set as u64,
+            oldset as u64,
+            sigsetsize as u64,
+        )
+    }
+}
+
+/// `setpgid(2)` — set the process group of `pid` (0 = self) to `pgid`
+/// (0 = use `pid`). Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn setpgid(pid: i32, pgid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_SETPGID, pid as i64 as u64, pgid as i64 as u64) }
+}
+
+/// `getpgid(2)` — return the process group of `pid` (0 = self).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn getpgid(pid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_GETPGID, pid as i64 as u64) }
+}
+
+/// `setsid(2)` — start a new session with the caller as leader.
+///
+/// Returns the new session id (= caller PID), or a negative errno value.
+pub fn setsid() -> i64 {
+    // SAFETY: no arguments, no memory access.
+    unsafe { syscall1(SYS_SETSID, 0) }
+}
+
+/// `getsid(2)` — return the session id of `pid` (0 = self).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn getsid(pid: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_GETSID, pid as i64 as u64) }
+}
+
+/// `struct rlimit` — soft (`rlim_cur`) and hard (`rlim_max`) resource limit.
+#[repr(C)]
+pub struct Rlimit {
+    /// Soft limit (enforced value).
+    pub rlim_cur: u64,
+    /// Hard limit (ceiling for `rlim_cur`).
+    pub rlim_max: u64,
+}
+
+/// `RLIM_INFINITY` — sentinel meaning "no limit".
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// `getrlimit(2)` — read the resource limit for `resource` into `rlim`.
+/// Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `rlim` must point to a writable [`Rlimit`].
+pub unsafe fn getrlimit(resource: i32, rlim: *mut Rlimit) -> i64 {
+    // SAFETY: caller guarantees `rlim` validity.
+    unsafe { syscall2(SYS_GETRLIMIT, resource as i64 as u64, rlim as u64) }
+}
+
+/// `setrlimit(2)` — set the resource limit for `resource` from `rlim`.
+/// Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `rlim` must point to a valid [`Rlimit`].
+pub unsafe fn setrlimit(resource: i32, rlim: *const Rlimit) -> i64 {
+    // SAFETY: caller guarantees `rlim` validity.
+    unsafe { syscall2(SYS_SETRLIMIT, resource as i64 as u64, rlim as u64) }
+}
+
+/// `prlimit64(2)` — get and/or set the resource limit of `pid` (0 = self).
+/// Writes the old value to `old` (if non-null), then applies `new` (if
+/// non-null). Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `new`/`old`, when non-null, must reference a valid [`Rlimit`].
+pub unsafe fn prlimit64(pid: i32, resource: i32, new: *const Rlimit, old: *mut Rlimit) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall4(
+            SYS_PRLIMIT64,
+            pid as i64 as u64,
+            resource as i64 as u64,
+            new as u64,
+            old as u64,
+        )
+    }
+}
+
+/// `socket(2)`/`socketpair(2)` domain: local (Unix-domain) communication.
+pub const AF_UNIX: i32 = 1;
+/// Socket type: sequenced, reliable, bidirectional byte stream.
+pub const SOCK_STREAM: i32 = 1;
+/// `socketpair`/`socket` type flag: set the new fds non-blocking.
+pub const SOCK_NONBLOCK: i32 = 0o4000;
+/// `socketpair`/`socket` type flag: set `FD_CLOEXEC` on the new fds.
+pub const SOCK_CLOEXEC: i32 = 0o2000000;
+
+/// `socketpair(2)` — create a connected pair of `AF_UNIX` sockets.
+///
+/// On success writes the two descriptors to `sv` (a `[i32; 2]`) and returns
+/// 0; otherwise returns a negative errno value.
+///
+/// # Safety
+///
+/// `sv` must point to two writable `i32`s.
+pub unsafe fn socketpair(domain: i32, type_: i32, protocol: i32, sv: *mut i32) -> i64 {
+    // SAFETY: caller guarantees `sv` points to two writable i32s.
+    unsafe {
+        syscall4(
+            SYS_SOCKETPAIR,
+            domain as i64 as u64,
+            type_ as i64 as u64,
+            protocol as i64 as u64,
+            sv as u64,
+        )
+    }
+}
+
 /// `access(2)` — check file accessibility.
 ///
 /// POSIX.1-2024 `access(3p)`. On ONCRIX ramfs, only existence is checked;
@@ -446,6 +1329,15 @@ pub unsafe fn access(path: *const u8, mode: i32) -> i64 {
 pub fn fsync(fd: i32) -> i64 {
     // SAFETY: SYS_FSYNC is idempotent on ramfs; no user pointers involved.
     unsafe { syscall1(SYS_FSYNC, fd as u64) }
+}
+
+/// `fdatasync(2)` — synchronize file data with backing store.
+///
+/// On ONCRIX's in-memory ramfs this always succeeds immediately.
+/// Returns 0.
+pub fn fdatasync(fd: i32) -> i64 {
+    // SAFETY: SYS_FDATASYNC is idempotent on ramfs; no user pointers involved.
+    unsafe { syscall1(SYS_FDATASYNC, fd as u64) }
 }
 
 /// `sync(2)` — flush filesystem buffers.
@@ -539,6 +1431,41 @@ pub unsafe fn getdents64(fd: i32, buf: *mut u8, count: usize) -> i64 {
 /// # Safety
 ///
 /// Both `oldfd` and `newfd` must be valid file descriptor values (>= 0).
+/// `ftruncate(2)` — resize the regular file referenced by `fd` to exactly
+/// `length` bytes. Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn ftruncate(fd: i32, length: u64) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall2(SYS_FTRUNCATE, fd as u64, length) }
+}
+
+/// `umask(2)` — replace the calling process's file-mode creation mask
+/// with `(mask & 0o777)` and return the previous mask.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn umask(mask: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_UMASK, mask as u64) }
+}
+
+/// `dup3(2)` — duplicate `oldfd` onto `newfd`, optionally setting
+/// `O_CLOEXEC` (the only accepted `flags` bit). `oldfd == newfd` is
+/// rejected with `-EINVAL` (unlike `dup2`). Returns `newfd` or a negative
+/// errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn dup3(oldfd: i32, newfd: i32, flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_DUP3, oldfd as u64, newfd as u64, flags as i64 as u64) }
+}
+
 pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i64 {
     // SAFETY: The caller guarantees both fd arguments are non-negative integers.
     unsafe { syscall2(SYS_DUP2, oldfd as u64, newfd as u64) }
@@ -906,4 +1833,1415 @@ pub const fn wtermsig(status: i32) -> i32 {
 pub unsafe fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
     // SAFETY: caller upholds the pointer contracts.
     unsafe { syscall2(SYS_NANOSLEEP, req as u64, rem as u64) }
+}
+
+
+// ── *at family (AT_FDCWD delegation) ───────────────────────────────
+
+/// `faccessat(2)` — check file accessibility relative to a directory fd.
+///
+/// Passes `dirfd`, `path`, `mode`, and `flags` to the kernel.  On ONCRIX only
+/// `AT_FDCWD` (-100) is supported as `dirfd`; any other value causes the kernel
+/// to return `-9` (EBADF).  The `flags` argument (`AT_EACCESS`,
+/// `AT_SYMLINK_NOFOLLOW`) is forwarded but currently ignored by the kernel —
+/// ramfs has no permission enforcement and no symlink semantics.
+///
+/// Returns 0 on success, or a negative errno value on error.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer valid for the duration
+/// of the call.
+pub unsafe fn faccessat(dirfd: i32, path: *const u8, mode: i32, flags: i32) -> i64 {
+    // SAFETY: The caller guarantees `path` is a valid NUL-terminated pointer.
+    unsafe { syscall4(SYS_FACCESSAT, dirfd as i64 as u64, path as u64, mode as u64, flags as u64) }
+}
+
+/// `fchmodat(2)` — change file permission bits relative to a directory file descriptor.
+///
+/// When `dirfd` is `AT_FDCWD` (`-100`) the call is equivalent to `chmod(path, mode)`.
+/// `flags` may be `0` or `AT_SYMLINK_NOFOLLOW` (currently ignored by the kernel).
+///
+/// Returns 0 on success, or a negative errno value on failure (`-9` / `EBADF` when
+/// `dirfd` is not `AT_FDCWD` and cross-directory resolution is unsupported).
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer that remains live for the
+/// duration of the call.
+pub unsafe fn fchmodat(dirfd: i32, path: *const u8, mode: u32, flags: i32) -> i64 {
+    // SAFETY: The caller guarantees `path` is a valid null-terminated pointer.
+    unsafe {
+        syscall4(
+            SYS_FCHMODAT,
+            dirfd as i64 as u64,
+            path as u64,
+            mode as u64,
+            flags as i64 as u64,
+        )
+    }
+}
+
+/// `fchownat(2)` — change file owner/group relative to a directory file descriptor.
+///
+/// When `dirfd` is `AT_FDCWD` (`-100`) and `flags` is `0`, this is equivalent
+/// to `chown(pathname, uid, gid)`. A `uid`/`gid` of `u32::MAX` (`(uid_t)-1`)
+/// leaves that id unchanged.
+///
+/// Returns 0 on success, or a negative errno value (`-EBADF` if `dirfd` is not
+/// `AT_FDCWD`, `-ENOENT` if the path does not exist, etc.).
+///
+/// # Safety
+///
+/// `pathname` must be a valid null-terminated string pointer valid for the
+/// duration of the call.
+pub unsafe fn fchownat(
+    dirfd: i32,
+    pathname: *const u8,
+    uid: u32,
+    gid: u32,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `pathname` is a valid NUL-terminated
+    // pointer; all other arguments are scalars.
+    unsafe {
+        syscall6(
+            SYS_FCHOWNAT,
+            dirfd as i64 as u64,
+            pathname as u64,
+            uid as u64,
+            gid as u64,
+            flags as i64 as u64,
+            0,
+        )
+    }
+}
+
+/// `mkdirat(2)` — create a directory relative to a directory file descriptor.
+///
+/// Creates the directory named by `path`. When `dirfd` is `AT_FDCWD` (-100)
+/// the call is equivalent to `mkdir(path, mode)`. Any other value of `dirfd`
+/// currently returns `-9` (EBADF) because cross-directory `*at` resolution is
+/// not yet modelled in the ONCRIX VFS layer.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `path` must be a valid pointer to a null-terminated UTF-8 path string that
+/// remains valid for the duration of the system call. `dirfd` must be either
+/// `AT_FDCWD` or a valid open directory file descriptor (only `AT_FDCWD` is
+/// currently accepted by the kernel).
+pub unsafe fn mkdirat(dirfd: i32, path: *const u8, mode: u32) -> i64 {
+    // SAFETY: SYS_MKDIRAT takes one scalar (dirfd) and one pointer (path)
+    // plus a scalar (mode). The caller guarantees `path` is null-terminated.
+    unsafe { syscall3(SYS_MKDIRAT, dirfd as i64 as u64, path as u64, mode as u64) }
+}
+
+/// `unlinkat(2)` — remove a directory entry relative to a directory fd.
+///
+/// When `dirfd` is `AT_FDCWD` (-100) and `flags` contains `AT_REMOVEDIR`
+/// (0x200), this call is equivalent to `rmdir(pathname)`.  Otherwise it is
+/// equivalent to `unlink(pathname)`.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `pathname` must be a valid, NUL-terminated string pointer in the caller's
+/// address space for the duration of the call.
+pub unsafe fn unlinkat(dirfd: i32, pathname: *const u8, flags: i32) -> i64 {
+    // SAFETY: The caller guarantees `pathname` is a valid NUL-terminated pointer.
+    unsafe { syscall3(SYS_UNLINKAT, dirfd as i64 as u64, pathname as u64, flags as i64 as u64) }
+}
+
+/// `renameat(2)` — rename/move a filesystem name relative to directory file descriptors.
+///
+/// Both `olddirfd` and `newdirfd` must currently be `AT_FDCWD` (-100); passing any other
+/// file descriptor returns `-EBADF` (-9) because cross-directory `*at` resolution is not
+/// yet implemented in the kernel VFS layer.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `oldpath` and `newpath` must be valid null-terminated string pointers for the duration
+/// of the call. `olddirfd` and `newdirfd` must be `AT_FDCWD` or valid open directory
+/// file descriptors.
+pub unsafe fn renameat(
+    olddirfd: i32,
+    oldpath: *const u8,
+    newdirfd: i32,
+    newpath: *const u8,
+) -> i64 {
+    // SAFETY: The caller guarantees both path pointers are valid null-terminated strings.
+    unsafe {
+        syscall4(
+            SYS_RENAMEAT,
+            olddirfd as i64 as u64,
+            oldpath as u64,
+            newdirfd as i64 as u64,
+            newpath as u64,
+        )
+    }
+}
+
+/// `readlinkat(2)` — read the target of symbolic link `pathname`, interpreting
+/// it relative to the directory file descriptor `dirfd`.
+///
+/// Pass `AT_FDCWD` (-100) as `dirfd` to use the current working directory,
+/// which is the only value currently supported by the kernel. Copies up to
+/// `bufsiz` bytes (no NUL terminator) into `buf`. Returns the byte count on
+/// success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `pathname` must be a valid NUL-terminated string pointer.
+/// `buf` must be writable for at least `bufsiz` bytes.
+/// `dirfd` must be `AT_FDCWD` (-100) or a valid open directory descriptor
+/// (the kernel currently rejects any value other than `AT_FDCWD` with
+/// `-EBADF`).
+pub unsafe fn readlinkat(dirfd: i32, pathname: *const u8, buf: *mut u8, bufsiz: usize) -> i64 {
+    // SAFETY: caller guarantees pathname is NUL-terminated and buf is writable
+    // for bufsiz bytes.
+    unsafe {
+        syscall4(SYS_READLINKAT, dirfd as i64 as u64, pathname as u64, buf as u64, bufsiz as u64)
+    }
+}
+
+/// `symlinkat(2)` — create a symbolic link `linkpath` relative to a directory fd.
+///
+/// When `newdirfd` is `AT_FDCWD` (-100), the call is equivalent to
+/// `symlink(target, linkpath)`. Any other `newdirfd` value is not yet
+/// supported by the kernel and returns `-EBADF`.
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `target` and `linkpath` must be valid null-terminated string pointers for
+/// the duration of this call.
+pub unsafe fn symlinkat(target: *const u8, newdirfd: i32, linkpath: *const u8) -> i64 {
+    // SAFETY: caller guarantees both string pointers are valid and NUL-terminated.
+    unsafe { syscall3(SYS_SYMLINKAT, target as u64, newdirfd as u64, linkpath as u64) }
+}
+
+/// `newfstatat(2)` — get file status for a path relative to a directory fd.
+///
+/// When `flags & AT_SYMLINK_NOFOLLOW` (0x100) is set the call behaves like
+/// `lstat(2)` and does **not** follow a terminal symbolic link.  Otherwise it
+/// behaves like `stat(2)`.
+///
+/// Pass `AT_FDCWD` (-100 cast to `i32`) as `dirfd` to interpret `path` relative
+/// to the current working directory.  The kernel currently rejects any other
+/// `dirfd` value with `-9` (`EBADF`).
+///
+/// Returns 0 on success, or a negative errno value on failure.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string in the caller's address space.
+/// `buf` must be a valid pointer to a writable [`Stat`].
+pub unsafe fn newfstatat(dirfd: i32, path: *const u8, buf: *mut Stat, flags: i32) -> i64 {
+    // SAFETY: caller guarantees `path` and `buf` are valid; dirfd and flags are
+    // plain integers forwarded verbatim to the kernel ABI.
+    unsafe {
+        syscall4(
+            SYS_NEWFSTATAT,
+            dirfd as i64 as u64,
+            path as u64,
+            buf as u64,
+            flags as u64,
+        )
+    }
+}
+
+
+// ── statfs / sysinfo / getrandom ───────────────────────────────────
+
+/// Linux x86_64 `struct statfs` (120 bytes).
+///
+/// Matches the ABI layout used by the kernel `statfs(2)` / `fstatfs(2)` syscalls.
+/// All integer fields are in native (little-endian on x86_64) byte order.
+#[repr(C)]
+pub struct Statfs {
+    /// Filesystem type magic number (e.g. `0x858458f6` for ramfs).
+    pub f_type: i64,
+    /// Optimal transfer block size in bytes.
+    pub f_bsize: i64,
+    /// Total data blocks in the filesystem (in units of `f_bsize`).
+    pub f_blocks: i64,
+    /// Free blocks available to the superuser.
+    pub f_bfree: i64,
+    /// Free blocks available to unprivileged users.
+    pub f_bavail: i64,
+    /// Total file nodes (inodes) in the filesystem.
+    pub f_files: i64,
+    /// Free file nodes.
+    pub f_ffree: i64,
+    /// Filesystem id (`[i32; 2]`, stored as two `i32` values).
+    pub f_fsid: [i32; 2],
+    /// Maximum length of filenames.
+    pub f_namelen: i64,
+    /// Fragment size (equals `f_bsize` on ramfs).
+    pub f_frsize: i64,
+    /// Mount flags.
+    pub f_flags: i64,
+    /// Spare fields (reserved, zero-filled).
+    pub f_spare: [i64; 4],
+}
+
+/// `statfs(2)` — get filesystem statistics for the filesystem containing
+/// `pathname`.
+///
+/// On success `buf` is filled with a [`Statfs`] structure and the function
+/// returns 0. On error it returns a negative errno value.
+///
+/// # Safety
+///
+/// `pathname` must be a valid null-terminated string in user space.
+/// `buf` must point to a valid, writable [`Statfs`]-sized region.
+pub unsafe fn statfs(pathname: *const u8, buf: *mut Statfs) -> i64 {
+    // SAFETY: caller guarantees pathname is null-terminated and buf is valid.
+    unsafe { syscall2(SYS_STATFS, pathname as u64, buf as u64) }
+}
+
+/// `fstatfs(2)` — get filesystem statistics for the filesystem underlying `fd`.
+///
+/// On success `buf` is filled with a [`Statfs`] structure and the function
+/// returns 0. On error it returns a negative errno value.
+///
+/// # Safety
+///
+/// `buf` must point to a valid, writable [`Statfs`]-sized region.
+pub unsafe fn fstatfs(fd: i32, buf: *mut Statfs) -> i64 {
+    // SAFETY: caller guarantees buf is valid.
+    unsafe { syscall2(SYS_FSTATFS, fd as u64, buf as u64) }
+}
+
+/// `struct sysinfo` — Linux x86_64 ABI, 112 bytes.
+///
+/// All `ram`/`swap`/`high` fields are in units of `mem_unit` bytes
+/// (always 1 in ONCRIX). The `loads` array holds the 1-, 5-, and
+/// 15-minute load averages scaled by `1 << SI_LOAD_SHIFT` (65536);
+/// ONCRIX always returns 0 for these until a scheduler load estimator
+/// is wired up.
+#[repr(C)]
+pub struct Sysinfo {
+    /// Seconds elapsed since boot.
+    pub uptime: i64,
+    /// 1-, 5-, 15-minute load averages (scaled by 65536).
+    pub loads: [u64; 3],
+    /// Total usable main memory (bytes when `mem_unit` == 1).
+    pub totalram: u64,
+    /// Available memory (bytes when `mem_unit` == 1).
+    pub freeram: u64,
+    /// Amount of shared memory (always 0 on ONCRIX).
+    pub sharedram: u64,
+    /// Memory used by buffers (always 0 on ONCRIX).
+    pub bufferram: u64,
+    /// Total swap space (always 0 on ONCRIX — no swap).
+    pub totalswap: u64,
+    /// Free swap space (always 0 on ONCRIX).
+    pub freeswap: u64,
+    /// Number of current processes.
+    pub procs: u16,
+    /// Explicit padding after `procs`.
+    pub pad: u16,
+    _pad2: u32,
+    /// Total high-memory size (always 0 — no high-mem zone).
+    pub totalhigh: u64,
+    /// Available high memory (always 0).
+    pub freehigh: u64,
+    /// Size of a memory unit in bytes (always 1).
+    pub mem_unit: u32,
+    _f: u32,
+}
+
+/// `sysinfo(2)` — retrieve general system statistics.
+///
+/// Fills `*info` with a snapshot of uptime, memory, and process counts.
+/// Returns 0 on success, or a negative errno value on error.
+///
+/// # Safety
+///
+/// `info` must point to a writable `Sysinfo` (112 bytes) in user space.
+pub unsafe fn sysinfo(info: *mut Sysinfo) -> i64 {
+    // SAFETY: caller guarantees `info` is a valid writable pointer.
+    unsafe { syscall1(SYS_SYSINFO, info as u64) }
+}
+
+/// `getrandom(2)` — fill `buf[..buflen]` with kernel pseudo-random bytes.
+///
+/// `flags` may be `GRND_NONBLOCK` (1) or `GRND_RANDOM` (2); both are
+/// accepted and currently ignored by the kernel.
+///
+/// Returns the number of bytes written on success, or a negative errno
+/// value on error (`-14` / `EFAULT` for an invalid buffer pointer).
+///
+/// # Safety
+///
+/// `buf` must point to a writable region of at least `buflen` bytes that
+/// remains valid for the duration of the call.
+pub unsafe fn getrandom(buf: *mut u8, buflen: usize, flags: u32) -> i64 {
+    // SAFETY: The caller guarantees `buf` is valid for `buflen` bytes.
+    unsafe { syscall3(SYS_GETRANDOM, buf as u64, buflen as u64, flags as u64) }
+}
+
+/// `GRND_NONBLOCK` — return `EAGAIN` instead of blocking (accepted, ignored).
+pub const GRND_NONBLOCK: u32 = 1;
+
+/// `GRND_RANDOM` — draw from the blocking `/dev/random` pool (accepted, ignored).
+pub const GRND_RANDOM: u32 = 2;
+
+
+// ── flock / mem+io advisory / sched queries ────────────────────────
+
+/// `flock(2)` — apply or remove an advisory lock on an open file.
+///
+/// On ONCRIX the lock table is not implemented; the call always succeeds
+/// once `fd` is validated as open (`-9` EBADF if the descriptor is closed).
+/// `op` is one of `LOCK_SH` (1), `LOCK_EX` (2), `LOCK_UN` (8), optionally
+/// OR'd with `LOCK_NB` (4).
+///
+/// Returns 0 on success, or a negative errno value.
+pub fn flock(fd: i32, op: i32) -> i64 {
+    // SAFETY: scalar-only syscall; no user pointers involved.
+    unsafe { syscall2(SYS_FLOCK, fd as u64, op as u64) }
+}
+
+/// `madvise(2)` — advise the kernel on memory-usage patterns.
+///
+/// All advice values are accepted and silently ignored on ONCRIX
+/// (no backing VM / page cache). Returns 0.
+///
+/// # Safety
+///
+/// `addr` must be a page-aligned pointer into a live mapping; `len` must
+/// not cause the range to overflow user address space. These are not
+/// validated by the kernel on ONCRIX but callers should still satisfy
+/// the POSIX preconditions for portability.
+pub unsafe fn madvise(addr: *mut u8, len: usize, advice: i32) -> i64 {
+    // SAFETY: no-op kernel side; the caller asserts the pointer preconditions.
+    unsafe { syscall3(SYS_MADVISE, addr as u64, len as u64, advice as u64) }
+}
+
+/// `msync(2)` — synchronize a memory mapping with its backing storage.
+///
+/// ramfs has no backing store; always returns 0 on ONCRIX.
+///
+/// # Safety
+///
+/// `addr` must be page-aligned and within an active mapping; `len` must
+/// not overflow the mapping. Not validated kernel-side on ONCRIX.
+pub unsafe fn msync(addr: *mut u8, len: usize, flags: i32) -> i64 {
+    // SAFETY: no-op kernel side; the caller asserts pointer validity.
+    unsafe { syscall3(SYS_MSYNC, addr as u64, len as u64, flags as u64) }
+}
+
+/// `mlock(2)` — lock pages in memory to prevent paging.
+///
+/// ONCRIX does not page memory out; this call is always a no-op
+/// that returns 0 immediately.
+///
+/// # Safety
+///
+/// `addr` must be page-aligned and `len` must not overflow user address
+/// space. Not validated kernel-side on ONCRIX.
+pub unsafe fn mlock(addr: *const u8, len: usize) -> i64 {
+    // SAFETY: no-op kernel side.
+    unsafe { syscall2(SYS_MLOCK, addr as u64, len as u64) }
+}
+
+/// `munlock(2)` — unlock previously locked pages.
+///
+/// No-op on ONCRIX (no pages are ever locked). Returns 0.
+///
+/// # Safety
+///
+/// `addr` must be page-aligned and within the calling process's address
+/// space. Not validated kernel-side on ONCRIX.
+pub unsafe fn munlock(addr: *const u8, len: usize) -> i64 {
+    // SAFETY: no-op kernel side.
+    unsafe { syscall2(SYS_MUNLOCK, addr as u64, len as u64) }
+}
+
+/// `mlockall(2)` — lock all of the calling process's virtual pages.
+///
+/// No-op on ONCRIX. `flags` is `MCL_CURRENT` (1), `MCL_FUTURE` (2), or
+/// their combination; accepted and ignored. Returns 0.
+pub fn mlockall(flags: i32) -> i64 {
+    // SAFETY: scalar-only syscall; no user pointers.
+    unsafe { syscall1(SYS_MLOCKALL, flags as u64) }
+}
+
+/// `munlockall(2)` — unlock all of the calling process's virtual pages.
+///
+/// No-op on ONCRIX. Returns 0.
+pub fn munlockall() -> i64 {
+    // SAFETY: no arguments; always safe.
+    unsafe { syscall1(SYS_MUNLOCKALL, 0) }
+}
+
+/// `getpgrp(2)` — return the process group ID of the calling process.
+///
+/// Equivalent to `getpgid(0)`. Always succeeds.
+pub fn getpgrp() -> i64 {
+    // SAFETY: no arguments, no memory access.
+    unsafe { syscall1(SYS_GETPGRP, 0) }
+}
+
+/// `getcpu(2)` — query the CPU index and NUMA node of the calling thread.
+///
+/// Writes `0` to `*cpu` (if non-null) and `0` to `*node` (if non-null)
+/// on ONCRIX's single-CPU system. `tcache` is accepted and ignored.
+/// Returns `0` on success, or `-14` (`EFAULT`) for a bad pointer.
+///
+/// # Safety
+///
+/// `cpu` and `node`, when non-null, must each point to a writable `u32`
+/// that remains valid for the duration of the call.
+pub unsafe fn getcpu(cpu: *mut u32, node: *mut u32, tcache: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe {
+        syscall3(SYS_GETCPU, cpu as u64, node as u64, tcache as u64)
+    }
+}
+
+/// `sched_get_priority_max(2)` — return the maximum static priority for
+/// `policy` (`SCHED_OTHER`=0, `SCHED_FIFO`=1, `SCHED_RR`=2).
+///
+/// Returns `99` for `SCHED_FIFO`/`SCHED_RR`, `0` for `SCHED_OTHER`,
+/// or `-22` (`EINVAL`) for an unknown policy.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn sched_get_priority_max(policy: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_SCHED_GET_PRIORITY_MAX, policy as u64) }
+}
+
+/// `sched_get_priority_min(2)` — return the minimum static priority for
+/// `policy` (`SCHED_OTHER`=0, `SCHED_FIFO`=1, `SCHED_RR`=2).
+///
+/// Returns `1` for `SCHED_FIFO`/`SCHED_RR`, `0` for `SCHED_OTHER`,
+/// or `-22` (`EINVAL`) for an unknown policy.
+///
+/// # Safety
+///
+/// Plain syscall wrapper with a scalar argument; always safe to call.
+pub unsafe fn sched_get_priority_min(policy: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_SCHED_GET_PRIORITY_MIN, policy as u64) }
+}
+
+/// `posix_fadvise(2)` — advise the kernel of the expected access pattern for
+/// the byte range `[offset, offset+len)` of the file `fd`.
+///
+/// On ONCRIX this is a hint only; the kernel validates `fd` and returns 0.
+/// A non-open `fd` returns `-EBADF`.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe {
+        syscall4(SYS_FADVISE64, fd as u64, offset as u64, len as u64, advice as u64)
+    }
+}
+
+/// `readahead(2)` — initiate read-ahead of `count` bytes at `offset` in `fd`.
+///
+/// On ONCRIX's in-memory ramfs all data is resident; this validates `fd` and
+/// returns 0. A non-open `fd` returns `-EBADF`.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn readahead(fd: i32, offset: i64, count: usize) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall3(SYS_READAHEAD, fd as u64, offset as u64, count as u64) }
+}
+
+/// `sync_file_range(2)` — sync the byte range `[offset, offset+nbytes)` of
+/// `fd` to backing store.
+///
+/// On ONCRIX's in-memory ramfs there is no backing store; this validates `fd`
+/// and returns 0. A non-open `fd` returns `-EBADF`.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe {
+        syscall4(
+            SYS_SYNC_FILE_RANGE,
+            fd as u64,
+            offset as u64,
+            nbytes as u64,
+            flags as u64,
+        )
+    }
+}
+
+/// `fallocate(2)` — manipulate file space allocation for `fd`.
+///
+/// `mode == 0`: ensures the file is at least `offset + len` bytes long,
+/// extending (zero-filling) if necessary. `mode != 0` (e.g.
+/// `FALLOC_FL_KEEP_SIZE`) is accepted silently on ramfs. Returns 0 or a
+/// negative errno value (`-EBADF`, `-EINVAL`, `-EFBIG`).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe {
+        syscall4(SYS_FALLOCATE, fd as u64, mode as u64, offset as u64, len as u64)
+    }
+}
+
+
+// ── uname / time / creds ───────────────────────────────────────────
+
+/// `struct utsname` — system identification information.
+///
+/// Six fixed-size fields, each 65 bytes (64 usable bytes + NUL terminator),
+/// in the order specified by POSIX.1-2024 `uname(3p)` and the Linux
+/// x86_64 ABI: `sysname`, `nodename`, `release`, `version`, `machine`,
+/// `domainname`.  Total size: 390 bytes.
+#[repr(C)]
+pub struct Utsname {
+    /// Operating system name (e.g., `"ONCRIX"`).
+    pub sysname: [u8; 65],
+    /// Network node hostname.
+    pub nodename: [u8; 65],
+    /// OS release level (e.g., `"0.1.0"`).
+    pub release: [u8; 65],
+    /// OS version string.
+    pub version: [u8; 65],
+    /// Hardware type (e.g., `"x86_64"`).
+    pub machine: [u8; 65],
+    /// NIS or YP domain name.
+    pub domainname: [u8; 65],
+}
+
+impl Utsname {
+    /// Return a zeroed `Utsname` suitable for passing to [`uname`].
+    pub const fn zeroed() -> Self {
+        Self {
+            sysname: [0u8; 65],
+            nodename: [0u8; 65],
+            release: [0u8; 65],
+            version: [0u8; 65],
+            machine: [0u8; 65],
+            domainname: [0u8; 65],
+        }
+    }
+}
+
+/// `uname(buf)` — retrieve system identification strings.
+///
+/// Fills `*buf` with operating-system identity information.
+/// Returns `0` on success.
+///
+/// `gethostname(2)` is emulated by calling `uname` and reading
+/// `buf.nodename`.
+///
+/// # Safety
+///
+/// `buf` must point to a writable, properly aligned `Utsname`.
+pub unsafe fn uname(buf: *mut Utsname) -> i64 {
+    // SAFETY: caller guarantees buf is a valid, writable pointer.
+    unsafe { syscall1(SYS_UNAME, buf as u64) }
+}
+
+/// `sethostname(name, len)` — set the system hostname.
+///
+/// `name` must point to `len` bytes of hostname data (no NUL required).
+/// `len` must be ≤ 64; otherwise `-EINVAL` is returned.
+///
+/// # Safety
+///
+/// `name` must be a valid pointer to at least `len` readable bytes.
+pub unsafe fn sethostname(name: *const u8, len: usize) -> i64 {
+    // SAFETY: caller guarantees name points to len readable bytes.
+    unsafe { syscall2(SYS_SETHOSTNAME, name as u64, len as u64) }
+}
+
+/// `setdomainname(name, len)` — set the NIS/YP domain name.
+///
+/// `name` must point to `len` bytes of domain-name data (no NUL required).
+/// `len` must be ≤ 64; otherwise `-EINVAL` is returned.
+///
+/// # Safety
+///
+/// `name` must be a valid pointer to at least `len` readable bytes.
+pub unsafe fn setdomainname(name: *const u8, len: usize) -> i64 {
+    // SAFETY: caller guarantees name points to len readable bytes.
+    unsafe { syscall2(SYS_SETDOMAINNAME, name as u64, len as u64) }
+}
+
+/// POSIX `struct timeval` — seconds and microseconds.
+///
+/// Layout matches the C ABI: two consecutive `i64` fields (16 bytes on
+/// x86_64).  Used by `gettimeofday(2)`, `select(2)`, `setitimer(2)`, etc.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimeVal {
+    /// Whole seconds.
+    pub tv_sec: i64,
+    /// Microseconds in `[0, 999_999]`.
+    pub tv_usec: i64,
+}
+
+/// `gettimeofday(tv, tz)` — read the current time into `*tv`.
+///
+/// `tv` may be null if only timezone information is wanted (rare; the `tz`
+/// argument is obsolete).  When non-null, `*tv` is filled with the
+/// since-boot time in seconds + microseconds.
+///
+/// `tz` should be null in new code; when non-null it receives a zeroed
+/// `struct timezone` (obsolete per POSIX.1-2024).
+///
+/// Returns 0 on success or a negative errno (`-EFAULT`).
+///
+/// # Safety
+///
+/// `tv` must be null or a valid `*mut TimeVal` in the calling process's
+/// address space.  `tz` must be null or point to at least 8 writable bytes.
+pub unsafe fn gettimeofday(tv: *mut TimeVal, tz: *mut u8) -> i64 {
+    // SAFETY: caller upholds the pointer contracts.
+    unsafe { syscall2(SYS_GETTIMEOFDAY, tv as u64, tz as u64) }
+}
+
+/// `settimeofday(tv, tz)` — attempt to set the system clock.
+///
+/// ONCRIX has no settable RTC source; this call always returns `-1`
+/// (`EPERM`).  Provided for API completeness and to allow code that calls
+/// `settimeofday` to link without changes.
+///
+/// # Safety
+///
+/// `tv` must be null or a valid `*const TimeVal`.  `tz` must be null or a
+/// valid pointer to a `struct timezone` (8 bytes).  Neither pointer is
+/// actually dereferenced by the kernel on ONCRIX.
+pub unsafe fn settimeofday(tv: *const TimeVal, tz: *const u8) -> i64 {
+    // SAFETY: caller upholds the pointer contracts; kernel ignores them.
+    unsafe { syscall2(SYS_SETTIMEOFDAY, tv as u64, tz as u64) }
+}
+
+/// `clock_getres(clk_id, res)` — query the resolution of a POSIX clock.
+///
+/// On ONCRIX, `CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1) are both
+/// backed by the 100 Hz PIT, so the resolution is 10 ms (10_000_000 ns).
+/// `res` may be null if the caller only wants to validate `clk_id`.
+///
+/// Returns 0 on success, `-EINVAL` for an unknown clock, `-EFAULT` for a
+/// bad non-null `res` pointer.
+///
+/// # Safety
+///
+/// `res` must be null or a valid `*mut Timespec` in the calling process's
+/// address space.
+pub unsafe fn clock_getres(clk_id: i32, res: *mut Timespec) -> i64 {
+    // SAFETY: caller upholds the pointer contract.
+    unsafe { syscall2(SYS_CLOCK_GETRES, clk_id as u64, res as u64) }
+}
+
+/// `CapUserHeader` — Linux `cap_user_header_t`.
+///
+/// Passed as the first argument to `capget(2)` and `capset(2)`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapUserHeader {
+    /// Capability ABI version.  Use `_LINUX_CAPABILITY_VERSION_3` (0x2008_0522)
+    /// for 64-bit capability sets.
+    pub version: u32,
+    /// Target thread PID; 0 means the calling thread.
+    pub pid: i32,
+}
+
+/// `CapUserData` — Linux `cap_user_data_t[2]` (version 3, 64-bit sets).
+///
+/// Represents effective, permitted, and inheritable capability sets each
+/// split into a low and high 32-bit word (two `cap_user_data_t` entries
+/// packed contiguously, 24 bytes total).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapUserData {
+    /// Effective capabilities (bits 0–31).
+    pub effective_lo: u32,
+    /// Permitted capabilities (bits 0–31).
+    pub permitted_lo: u32,
+    /// Inheritable capabilities (bits 0–31).
+    pub inheritable_lo: u32,
+    /// Effective capabilities (bits 32–63).
+    pub effective_hi: u32,
+    /// Permitted capabilities (bits 32–63).
+    pub permitted_hi: u32,
+    /// Inheritable capabilities (bits 32–63).
+    pub inheritable_hi: u32,
+}
+
+/// Linux capability ABI version 3 constant (64-bit sets).
+pub const _LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `capget(2)` — get the capability sets of the calling thread.
+///
+/// On ONCRIX the process holds no capabilities; `data` is zero-filled.
+/// Returns 0 on success or a negative errno value.
+///
+/// # Safety
+///
+/// `hdr` and `data` must be valid, writable pointers. `data` may be null
+/// if only the header version is being probed.
+pub unsafe fn capget(hdr: *mut CapUserHeader, data: *mut CapUserData) -> i64 {
+    // SAFETY: caller guarantees hdr is valid.
+    unsafe { syscall2(SYS_CAPGET, hdr as u64, data as u64) }
+}
+
+/// `capset(2)` — set the capability sets of the calling thread.
+///
+/// On ONCRIX this is a no-op; any well-formed call returns 0.
+/// Returns 0 on success or a negative errno value.
+///
+/// # Safety
+///
+/// `hdr` must be a valid pointer. `data` may be null for version-probe calls.
+pub unsafe fn capset(hdr: *const CapUserHeader, data: *const CapUserData) -> i64 {
+    // SAFETY: caller guarantees hdr is valid.
+    unsafe { syscall2(SYS_CAPSET, hdr as u64, data as u64) }
+}
+
+/// `getgroups(2)` — get supplementary group IDs of the calling process.
+///
+/// ONCRIX has no supplementary groups; always returns 0 (empty list).
+/// If `size == 0`, returns the count (0) without touching `list`.
+/// If `size > 0`, validates `list` and returns 0.
+///
+/// Returns the number of supplementary groups (0) or a negative errno value.
+///
+/// # Safety
+///
+/// When `size > 0`, `list` must be a valid pointer to at least `size`
+/// writable `u32` slots.
+pub unsafe fn getgroups(size: i32, list: *mut u32) -> i64 {
+    // SAFETY: caller guarantees list is valid when size > 0.
+    unsafe { syscall2(SYS_GETGROUPS, size as u64, list as u64) }
+}
+
+/// `setgroups(2)` — set supplementary group IDs of the calling process.
+///
+/// ONCRIX returns `-EPERM` for `size > 0`; `size == 0` (clear) succeeds.
+///
+/// Returns 0 on success or a negative errno value (`-EPERM` if `size > 0`).
+///
+/// # Safety
+///
+/// When `size > 0`, `list` must be a valid pointer to at least `size`
+/// readable `u32` slots.
+pub unsafe fn setgroups(size: i32, list: *const u32) -> i64 {
+    // SAFETY: caller guarantees list is valid when size > 0.
+    unsafe { syscall2(SYS_SETGROUPS, size as u64, list as u64) }
+}
+
+/// `personality(2)` — query or set the execution domain.
+///
+/// Pass `0xFFFF_FFFF_u32` as `persona` to query the current personality
+/// without changing it.  ONCRIX supports only `PER_LINUX` (0); all calls
+/// return 0 (the previous personality).
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn personality(persona: u32) -> i64 {
+    // SAFETY: scalar-only syscall.
+    unsafe { syscall1(SYS_PERSONALITY, persona as u64) }
+}
+
+
+// ── tkill / tgkill / sched_rr_get_interval ─────────────────────────
+
+/// `tkill(2)` — send signal `sig` to thread `tid` (legacy; prefer `tgkill`).
+///
+/// On ONCRIX each thread is its own process (tid == pid), so this is
+/// equivalent to `kill(tid, sig)`.
+///
+/// Returns 0 on success, or a negative errno value:
+/// - `-3`  (`ESRCH`)  — no such thread.
+/// - `-22` (`EINVAL`) — signal number out of range.
+///
+/// `sig == 0` performs an existence check without sending a signal.
+pub fn tkill(tid: i32, sig: i32) -> i64 {
+    // SAFETY: SYS_TKILL takes two scalar arguments only; no pointers.
+    unsafe { syscall2(SYS_TKILL, tid as u64, sig as u64) }
+}
+
+/// `tgkill(2)` — send signal `sig` to thread `tid` in thread group `tgid`.
+///
+/// On ONCRIX `tgid == tid == pid` always (single-thread-per-process).
+/// If `tgid != tid` the kernel returns `-3` (`ESRCH`).
+///
+/// Returns 0 on success, or a negative errno value:
+/// - `-3`  (`ESRCH`)  — no such thread / group mismatch.
+/// - `-22` (`EINVAL`) — signal number out of range.
+///
+/// `sig == 0` performs an existence check without sending a signal.
+///
+/// # Safety
+///
+/// No pointer arguments; this function is safe to call from any context
+/// that holds a valid tid and signal number.
+pub fn tgkill(tgid: i32, tid: i32, sig: i32) -> i64 {
+    // SAFETY: SYS_TGKILL takes three scalar arguments only; no pointers.
+    unsafe { syscall3(SYS_TGKILL, tgid as u64, tid as u64, sig as u64) }
+}
+
+/// `sched_rr_get_interval(2)` — write the round-robin time quantum for `pid`
+/// into `*tp`.
+///
+/// On ONCRIX the PIT runs at 100 Hz and every task receives a fixed 10 ms
+/// quantum; `pid` is accepted but ignored.  On success `*tp` is set to
+/// `{tv_sec: 0, tv_nsec: 10_000_000}` and `0` is returned.  Returns `-14`
+/// (`EFAULT`) if `tp` is null or unmapped.
+///
+/// # Safety
+///
+/// `tp` must be a valid `*mut Timespec` in the calling process's address
+/// space and must remain valid for the duration of the call.
+pub unsafe fn sched_rr_get_interval(pid: i32, tp: *mut Timespec) -> i64 {
+    // SAFETY: caller guarantees `tp` is a valid writable pointer.
+    unsafe { syscall2(SYS_SCHED_RR_GET_INTERVAL, pid as u64, tp as u64) }
+}
+
+// ── rt_sigpending / sigaltstack / rt_sigqueueinfo ──────────────────
+
+/// `rt_sigpending(2)` — get the set of pending signals into `*set` (a `u64`
+/// sigset). `sigsetsize` must be 8. Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `set` must point to a writable `u64`.
+pub unsafe fn rt_sigpending(set: *mut u64, sigsetsize: usize) -> i64 {
+    // SAFETY: caller guarantees `set` validity.
+    unsafe { syscall2(SYS_RT_SIGPENDING, set as u64, sigsetsize as u64) }
+}
+
+/// `sigaltstack(2)` — set/get the alternate signal stack. ONCRIX does not
+/// honour an alternate stack; the call accepts `ss` and reports `old_ss`
+/// disabled. `ss`/`old_ss` are `stack_t*` (may be NULL). Returns 0 or errno.
+///
+/// # Safety
+///
+/// `ss`/`old_ss`, when non-null, must reference a valid `stack_t` (24 bytes).
+pub unsafe fn sigaltstack(ss: *const u8, old_ss: *mut u8) -> i64 {
+    // SAFETY: caller guarantees pointer validity.
+    unsafe { syscall2(SYS_SIGALTSTACK, ss as u64, old_ss as u64) }
+}
+
+/// `rt_sigqueueinfo(2)` — queue signal `sig` to `tgid` with siginfo `uinfo`.
+/// On ONCRIX the siginfo payload is ignored (delivered like `kill`).
+/// Returns 0 or a negative errno value.
+///
+/// # Safety
+///
+/// `uinfo` must point to a valid `siginfo_t` (128 bytes) when non-null.
+pub unsafe fn rt_sigqueueinfo(tgid: i32, sig: i32, uinfo: *const u8) -> i64 {
+    // SAFETY: caller guarantees `uinfo` validity.
+    unsafe { syscall3(SYS_RT_SIGQUEUEINFO, tgid as u64, sig as u64, uinfo as u64) }
+}
+
+
+// ── dup / close_range / xattr / sendfile / copy_file_range ─────────
+
+/// `dup(2)` — duplicate `oldfd` to the lowest available file descriptor.
+///
+/// The new descriptor does not inherit `FD_CLOEXEC`. Returns the new fd
+/// (>= 0) on success, or a negative errno value on error.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn dup(oldfd: i32) -> i64 {
+    // SAFETY: scalar-only syscall; no pointer arguments.
+    unsafe { syscall1(SYS_DUP, oldfd as u64) }
+}
+
+/// `close_range(2)` — close all open file descriptors in `[first, last]`.
+///
+/// `flags` accepts `0` or `CLOSE_RANGE_CLOEXEC` (4). Unknown flag bits
+/// yield `-EINVAL`. Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn close_range(first: u32, last: u32, flags: u32) -> i64 {
+    // SAFETY: scalar-only syscall; no pointer arguments.
+    unsafe { syscall3(SYS_CLOSE_RANGE, first as u64, last as u64, flags as u64) }
+}
+
+/// `setxattr(2)` — Set an extended attribute on the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-95` (ENOTSUP).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+/// `value` must point to at least `size` readable bytes (may be null when
+/// `size` is 0).
+pub unsafe fn setxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe { syscall6(SYS_SETXATTR, path as u64, name as u64, value as u64, size as u64, flags as u64, 0) }
+}
+
+/// `lsetxattr(2)` — Set an extended attribute; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-95` (ENOTSUP).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+/// `value` must point to at least `size` readable bytes (may be null when
+/// `size` is 0).
+pub unsafe fn lsetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe {
+        syscall6(SYS_LSETXATTR, path as u64, name as u64, value as u64, size as u64, flags as u64, 0)
+    }
+}
+
+/// `fsetxattr(2)` — Set an extended attribute on the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-95` (ENOTSUP).
+///
+/// # Safety
+///
+/// `name` must be a valid null-terminated string pointer. `value` must point
+/// to at least `size` readable bytes (may be null when `size` is 0).
+pub unsafe fn fsetxattr(
+    fd: i32,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `name` and `value` are valid.
+    unsafe {
+        syscall6(SYS_FSETXATTR, fd as u64, name as u64, value as u64, size as u64, flags as u64, 0)
+    }
+}
+
+/// `getxattr(2)` — Get an extended attribute from the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers. `value`
+/// must point to at least `size` writable bytes (may be null when `size` is
+/// 0).
+pub unsafe fn getxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe { syscall4(SYS_GETXATTR, path as u64, name as u64, value as u64, size as u64) }
+}
+
+/// `lgetxattr(2)` — Get an extended attribute; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers. `value`
+/// must point to at least `size` writable bytes (may be null when `size` is
+/// 0).
+pub unsafe fn lgetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe { syscall4(SYS_LGETXATTR, path as u64, name as u64, value as u64, size as u64) }
+}
+
+/// `fgetxattr(2)` — Get an extended attribute from the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `name` must be a valid null-terminated string pointer. `value` must point
+/// to at least `size` writable bytes (may be null when `size` is 0).
+pub unsafe fn fgetxattr(fd: i32, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `name` and `value` are valid.
+    unsafe { syscall4(SYS_FGETXATTR, fd as u64, name as u64, value as u64, size as u64) }
+}
+
+/// `listxattr(2)` — List extended attribute names for the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `0` (empty list).
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer. `list` must point
+/// to at least `size` writable bytes (may be null when `size` is 0).
+pub unsafe fn listxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `path` and `list` are valid.
+    unsafe { syscall3(SYS_LISTXATTR, path as u64, list as u64, size as u64) }
+}
+
+/// `llistxattr(2)` — List extended attribute names; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `0` (empty list).
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer. `list` must point
+/// to at least `size` writable bytes (may be null when `size` is 0).
+pub unsafe fn llistxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `path` and `list` are valid.
+    unsafe { syscall3(SYS_LLISTXATTR, path as u64, list as u64, size as u64) }
+}
+
+/// `flistxattr(2)` — List extended attribute names for the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `0` (empty list).
+///
+/// # Safety
+///
+/// `list` must point to at least `size` writable bytes (may be null when
+/// `size` is 0).
+pub unsafe fn flistxattr(fd: i32, list: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `list` is valid.
+    unsafe { syscall3(SYS_FLISTXATTR, fd as u64, list as u64, size as u64) }
+}
+
+/// `removexattr(2)` — Remove an extended attribute from the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+pub unsafe fn removexattr(path: *const u8, name: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` and `name` are valid.
+    unsafe { syscall2(SYS_REMOVEXATTR, path as u64, name as u64) }
+}
+
+/// `lremovexattr(2)` — Remove an extended attribute; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+pub unsafe fn lremovexattr(path: *const u8, name: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` and `name` are valid.
+    unsafe { syscall2(SYS_LREMOVEXATTR, path as u64, name as u64) }
+}
+
+/// `fremovexattr(2)` — Remove an extended attribute from the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `name` must be a valid null-terminated string pointer.
+pub unsafe fn fremovexattr(fd: i32, name: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `name` is valid.
+    unsafe { syscall2(SYS_FREMOVEXATTR, fd as u64, name as u64) }
+}
+
+/// `sendfile(2)` — copy up to `count` bytes from `in_fd` to `out_fd`
+/// in the kernel, without passing data through user space.
+///
+/// If `offset` is non-null, data is read from `*offset` inside `in_fd` and
+/// `*offset` is advanced by the number of bytes copied; `in_fd`'s own file
+/// position is left unchanged.  If `offset` is null, `in_fd`'s file position
+/// is used and advanced.
+///
+/// Both `in_fd` and `out_fd` must be regular ramfs files.
+///
+/// Returns the number of bytes copied (≥ 0) or a negative errno.
+///
+/// # Safety
+///
+/// - `offset`, when non-null, must point to a valid `i64` in the calling
+///   process's address space and must remain valid for the duration of the
+///   call.
+/// - Both `in_fd` and `out_fd` must be open and backed by regular files.
+pub unsafe fn sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> i64 {
+    // SAFETY: the caller upholds the pointer and fd validity requirements.
+    unsafe {
+        syscall4(
+            SYS_SENDFILE,
+            out_fd as u64,
+            in_fd as u64,
+            offset as u64,
+            count as u64,
+        )
+    }
+}
+
+/// `copy_file_range(2)` — copy up to `len` bytes from `fd_in` to `fd_out`
+/// entirely within the kernel.
+///
+/// `off_in` and `off_out`, when non-null, supply the read and write offsets
+/// respectively; each is updated by the number of bytes copied and the
+/// corresponding handle's file position is left unchanged.  When null, the
+/// handle's current file position is used and advanced.
+///
+/// `flags` is reserved and must be zero.
+///
+/// Returns the number of bytes copied (≥ 0) or a negative errno.
+///
+/// # Safety
+///
+/// - `off_in` / `off_out`, when non-null, must each point to a valid `i64`
+///   in the calling process's address space.
+/// - Both `fd_in` and `fd_out` must be open and backed by regular files.
+pub unsafe fn copy_file_range(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> i64 {
+    // SAFETY: the caller upholds the pointer and fd validity requirements.
+    unsafe {
+        syscall6(
+            SYS_COPY_FILE_RANGE,
+            fd_in as u64,
+            off_in as u64,
+            fd_out as u64,
+            off_out as u64,
+            len as u64,
+            flags as u64,
+        )
+    }
+}
+
+
+// ── sched_setattr/getattr / clock_settime / adjtimex / clock_adjtime ─
+
+/// Argument structure for `sched_setattr(2)` and `sched_getattr(2)`.
+///
+/// Matches `struct sched_attr` from the Linux UAPI
+/// (`include/uapi/linux/sched/types.h`), version 0 (48 bytes).
+/// ONCRIX only uses `size`, `sched_policy`, `sched_nice`, and
+/// `sched_priority`; deadline and flags fields are accepted on input
+/// and zeroed on output.
+#[repr(C)]
+pub struct SchedAttr {
+    /// Structure size in bytes; caller sets this to `size_of::<SchedAttr>()`
+    /// for `sched_setattr`; kernel sets it to `48` on `sched_getattr`.
+    pub size: u32,
+    /// Scheduling policy: `SCHED_OTHER`=0 / `SCHED_FIFO`=1 / `SCHED_RR`=2.
+    pub sched_policy: u32,
+    /// Scheduling flags (combination of `SCHED_FLAG_*`); must be 0 on ONCRIX.
+    pub sched_flags: u64,
+    /// Nice value for `SCHED_OTHER` (`[-20, 19]`); clamped by the kernel.
+    pub sched_nice: i32,
+    /// Static priority for `SCHED_FIFO`/`SCHED_RR` (`[1, 99]`).
+    /// ONCRIX maps this via nice; set `0` when using `sched_nice`.
+    pub sched_priority: u32,
+    /// `SCHED_DEADLINE`: runtime budget per period (nanoseconds); `0` on ONCRIX.
+    pub sched_runtime: u64,
+    /// `SCHED_DEADLINE`: absolute deadline (nanoseconds); `0` on ONCRIX.
+    pub sched_deadline: u64,
+    /// `SCHED_DEADLINE`: period (nanoseconds); `0` on ONCRIX.
+    pub sched_period: u64,
+}
+
+/// `sched_setattr(2)` — set extended scheduling attributes.
+///
+/// Sets the calling thread's scheduling policy and nice value from `*attr`.
+/// `flags` must be `0`. `pid` of `0` targets the calling thread.
+///
+/// Returns `0` on success or a negative errno value:
+/// - `-14` (`EFAULT`): `attr` is null or non-canonical.
+/// - `-22` (`EINVAL`): unknown policy, non-zero `flags`, or `sched_flags != 0`.
+///
+/// # Safety
+///
+/// `attr` must point to a readable, validly-aligned `SchedAttr` for the
+/// duration of the call. The kernel copies out of user space; the caller
+/// is responsible for ensuring the pointer lifetime and alignment.
+pub unsafe fn sched_setattr(pid: i32, attr: *const SchedAttr, flags: u32) -> i64 {
+    // SAFETY: caller guarantees `attr` is a valid readable pointer.
+    unsafe { syscall3(SYS_SCHED_SETATTR, pid as u64, attr as u64, flags as u64) }
+}
+
+/// `sched_getattr(2)` — get extended scheduling attributes.
+///
+/// Writes the calling thread's current policy and nice into `*attr`.
+/// `size` is the size of the caller's buffer (must be `>= 48`). `flags`
+/// must be `0`. `pid` of `0` targets the calling thread.
+///
+/// Returns `0` on success or a negative errno value:
+/// - `-14` (`EFAULT`): `attr` is null or non-canonical.
+/// - `-22` (`EINVAL`): `size < 48` or non-zero `flags`.
+///
+/// # Safety
+///
+/// `attr` must point to a writable `SchedAttr`-sized buffer for the
+/// duration of the call. The kernel writes 48 bytes into user space.
+pub unsafe fn sched_getattr(pid: i32, attr: *mut SchedAttr, size: u32, flags: u32) -> i64 {
+    // SAFETY: caller guarantees `attr` is a valid writable pointer.
+    unsafe {
+        syscall4(
+            SYS_SCHED_GETATTR,
+            pid as u64,
+            attr as u64,
+            size as u64,
+            flags as u64,
+        )
+    }
+}
+
+/// `struct timex` — kernel clock adjustment parameters (NTP interface).
+///
+/// Passed to [`adjtimex`] and [`clock_adjtime`].  On ONCRIX no fields are
+/// read or written by the kernel; the struct is defined purely for ABI
+/// compatibility with POSIX / Linux callers.
+///
+/// Fields follow the Linux `timex` layout (`<sys/timex.h>`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Timex {
+    /// Mode selector / adjustment flags (`ADJ_*` bits).
+    pub modes: u32,
+    /// Time offset (nanoseconds when `STA_NANO` set, else microseconds).
+    pub offset: i64,
+    /// Frequency offset (scaled ppm).
+    pub freq: i64,
+    /// Maximum time error (microseconds).
+    pub maxerror: i64,
+    /// Estimated time error (microseconds).
+    pub esterror: i64,
+    /// Clock status bits (`STA_*`).
+    pub status: i32,
+    /// PLL time constant.
+    pub constant: i64,
+    /// Clock precision (read-only, microseconds or nanoseconds).
+    pub precision: i64,
+    /// Clock frequency tolerance (read-only, scaled ppm).
+    pub tolerance: i64,
+    /// Current time (read-only).
+    pub time_tv_sec: i64,
+    /// Current time fractional part (read-only).
+    pub time_tv_usec: i64,
+    /// Tick value in microseconds (read-only).
+    pub tick: i64,
+    /// PPS frequency (read-only).
+    pub ppsfreq: i64,
+    /// PPS jitter (read-only).
+    pub jitter: i64,
+    /// PPS interval duration (read-only).
+    pub shift: i32,
+    /// PPS stability (read-only).
+    pub stabil: i64,
+    /// PPS jitter count (read-only).
+    pub jitcnt: i64,
+    /// PPS calibration intervals (read-only).
+    pub calcnt: i64,
+    /// PPS error counter (read-only).
+    pub errcnt: i64,
+    /// PPS stability count (read-only).
+    pub stbcnt: i64,
+    /// TAI offset set by `adjtimex` (read-only).
+    pub tai: i32,
+    /// Reserved padding.
+    pub _pad: [i32; 11],
+}
+
+/// `clock_settime(clk_id, tp)` — attempt to set a POSIX clock.
+///
+/// ONCRIX has no settable clock source.  For a recognised `clk_id`
+/// (`CLOCK_REALTIME` = 0, `CLOCK_MONOTONIC` = 1) this always returns `-1`
+/// (`-EPERM`).  An unknown `clk_id` returns `-22` (`-EINVAL`) and a bad
+/// `tp` pointer returns `-14` (`-EFAULT`).
+///
+/// # Safety
+///
+/// `tp` must be a valid `*const Timespec` in the calling process's address
+/// space.  The kernel validates the pointer but does not dereference it on
+/// ONCRIX.
+pub unsafe fn clock_settime(clk_id: i32, tp: *const Timespec) -> i64 {
+    // SAFETY: caller upholds the pointer contract; kernel validates only.
+    unsafe { syscall2(SYS_CLOCK_SETTIME, clk_id as u64, tp as u64) }
+}
+
+/// `adjtimex(buf)` — query or adjust kernel clock parameters.
+///
+/// ONCRIX performs no NTP clock discipline.  The call always returns
+/// `0` (`TIME_OK`) without modifying `*buf`.  Provided for ABI
+/// compatibility with POSIX / Linux programs that call `adjtimex`.
+///
+/// # Safety
+///
+/// `buf` must be a valid `*mut Timex` in the calling process's address
+/// space.  The kernel validates the pointer but does not read or write
+/// it on ONCRIX.
+pub unsafe fn adjtimex(buf: *mut Timex) -> i64 {
+    // SAFETY: caller upholds the pointer contract; kernel validates only.
+    unsafe { syscall1(SYS_ADJTIMEX, buf as u64) }
+}
+
+/// `clock_adjtime(clk_id, buf)` — adjust the time of a specific POSIX clock.
+///
+/// ONCRIX performs no NTP clock discipline.  The call always returns
+/// `0` (`TIME_OK`) without modifying `*buf`.  Provided for ABI
+/// compatibility with Linux programs that call `clock_adjtime`.
+///
+/// # Safety
+///
+/// `buf` must be a valid `*mut Timex` in the calling process's address
+/// space.  The kernel validates the pointer but does not read or write
+/// it on ONCRIX.
+pub unsafe fn clock_adjtime(clk_id: i32, buf: *mut Timex) -> i64 {
+    // SAFETY: caller upholds the pointer contract; kernel validates only.
+    unsafe { syscall2(SYS_CLOCK_ADJTIME, clk_id as u64, buf as u64) }
+}
+
+// ── memfd_create ───────────────────────────────────────────────────
+
+/// `memfd_create` flag: set `FD_CLOEXEC` on the new descriptor.
+pub const MFD_CLOEXEC: u32 = 1;
+/// `memfd_create` flag: permit file seals (accepted, ignored on ONCRIX).
+pub const MFD_ALLOW_SEALING: u32 = 2;
+
+/// `memfd_create(2)` — create an anonymous in-memory file and return an fd.
+///
+/// On ONCRIX the file is backed by a synthetic ramfs path; the `name` is for
+/// diagnostics only. Returns the new fd or a negative errno value.
+///
+/// # Safety
+///
+/// `name` must be a valid NUL-terminated string pointer.
+pub unsafe fn memfd_create(name: *const u8, flags: u32) -> i64 {
+    // SAFETY: caller guarantees `name` is NUL-terminated.
+    unsafe { syscall2(SYS_MEMFD_CREATE, name as u64, flags as u64) }
 }

@@ -520,6 +520,129 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
                 )
             }
         }
+        // SYS_PREAD64 (17) / SYS_PWRITE64 (18): positional I/O — read/write
+        // at an offset without moving the file position.
+        oncrix_syscall::number::SYS_PREAD64 => {
+            // SAFETY: see SYS_READ above.
+            unsafe {
+                crate::fd_table::dispatch_pread(args.arg0 as usize, args.arg1, args.arg2, args.arg3)
+            }
+        }
+        oncrix_syscall::number::SYS_PWRITE64 => {
+            // SAFETY: see SYS_READ above.
+            unsafe {
+                crate::fd_table::dispatch_pwrite(
+                    args.arg0 as usize,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+        // SYS_READV (19) / SYS_WRITEV (20): scatter/gather vectored I/O.
+        oncrix_syscall::number::SYS_READV => {
+            // SAFETY: see SYS_READ above.
+            unsafe { crate::fd_table::dispatch_readv(args.arg0 as usize, args.arg1, args.arg2) }
+        }
+        oncrix_syscall::number::SYS_WRITEV => {
+            // SAFETY: see SYS_READ above.
+            unsafe { crate::fd_table::dispatch_writev(args.arg0 as usize, args.arg1, args.arg2) }
+        }
+
+        // SYS_FACCESSAT (269): check file accessibility relative to a directory fd.
+        // POSIX.1-2024 faccessat(3p). Only AT_FDCWD is modelled; arbitrary dirfds
+        // return EBADF. flags (arg3) are accepted but ignored on ramfs.
+        oncrix_syscall::number::SYS_FACCESSAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_faccessat(args.arg0 as i64, args.arg1, args.arg2, args.arg3)
+            }
+        }
+
+        // SYS_FCHMODAT (268): fchmodat(dirfd, pathname, mode, flags) — chmod relative to dir fd.
+        // POSIX.1-2024 fchmodat(3p).
+        oncrix_syscall::number::SYS_FCHMODAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1 is a user-space path pointer.
+            unsafe {
+                crate::fs_syscalls::sys_fchmodat(args.arg0 as i64, args.arg1, args.arg2, args.arg3)
+            }
+        }
+
+        // SYS_FCHOWNAT (260): fchownat(dirfd, pathname, uid, gid, flags).
+        // POSIX.1-2024 fchownat(3p). Only AT_FDCWD is supported; other dirfd
+        // values return -EBADF until dirfd-relative path resolution is modelled.
+        oncrix_syscall::number::SYS_FCHOWNAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1 is a user-space
+            // pointer to a NUL-terminated pathname forwarded unchanged to sys_chown.
+            unsafe {
+                crate::fs_syscalls::sys_fchownat(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                    args.arg4,
+                )
+            }
+        }
+
+        oncrix_syscall::number::SYS_MKDIRAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_mkdirat(args.arg0 as i64, args.arg1, args.arg2) }
+        }
+
+        // SYS_UNLINKAT (263): remove a directory entry relative to a directory fd.
+        // POSIX.1-2024 unlinkat(3p). AT_FDCWD only; cross-dir not yet implemented.
+        oncrix_syscall::number::SYS_UNLINKAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1 is the user pathname pointer.
+            unsafe { crate::fs_syscalls::sys_unlinkat(args.arg0 as i64, args.arg1, args.arg2) }
+        }
+
+        oncrix_syscall::number::SYS_RENAMEAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg1/arg3 are NUL-terminated
+            // user-space path pointers, arg0/arg2 are dirfds (AT_FDCWD or open fds).
+            unsafe {
+                crate::fs_syscalls::sys_renameat(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2 as i64,
+                    args.arg3,
+                )
+            }
+        }
+
+        // SYS_READLINKAT (267): read symlink target relative to a directory fd.
+        // Delegates to sys_readlinkat which enforces AT_FDCWD-only semantics.
+        oncrix_syscall::number::SYS_READLINKAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; pointer validation is
+            // performed inside sys_readlinkat / sys_readlink.
+            unsafe {
+                crate::fs_syscalls::sys_readlinkat(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+
+        oncrix_syscall::number::SYS_SYMLINKAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg0 = target ptr (u64),
+            // arg1 = newdirfd (i64), arg2 = linkpath ptr (u64).
+            unsafe { crate::fs_syscalls::sys_symlinkat(args.arg0, args.arg1 as i64, args.arg2) }
+        }
+
+        oncrix_syscall::number::SYS_NEWFSTATAT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; arg0=dirfd (i64), arg1=pathname,
+            // arg2=statbuf, arg3=flags.  sys_newfstatat validates all pointers internally.
+            unsafe {
+                crate::fs_syscalls::sys_newfstatat(
+                    args.arg0 as i64, // dirfd
+                    args.arg1,        // pathname ptr
+                    args.arg2,        // statbuf ptr
+                    args.arg3,        // flags
+                )
+            }
+        }
 
         // ── Process management syscalls ──────────────────────────
 
@@ -555,6 +678,11 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
         oncrix_syscall::number::SYS_WAIT4 => {
             // SAFETY: see SYS_FORK above.
             unsafe { crate::fork_dispatch::sys_wait4(args.arg0, args.arg1, args.arg2, args.arg3) }
+        }
+        // SYS_WAITID (247): wait for a child by idtype/id, fill siginfo_t.
+        oncrix_syscall::number::SYS_WAITID => {
+            // SAFETY: see SYS_FORK above.
+            unsafe { crate::fork_dispatch::sys_waitid(args.arg0, args.arg1, args.arg2, args.arg3) }
         }
         oncrix_syscall::number::SYS_EXECVE => {
             // SAFETY: see SYS_FORK above.
@@ -710,15 +838,143 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_access(args.arg0, args.arg1) }
         }
 
-        // SYS_FSYNC (74): synchronize file state with backing store.
-        // POSIX.1-2024 fsync(3p). ramfs is in-memory — nothing to flush;
-        // return success immediately (mirrors SYS_SYNC).
-        oncrix_syscall::number::SYS_FSYNC => 0,
+        // SYS_FSYNC (74) / SYS_FDATASYNC (75): synchronize file state with
+        // backing store. POSIX.1-2024 fsync(3p) / fdatasync(3p). ramfs is
+        // in-memory — nothing to flush; return success (mirrors SYS_SYNC).
+        oncrix_syscall::number::SYS_FSYNC | oncrix_syscall::number::SYS_FDATASYNC => 0,
+
+        // SYS_STATFS (137): get filesystem statistics by path.
+        // POSIX.1-2024 statfs(2).
+        oncrix_syscall::number::SYS_STATFS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_statfs(args.arg0, args.arg1) }
+        }
+
+        // SYS_FSTATFS (138): get filesystem statistics by file descriptor.
+        // POSIX.1-2024 fstatfs(2).
+        oncrix_syscall::number::SYS_FSTATFS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_fstatfs(args.arg0 as i32, args.arg1) }
+        }
+
+        // SYS_SYSINFO (99): fill struct sysinfo for the caller.
+        oncrix_syscall::number::SYS_SYSINFO => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_sysinfo(args.arg0) }
+        }
+
+        // SYS_GETRANDOM (318): fill user buffer with pseudo-random bytes.
+        // flags GRND_NONBLOCK/GRND_RANDOM are accepted and ignored.
+        oncrix_syscall::number::SYS_GETRANDOM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::random_syscall::sys_getrandom(args.arg0, args.arg1, args.arg2) }
+        }
 
         // SYS_SYNC (162): flush filesystem buffers.
         // POSIX.1-2024 sync(3p). ramfs is in-memory, so there is nothing
         // to flush — return success immediately.
         oncrix_syscall::number::SYS_SYNC => 0,
+
+        // SYS_FLOCK (73): advisory whole-file lock. Single-user in-memory VFS;
+        // always succeeds after validating that `fd` is open (EBADF check).
+        // POSIX.1-2024 / Linux flock(2).
+        oncrix_syscall::number::SYS_FLOCK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_flock(args.arg0 as i32, args.arg1 as i32) }
+        }
+
+        // SYS_MSYNC (26): sync memory mapping with backing store.
+        // ramfs has no backing store; always succeed. POSIX.1-2024 msync(3p).
+        oncrix_syscall::number::SYS_MSYNC => 0,
+
+        // SYS_MADVISE (28): advise the kernel on memory-use patterns.
+        // No page cache or VM on ONCRIX; advice is accepted and ignored.
+        // POSIX.1-2024 madvise(3p).
+        oncrix_syscall::number::SYS_MADVISE => 0,
+
+        // SYS_MLOCK (149) / SYS_MUNLOCK (150): lock/unlock pages in memory.
+        // ONCRIX does not swap pages out, so these are always no-ops.
+        oncrix_syscall::number::SYS_MLOCK => 0,
+        oncrix_syscall::number::SYS_MUNLOCK => 0,
+
+        // SYS_MLOCKALL (151) / SYS_MUNLOCKALL (152): lock/unlock all process
+        // pages. No-op on ONCRIX (no page-out, no swap). POSIX.1-2024.
+        oncrix_syscall::number::SYS_MLOCKALL => 0,
+        oncrix_syscall::number::SYS_MUNLOCKALL => 0,
+
+        // SYS_GETPGRP (111): equivalent to getpgid(0) per POSIX.1-2024.
+        oncrix_syscall::number::SYS_GETPGRP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getpgid(0) }
+        }
+
+        // SYS_GETCPU (309): query current CPU + NUMA node (always 0 on ONCRIX).
+        oncrix_syscall::number::SYS_GETCPU => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getcpu(args.arg0, args.arg1, args.arg2) }
+        }
+
+        // SYS_SCHED_GET_PRIORITY_MAX (146) / SYS_SCHED_GET_PRIORITY_MIN (147):
+        // POSIX.1-2024 sched_get_priority_max(3p) / sched_get_priority_min(3p).
+        oncrix_syscall::number::SYS_SCHED_GET_PRIORITY_MAX => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_get_priority_max(args.arg0 as i64) }
+        }
+        oncrix_syscall::number::SYS_SCHED_GET_PRIORITY_MIN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_get_priority_min(args.arg0 as i64) }
+        }
+
+        // SYS_FADVISE64 (221): posix_fadvise — access-pattern hint; no backing store
+        // to tune on ramfs; validate fd and return 0.
+        oncrix_syscall::number::SYS_FADVISE64 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_fadvise64(
+                    args.arg0 as i32,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as i32,
+                )
+            }
+        }
+
+        // SYS_READAHEAD (187): initiate read-ahead; ramfs is always resident,
+        // so validate fd and return 0.
+        oncrix_syscall::number::SYS_READAHEAD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_readahead(args.arg0 as i32, args.arg1, args.arg2 as usize)
+            }
+        }
+
+        // SYS_SYNC_FILE_RANGE (277): sync a file segment to backing store;
+        // ramfs has no backing store — validate fd and return 0.
+        oncrix_syscall::number::SYS_SYNC_FILE_RANGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_sync_file_range(
+                    args.arg0 as i32,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as u32,
+                )
+            }
+        }
+
+        // SYS_FALLOCATE (285): pre-allocate / extend file space.
+        // mode==0 extends the file to offset+len; non-zero mode is a no-op on ramfs.
+        oncrix_syscall::number::SYS_FALLOCATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_fallocate(
+                    args.arg0 as i32,
+                    args.arg1 as i32,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
 
         // SYS_SYMLINK (88): create a symbolic link.
         // POSIX.1-2024 symlink(3p).
@@ -762,14 +1018,84 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_getdents64(args.arg0 as usize, args.arg1, args.arg2) }
         }
 
+        // SYS_MEMFD_CREATE (319): create an anonymous in-memory file fd.
+        oncrix_syscall::number::SYS_MEMFD_CREATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_memfd_create(args.arg0, args.arg1 as u32) }
+        }
+
+        // SYS_DUP (32): duplicate `oldfd` to the lowest available fd.
+        // POSIX.1-2024 dup(3p). New descriptor does not inherit FD_CLOEXEC.
+        oncrix_syscall::number::SYS_DUP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_dup(args.arg0 as usize) }
+        }
+
+        // SYS_CLOSE_RANGE (436): close all open fds in [first, last].
+        // Linux close_range(2); flags=0 or CLOSE_RANGE_CLOEXEC(4).
+        oncrix_syscall::number::SYS_CLOSE_RANGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_close_range(
+                    args.arg0 as usize,
+                    args.arg1 as usize,
+                    args.arg2 as u32,
+                )
+            }
+        }
+
+        // SYS_SETXATTR (188) / SYS_LSETXATTR (189) / SYS_FSETXATTR (190):
+        // Set an extended attribute. ONCRIX ramfs carries no xattr store;
+        // POSIX.1-2024 permits returning ENOTSUP (-95) when the filesystem
+        // does not support extended attributes.
+        oncrix_syscall::number::SYS_SETXATTR
+        | oncrix_syscall::number::SYS_LSETXATTR
+        | oncrix_syscall::number::SYS_FSETXATTR => -95,
+
+        // SYS_GETXATTR (191) / SYS_LGETXATTR (192) / SYS_FGETXATTR (193):
+        // Get an extended attribute. With no xattr store the named attribute
+        // is always absent; return ENODATA (-61) per Linux / POSIX convention.
+        oncrix_syscall::number::SYS_GETXATTR
+        | oncrix_syscall::number::SYS_LGETXATTR
+        | oncrix_syscall::number::SYS_FGETXATTR => -61,
+
+        // SYS_LISTXATTR (194) / SYS_LLISTXATTR (195) / SYS_FLISTXATTR (196):
+        // List extended attribute names. The attribute list is empty; return 0
+        // (zero bytes written) without touching the user buffer.
+        oncrix_syscall::number::SYS_LISTXATTR
+        | oncrix_syscall::number::SYS_LLISTXATTR
+        | oncrix_syscall::number::SYS_FLISTXATTR => 0,
+
+        // SYS_REMOVEXATTR (197) / SYS_LREMOVEXATTR (198) / SYS_FREMOVEXATTR (199):
+        // Remove an extended attribute. Attribute is always absent on ramfs;
+        // return ENODATA (-61).
+        oncrix_syscall::number::SYS_REMOVEXATTR
+        | oncrix_syscall::number::SYS_LREMOVEXATTR
+        | oncrix_syscall::number::SYS_FREMOVEXATTR => -61,
+
+        // SYS_SENDFILE (40): copy data between file descriptors in the kernel.
+        // POSIX-adjacent; Linux sendfile(2). Both fds must be RamfsFile.
+        oncrix_syscall::number::SYS_SENDFILE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_sendfile(args.arg0, args.arg1, args.arg2, args.arg3) }
+        }
+
+        // SYS_COPY_FILE_RANGE (326): in-kernel file-to-file range copy.
+        // Linux copy_file_range(2). Both fds must be RamfsFile; flags must
+        // be zero.
+        oncrix_syscall::number::SYS_COPY_FILE_RANGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_copy_file_range(
+                    args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+                )
+            }
+        }
+
         // ── Signal syscalls ──────────────────────────────────────
 
-        // SYS_RT_SIGACTION (13): install a user-space signal handler.
-        // POSIX.1-2024 sigaction(3p).
-        oncrix_syscall::number::SYS_RT_SIGACTION => {
-            // SAFETY: Single-CPU SYSCALL dispatch path.
-            unsafe { crate::signal_syscall::sys_rt_sigaction(args.arg0, args.arg1, args.arg2) }
-        }
+        // Superseded by the full rt_sigaction below (sched_syscalls path
+        // with sigsetsize). Old 3-arg stub kept out of the dispatch table.
 
         // SYS_RT_SIGRETURN (15): return from a user-mode signal handler.
         // Reads the kernel-pushed UserSignalFrame at `arg0` and restores
@@ -787,12 +1113,91 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fork_dispatch::sys_kill(args.arg0, args.arg1) }
         }
 
+        // SYS_TKILL (200): send signal to a specific thread.
+        // ONCRIX is single-thread-per-process (tid == pid), so delegate
+        // directly to sys_kill(tid, sig).
+        // SYS_RT_SIGPENDING (127): copy the pending-signal set to user space.
+        oncrix_syscall::number::SYS_RT_SIGPENDING => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_rt_sigpending(args.arg0, args.arg1) }
+        }
+        // SYS_SIGALTSTACK (131): set/query the alternate signal stack (no-op).
+        oncrix_syscall::number::SYS_SIGALTSTACK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_sigaltstack(args.arg0, args.arg1) }
+        }
+        // SYS_RT_SIGQUEUEINFO (129): queue a signal (delegates to kill).
+        oncrix_syscall::number::SYS_RT_SIGQUEUEINFO => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_rt_sigqueueinfo(args.arg0, args.arg1, args.arg2) }
+        }
+
+        oncrix_syscall::number::SYS_TKILL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fork_dispatch::sys_kill(args.arg0, args.arg1) }
+        }
+
+        // SYS_TGKILL (234): send signal to thread `tid` in thread group `tgid`.
+        // ONCRIX is single-thread-per-process, so tgid must equal tid.
+        // If tgid != tid there is no matching thread; return -ESRCH (-3).
+        oncrix_syscall::number::SYS_TGKILL => {
+            let tgid = args.arg0;
+            let tid = args.arg1;
+            let sig = args.arg2;
+            if tgid != tid {
+                -3 // ESRCH — no such thread in that group
+            } else {
+                // SAFETY: Single-CPU SYSCALL dispatch path.
+                unsafe { crate::fork_dispatch::sys_kill(tid, sig) }
+            }
+        }
+
+        // SYS_SCHED_RR_GET_INTERVAL (148): POSIX.1-2024 sched_rr_get_interval(3p).
+        // Writes the 10 ms round-robin quantum to the user timespec pointer.
+        oncrix_syscall::number::SYS_SCHED_RR_GET_INTERVAL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_rr_get_interval(args.arg0, args.arg1) }
+        }
+
         // SYS_DUP2 (33): duplicate `oldfd` onto `newfd`, atomically
         // closing `newfd` if it was already open.
         // POSIX.1-2024 dup2(3p).
         oncrix_syscall::number::SYS_DUP2 => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::fd_table::fd_dup2(args.arg0 as usize, args.arg1 as usize) }
+        }
+
+        // SYS_UMASK (95): set the file-mode creation mask. POSIX.1-2024.
+        oncrix_syscall::number::SYS_UMASK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_umask(args.arg0) }
+        }
+
+        // SYS_FTRUNCATE (77): truncate the regular file referenced by fd.
+        oncrix_syscall::number::SYS_FTRUNCATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_ftruncate(args.arg0, args.arg1) }
+        }
+
+        // SYS_FCHMOD (91) / SYS_FCHOWN (93): chmod/chown by descriptor.
+        oncrix_syscall::number::SYS_FCHMOD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_fchmod(args.arg0 as i32, args.arg1 as u32) }
+        }
+        oncrix_syscall::number::SYS_FCHOWN => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_fchown(args.arg0 as i32, args.arg1 as u32, args.arg2 as u32)
+            }
+        }
+
+        // SYS_DUP3 (292): like dup2 but takes an O_CLOEXEC flag and rejects
+        // oldfd==newfd with EINVAL. POSIX.1-2024 dup3(2).
+        oncrix_syscall::number::SYS_DUP3 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_dup3(args.arg0 as usize, args.arg1 as usize, args.arg2 as u32)
+            }
         }
 
         // ── Working directory syscalls ────────────────────────────
@@ -841,11 +1246,411 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::time_syscalls::sys_clock_gettime(args.arg0 as u32, args.arg1) }
         }
 
+        // SYS_SCHED_SETATTR (314) / SYS_SCHED_GETATTR (315): extended
+        // scheduling attribute interface (Linux 3.14+). ONCRIX supports
+        // Other/FIFO/RR policies and nice values; pid is treated as the
+        // calling thread (no cross-thread lookup yet — documented).
+        oncrix_syscall::number::SYS_SCHED_SETATTR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_setattr(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2 as i64,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_SCHED_GETATTR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_getattr(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as i64,
+                )
+            }
+        }
+
+        // SYS_ADJTIMEX (159): query/adjust kernel clock parameters (NTP).
+        // ONCRIX has no NTP discipline; validates buf pointer and returns TIME_OK (0).
+        // POSIX.1-2024 / Linux adjtimex(2).
+        oncrix_syscall::number::SYS_ADJTIMEX => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_adjtimex(args.arg0) }
+        }
+
+        // SYS_CLOCK_SETTIME (227): set a POSIX clock — always EPERM on ONCRIX.
+        // ONCRIX has no settable clock source. Validates clk_id and tp pointer
+        // before returning -EPERM. POSIX.1-2024 clock_settime(3p).
+        oncrix_syscall::number::SYS_CLOCK_SETTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_clock_settime(args.arg0 as u32, args.arg1) }
+        }
+
+        // SYS_CLOCK_ADJTIME (305): adjust a specific POSIX clock (NTP-style).
+        // ONCRIX has no NTP discipline; validates buf pointer and returns TIME_OK (0).
+        // Linux clock_adjtime(2).
+        oncrix_syscall::number::SYS_CLOCK_ADJTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_clock_adjtime(args.arg0 as u32, args.arg1) }
+        }
+
+        // SYS_UNAME (63): fill struct utsname with system identification.
+        // POSIX.1-2024 uname(3p). nodename/domainname reflect the mutable globals.
+        oncrix_syscall::number::SYS_UNAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sysid_syscall::sys_uname(args.arg0) }
+        }
+
+        // SYS_SETHOSTNAME (170): set the system hostname (up to 64 bytes).
+        oncrix_syscall::number::SYS_SETHOSTNAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sysid_syscall::sys_sethostname(args.arg0, args.arg1) }
+        }
+
+        // SYS_SETDOMAINNAME (171): set the NIS/YP domain name (up to 64 bytes).
+        oncrix_syscall::number::SYS_SETDOMAINNAME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sysid_syscall::sys_setdomainname(args.arg0, args.arg1) }
+        }
+
+        // SYS_GETTIMEOFDAY (96): write struct timeval from PIT tick counter;
+        // zero-fill optional struct timezone. POSIX.1-2024 gettimeofday(3p)
+        // (marked obsolescent — use clock_gettime instead).
+        oncrix_syscall::number::SYS_GETTIMEOFDAY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_gettimeofday(args.arg0, args.arg1) }
+        }
+
+        // SYS_SETTIMEOFDAY (164): ONCRIX has no settable RTC; always -EPERM.
+        // POSIX.1-2024 settimeofday(3p).
+        oncrix_syscall::number::SYS_SETTIMEOFDAY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path; no pointer is dereferenced.
+            unsafe { crate::time_syscalls::sys_settimeofday(args.arg0, args.arg1) }
+        }
+
+        // SYS_CLOCK_GETRES (229): report PIT clock resolution (10 ms / 10_000_000 ns).
+        // POSIX.1-2024 clock_getres(3p).
+        oncrix_syscall::number::SYS_CLOCK_GETRES => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::time_syscalls::sys_clock_getres(args.arg0 as u32, args.arg1) }
+        }
+
+        // SYS_CAPGET (125): retrieve capability sets for the calling thread.
+        // ONCRIX has no capability model; data is zero-filled. POSIX.1-2024 / Linux capget(2).
+        oncrix_syscall::number::SYS_CAPGET => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_capget(args.arg0, args.arg1) }
+        }
+
+        // SYS_CAPSET (126): set capability sets for the calling thread.
+        // No-op on ONCRIX (no capability enforcement). Linux capset(2).
+        oncrix_syscall::number::SYS_CAPSET => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_capset(args.arg0, args.arg1) }
+        }
+
+        // SYS_GETGROUPS (115): get supplementary group IDs.
+        // ONCRIX has no supplementary groups; always returns 0. POSIX.1-2024 getgroups(3p).
+        oncrix_syscall::number::SYS_GETGROUPS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_getgroups(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_SETGROUPS (116): set supplementary group IDs.
+        // Refused with EPERM for size>0; size==0 is a no-op. POSIX.1-2024 setgroups(3p).
+        oncrix_syscall::number::SYS_SETGROUPS => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_setgroups(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_PERSONALITY (135): query or set execution domain.
+        // ONCRIX supports PER_LINUX only; always returns 0. Linux personality(2).
+        oncrix_syscall::number::SYS_PERSONALITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_personality(args.arg0) }
+        }
+
         // SYS_NANOSLEEP (35): block for the requested duration via
         // cooperative yield_now polling. POSIX.1-2024 nanosleep(3p).
         oncrix_syscall::number::SYS_NANOSLEEP => {
             // SAFETY: Single-CPU SYSCALL dispatch path.
             unsafe { crate::time_syscalls::sys_nanosleep(args.arg0, args.arg1) }
+        }
+
+        // SYS_GETPRIORITY (140) / SYS_SETPRIORITY (141) / SYS_NICE (34):
+        // POSIX.1-2024 process scheduling priority. Handlers live in the
+        // kernel sched_syscalls module and operate on the current thread.
+        oncrix_syscall::number::SYS_GETPRIORITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getpriority(args.arg0 as i64, args.arg1 as i64) }
+        }
+        oncrix_syscall::number::SYS_SETPRIORITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_setpriority(
+                    args.arg0 as i64,
+                    args.arg1 as i64,
+                    args.arg2 as i64,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_NICE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_nice(args.arg0 as i64) }
+        }
+
+        // SYS_FCNTL (72): file/descriptor control — F_DUPFD, F_GETFD/SETFD
+        // (FD_CLOEXEC), F_GETFL/SETFL (O_NONBLOCK/O_APPEND). POSIX.1-2024.
+        oncrix_syscall::number::SYS_FCNTL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_fcntl(args.arg0 as usize, args.arg1 as i32, args.arg2) }
+        }
+
+        // SYS_SCHED_* (24/142-145): POSIX.1-2024 scheduling policy/params.
+        // pid is treated as the calling thread (no cross-pid lookup yet).
+        oncrix_syscall::number::SYS_SCHED_YIELD => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_yield() }
+        }
+        oncrix_syscall::number::SYS_SCHED_SETSCHEDULER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_setscheduler(
+                    args.arg0 as i64,
+                    args.arg1 as i64,
+                    args.arg2,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_SCHED_GETSCHEDULER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_getscheduler(args.arg0 as i64) }
+        }
+        oncrix_syscall::number::SYS_SCHED_GETPARAM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_getparam(args.arg0 as i64, args.arg1) }
+        }
+        oncrix_syscall::number::SYS_SCHED_SETPARAM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_sched_setparam(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_POLL (7): wait for readiness on a set of fds. POSIX.1-2024.
+        oncrix_syscall::number::SYS_POLL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_poll(args.arg0, args.arg1, args.arg2 as i64) }
+        }
+
+        // SYS_CLOCK_NANOSLEEP (230): sleep against a clock, relative or
+        // TIMER_ABSTIME. POSIX.1-2024 clock_nanosleep(3p).
+        oncrix_syscall::number::SYS_CLOCK_NANOSLEEP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::time_syscalls::sys_clock_nanosleep(
+                    args.arg0 as u32,
+                    args.arg1 as i32,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+
+        // SYS_SETPGID (109) / SYS_GETPGID (121) / SYS_SETSID (112) /
+        // SYS_GETSID (124): POSIX.1-2024 process group + session API.
+        oncrix_syscall::number::SYS_SETPGID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setpgid(args.arg0, args.arg1) }
+        }
+        oncrix_syscall::number::SYS_GETPGID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getpgid(args.arg0) }
+        }
+        oncrix_syscall::number::SYS_SETSID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setsid() }
+        }
+        oncrix_syscall::number::SYS_GETSID => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getsid(args.arg0) }
+        }
+
+        // SYS_PRLIMIT64 (302) / SYS_GETRLIMIT (97) / SYS_SETRLIMIT (160):
+        // POSIX.1-2024 resource limits.
+        oncrix_syscall::number::SYS_PRLIMIT64 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_prlimit64(args.arg0, args.arg1, args.arg2, args.arg3)
+            }
+        }
+        oncrix_syscall::number::SYS_GETRLIMIT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getrlimit(args.arg0, args.arg1) }
+        }
+        oncrix_syscall::number::SYS_SETRLIMIT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setrlimit(args.arg0, args.arg1) }
+        }
+
+        // SYS_RT_SIGACTION (13) / SYS_RT_SIGPROCMASK (14): per-process
+        // signal disposition + per-thread blocked-signal mask.
+        oncrix_syscall::number::SYS_RT_SIGACTION => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_rt_sigaction(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_RT_SIGPROCMASK => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_rt_sigprocmask(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+
+        // SYS_EVENTFD2 (290): create a pollable u64 counter fd.
+        oncrix_syscall::number::SYS_EVENTFD2 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_eventfd2(args.arg0, args.arg1 as u32) }
+        }
+
+        // SYS_SOCKETPAIR (53): connected AF_UNIX descriptor pair.
+        oncrix_syscall::number::SYS_SOCKETPAIR => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_socketpair(
+                    args.arg0 as i64,
+                    args.arg1 as i64,
+                    args.arg2 as i64,
+                    args.arg3,
+                )
+            }
+        }
+
+        // SYS_SIGNALFD4 (289): pollable signal file descriptor.
+        oncrix_syscall::number::SYS_SIGNALFD4 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_signalfd4(
+                    args.arg0 as i32,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3 as i32,
+                )
+            }
+        }
+
+        // SYS_TIMERFD_* (283/286/287): pollable timer file descriptors.
+        oncrix_syscall::number::SYS_TIMERFD_CREATE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_timerfd_create(args.arg0 as i32, args.arg1 as i32) }
+        }
+        oncrix_syscall::number::SYS_TIMERFD_SETTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_timerfd_settime(
+                    args.arg0 as usize,
+                    args.arg1 as i32,
+                    args.arg2,
+                    args.arg3,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_TIMERFD_GETTIME => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_timerfd_gettime(args.arg0 as usize, args.arg1) }
+        }
+
+        // SYS_EPOLL_* (291/233/232): scalable I/O event notification.
+        oncrix_syscall::number::SYS_EPOLL_CREATE1 => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_epoll_create1(args.arg0 as i32) }
+        }
+        oncrix_syscall::number::SYS_EPOLL_CTL => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_epoll_ctl(
+                    args.arg0 as usize,
+                    args.arg1 as i32,
+                    args.arg2 as usize,
+                    args.arg3,
+                )
+            }
+        }
+        oncrix_syscall::number::SYS_EPOLL_WAIT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_epoll_wait(
+                    args.arg0 as usize,
+                    args.arg1,
+                    args.arg2 as i32,
+                    args.arg3 as i64,
+                )
+            }
+        }
+
+        // SYS_ALARM (37) / SYS_SETITIMER (38) / SYS_GETITIMER (36):
+        // ITIMER_REAL interval timers; expiry raises SIGALRM. POSIX.1-2024.
+        oncrix_syscall::number::SYS_ALARM => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_alarm(args.arg0) }
+        }
+        oncrix_syscall::number::SYS_SETITIMER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_setitimer(args.arg0 as i64, args.arg1, args.arg2) }
+        }
+        oncrix_syscall::number::SYS_GETITIMER => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getitimer(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_SELECT (23): synchronous I/O multiplexing over fd_set bitmaps.
+        oncrix_syscall::number::SYS_SELECT => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_select(
+                    args.arg0 as i64,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                    args.arg4,
+                )
+            }
+        }
+
+        // SYS_TIMES (100) / SYS_GETRUSAGE (98): process CPU-time accounting.
+        oncrix_syscall::number::SYS_TIMES => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_times(args.arg0) }
+        }
+        oncrix_syscall::number::SYS_GETRUSAGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::sched_syscalls::sys_getrusage(args.arg0 as i64, args.arg1) }
+        }
+
+        // SYS_SCHED_GETAFFINITY (204) / SYS_SCHED_SETAFFINITY (203): CPU
+        // affinity. Single-CPU system, so the only valid mask is {CPU 0}.
+        oncrix_syscall::number::SYS_SCHED_GETAFFINITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_getaffinity(args.arg0 as i64, args.arg1, args.arg2)
+            }
+        }
+        oncrix_syscall::number::SYS_SCHED_SETAFFINITY => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::sched_syscalls::sys_sched_setaffinity(args.arg0 as i64, args.arg1, args.arg2)
+            }
         }
 
         // ── Everything else ──────────────────────────────────────
@@ -1015,6 +1820,11 @@ unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
 
     match result {
         Some(Ok(inode)) => {
+            // FIFO: route to the pipe-backed open path instead of a ramfs handle.
+            if inode.file_type == oncrix_vfs::inode::FileType::Fifo {
+                // SAFETY: single-CPU SYSCALL context.
+                return unsafe { crate::fd_table::open_fifo(inode.ino, flags as u32) };
+            }
             // Build a FileHandle for the ramfs inode.
             let handle_flags = crate::fd_table::HandleFlags(flags as u32);
             let handle = crate::fd_table::FileHandle::ramfs_file(inode.ino, handle_flags);

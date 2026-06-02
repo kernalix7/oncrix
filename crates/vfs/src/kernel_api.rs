@@ -309,6 +309,16 @@ impl KernelVfs {
         self.ramfs.truncate(&inode, length)
     }
 
+    /// Truncate the regular file identified by `ino` to `length` bytes.
+    ///
+    /// The fd-keyed counterpart of [`truncate_path`], for `ftruncate(2)`.
+    /// Returns `NotFound` if no inode with that number exists,
+    /// `InvalidArgument` if the inode is not a regular file.
+    pub fn truncate_ino(&mut self, ino: InodeNumber, length: u64) -> Result<()> {
+        let inode = self.ramfs.inode_by_number(ino).ok_or(Error::NotFound)?;
+        self.ramfs.truncate(&inode, length)
+    }
+
     /// Create a symbolic link at `link_path` whose target is `target`.
     ///
     /// POSIX.1-2024 `symlink(2)` (ramfs subset). The target is stored
@@ -362,6 +372,28 @@ impl KernelVfs {
     pub fn chmod_path(&mut self, path: &[u8], mode: u32) -> Result<()> {
         let inode = self.lookup_path(path)?;
         self.ramfs.set_mode(inode.ino, FileMode(mode as u16))
+    }
+
+    /// Change the permission bits of the file identified by `ino`.
+    ///
+    /// The fd-keyed counterpart of [`chmod_path`], for `fchmod(2)`.
+    pub fn chmod_ino(&mut self, ino: InodeNumber, mode: u32) -> Result<()> {
+        self.ramfs.set_mode(ino, FileMode(mode as u16))
+    }
+
+    /// Return the number of inode slots currently in use in the ramfs.
+    ///
+    /// Used by the `statfs(2)`/`fstatfs(2)` handlers to compute `f_ffree`.
+    pub fn ramfs_used_inodes(&self) -> usize {
+        self.ramfs.used_inodes()
+    }
+
+    /// Change the owner/group of the file identified by `ino`.
+    ///
+    /// The fd-keyed counterpart of [`chown_path`], for `fchown(2)`.
+    /// `u32::MAX` leaves the corresponding id unchanged.
+    pub fn chown_ino(&mut self, ino: InodeNumber, uid: u32, gid: u32) -> Result<()> {
+        self.ramfs.set_owner(ino, uid, gid)
     }
 
     /// List the contents of the directory at `path`.
@@ -483,6 +515,23 @@ impl KernelVfs {
     /// the number stored inside a [`FileBackend::RamfsFile`] handle.
     pub fn lookup_path_by_ino(&self, ino: InodeNumber) -> Option<Inode> {
         self.ramfs.inode_by_number(ino)
+    }
+
+    /// Return the pipe-ring index backing the FIFO `ino`, if allocated.
+    ///
+    /// `Ok(None)` means the FIFO exists but has not yet been opened.
+    /// Returns `Err(InvalidArgument)` if `ino` is not a FIFO, `NotFound`
+    /// if no such inode exists. Backs lazy FIFO ring wiring in the fd layer.
+    pub fn fifo_ring_id(&self, ino: InodeNumber) -> Result<Option<u32>> {
+        self.ramfs.fifo_ring_id(ino)
+    }
+
+    /// Record the pipe-ring index backing the FIFO `ino`.
+    ///
+    /// Returns `Err(InvalidArgument)` if `ino` is not a FIFO, `NotFound`
+    /// if no such inode exists.
+    pub fn set_fifo_ring_id(&mut self, ino: InodeNumber, id: u32) -> Result<()> {
+        self.ramfs.set_fifo_ring_id(ino, id)
     }
 
     /// Read the entire contents of the file at `path` into a `Vec<u8>`.

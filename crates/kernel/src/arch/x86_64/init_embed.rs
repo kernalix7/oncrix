@@ -559,6 +559,10 @@ static EMBEDDED_MV: &[u8] = include_bytes!(env!("ONCRIX_MV_BIN"));
 #[cfg(feature = "embed-init")]
 static EMBEDDED_MKFIFO: &[u8] = include_bytes!(env!("ONCRIX_MKFIFO_BIN"));
 
+/// The embedded `/bin/renice` ELF binary.
+#[cfg(feature = "embed-init")]
+static EMBEDDED_RENICE: &[u8] = include_bytes!(env!("ONCRIX_RENICE_BIN"));
+
 /// The embedded `/bin/ifconfig` ELF binary.
 #[cfg(feature = "embed-init")]
 static EMBEDDED_IFCONFIG: &[u8] = include_bytes!(env!("ONCRIX_IFCONFIG_BIN"));
@@ -950,6 +954,7 @@ pub fn embedded_lookup(path: &[u8]) -> Option<&'static [u8]> {
         b"/bin/ln" | b"ln" => Some(EMBEDDED_LN),
         b"/bin/mv" | b"mv" => Some(EMBEDDED_MV),
         b"/bin/mkfifo" | b"mkfifo" => Some(EMBEDDED_MKFIFO),
+        b"/bin/renice" | b"renice" => Some(EMBEDDED_RENICE),
         b"/bin/ifconfig" | b"ifconfig" => Some(EMBEDDED_IFCONFIG),
         b"/bin/route" | b"route" => Some(EMBEDDED_ROUTE),
         b"/bin/netstat" | b"netstat" => Some(EMBEDDED_NETSTAT),

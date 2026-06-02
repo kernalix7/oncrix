@@ -106,6 +106,23 @@ impl PipeRing {
         self.read_refs = 1;
     }
 
+    /// Initialize this slot as a FIFO backing ring with **no** fds attached.
+    ///
+    /// Unlike [`open`](Self::open), both ends start with a zero refcount and
+    /// are marked closed; each `open(2)` of the FIFO path bumps exactly one
+    /// end via [`pipe_open_end`]. This lets a writer and a reader that open
+    /// the same FIFO path independently share one buffer, and lets the slot
+    /// free itself once both ends drop back to zero.
+    pub fn open_fifo(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+        self.write_open = false;
+        self.read_open = false;
+        self.in_use = true;
+        self.write_refs = 0;
+        self.read_refs = 0;
+    }
+
     /// Number of bytes available to read.
     pub fn available(&self) -> usize {
         (self.tail + PIPE_BUF - self.head) % PIPE_BUF
@@ -198,6 +215,87 @@ pub unsafe fn pipe_alloc() -> Option<u32> {
     None
 }
 
+/// Allocate a free pipe slot as a FIFO backing ring and return its `ring_id`.
+///
+/// The slot is initialized with [`PipeRing::open_fifo`] (both ends closed,
+/// zero refs); the caller must follow up with [`pipe_open_end`] for each
+/// fd that opens the FIFO. Returns `None` if all [`MAX_PIPES`] slots are
+/// occupied (`ENFILE`).
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU,
+/// interrupts effectively disabled).
+pub unsafe fn pipe_alloc_fifo() -> Option<u32> {
+    // SAFETY: Single-CPU SYSCALL context; no aliased mutation.
+    unsafe {
+        #[allow(static_mut_refs)]
+        for (i, slot) in PIPE_TABLE.iter_mut().enumerate() {
+            if !slot.in_use {
+                slot.open_fifo();
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Attach one fd to an end of FIFO ring `ring_id`, bumping its refcount and
+/// marking that end open.
+///
+/// `is_write_end` selects the write end (`true`) or read end (`false`).
+/// Returns `false` if the slot is out of range or not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_open_end(ring_id: u32, is_write_end: bool) -> bool {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get_mut(ring_id as usize)
+            && slot.in_use
+        {
+            if is_write_end {
+                slot.write_refs = slot.write_refs.saturating_add(1);
+                slot.write_open = true;
+            } else {
+                slot.read_refs = slot.read_refs.saturating_add(1);
+                slot.read_open = true;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the reference count of the **peer** end of FIFO ring `ring_id`.
+///
+/// For a caller opening the write end (`opening_write_end == true`) this is
+/// the read-end refcount, and vice versa. Used by blocking FIFO `open(2)`
+/// to wait until a peer has attached. Returns 0 if the slot is out of range
+/// or not in use.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_peer_refs(ring_id: u32, opening_write_end: bool) -> u32 {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get(ring_id as usize)
+            && slot.in_use
+        {
+            return if opening_write_end {
+                slot.read_refs
+            } else {
+                slot.write_refs
+            };
+        }
+    }
+    0
+}
+
 /// Get a shared reference to the pipe ring for `ring_id`.
 ///
 /// Returns `None` if the id is out of range or the slot is not in use.
@@ -212,6 +310,35 @@ pub unsafe fn pipe_get(ring_id: u32) -> Option<&'static PipeRing> {
         let slot = PIPE_TABLE.get(ring_id as usize)?;
         if slot.in_use { Some(slot) } else { None }
     }
+}
+
+/// Readiness flags for poll(2): `(readable, writable, hup)`.
+///
+/// For a pipe ring `ring_id`, reports whether a read would not block
+/// (`readable` — data buffered, or the write end is closed so a read
+/// returns EOF immediately), whether a write would not block (`writable`
+/// — free space remains AND a reader is still attached), and whether the
+/// pipe has hung up (`hup` — the write end is closed). Returns
+/// `(false, false, true)` if the slot is out of range or not in use, so
+/// callers surface POLLHUP/POLLNVAL rather than spinning.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path.
+pub unsafe fn pipe_poll(ring_id: u32) -> (bool, bool, bool) {
+    // SAFETY: Single-CPU SYSCALL context.
+    unsafe {
+        #[allow(static_mut_refs)]
+        if let Some(slot) = PIPE_TABLE.get(ring_id as usize)
+            && slot.in_use
+        {
+            let readable = slot.available() > 0 || !slot.write_open;
+            let writable = slot.read_open && slot.free_space() > 0;
+            let hup = !slot.write_open;
+            return (readable, writable, hup);
+        }
+    }
+    (false, false, true)
 }
 
 /// Get a mutable reference to the pipe ring for `ring_id`.
@@ -339,10 +466,20 @@ pub unsafe fn pipe_dup_read(ring_id: u32) {
 /// # Safety
 ///
 /// Must be called from the SYSCALL dispatch path.
-pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
+pub unsafe fn sys_pipe2(fildes_ptr: u64, flags: u64) -> i64 {
+    /// `O_NONBLOCK` flag bit (octal 04000), matching `pipe2(2)` /
+    /// `oncrix_vfs::file_ops::O_NONBLOCK`.
+    const O_NONBLOCK: u64 = 0o4000;
+    /// `O_CLOEXEC` flag bit (octal 02000000), matching `pipe2(2)`.
+    const O_CLOEXEC: u64 = 0o2000000;
+
     // Validate the user pointer.
     if fildes_ptr == 0 || fildes_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
+    }
+    // Unknown flag bits are rejected per POSIX.1-2024 pipe2(2).
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return -22; // EINVAL
     }
 
     // Allocate a pipe slot.
@@ -354,6 +491,20 @@ pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
         }
     };
 
+    // Translate pipe2 flag bits to handle flags. The access mode is
+    // baked in per end (RDONLY / WRONLY); only the status / descriptor
+    // flag bits are configurable from `flags`.
+    let mut read_flags = crate::fd_table::HandleFlags::RDONLY.0;
+    let mut write_flags = crate::fd_table::HandleFlags::WRONLY.0;
+    if flags & O_NONBLOCK != 0 {
+        read_flags |= crate::fd_table::HandleFlags::NONBLOCK;
+        write_flags |= crate::fd_table::HandleFlags::NONBLOCK;
+    }
+    if flags & O_CLOEXEC != 0 {
+        read_flags |= crate::fd_table::HandleFlags::FD_CLOEXEC_BIT;
+        write_flags |= crate::fd_table::HandleFlags::FD_CLOEXEC_BIT;
+    }
+
     // Build FileHandles for the read and write ends.
     let read_handle = crate::fd_table::FileHandle {
         backend: crate::fd_table::FileBackend::Pipe {
@@ -361,7 +512,7 @@ pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
             is_write_end: false,
         },
         offset: 0,
-        flags: crate::fd_table::HandleFlags::RDONLY,
+        flags: crate::fd_table::HandleFlags(read_flags),
     };
     let write_handle = crate::fd_table::FileHandle {
         backend: crate::fd_table::FileBackend::Pipe {
@@ -369,7 +520,7 @@ pub unsafe fn sys_pipe2(fildes_ptr: u64, _flags: u64) -> i64 {
             is_write_end: true,
         },
         offset: 0,
-        flags: crate::fd_table::HandleFlags::WRONLY,
+        flags: crate::fd_table::HandleFlags(write_flags),
     };
 
     // Install both fds (lowest-available order).

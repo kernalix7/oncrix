@@ -57,6 +57,87 @@ impl core::fmt::Display for ExitStatus {
 
 /// A process entry in the global process table.
 ///
+/// Per-process `ITIMER_REAL` interval timer state (`setitimer(2)` /
+/// `alarm(2)`).
+///
+/// Counted down in PIT ticks by the timer interrupt. When `value_ticks`
+/// reaches zero the kernel raises `SIGALRM` on the owning process and, if
+/// `interval_ticks` is non-zero, reloads `value_ticks` from it (periodic
+/// timer); otherwise the timer disarms (`value_ticks` stays `0`).
+///
+/// All durations are stored in PIT ticks (100 Hz) rather than `timeval`s
+/// so the timer-tick decrement is a single subtraction. A `value_ticks`
+/// of `0` means "disarmed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ItimerReal {
+    /// Ticks remaining until the next `SIGALRM`. `0` = disarmed.
+    pub value_ticks: u64,
+    /// Reload value in ticks for a periodic timer. `0` = one-shot.
+    pub interval_ticks: u64,
+}
+
+impl ItimerReal {
+    /// Create a disarmed timer.
+    pub const fn new() -> Self {
+        Self {
+            value_ticks: 0,
+            interval_ticks: 0,
+        }
+    }
+
+    /// Returns `true` if the timer is currently armed (counting down).
+    pub const fn is_armed(&self) -> bool {
+        self.value_ticks != 0
+    }
+
+    /// Advance the timer by one PIT tick.
+    ///
+    /// Returns `true` if the timer expired on this tick (the caller must
+    /// then raise `SIGALRM`). On expiry the timer reloads from
+    /// `interval_ticks` for a periodic timer, or disarms for a one-shot.
+    /// A disarmed timer is a no-op and returns `false`.
+    pub fn tick(&mut self) -> bool {
+        if self.value_ticks == 0 {
+            return false;
+        }
+        self.value_ticks -= 1;
+        if self.value_ticks == 0 {
+            // Expired: reload for periodic, else stay disarmed.
+            self.value_ticks = self.interval_ticks;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A single resource limit, as reported by `getrlimit(2)` / set by
+/// `setrlimit(2)` / `prlimit64(2)`.
+///
+/// `rlim_cur` is the soft limit (the value the kernel enforces), and
+/// `rlim_max` is the hard limit (the ceiling to which an unprivileged
+/// process may raise the soft limit). [`RLIM_INFINITY`] means "no limit".
+#[derive(Debug, Clone, Copy)]
+pub struct Rlimit {
+    /// Soft limit (enforced value).
+    pub rlim_cur: u64,
+    /// Hard limit (ceiling for `rlim_cur`).
+    pub rlim_max: u64,
+}
+
+/// `RLIM_INFINITY` — sentinel meaning "no limit".
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// Number of modelled resource-limit slots (`RLIMIT_*` indices `0..16`).
+pub const RLIMIT_NLIMITS: usize = 16;
+
+/// `RLIMIT_NOFILE` index — maximum number of open file descriptors.
+pub const RLIMIT_NOFILE: usize = 7;
+
+/// Default soft/hard cap for `RLIMIT_NOFILE`, matching the per-process
+/// file-descriptor table capacity.
+pub const RLIMIT_NOFILE_DEFAULT: u64 = 256;
+
 /// Extends [`Process`] with parent relationship, signal state,
 /// and exit information needed by `wait4` and `kill`.
 #[derive(Debug)]
@@ -69,16 +150,63 @@ pub struct ProcessEntry {
     pub signals: SignalState,
     /// Exit status, set when the process terminates.
     pub exit_status: Option<ExitStatus>,
+    /// `ITIMER_REAL` interval timer (`setitimer`/`alarm`).
+    pub itimer_real: ItimerReal,
+    /// Process group ID (`getpgid(2)`/`setpgid(2)`).
+    ///
+    /// At construction this is initialised to the process's own PID, so
+    /// a brand-new process is in its own process group (and is therefore
+    /// the leader of that group). `sys_fork` is responsible for
+    /// overwriting this with the parent's `pgid` so children inherit
+    /// the group POSIX-correctly; `setpgid(2)` mutates it explicitly.
+    pub pgid: Pid,
+    /// Session ID (`getsid(2)`/`setsid(2)`).
+    ///
+    /// Initialised to the process's own PID — same inheritance rule as
+    /// [`pgid`](Self::pgid): the fork path must propagate the parent's
+    /// `sid`. `setsid(2)` creates a new session and resets both fields
+    /// to the caller's PID.
+    pub sid: Pid,
+    /// Per-process resource limits, indexed by `RLIMIT_*` resource id
+    /// (`getrlimit`/`setrlimit`/`prlimit64`). All default to
+    /// [`RLIM_INFINITY`] except `RLIMIT_NOFILE`. Stored for query/retrieval;
+    /// enforcement is not yet wired into the allocators.
+    pub rlimits: [Rlimit; RLIMIT_NLIMITS],
+    /// `umask(2)` — file-mode creation mask. Bits set here are CLEARED on
+    /// newly created files (`open`/`creat`/`mkdir`). Standard default is
+    /// `0o022` (group / others write bits are stripped).
+    pub umask: u32,
 }
 
 impl ProcessEntry {
     /// Create a new process entry.
+    ///
+    /// `pgid` and `sid` default to the process's own PID, matching the
+    /// "every process is initially its own session/group leader"
+    /// convenience used at boot. The fork path overrides these to
+    /// inherit from the parent before insertion.
     pub fn new(process: Process, parent: Pid) -> Self {
+        let pid = process.pid();
         Self {
             process,
             parent,
             signals: SignalState::new(),
             exit_status: None,
+            itimer_real: ItimerReal::new(),
+            pgid: pid,
+            sid: pid,
+            rlimits: {
+                let mut limits = [Rlimit {
+                    rlim_cur: RLIM_INFINITY,
+                    rlim_max: RLIM_INFINITY,
+                }; RLIMIT_NLIMITS];
+                limits[RLIMIT_NOFILE] = Rlimit {
+                    rlim_cur: RLIMIT_NOFILE_DEFAULT,
+                    rlim_max: RLIMIT_NOFILE_DEFAULT,
+                };
+                limits
+            },
+            umask: 0o022,
         }
     }
 

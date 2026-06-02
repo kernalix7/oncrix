@@ -206,6 +206,7 @@ fn main() {
         ("oncrix-ln", "ln"),
         ("oncrix-mv", "mv"),
         ("oncrix-mkfifo", "mkfifo"),
+        ("oncrix-renice", "renice"),
         ("oncrix-ifconfig", "ifconfig"),
         ("oncrix-route", "route"),
         ("oncrix-netstat", "netstat"),
