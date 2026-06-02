@@ -1018,6 +1018,74 @@ extern "C" fn syscall_dispatch_wrapper(args: *mut oncrix_syscall::dispatch::Sysc
             unsafe { crate::fs_syscalls::sys_getdents64(args.arg0 as usize, args.arg1, args.arg2) }
         }
 
+        // SYS_DUP (32): duplicate `oldfd` to the lowest available fd.
+        // POSIX.1-2024 dup(3p). New descriptor does not inherit FD_CLOEXEC.
+        oncrix_syscall::number::SYS_DUP => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fd_table::sys_dup(args.arg0 as usize) }
+        }
+
+        // SYS_CLOSE_RANGE (436): close all open fds in [first, last].
+        // Linux close_range(2); flags=0 or CLOSE_RANGE_CLOEXEC(4).
+        oncrix_syscall::number::SYS_CLOSE_RANGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fd_table::sys_close_range(
+                    args.arg0 as usize,
+                    args.arg1 as usize,
+                    args.arg2 as u32,
+                )
+            }
+        }
+
+        // SYS_SETXATTR (188) / SYS_LSETXATTR (189) / SYS_FSETXATTR (190):
+        // Set an extended attribute. ONCRIX ramfs carries no xattr store;
+        // POSIX.1-2024 permits returning ENOTSUP (-95) when the filesystem
+        // does not support extended attributes.
+        oncrix_syscall::number::SYS_SETXATTR
+        | oncrix_syscall::number::SYS_LSETXATTR
+        | oncrix_syscall::number::SYS_FSETXATTR => -95,
+
+        // SYS_GETXATTR (191) / SYS_LGETXATTR (192) / SYS_FGETXATTR (193):
+        // Get an extended attribute. With no xattr store the named attribute
+        // is always absent; return ENODATA (-61) per Linux / POSIX convention.
+        oncrix_syscall::number::SYS_GETXATTR
+        | oncrix_syscall::number::SYS_LGETXATTR
+        | oncrix_syscall::number::SYS_FGETXATTR => -61,
+
+        // SYS_LISTXATTR (194) / SYS_LLISTXATTR (195) / SYS_FLISTXATTR (196):
+        // List extended attribute names. The attribute list is empty; return 0
+        // (zero bytes written) without touching the user buffer.
+        oncrix_syscall::number::SYS_LISTXATTR
+        | oncrix_syscall::number::SYS_LLISTXATTR
+        | oncrix_syscall::number::SYS_FLISTXATTR => 0,
+
+        // SYS_REMOVEXATTR (197) / SYS_LREMOVEXATTR (198) / SYS_FREMOVEXATTR (199):
+        // Remove an extended attribute. Attribute is always absent on ramfs;
+        // return ENODATA (-61).
+        oncrix_syscall::number::SYS_REMOVEXATTR
+        | oncrix_syscall::number::SYS_LREMOVEXATTR
+        | oncrix_syscall::number::SYS_FREMOVEXATTR => -61,
+
+        // SYS_SENDFILE (40): copy data between file descriptors in the kernel.
+        // POSIX-adjacent; Linux sendfile(2). Both fds must be RamfsFile.
+        oncrix_syscall::number::SYS_SENDFILE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe { crate::fs_syscalls::sys_sendfile(args.arg0, args.arg1, args.arg2, args.arg3) }
+        }
+
+        // SYS_COPY_FILE_RANGE (326): in-kernel file-to-file range copy.
+        // Linux copy_file_range(2). Both fds must be RamfsFile; flags must
+        // be zero.
+        oncrix_syscall::number::SYS_COPY_FILE_RANGE => {
+            // SAFETY: Single-CPU SYSCALL dispatch path.
+            unsafe {
+                crate::fs_syscalls::sys_copy_file_range(
+                    args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+                )
+            }
+        }
+
         // ── Signal syscalls ──────────────────────────────────────
 
         // Superseded by the full rt_sigaction below (sched_syscalls path

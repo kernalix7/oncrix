@@ -67,6 +67,46 @@ pub const SYS_FALLOCATE: SyscallNumber = 285;
 /// `memfd_create(name, flags)` — Create anonymous memory file.
 pub const SYS_MEMFD_CREATE: SyscallNumber = 319;
 
+/// `dup(oldfd)` — Duplicate a file descriptor to the lowest available slot.
+pub const SYS_DUP: SyscallNumber = 32;
+/// `close_range(first, last, flags)` — Close all open fds in [first, last].
+pub const SYS_CLOSE_RANGE: SyscallNumber = 436;
+// ── Extended attributes ──────────────────────────────────────────
+
+/// `setxattr(path, name, value, size, flags)` — Set an extended attribute by path.
+pub const SYS_SETXATTR: SyscallNumber = 188;
+/// `lsetxattr(path, name, value, size, flags)` — Set an extended attribute (no symlink follow).
+pub const SYS_LSETXATTR: SyscallNumber = 189;
+/// `fsetxattr(fd, name, value, size, flags)` — Set an extended attribute by descriptor.
+pub const SYS_FSETXATTR: SyscallNumber = 190;
+/// `getxattr(path, name, value, size)` — Get an extended attribute by path.
+pub const SYS_GETXATTR: SyscallNumber = 191;
+/// `lgetxattr(path, name, value, size)` — Get an extended attribute (no symlink follow).
+pub const SYS_LGETXATTR: SyscallNumber = 192;
+/// `fgetxattr(fd, name, value, size)` — Get an extended attribute by descriptor.
+pub const SYS_FGETXATTR: SyscallNumber = 193;
+/// `listxattr(path, list, size)` — List extended attribute names by path.
+pub const SYS_LISTXATTR: SyscallNumber = 194;
+/// `llistxattr(path, list, size)` — List extended attribute names (no symlink follow).
+pub const SYS_LLISTXATTR: SyscallNumber = 195;
+/// `flistxattr(fd, list, size)` — List extended attribute names by descriptor.
+pub const SYS_FLISTXATTR: SyscallNumber = 196;
+/// `removexattr(path, name)` — Remove an extended attribute by path.
+pub const SYS_REMOVEXATTR: SyscallNumber = 197;
+/// `lremovexattr(path, name)` — Remove an extended attribute (no symlink follow).
+pub const SYS_LREMOVEXATTR: SyscallNumber = 198;
+/// `fremovexattr(fd, name)` — Remove an extended attribute by descriptor.
+pub const SYS_FREMOVEXATTR: SyscallNumber = 199;
+/// `sendfile(out_fd, in_fd, offset, count)` — copy data between file
+/// descriptors in the kernel, bypassing user-space buffers.
+/// Linux / ONCRIX syscall number 40.
+pub const SYS_SENDFILE: SyscallNumber = 40;
+
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` — copy a
+/// range of data from one file descriptor to another within the kernel.
+/// Linux / ONCRIX syscall number 326.
+pub const SYS_COPY_FILE_RANGE: SyscallNumber = 326;
+
 // ── Process lifecycle ───────────────────────────────────────────
 
 /// `getpid()` — Get process ID.

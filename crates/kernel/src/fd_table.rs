@@ -3396,3 +3396,196 @@ pub unsafe fn dispatch_lseek(fd: usize, off: i64, whence: i32) -> i64 {
         }
     }
 }
+
+// ── dup / close_range ─────────────────────────────────────────────
+
+/// Kernel handler for `SYS_DUP` (Linux number 32).
+///
+/// POSIX.1-2024 `dup(3p)` semantics: duplicates `oldfd` to the lowest
+/// available file descriptor, preserving all file-status flags.
+/// The new descriptor does **not** inherit `FD_CLOEXEC`.
+///
+/// Returns the new fd (>= 0) on success, or a negative errno:
+/// - `-EBADF` (-9)  — `oldfd` is not open.
+/// - `-EMFILE` (-24) — the fd table is full.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// effectively disabled for the current thread's fd table).
+pub unsafe fn sys_dup(oldfd: usize) -> i64 {
+    // SAFETY: single-CPU SYSCALL context.
+    let handle = unsafe {
+        match fd_get(oldfd) {
+            Some(h) => h,
+            None => return -9, // EBADF
+        }
+    };
+
+    // Bump backend refcounts so the new alias keeps the resource alive.
+    match handle.backend {
+        FileBackend::Pipe {
+            ring_id,
+            is_write_end,
+        } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe {
+                if is_write_end {
+                    crate::pipe::pipe_dup_write(ring_id);
+                } else {
+                    crate::pipe::pipe_dup_read(ring_id);
+                }
+            }
+        }
+        FileBackend::SocketPair {
+            read_ring,
+            write_ring,
+        } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe {
+                crate::pipe::pipe_dup_read(read_ring);
+                crate::pipe::pipe_dup_write(write_ring);
+            }
+        }
+        FileBackend::EventFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { eventfd_dup(id) }
+        }
+        FileBackend::EpollInstance { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { epoll_dup(id) }
+        }
+        FileBackend::TimerFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { timerfd_dup(id) }
+        }
+        FileBackend::SignalFd { id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { signalfd_dup(id) }
+        }
+        // Console / RamfsFile / Socket / DevFile / ProcFile carry no
+        // independent refcount; the handle copy is sufficient.
+        FileBackend::Console
+        | FileBackend::RamfsFile { .. }
+        | FileBackend::Socket { .. }
+        | FileBackend::DevFile { .. }
+        | FileBackend::ProcFile { .. } => {}
+    }
+
+    // FD_CLOEXEC is cleared on the new descriptor per POSIX dup(3p).
+    let mut dup = handle;
+    dup.flags = HandleFlags(dup.flags.0 & !HandleFlags::FD_CLOEXEC_BIT);
+
+    // Install at the lowest free slot >= 0.
+    // SAFETY: single-CPU SYSCALL context.
+    let installed = unsafe {
+        match crate::current::current_thread_mut() {
+            Some(t) => t.fd_table.install_from(0, dup),
+            None => return -9, // EBADF — no current thread
+        }
+    };
+
+    match installed {
+        Ok(newfd) => newfd as i64,
+        Err(_) => {
+            // Roll back the backend refcount bump to avoid a leak.
+            match handle.backend {
+                FileBackend::Pipe {
+                    ring_id,
+                    is_write_end,
+                } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe {
+                        if is_write_end {
+                            crate::pipe::pipe_close_write(ring_id);
+                        } else {
+                            crate::pipe::pipe_close_read(ring_id);
+                        }
+                    }
+                }
+                FileBackend::SocketPair {
+                    read_ring,
+                    write_ring,
+                } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe {
+                        crate::pipe::pipe_close_read(read_ring);
+                        crate::pipe::pipe_close_write(write_ring);
+                    }
+                }
+                FileBackend::EventFd { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { eventfd_close(id) }
+                }
+                FileBackend::EpollInstance { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { epoll_close(id) }
+                }
+                FileBackend::TimerFd { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { timerfd_close(id) }
+                }
+                FileBackend::SignalFd { id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { signalfd_close(id) }
+                }
+                _ => {}
+            }
+            -24 // EMFILE
+        }
+    }
+}
+
+/// Kernel handler for `SYS_CLOSE_RANGE` (Linux number 436).
+///
+/// Closes every open file descriptor in the inclusive range `[first, last]`.
+/// The range is capped at `MAX_FDS - 1`; descriptors beyond the table limit
+/// are silently ignored.
+///
+/// `flags` may be:
+/// - `0` — close each fd in range.
+/// - `CLOSE_RANGE_CLOEXEC` (4) — mark each open fd in range as
+///   close-on-exec. Because ONCRIX does not yet implement `exec`, the flag
+///   is accepted and returns 0 without modifying any descriptor. Future
+///   `execve` support will honour this flag.
+/// - Any other bit — returns `-EINVAL` (-22).
+///
+/// Per-descriptor `EBADF` errors (fd not open) are silently skipped;
+/// the loop continues to the end of the range.
+///
+/// Returns 0 on success, or a negative errno:
+/// - `-EINVAL` (-22) — `first > last`, or an unknown flag bit is set.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// effectively disabled for the current thread's fd table).
+pub unsafe fn sys_close_range(first: usize, last: usize, flags: u32) -> i64 {
+    /// Accept `CLOSE_RANGE_CLOEXEC`; reject every other flag bit.
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+
+    if flags & !CLOSE_RANGE_CLOEXEC != 0 {
+        return -22; // EINVAL — unknown flag bits
+    }
+    if first > last {
+        return -22; // EINVAL — empty or inverted range
+    }
+
+    // CLOSE_RANGE_CLOEXEC: accepted but no-op until exec is wired up.
+    // Document: when execve(2) is implemented, each open fd in [first, last]
+    // will be closed across exec. For now we return success immediately.
+    if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        return 0;
+    }
+
+    // Cap at the highest possible fd index so the loop is always bounded.
+    let end = last.min(MAX_FDS - 1);
+
+    for fd in first..=end {
+        // Per POSIX, per-fd EBADF is not an error for close_range; skip silently.
+        // SAFETY: single-CPU SYSCALL context; called once per fd in sequence.
+        let _ = unsafe { fd_close(fd) };
+    }
+
+    0
+}

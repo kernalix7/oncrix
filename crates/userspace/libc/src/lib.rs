@@ -93,6 +93,23 @@ const SYS_RT_SIGQUEUEINFO: u64 = 129;
 const SYS_SIGALTSTACK: u64 = 131;
 const SYS_SCHED_RR_GET_INTERVAL: u64 = 148;
 const SYS_GETDENTS64: u64 = 217;
+// fd-ops / xattr / copy
+const SYS_DUP: u64 = 32;
+const SYS_CLOSE_RANGE: u64 = 436;
+const SYS_SETXATTR: u64 = 188;
+const SYS_LSETXATTR: u64 = 189;
+const SYS_FSETXATTR: u64 = 190;
+const SYS_GETXATTR: u64 = 191;
+const SYS_LGETXATTR: u64 = 192;
+const SYS_FGETXATTR: u64 = 193;
+const SYS_LISTXATTR: u64 = 194;
+const SYS_LLISTXATTR: u64 = 195;
+const SYS_FLISTXATTR: u64 = 196;
+const SYS_REMOVEXATTR: u64 = 197;
+const SYS_LREMOVEXATTR: u64 = 198;
+const SYS_FREMOVEXATTR: u64 = 199;
+const SYS_SENDFILE: u64 = 40;
+const SYS_COPY_FILE_RANGE: u64 = 326;
 // identity / time / creds
 const SYS_UNAME: u64 = 63;
 const SYS_SETHOSTNAME: u64 = 170;
@@ -2729,4 +2746,292 @@ pub unsafe fn sigaltstack(ss: *const u8, old_ss: *mut u8) -> i64 {
 pub unsafe fn rt_sigqueueinfo(tgid: i32, sig: i32, uinfo: *const u8) -> i64 {
     // SAFETY: caller guarantees `uinfo` validity.
     unsafe { syscall3(SYS_RT_SIGQUEUEINFO, tgid as u64, sig as u64, uinfo as u64) }
+}
+
+
+// ── dup / close_range / xattr / sendfile / copy_file_range ─────────
+
+/// `dup(2)` — duplicate `oldfd` to the lowest available file descriptor.
+///
+/// The new descriptor does not inherit `FD_CLOEXEC`. Returns the new fd
+/// (>= 0) on success, or a negative errno value on error.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn dup(oldfd: i32) -> i64 {
+    // SAFETY: scalar-only syscall; no pointer arguments.
+    unsafe { syscall1(SYS_DUP, oldfd as u64) }
+}
+
+/// `close_range(2)` — close all open file descriptors in `[first, last]`.
+///
+/// `flags` accepts `0` or `CLOSE_RANGE_CLOEXEC` (4). Unknown flag bits
+/// yield `-EINVAL`. Returns 0 on success, or a negative errno value.
+///
+/// # Safety
+///
+/// Plain syscall wrapper; always safe to call.
+pub unsafe fn close_range(first: u32, last: u32, flags: u32) -> i64 {
+    // SAFETY: scalar-only syscall; no pointer arguments.
+    unsafe { syscall3(SYS_CLOSE_RANGE, first as u64, last as u64, flags as u64) }
+}
+
+/// `setxattr(2)` — Set an extended attribute on the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-95` (ENOTSUP).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+/// `value` must point to at least `size` readable bytes (may be null when
+/// `size` is 0).
+pub unsafe fn setxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe { syscall6(SYS_SETXATTR, path as u64, name as u64, value as u64, size as u64, flags as u64, 0) }
+}
+
+/// `lsetxattr(2)` — Set an extended attribute; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-95` (ENOTSUP).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+/// `value` must point to at least `size` readable bytes (may be null when
+/// `size` is 0).
+pub unsafe fn lsetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe {
+        syscall6(SYS_LSETXATTR, path as u64, name as u64, value as u64, size as u64, flags as u64, 0)
+    }
+}
+
+/// `fsetxattr(2)` — Set an extended attribute on the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-95` (ENOTSUP).
+///
+/// # Safety
+///
+/// `name` must be a valid null-terminated string pointer. `value` must point
+/// to at least `size` readable bytes (may be null when `size` is 0).
+pub unsafe fn fsetxattr(
+    fd: i32,
+    name: *const u8,
+    value: *const u8,
+    size: usize,
+    flags: i32,
+) -> i64 {
+    // SAFETY: The caller guarantees `name` and `value` are valid.
+    unsafe {
+        syscall6(SYS_FSETXATTR, fd as u64, name as u64, value as u64, size as u64, flags as u64, 0)
+    }
+}
+
+/// `getxattr(2)` — Get an extended attribute from the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers. `value`
+/// must point to at least `size` writable bytes (may be null when `size` is
+/// 0).
+pub unsafe fn getxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe { syscall4(SYS_GETXATTR, path as u64, name as u64, value as u64, size as u64) }
+}
+
+/// `lgetxattr(2)` — Get an extended attribute; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers. `value`
+/// must point to at least `size` writable bytes (may be null when `size` is
+/// 0).
+pub unsafe fn lgetxattr(
+    path: *const u8,
+    name: *const u8,
+    value: *mut u8,
+    size: usize,
+) -> i64 {
+    // SAFETY: The caller guarantees `path`, `name`, and `value` are valid.
+    unsafe { syscall4(SYS_LGETXATTR, path as u64, name as u64, value as u64, size as u64) }
+}
+
+/// `fgetxattr(2)` — Get an extended attribute from the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `name` must be a valid null-terminated string pointer. `value` must point
+/// to at least `size` writable bytes (may be null when `size` is 0).
+pub unsafe fn fgetxattr(fd: i32, name: *const u8, value: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `name` and `value` are valid.
+    unsafe { syscall4(SYS_FGETXATTR, fd as u64, name as u64, value as u64, size as u64) }
+}
+
+/// `listxattr(2)` — List extended attribute names for the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `0` (empty list).
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer. `list` must point
+/// to at least `size` writable bytes (may be null when `size` is 0).
+pub unsafe fn listxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `path` and `list` are valid.
+    unsafe { syscall3(SYS_LISTXATTR, path as u64, list as u64, size as u64) }
+}
+
+/// `llistxattr(2)` — List extended attribute names; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `0` (empty list).
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated string pointer. `list` must point
+/// to at least `size` writable bytes (may be null when `size` is 0).
+pub unsafe fn llistxattr(path: *const u8, list: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `path` and `list` are valid.
+    unsafe { syscall3(SYS_LLISTXATTR, path as u64, list as u64, size as u64) }
+}
+
+/// `flistxattr(2)` — List extended attribute names for the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `0` (empty list).
+///
+/// # Safety
+///
+/// `list` must point to at least `size` writable bytes (may be null when
+/// `size` is 0).
+pub unsafe fn flistxattr(fd: i32, list: *mut u8, size: usize) -> i64 {
+    // SAFETY: The caller guarantees `list` is valid.
+    unsafe { syscall3(SYS_FLISTXATTR, fd as u64, list as u64, size as u64) }
+}
+
+/// `removexattr(2)` — Remove an extended attribute from the file at `path`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+pub unsafe fn removexattr(path: *const u8, name: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` and `name` are valid.
+    unsafe { syscall2(SYS_REMOVEXATTR, path as u64, name as u64) }
+}
+
+/// `lremovexattr(2)` — Remove an extended attribute; does not follow symbolic links.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `path` and `name` must be valid null-terminated string pointers.
+pub unsafe fn lremovexattr(path: *const u8, name: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `path` and `name` are valid.
+    unsafe { syscall2(SYS_LREMOVEXATTR, path as u64, name as u64) }
+}
+
+/// `fremovexattr(2)` — Remove an extended attribute from the open file `fd`.
+///
+/// ONCRIX ramfs carries no xattr store; always returns `-61` (ENODATA).
+///
+/// # Safety
+///
+/// `name` must be a valid null-terminated string pointer.
+pub unsafe fn fremovexattr(fd: i32, name: *const u8) -> i64 {
+    // SAFETY: The caller guarantees `name` is valid.
+    unsafe { syscall2(SYS_FREMOVEXATTR, fd as u64, name as u64) }
+}
+
+/// `sendfile(2)` — copy up to `count` bytes from `in_fd` to `out_fd`
+/// in the kernel, without passing data through user space.
+///
+/// If `offset` is non-null, data is read from `*offset` inside `in_fd` and
+/// `*offset` is advanced by the number of bytes copied; `in_fd`'s own file
+/// position is left unchanged.  If `offset` is null, `in_fd`'s file position
+/// is used and advanced.
+///
+/// Both `in_fd` and `out_fd` must be regular ramfs files.
+///
+/// Returns the number of bytes copied (≥ 0) or a negative errno.
+///
+/// # Safety
+///
+/// - `offset`, when non-null, must point to a valid `i64` in the calling
+///   process's address space and must remain valid for the duration of the
+///   call.
+/// - Both `in_fd` and `out_fd` must be open and backed by regular files.
+pub unsafe fn sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> i64 {
+    // SAFETY: the caller upholds the pointer and fd validity requirements.
+    unsafe {
+        syscall4(
+            SYS_SENDFILE,
+            out_fd as u64,
+            in_fd as u64,
+            offset as u64,
+            count as u64,
+        )
+    }
+}
+
+/// `copy_file_range(2)` — copy up to `len` bytes from `fd_in` to `fd_out`
+/// entirely within the kernel.
+///
+/// `off_in` and `off_out`, when non-null, supply the read and write offsets
+/// respectively; each is updated by the number of bytes copied and the
+/// corresponding handle's file position is left unchanged.  When null, the
+/// handle's current file position is used and advanced.
+///
+/// `flags` is reserved and must be zero.
+///
+/// Returns the number of bytes copied (≥ 0) or a negative errno.
+///
+/// # Safety
+///
+/// - `off_in` / `off_out`, when non-null, must each point to a valid `i64`
+///   in the calling process's address space.
+/// - Both `fd_in` and `fd_out` must be open and backed by regular files.
+pub unsafe fn copy_file_range(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    len: usize,
+    flags: u32,
+) -> i64 {
+    // SAFETY: the caller upholds the pointer and fd validity requirements.
+    unsafe {
+        syscall6(
+            SYS_COPY_FILE_RANGE,
+            fd_in as u64,
+            off_in as u64,
+            fd_out as u64,
+            off_out as u64,
+            len as u64,
+            flags as u64,
+        )
+    }
 }

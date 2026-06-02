@@ -2255,3 +2255,336 @@ pub unsafe fn sys_personality(_persona: u64) -> i64 {
     // Return the previous personality: PER_LINUX = 0.
     0
 }
+
+// ── sendfile / copy_file_range ────────────────────────────────────
+
+// ── sys_sendfile ──────────────────────────────────────────────────
+
+/// Kernel handler for `SYS_SENDFILE` (number 40).
+///
+/// `sendfile(out_fd, in_fd, offset, count)` — copy up to `count` bytes from
+/// `in_fd` to `out_fd` entirely within the kernel, bypassing user-space
+/// memory.  Both descriptors must back a [`FileBackend::RamfsFile`]; any
+/// other backend (console, pipe, socket, …) returns `-EINVAL`.
+///
+/// **Offset semantics** (POSIX / Linux `sendfile(2)`):
+/// - If `offset_ptr` is non-null it is treated as a `*mut i64` pointing to
+///   the source offset.  Data is read from `*offset_ptr` inside `in_fd`;
+///   the file-position of `in_fd` is **not** changed, but `*offset_ptr` is
+///   advanced by the number of bytes copied.
+/// - If `offset_ptr` is null, data is read from `in_fd`'s current file
+///   position, which is advanced by the number of bytes copied.
+///
+/// The copy is performed through a 4 096-byte kernel stack bounce buffer
+/// (`kbuf`) that is never exposed to user space.  The destination `out_fd`
+/// is always written at its current file position, which is advanced.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-9`  EBADF  — `in_fd` or `out_fd` is not open.
+/// - `-14` EFAULT — `offset_ptr` is non-null but falls in kernel space.
+/// - `-22` EINVAL — either fd's backend is not a `RamfsFile`.
+/// - `-5`  EIO    — the VFS is uninitialised (global state missing).
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64) -> i64 {
+    // Validate the optional offset pointer: if non-null it must be a
+    // readable/writable user-space address.
+    if offset_ptr != 0 && offset_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Resolve both descriptors to RamfsFile inode numbers.
+    // SAFETY: single-CPU SYSCALL context.
+    let in_ino = match unsafe { fd_ramfs_ino(in_fd as i32) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let out_ino = match unsafe { fd_ramfs_ino(out_fd as i32) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+
+    // Determine the starting read offset inside in_fd.
+    // If offset_ptr is non-null, read *offset_ptr; otherwise use the handle
+    // position.  We snapshot it now; advancement happens after each chunk.
+    let use_ptr_offset = offset_ptr != 0;
+    let mut in_off: u64 = if use_ptr_offset {
+        // SAFETY: offset_ptr validated above (non-null, user-space).
+        let raw = unsafe { (offset_ptr as *const i64).read_volatile() };
+        if raw < 0 {
+            return -22; // EINVAL — negative offset
+        }
+        raw as u64
+    } else {
+        // SAFETY: single-CPU SYSCALL context.
+        match unsafe { crate::fd_table::fd_get(in_fd as usize) } {
+            Some(h) => h.offset,
+            None => return -9, // EBADF
+        }
+    };
+
+    // Current write offset inside out_fd (always from handle position).
+    let mut out_off: u64 = match unsafe { crate::fd_table::fd_get(out_fd as usize) } {
+        Some(h) => h.offset,
+        None => return -9, // EBADF
+    };
+
+    let want = count as usize;
+    let mut total_copied: usize = 0;
+    let mut kbuf = [0u8; 4096];
+
+    while total_copied < want {
+        let chunk = (want - total_copied).min(kbuf.len());
+
+        // ── Read chunk from in_fd via VFS ──────────────────────────
+        let n_read = {
+            let res = crate::state::with_global(|s| {
+                let inode = match s.vfs.lookup_path_by_ino(in_ino) {
+                    Some(i) => i,
+                    None => return Err(oncrix_lib::Error::NotFound),
+                };
+                s.vfs.read_inode(&inode, in_off, &mut kbuf[..chunk])
+            });
+            match res {
+                Some(Ok(n)) => n,
+                Some(Err(oncrix_lib::Error::NotFound)) => return -9, // EBADF
+                Some(Err(_)) => return -22,                          // EINVAL
+                None => return -5,                                   // EIO
+            }
+        };
+
+        if n_read == 0 {
+            break; // EOF on in_fd
+        }
+
+        // ── Write chunk to out_fd via VFS ─────────────────────────
+        let n_written = {
+            let res = crate::state::with_global_mut(|s| {
+                let inode = match s.vfs.lookup_path_by_ino(out_ino) {
+                    Some(i) => i,
+                    None => return Err(oncrix_lib::Error::NotFound),
+                };
+                s.vfs.write_inode(&inode, out_off, &kbuf[..n_read])
+            });
+            match res {
+                Some(Ok(n)) => n,
+                Some(Err(oncrix_lib::Error::NotFound)) => return -9, // EBADF
+                Some(Err(_)) => return -22,                          // EINVAL
+                None => return -5,                                   // EIO
+            }
+        };
+
+        in_off += n_written as u64;
+        out_off += n_written as u64;
+        total_copied += n_written;
+    }
+
+    // ── Persist updated offsets ───────────────────────────────────
+    if use_ptr_offset {
+        // Advance *offset_ptr; do NOT touch in_fd's file position.
+        // SAFETY: validated as non-null user-space pointer above.
+        unsafe {
+            (offset_ptr as *mut i64).write_volatile(in_off as i64);
+        }
+    } else {
+        // Advance in_fd's file position.
+        // SAFETY: single-CPU SYSCALL context.
+        unsafe {
+            if let Some(t) = crate::current::current_thread_mut() {
+                if let Some(h) = t.fd_table.get_mut(in_fd as usize) {
+                    h.offset = in_off;
+                }
+            }
+        }
+    }
+
+    // Always advance out_fd's file position.
+    // SAFETY: single-CPU SYSCALL context.
+    unsafe {
+        if let Some(t) = crate::current::current_thread_mut() {
+            if let Some(h) = t.fd_table.get_mut(out_fd as usize) {
+                h.offset = out_off;
+            }
+        }
+    }
+
+    total_copied as i64
+}
+
+// ── sys_copy_file_range ───────────────────────────────────────────
+
+/// Kernel handler for `SYS_COPY_FILE_RANGE` (number 326).
+///
+/// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` — copy up
+/// to `len` bytes from `fd_in` to `fd_out` entirely within the kernel.
+/// Both descriptors must back a [`FileBackend::RamfsFile`].
+///
+/// **Offset semantics** (Linux `copy_file_range(2)`, POSIX future):
+/// - `off_in` / `off_out` are `*mut i64`.  If non-null, the pointed-to
+///   value supplies the read / write offset, which is updated on return; the
+///   handle's file position is **not** changed.  If null, the handle's
+///   current file position is used and advanced.
+/// - `flags` is reserved; must be zero (non-zero → `-EINVAL`).
+///
+/// The copy proceeds through a 4 096-byte kernel stack bounce buffer.
+/// Returns the number of bytes copied (≥ 0) or a negative errno.
+///
+/// # Errors (returned as negative errno)
+///
+/// - `-9`  EBADF  — `fd_in` or `fd_out` is not open.
+/// - `-14` EFAULT — a non-null offset pointer falls in kernel space.
+/// - `-22` EINVAL — either fd is not a `RamfsFile`, `flags != 0`, or a
+///   supplied offset is negative.
+/// - `-5`  EIO    — VFS uninitialised.
+///
+/// # Safety
+///
+/// Must be called from the single-CPU SYSCALL dispatch path.
+pub unsafe fn sys_copy_file_range(
+    fd_in: u64,
+    off_in_ptr: u64,
+    fd_out: u64,
+    off_out_ptr: u64,
+    len: u64,
+    flags: u64,
+) -> i64 {
+    // flags must be zero (Linux ABI).
+    if flags != 0 {
+        return -22; // EINVAL
+    }
+
+    // Validate optional offset pointers.
+    if off_in_ptr != 0 && off_in_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+    if off_out_ptr != 0 && off_out_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
+    // Resolve both descriptors to RamfsFile inode numbers.
+    // SAFETY: single-CPU SYSCALL context.
+    let in_ino = match unsafe { fd_ramfs_ino(fd_in as i32) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    let out_ino = match unsafe { fd_ramfs_ino(fd_out as i32) } {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+
+    // Determine starting read offset.
+    let use_in_ptr = off_in_ptr != 0;
+    let mut in_off: u64 = if use_in_ptr {
+        // SAFETY: validated above.
+        let raw = unsafe { (off_in_ptr as *const i64).read_volatile() };
+        if raw < 0 {
+            return -22; // EINVAL
+        }
+        raw as u64
+    } else {
+        match unsafe { crate::fd_table::fd_get(fd_in as usize) } {
+            Some(h) => h.offset,
+            None => return -9, // EBADF
+        }
+    };
+
+    // Determine starting write offset.
+    let use_out_ptr = off_out_ptr != 0;
+    let mut out_off: u64 = if use_out_ptr {
+        // SAFETY: validated above.
+        let raw = unsafe { (off_out_ptr as *const i64).read_volatile() };
+        if raw < 0 {
+            return -22; // EINVAL
+        }
+        raw as u64
+    } else {
+        match unsafe { crate::fd_table::fd_get(fd_out as usize) } {
+            Some(h) => h.offset,
+            None => return -9, // EBADF
+        }
+    };
+
+    let want = len as usize;
+    let mut total_copied: usize = 0;
+    let mut kbuf = [0u8; 4096];
+
+    while total_copied < want {
+        let chunk = (want - total_copied).min(kbuf.len());
+
+        // ── Read from fd_in ───────────────────────────────────────
+        let n_read = {
+            let res = crate::state::with_global(|s| {
+                let inode = match s.vfs.lookup_path_by_ino(in_ino) {
+                    Some(i) => i,
+                    None => return Err(oncrix_lib::Error::NotFound),
+                };
+                s.vfs.read_inode(&inode, in_off, &mut kbuf[..chunk])
+            });
+            match res {
+                Some(Ok(n)) => n,
+                Some(Err(oncrix_lib::Error::NotFound)) => return -9,
+                Some(Err(_)) => return -22,
+                None => return -5,
+            }
+        };
+
+        if n_read == 0 {
+            break; // EOF
+        }
+
+        // ── Write to fd_out ───────────────────────────────────────
+        let n_written = {
+            let res = crate::state::with_global_mut(|s| {
+                let inode = match s.vfs.lookup_path_by_ino(out_ino) {
+                    Some(i) => i,
+                    None => return Err(oncrix_lib::Error::NotFound),
+                };
+                s.vfs.write_inode(&inode, out_off, &kbuf[..n_read])
+            });
+            match res {
+                Some(Ok(n)) => n,
+                Some(Err(oncrix_lib::Error::NotFound)) => return -9,
+                Some(Err(_)) => return -22,
+                None => return -5,
+            }
+        };
+
+        in_off += n_written as u64;
+        out_off += n_written as u64;
+        total_copied += n_written;
+    }
+
+    // ── Persist updated offsets ───────────────────────────────────
+    if use_in_ptr {
+        // SAFETY: validated as non-null user-space pointer above.
+        unsafe { (off_in_ptr as *mut i64).write_volatile(in_off as i64) };
+    } else {
+        // SAFETY: single-CPU SYSCALL context.
+        unsafe {
+            if let Some(t) = crate::current::current_thread_mut() {
+                if let Some(h) = t.fd_table.get_mut(fd_in as usize) {
+                    h.offset = in_off;
+                }
+            }
+        }
+    }
+
+    if use_out_ptr {
+        // SAFETY: validated as non-null user-space pointer above.
+        unsafe { (off_out_ptr as *mut i64).write_volatile(out_off as i64) };
+    } else {
+        // SAFETY: single-CPU SYSCALL context.
+        unsafe {
+            if let Some(t) = crate::current::current_thread_mut() {
+                if let Some(h) = t.fd_table.get_mut(fd_out as usize) {
+                    h.offset = out_off;
+                }
+            }
+        }
+    }
+
+    total_copied as i64
+}
