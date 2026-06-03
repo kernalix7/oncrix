@@ -15,7 +15,9 @@
 //! ┌──────────────────────────────┐
 //! │  .text / .data / .rodata ... │  ← hashed payload
 //! ├──────────────────────────────┤
-//! │  PKCS#7 / CMS signature     │  ← variable length
+//! │  signer name (signer_len)   │  ← metadata
+//! │  key_id    (key_id_len)     │  ← signer fingerprint
+//! │  raw signature (sig_len)    │  ← asymmetric signature blob
 //! ├──────────────────────────────┤
 //! │  SignatureTrailer (24 bytes) │  ← fixed trailer
 //! │  ┌─ algo, hash, id_type ─┐  │
@@ -25,27 +27,47 @@
 //! └──────────────────────────────┘
 //! ```
 //!
+//! The payload is everything preceding the
+//! `signer || key_id || signature || trailer` suffix.
+//!
 //! # Verification Flow
 //!
 //! ```text
 //! verify_module(binary)
 //!   ├── parse_trailer()      → extract lengths & algo info
-//!   ├── extract_signature()  → isolate signature bytes
-//!   ├── compute_hash()       → hash module sections
-//!   ├── find_key()           → match signer in keyring
-//!   └── check_signature()    → verify hash against sig+key
+//!   ├── split payload/sig    → isolate payload + key_id + sig bytes
+//!   ├── compute_hash()       → SHA-256 over the payload
+//!   ├── find_key()           → constant-time key_id match in keyring
+//!   └── check_signature()    → verify digest against sig with key
 //! ```
 //!
 //! # Enforcement Modes
 //!
 //! | Mode | Behaviour |
 //! |------|-----------|
-//! | Permissive | Warn on bad/missing signature, allow load |
-//! | Required | Reject on bad/missing signature |
+//! | Permissive | Warn on bad/missing signature, allow load (default) |
+//! | Required | Reject on bad/missing/unverifiable signature |
+//!
+//! # Security Status
+//!
+//! The payload digest (SHA-256, FIPS 180-4) is computed and the
+//! signing key is selected by a constant-time `key_id` match, so the
+//! input is fully bound. The asymmetric signature primitive
+//! (RSA-PKCS#1 / ECDSA-P256 / Ed25519) is **not yet implemented**
+//! in-tree, so the actual public-key check over the digest cannot be
+//! performed. Until that exists, verification **fails closed**:
+//! [`EnforcementMode::Required`] returns [`VerifyResult::BadSignature`]
+//! (the load is rejected); [`EnforcementMode::Permissive`] — the
+//! default — logs the result and allows the load so boot is
+//! unaffected. The verifier **never** returns [`VerifyResult::Ok`] on
+//! structural validity alone. Implementing the asymmetric verifier and
+//! flipping [`VerifyResult::Unverified`] to a real accept/reject is the
+//! remaining work.
 //!
 //! Reference: Linux `kernel/module/signing.c`,
 //! `include/linux/module_signature.h`.
 
+use crate::crypto::{Sha256, constant_time_eq};
 use oncrix_lib::{Error, Result};
 
 // ── Constants ──────────────────────────────────────────────────
@@ -125,6 +147,10 @@ pub enum VerifyResult {
     Expired,
     /// Malformed trailer or data.
     Malformed,
+    /// Structurally valid and digest bound, but the asymmetric
+    /// signature could not be verified because no in-tree public-key
+    /// verifier exists yet. Treated as a failure (fail closed).
+    Unverified,
 }
 
 // ── TrustedKey ─────────────────────────────────────────────────
@@ -360,6 +386,14 @@ impl ModuleSigVerifier {
     }
 
     /// Internal verification logic.
+    ///
+    /// Parses the trailer, isolates the payload, computes its
+    /// SHA-256 digest, locates the trusted key by a constant-time
+    /// `key_id` match, then attempts the asymmetric signature check.
+    /// Because no in-tree public-key verifier exists yet, a
+    /// structurally valid, digest-bound, key-matched module yields
+    /// [`VerifyResult::Unverified`] (fail closed) — never
+    /// [`VerifyResult::Ok`].
     fn do_verify(&self, binary: &[u8], now: u64) -> VerifyResult {
         if binary.len() < TRAILER_SIZE {
             return VerifyResult::NoSignature;
@@ -368,30 +402,80 @@ impl ModuleSigVerifier {
             Ok(t) => t,
             Err(_) => return VerifyResult::Malformed,
         };
-        let total_sig = trailer.sig_len as usize + TRAILER_SIZE;
-        if binary.len() < total_sig {
-            return VerifyResult::Malformed;
-        }
         if trailer.sig_len == 0 || trailer.sig_len > MAX_SIG_LEN as u32 {
             return VerifyResult::NoSignature;
         }
-        // Find matching key in keyring.
-        let key_pos = self
-            .keys
-            .iter()
-            .position(|k| k.active && k.algo == trailer.algo);
+        if trailer.signer_len as usize > MAX_SIGNER_LEN
+            || trailer.key_id_len as usize > MAX_KEY_ID_LEN
+        {
+            return VerifyResult::Malformed;
+        }
+        // Suffix = signer || key_id || signature || trailer.
+        let suffix_len = TRAILER_SIZE
+            + trailer.sig_len as usize
+            + trailer.signer_len as usize
+            + trailer.key_id_len as usize;
+        if binary.len() < suffix_len {
+            return VerifyResult::Malformed;
+        }
+        // Payload is everything before the signature suffix; it is the
+        // exact byte range covered by the signature.
+        let payload_end = binary.len() - suffix_len;
+        let payload = &binary[..payload_end];
+        // Locate the declared key_id bytes within the suffix.
+        let key_id_start = payload_end + trailer.signer_len as usize;
+        let key_id_end = key_id_start + trailer.key_id_len as usize;
+        let key_id = &binary[key_id_start..key_id_end];
+        if key_id.is_empty() {
+            return VerifyResult::Malformed;
+        }
+
+        // Compute the real payload digest (FIPS 180-4). Reject any
+        // hash algorithm whose primitive is not implemented in-tree;
+        // only SHA-256 is available, so SHA-384/SHA-512 are refused
+        // rather than silently downgraded.
+        let _digest = match trailer.hash {
+            SigHashAlgo::Sha256 => {
+                let mut h = Sha256::new();
+                h.update(payload);
+                h.finalize()
+            }
+            SigHashAlgo::Sha384 | SigHashAlgo::Sha512 => return VerifyResult::BadSignature,
+        };
+
+        // Select the trusted key by a constant-time key_id match (not
+        // "first active key of the same algorithm"). The algorithm
+        // must also match the trailer so the right primitive is used.
+        let mut key_pos: Option<usize> = None;
+        for (i, k) in self.keys.iter().enumerate() {
+            if !k.active || k.algo != trailer.algo {
+                continue;
+            }
+            let stored = &k.key_id[..k.key_id_len as usize];
+            if constant_time_eq(stored, key_id) {
+                key_pos = Some(i);
+            }
+        }
         let key_pos = match key_pos {
             Some(p) => p,
             None => return VerifyResult::UntrustedKey,
         };
-        // Check expiry.
+
+        // Check expiry against the matched key.
         if self.keys[key_pos].expires > 0 && now > self.keys[key_pos].expires {
             return VerifyResult::Expired;
         }
-        // In a real implementation this would perform the
-        // cryptographic verification. Here we accept
-        // structurally valid signatures.
-        VerifyResult::Ok
+
+        // The asymmetric signature primitive (RSA-PKCS#1 / ECDSA-P256 /
+        // Ed25519) over `_digest` is not yet implemented in-tree. Fail
+        // closed: the payload is bound and the signer is identified,
+        // but we cannot assert the signature is valid, so we must not
+        // accept. `verify()` rejects this in `Required` mode and
+        // logs+allows in `Permissive` mode.
+        // TODO(security): implement the public-key verify of the raw
+        // signature blob over `_digest` and return `Ok` only on
+        // cryptographic success.
+        VerifyResult::Unverified
     }
 
     /// Records a verification result in the log.

@@ -7,7 +7,23 @@
 //! are loaded. Supports multiple signature formats and key sources.
 //! When signature enforcement is enabled, unsigned or incorrectly
 //! signed modules are rejected.
+//!
+//! # Security Status
+//!
+//! [`ModuleSigVerifier::verify`] takes the full module payload,
+//! computes its real SHA-256 digest (FIPS 180-4, [`crate::crypto::Sha256`])
+//! so the verified input is cryptographically bound, and selects the
+//! signing key by a constant-time `key_id` match. The asymmetric
+//! signature primitive (RSA-PKCS#1 / ECDSA-P256 / Ed25519) is **not
+//! yet implemented** in-tree, so the public-key check over the digest
+//! cannot be performed. Until it exists, verification **fails closed**:
+//! a structurally valid, key-matched module yields
+//! [`VerificationResult::Unverified`], which is rejected when
+//! enforcement is enabled. The verifier **never** returns
+//! [`VerificationResult::Valid`] on structural validity alone.
+//! Implementing the asymmetric verifier is the remaining work.
 
+use crate::crypto::{Sha256, constant_time_eq};
 use oncrix_lib::{Error, Result};
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -23,6 +39,13 @@ const MAX_VERIFICATION_LOG: usize = 128;
 
 /// Signature magic suffix appended to modules.
 const MODULE_SIG_MAGIC: [u8; 8] = *b"ONCRIXSG";
+
+/// Placeholder digest used in log entries when the declared hash
+/// algorithm is unsupported and no real payload digest can be
+/// computed. All-zero is never a valid SHA-256 of a signed payload.
+const fn digest_unavailable() -> [u8; 32] {
+    [0u8; 32]
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -75,6 +98,10 @@ pub enum VerificationResult {
     UnknownKey,
     /// Signature format is unsupported.
     UnsupportedFormat,
+    /// Structurally valid and digest bound, but the asymmetric
+    /// signature could not be verified because no in-tree public-key
+    /// verifier exists yet. Treated as a failure (fail closed).
+    Unverified,
 }
 
 /// Represents a trusted signing key.
@@ -159,8 +186,8 @@ impl ModuleSignature {
 /// Verification log entry.
 #[derive(Debug, Clone)]
 pub struct VerificationLogEntry {
-    /// Module identifier or name hash.
-    module_hash: u64,
+    /// SHA-256 digest of the verified module payload.
+    module_digest: [u8; 32],
     /// Verification result.
     result: VerificationResult,
     /// Algorithm used.
@@ -170,14 +197,14 @@ pub struct VerificationLogEntry {
 }
 
 impl VerificationLogEntry {
-    /// Creates a new log entry.
+    /// Creates a new log entry bound to the module payload digest.
     pub const fn new(
-        module_hash: u64,
+        module_digest: [u8; 32],
         result: VerificationResult,
         algorithm: SignatureAlgorithm,
     ) -> Self {
         Self {
-            module_hash,
+            module_digest,
             result,
             algorithm,
             timestamp_ns: 0,
@@ -275,54 +302,90 @@ impl ModuleSigVerifier {
     }
 
     /// Verifies a module signature against the trusted keyring.
+    ///
+    /// `payload` is the full module image that the signature is
+    /// expected to cover. Its SHA-256 digest is computed (FIPS 180-4)
+    /// so the verified input is cryptographically bound, the signing
+    /// key is selected by a constant-time `key_id` match, and the
+    /// asymmetric signature check is attempted.
+    ///
+    /// Because no in-tree public-key verifier exists yet, a
+    /// structurally valid, key-matched module yields
+    /// [`VerificationResult::Unverified`] (fail closed) — never
+    /// [`VerificationResult::Valid`]. When enforcement is enabled,
+    /// any non-`Valid` result returns [`Error::PermissionDenied`].
     pub fn verify(
         &mut self,
-        module_hash: u64,
+        payload: &[u8],
         signature: &ModuleSignature,
     ) -> Result<VerificationResult> {
         self.stats.total_verifications += 1;
+        // Compute the real payload digest. Only SHA-256 is available
+        // in-tree; reject any module that declares a hash whose
+        // primitive is not implemented rather than downgrading.
+        let digest = match signature.hash {
+            HashAlgorithm::Sha256 => {
+                let mut h = Sha256::new();
+                h.update(payload);
+                h.finalize()
+            }
+            HashAlgorithm::Sha384 | HashAlgorithm::Sha512 => {
+                self.stats.invalid_count += 1;
+                let result = VerificationResult::UnsupportedFormat;
+                self.log_verification(digest_unavailable(), result, signature.algorithm);
+                if self.enforce {
+                    return Err(Error::PermissionDenied);
+                }
+                return Ok(result);
+            }
+        };
         if signature.sig_len == 0 {
             self.stats.unsigned_count += 1;
             let result = VerificationResult::Unsigned;
-            self.log_verification(module_hash, result, signature.algorithm);
+            self.log_verification(digest, result, signature.algorithm);
             if self.enforce {
                 return Err(Error::PermissionDenied);
             }
             return Ok(result);
         }
-        // Look up the signing key.
-        let key = self
-            .keys
-            .iter()
-            .flatten()
-            .find(|k| k.key_id == signature.key_id && k.valid);
-        let result = match key {
-            None => {
-                self.stats.unknown_key_count += 1;
-                VerificationResult::UnknownKey
+        // Select the signing key by a constant-time key_id match
+        // (both identifiers are fixed 32-byte fingerprints), scanning
+        // all slots so timing does not depend on the match position.
+        let mut found = false;
+        for k in self.keys.iter().flatten() {
+            if k.valid && constant_time_eq(&k.key_id, &signature.key_id) {
+                found = true;
             }
-            Some(_k) => {
-                // Simplified: real verification would involve
-                // cryptographic computation.
-                self.stats.valid_count += 1;
-                VerificationResult::Valid
-            }
+        }
+        let result = if !found {
+            self.stats.unknown_key_count += 1;
+            VerificationResult::UnknownKey
+        } else {
+            // The asymmetric signature primitive over `digest` is not
+            // yet implemented in-tree. The payload is bound and the
+            // signer is identified, but we cannot assert the signature
+            // is valid, so we must not accept. Fail closed.
+            // TODO(security): verify `signature.sig_data[..sig_len]`
+            // over `digest` with the matched public key and return
+            // `Valid` only on cryptographic success.
+            self.stats.invalid_count += 1;
+            VerificationResult::Unverified
         };
-        self.log_verification(module_hash, result, signature.algorithm);
+        self.log_verification(digest, result, signature.algorithm);
         if self.enforce && result != VerificationResult::Valid {
             return Err(Error::PermissionDenied);
         }
         Ok(result)
     }
 
-    /// Logs a verification event.
+    /// Logs a verification event bound to the payload digest.
     fn log_verification(
         &mut self,
-        module_hash: u64,
+        module_digest: [u8; 32],
         result: VerificationResult,
         algorithm: SignatureAlgorithm,
     ) {
-        let entry = VerificationLogEntry::new(module_hash, result, algorithm);
+        let entry = VerificationLogEntry::new(module_digest, result, algorithm);
         self.log[self.log_pos] = Some(entry);
         self.log_pos = (self.log_pos + 1) % MAX_VERIFICATION_LOG;
     }
