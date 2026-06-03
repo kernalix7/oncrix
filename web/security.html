@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Security — ONCRIX</title>
+<meta name="description" content="ONCRIX is memory-safe by language, least-privilege by design, and continuously hardened through systematic adversarial security auditing." />
+<meta name="theme-color" content="#0a0e16" />
+<link rel="canonical" href="https://www.oncrix.org/security.html" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Security — ONCRIX" />
+<meta property="og:description" content="ONCRIX is memory-safe by language, least-privilege by design, and continuously hardened through systematic adversarial security auditing." />
+<meta property="og:url" content="https://www.oncrix.org/security.html" />
+<meta property="og:site_name" content="ONCRIX" />
+<meta name="twitter:card" content="summary" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="/">
+      <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="2" y="2" width="28" height="28" rx="7" fill="none" stroke="#48e0c0" stroke-width="2"/>
+        <path d="M10 16 L14 20 L22 11" fill="none" stroke="#7aa2ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg><b>ONCRIX</b>
+    </a>
+    <button class="menu-btn" aria-label="Toggle menu" onclick="document.getElementById('nav').classList.toggle('open')">&#8801;</button>
+    <nav class="navlinks" id="nav">
+      <a href="/">Home</a>
+      <a href="/architecture.html">Architecture</a>
+      <a href="/security.html" class="active">Security</a>
+      <a href="/roadmap.html">Roadmap</a>
+      <a href="/docs.html">Docs</a>
+      <a class="gh" href="https://github.com/kernalix7/oncrix">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="phead flush">
+    <div class="wrap">
+      <div class="crumb"><a href="/">Home</a> / Security</div>
+      <h1>Security</h1>
+      <p>Memory-safe by language, least-privilege by design, and continuously hardened through systematic adversarial auditing.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Principles</p>
+      <h2 class="sect-title">Security is the architecture, not a feature</h2>
+      <p class="sect-sub">ONCRIX treats security as a property of the system's shape. A microkernel keeps the
+        privileged core small, the language removes whole bug classes, and every authority is a thing you
+        must explicitly hold — never something you implicitly have.</p>
+      <div class="grid g3">
+        <div class="card"><div class="ic">// minimal TCB</div><h3>Minimal trusted computing base</h3>
+          <p>The kernel keeps only scheduling, memory management, and IPC. Drivers, filesystems, and
+            services run in user space, so the amount of code that must be trusted absolutely is kept
+            as small as the design allows.</p></div>
+        <div class="card"><div class="ic">// separation</div><h3>Privilege separation</h3>
+          <p>Each service runs in its own isolated address space with only the authority it needs to do
+            its job. A compromise in one component does not hand the attacker the whole system.</p></div>
+        <div class="card"><div class="ic">// capabilities</div><h3>Capability-based access</h3>
+          <p>Access to a resource requires holding an unforgeable capability for it. There is no ambient
+            authority and no global namespace that any process can reach by default.</p></div>
+        <div class="card"><div class="ic">// fail closed</div><h3>Fail-closed defaults</h3>
+          <p>When a check cannot be satisfied or a pointer cannot be validated, the operation is refused.
+            The default answer to an unverified request is "no", not "probably fine".</p></div>
+        <div class="card"><div class="ic">// layers</div><h3>Defense in depth</h3>
+          <p>Language-level memory safety, address-space isolation, capability checks, and validated
+            syscall boundaries are independent layers. Defeating one does not defeat the rest.</p></div>
+        <div class="card"><div class="ic">// least privilege</div><h3>Least privilege</h3>
+          <p>Components are granted the narrowest authority that lets them function, and nothing more.
+            Privilege is something you are given deliberately, not something you accumulate.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Memory safety by language</p>
+      <h2 class="sect-title">Whole bug classes deleted at the source</h2>
+      <p class="sect-sub">ONCRIX is written in Rust. The kernel is <code>#![no_std]</code> and
+        <code>#![no_main]</code>, and the same ownership and borrowing rules that protect application code
+        protect the kernel itself.</p>
+      <div class="prose">
+        <p>In safe Rust, null-pointer dereferences, use-after-free, double-free, and data races on shared
+          mutable state are not bugs you have to remember to avoid — they do not compile. That removes an
+          entire category of vulnerabilities that has historically dominated kernel CVEs in
+          memory-unsafe languages.</p>
+        <p>Some kernel work genuinely requires raw hardware access and cannot be expressed in safe Rust.
+          ONCRIX does not scatter <code>unsafe</code> through the codebase. Instead:</p>
+        <ul>
+          <li><strong>Unsafe is wrapped.</strong> Every <code>unsafe</code> block lives behind a safe
+            abstraction, so the dangerous operation is auditable in one place rather than duplicated
+            across callers.</li>
+          <li><strong>Invariants are documented.</strong> Each <code>unsafe</code> block carries a
+            <code>// SAFETY:</code> comment stating exactly which invariant makes the operation sound,
+            so a reviewer can check the claim instead of guessing.</li>
+          <li><strong>No <code>unwrap</code> / <code>expect</code> in production paths.</strong> Fallible
+            operations return <code>Result&lt;T, E&gt;</code> and propagate errors with <code>?</code>,
+            so an unexpected condition is handled deliberately rather than panicking the kernel.</li>
+        </ul>
+        <p>This last point matters because <strong>a ring-0 fault is treated as fatal</strong>. A kernel
+          cannot safely continue after dereferencing a bad pointer, so the only acceptable strategy is to
+          never reach that state. Every kernel dereference of untrusted input — user-supplied pointers,
+          lengths, and offsets crossing the syscall boundary — is validated <em>before</em> it is used.</p>
+      </div>
+
+      <div class="code">
+        <div class="h">crates/syscall — validate before you touch</div>
+<pre><span class="c">// Untrusted (ptr, len) arrive from user space across the syscall boundary.</span>
+<span class="c">// Validate the whole range first; only then is a read sound.</span>
+<span class="k">fn</span> sys_write(fd: Fd, ptr: UserPtr, len: usize) -&gt; Result&lt;usize, Errno&gt; {
+    <span class="c">// SAFETY of the later read depends on this check succeeding.</span>
+    <span class="k">let</span> region = current_addr_space()
+        .validate_user_range(ptr, len)?;   <span class="c">// fail-closed: EFAULT on any miss</span>
+
+    <span class="k">let</span> file = current_caps()
+        .resolve(fd)?;                      <span class="c">// capability check, not ambient access</span>
+
+    file.write(region)                      <span class="c">// no unwrap/expect on this path</span>
+}</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Capability-based access control</p>
+      <h2 class="sect-title">Authority you hold, not authority you have</h2>
+      <p class="sect-sub">ONCRIX governs access with capabilities: unforgeable handles that name a
+        specific resource together with the rights you are permitted to exercise on it.</p>
+      <div class="prose">
+        <p>A process can only act on resources it has been explicitly handed a capability for. There is no
+          ambient authority — possessing a name or guessing an identifier grants nothing, because the
+          right to act is carried by the handle itself, not by the caller's identity. Capabilities are
+          <strong>unforgeable</strong>: they are issued and tracked by the kernel and cannot be
+          fabricated by a process, only received, used within their granted rights, or passed on.</p>
+        <p>This makes <strong>least privilege the path of least resistance</strong>. A service is started
+          with exactly the capabilities its job requires. To reach anything else it would need a handle it
+          was never given, which is precisely what the model is built to prevent.</p>
+      </div>
+      <div class="flow">
+  request: process holds <b>cap(file, {read})</b> &rarr; <i>kernel checks the handle</i>
+         &rarr; rights include read? &rarr; <b>allow</b>
+  request: process holds <b>cap(file, {read})</b>, asks to <b>write</b>
+         &rarr; <i>kernel checks the handle</i> &rarr; right not granted &rarr; <b>deny (fail-closed)</b>
+  request: process holds <b>no capability</b> for the resource
+         &rarr; nothing to check against &rarr; <b>deny</b>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Isolation</p>
+      <h2 class="sect-title">A driver bug stays a driver bug</h2>
+      <p class="sect-sub">In a monolithic kernel, a flaw in a single device driver runs with full kernel
+        privilege. In ONCRIX, drivers and services live in user space, behind IPC boundaries.</p>
+      <div class="prose">
+        <p>User-space drivers and services do not share the kernel's address space and cannot call into it
+          directly. They communicate with the rest of the system only by passing messages through the IPC
+          layer, and they can only act on resources for which they hold capabilities. The kernel validates
+          what crosses the boundary; the boundary itself is enforced by hardware-backed address-space
+          separation.</p>
+        <p>The consequence is containment. <strong>A bug — or a compromise — in a user-space driver cannot
+          take down the kernel</strong> and cannot reach memory or resources it was never granted. A faulty
+          driver fails inside its own isolated component, where it can be confined, restarted, or replaced,
+          instead of corrupting the privileged core.</p>
+      </div>
+      <div class="flow">
+  hardware interrupt &rarr; <i>HAL</i> &rarr; <b>kernel: minimal handler</b>
+                     &rarr; message via IPC &rarr; <i>user-space driver</i>
+                     &rarr; driver acts only within its <b>granted capabilities</b>
+  if the driver misbehaves: fault is contained in its address space,
+                     the <b>kernel core keeps running</b>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Continuous adversarial auditing</p>
+      <h2 class="sect-title">Hardening is a process, not a milestone</h2>
+      <p class="sect-sub">Language safety removes many bugs, but not logic flaws. ONCRIX is repeatedly read
+        with an attacker's mindset to find them.</p>
+      <div class="prose">
+        <p>The codebase is audited not for one bug at a time but for <strong>whole classes</strong> of
+          security defects. When a finding is confirmed, it is fixed, and the fix is then
+          <strong>independently re-verified</strong> rather than assumed correct. Every change must pass the
+          CI gate before it lands: a Rust quality job (formatting, a zero-warning
+          <code>cargo clippy --workspace -- -D warnings</code> policy, and a workspace build) and a
+          <strong>QEMU boot integration test</strong> that confirms the kernel still boots to userspace.</p>
+        <p>The bug classes that are systematically hunted include:</p>
+      </div>
+      <table class="tbl">
+        <thead>
+          <tr><th>Bug class</th><th>What is looked for</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Unvalidated input &rarr; out-of-bounds access</strong></td>
+            <td>User, disk, network, or device data used as a pointer, length, or index without first
+              validating that the access stays in bounds.</td>
+          </tr>
+          <tr>
+            <td><strong>Missing or inverted permission checks</strong></td>
+            <td>Permission and capability checks that are absent, reachable on a path that skips them, or
+              wired up with the comparison reversed.</td>
+          </tr>
+          <tr>
+            <td><strong>Integer overflow in size/offset math</strong></td>
+            <td>Arithmetic on sizes, counts, and offsets that can wrap and turn a bounds check into a lie —
+              especially before allocation or copy operations.</td>
+          </tr>
+          <tr>
+            <td><strong>Weak or placeholder cryptography</strong></td>
+            <td>Cryptographic primitives that are stubbed, weak, or stand-in placeholders being trusted as
+              if they were production-grade.</td>
+          </tr>
+          <tr>
+            <td><strong>Trusting attacker-supplied identity</strong></td>
+            <td>Authorization decisions that believe an identifier, name, or token supplied by the caller
+              instead of an authority the kernel itself can vouch for.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="note">
+        <p><b>Security here is an ongoing process, not a checkbox.</b> No audit pass "completes" security.
+          New code introduces new surface, and each round of hardening is followed by another. ONCRIX
+          treats adversarial review, fixing, and independent re-verification as a permanent part of
+          development — gated by CI — rather than a one-time certification.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Reporting</p>
+      <h2 class="sect-title">Found something? Tell us.</h2>
+      <p class="sect-sub">Responsible disclosure makes ONCRIX safer for everyone. If you believe you have
+        found a security issue, please reach out through the project's GitHub repository.</p>
+      <div class="prose">
+        <p>Security reports and disclosures are handled through the
+          <a href="https://github.com/kernalix7/oncrix">ONCRIX GitHub repository</a> — via its issues and
+          security channels. Please include enough detail to reproduce the problem, and give maintainers a
+          reasonable opportunity to investigate and ship a fix before any public disclosure. The source,
+          the design docs, and the full history are open, so reports can be discussed and verified in the
+          open as well.</p>
+      </div>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/kernalix7/oncrix">Report on GitHub &#8599;</a>
+        <a class="btn" href="/architecture.html">See the architecture</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div class="col" style="max-width:300px">
+        <div class="brand"><b>ONCRIX</b></div>
+        <p style="color:var(--faint);margin:10px 0 0;font-size:13px">A capability-based microkernel operating system written in Rust. Not a Copy, Real Independent uniX.</p>
+      </div>
+      <div class="col"><h4>Project</h4><a href="/architecture.html">Architecture</a><a href="/security.html">Security</a><a href="/roadmap.html">Roadmap</a><a href="/docs.html">Docs</a></div>
+      <div class="col"><h4>Source</h4><a href="https://github.com/kernalix7/oncrix">GitHub repository</a><a href="https://github.com/kernalix7/oncrix/tree/main/docs">Documentation</a><a href="https://github.com/kernalix7/oncrix/blob/main/LICENSE">Apache-2.0 License</a></div>
+    </div>
+    <p class="disc">Copyright 2026 ONCRIX Contributors. Licensed under the Apache License 2.0. ONCRIX is an independent project and is not affiliated with or derived from UNIX&reg;, Linux&reg;, or any other operating system.</p>
+  </div>
+</footer>
+
+</body></html>

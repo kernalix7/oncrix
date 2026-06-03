@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Architecture — ONCRIX</title>
+<meta name="description" content="How ONCRIX keeps a true microkernel: a minimal trusted computing base, user-space drivers and services, capability-based access control, and IPC as the spine of the system." />
+<meta name="theme-color" content="#0a0e16" />
+<link rel="canonical" href="https://www.oncrix.org/architecture.html" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Architecture — ONCRIX" />
+<meta property="og:description" content="How ONCRIX keeps a true microkernel: a minimal trusted computing base, user-space drivers and services, capability-based access control, and IPC as the spine of the system." />
+<meta property="og:url" content="https://www.oncrix.org/architecture.html" />
+<meta property="og:site_name" content="ONCRIX" />
+<meta name="twitter:card" content="summary" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="/">
+      <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="2" y="2" width="28" height="28" rx="7" fill="none" stroke="#48e0c0" stroke-width="2"/>
+        <path d="M10 16 L14 20 L22 11" fill="none" stroke="#7aa2ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg><b>ONCRIX</b>
+    </a>
+    <button class="menu-btn" aria-label="Toggle menu" onclick="document.getElementById('nav').classList.toggle('open')">&#8801;</button>
+    <nav class="navlinks" id="nav">
+      <a href="/">Home</a>
+      <a href="/architecture.html" class="active">Architecture</a>
+      <a href="/security.html">Security</a>
+      <a href="/roadmap.html">Roadmap</a>
+      <a href="/docs.html">Docs</a>
+      <a class="gh" href="https://github.com/kernalix7/oncrix">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="phead flush">
+    <div class="wrap">
+      <div class="crumb"><a href="/">Home</a> / Architecture</div>
+      <h1>Architecture</h1>
+      <p>A minimal trusted computing base, user-space drivers and services, capability-based access control, and IPC as the spine of the system.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="prose">
+        <h2>The microkernel philosophy</h2>
+        <p>A microkernel is an operating-system kernel reduced to the smallest set of
+          functions that <strong>must</strong> run in privileged mode. In ONCRIX, that set is
+          exactly three things: <strong>scheduling</strong>, <strong>memory management</strong>,
+          and <strong>inter-process communication</strong>. Everything else — device drivers,
+          filesystems, network stacks, and system services — runs as an ordinary user-space
+          process and talks to the rest of the system by passing messages.</p>
+        <p>The contrast with a <strong>monolithic</strong> kernel is structural. In a monolithic
+          design, drivers, filesystems, and the network stack are all linked into a single
+          privileged image; a fault in any one of them is a fault in the whole kernel, and the
+          attack surface running in ring&nbsp;0 grows with every feature. A microkernel inverts
+          that: each subsystem is an isolated process with its own address space, so a crashing
+          driver takes down a service, not the machine, and a compromised component is confined
+          by the kernel rather than able to bypass it.</p>
+        <p>ONCRIX takes this seriously as a design constraint, not a slogan. It is an original
+          operating system written from scratch in Rust — <strong>ONCRIX is Not a Copy, Real
+          Independent uniX</strong> — not a fork or clone of Linux or UNIX. The kernel is
+          <code>#![no_std]</code> and <code>#![no_main]</code>, kernel-space crates depend only on
+          <code>core</code> and <code>alloc</code>, and architecture-specific behaviour is kept
+          behind the hardware abstraction layer. The result is a small, auditable core that does
+          as little as possible and delegates everything it can.</p>
+
+        <h2>Inside the trusted computing base</h2>
+        <p>The <strong>trusted computing base</strong> (TCB) is the set of code that the security
+          of the whole system depends on — the code that, if it were buggy or hostile, could
+          violate every guarantee above it. The goal of a microkernel is to make that set
+          <strong>small</strong>. The smaller the privileged core, the less code can hold a
+          fatal bug, the smaller the attack surface, and the more of the system can be reasoned
+          about, audited, and restarted independently.</p>
+        <p>In ONCRIX the split is explicit:</p>
+        <ul>
+          <li><strong>Runs in the privileged core:</strong> the <strong>scheduler</strong> (which
+            thread runs next, on which CPU), <strong>memory management</strong> (address spaces,
+            page tables, the page allocator), and <strong>IPC</strong> (the message-passing
+            primitives that let isolated processes cooperate).</li>
+          <li><strong>Runs in user space:</strong> <strong>device drivers</strong>,
+            <strong>filesystems</strong>, and <strong>system services</strong> — each in its own
+            process, each holding only the capabilities it was explicitly granted.</li>
+        </ul>
+        <p>Because drivers and filesystems are user-space processes, they are subject to the same
+          isolation, scheduling, and capability rules as any other program. A faulty storage
+          driver cannot corrupt unrelated memory; a compromised network service cannot reach
+          hardware it was never handed. The privileged core stays small precisely so that this
+          confinement is meaningful.</p>
+        <div class="note"><b>Minimal TCB, by construction.</b> ONCRIX combines a tiny privileged
+          core with Rust's memory safety: <code>unsafe</code> is wrapped in safe abstractions
+          with documented <code>// SAFETY:</code> invariants, production paths avoid
+          <code>unwrap()</code>/<code>expect()</code> in favour of <code>Result&lt;T, E&gt;</code>
+          and the <code>?</code> operator, and the workspace is held to a zero-warning policy.</div>
+
+        <h2>Ten crates</h2>
+        <p>ONCRIX is organised as a Cargo workspace of ten focused crates. Each has a single clear
+          responsibility, and the kernel/user boundary is reflected directly in the crate
+          structure: kernel-space crates take only <code>core</code> and <code>alloc</code>, while
+          drivers and services are built to run unprivileged.</p>
+      </div>
+
+      <table class="tbl">
+        <thead>
+          <tr><th>Crate</th><th>Space</th><th>Role</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>kernel</code></td><td>Kernel</td><td>Privileged core — scheduler, IPC, and memory core.</td></tr>
+          <tr><td><code>mm</code></td><td>Kernel</td><td>Virtual memory and the page allocator.</td></tr>
+          <tr><td><code>vfs</code></td><td>Kernel</td><td>Virtual filesystem layer that dispatches to filesystem services.</td></tr>
+          <tr><td><code>process</code></td><td>Kernel</td><td>Process and thread management — creation, lifecycle, scheduling state.</td></tr>
+          <tr><td><code>ipc</code></td><td>Kernel</td><td>IPC primitives — channels, shared memory, and message queues.</td></tr>
+          <tr><td><code>syscall</code></td><td>Kernel</td><td>POSIX-compatible system-call interface — validates and dispatches.</td></tr>
+          <tr><td><code>hal</code></td><td>Kernel</td><td>Hardware abstraction layer — isolates architecture-specific code.</td></tr>
+          <tr><td><code>drivers</code></td><td>User</td><td>User-space device drivers that talk to hardware via the HAL and IPC.</td></tr>
+          <tr><td><code>bootloader</code></td><td>Kernel</td><td>Boot protocol and early initialization.</td></tr>
+          <tr><td><code>lib</code></td><td>Shared</td><td>Shared libraries and common utilities used across crates.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="prose">
+        <p>The <code>drivers</code> crate is deliberately the only one marked for user space: it is
+          the concrete realisation of the microkernel promise that hardware drivers do not belong
+          in the privileged core. The <code>hal</code> crate is the seam that keeps the
+          <code>x86_64-unknown-none</code> primary target, the secondary <code>aarch64</code>
+          target, and the tertiary <code>riscv64</code> target from leaking
+          architecture details into the rest of the system; arch-specific code uses inline
+          assembly gated behind it.</p>
+
+        <h2>How data flows</h2>
+        <p>Three paths describe almost everything that happens in ONCRIX: how a program asks the
+          kernel for something, how two programs talk to each other, and how a hardware event
+          reaches the driver that handles it.</p>
+
+        <h3>The syscall path</h3>
+        <div class="flow">
+<b>user space</b> &rarr; <i>syscall</i> crate (validate + dispatch) &rarr; <i>kernel</i> / <i>process</i> / <i>mm</i> / <i>vfs</i> &rarr; <i>HAL</i> &rarr; <b>hardware</b>
+        </div>
+        <p>A user program issues a POSIX-compatible system call. The <code>syscall</code> crate is
+          the single front door: it <strong>validates</strong> every argument — including any
+          user-space pointer — before anything is dereferenced, then <strong>dispatches</strong>
+          to the right subsystem crate (<code>kernel</code>, <code>process</code>, <code>mm</code>,
+          or <code>vfs</code>). From there, if real hardware is involved, the request reaches it
+          only through the <code>hal</code>. Validation happens once, at the boundary, so the
+          subsystems behind it can assume their inputs are sound.</p>
+
+        <h3>The IPC path</h3>
+        <div class="flow">
+<b>Process A</b> &rarr; <i>ipc</i> crate (message queue / shared memory) &rarr; <b>Process B</b>
+        </div>
+        <p>Because drivers, filesystems, and services are separate processes, they cannot call each
+          other directly — they communicate by message passing. The <code>ipc</code> crate provides
+          the channels, message queues, and shared-memory regions that carry those messages. This
+          is the spine of the system: a filesystem request, a driver command, or a service reply
+          is an IPC message, mediated by the kernel, between two isolated address spaces.</p>
+
+        <h3>The driver path</h3>
+        <div class="flow">
+<b>hardware interrupt</b> &rarr; <i>HAL</i> &rarr; <i>kernel</i> (minimal handler) &rarr; <b>user-space driver</b> via <i>IPC</i>
+        </div>
+        <p>When hardware raises an interrupt, the <code>hal</code> receives it and the kernel runs a
+          deliberately <strong>minimal</strong> handler — just enough to acknowledge the event and
+          hand it off. The real work is deferred to the user-space driver, which is notified over
+          IPC. Keeping interrupt handlers tiny keeps the privileged core small and predictable, and
+          keeps driver logic — the part most likely to be complex or buggy — out of ring&nbsp;0.</p>
+
+        <h2>Capability-based access control</h2>
+        <p>ONCRIX names and grants access to resources through <strong>capabilities</strong>:
+          unforgeable tokens that both identify a resource and convey the right to use it. A
+          process can act on a resource only if it holds a capability for it — there is no ambient
+          authority to fall back on, and a capability cannot be guessed or fabricated.</p>
+        <p>This makes <strong>least privilege</strong> the default rather than an aspiration. A
+          user-space driver is handed exactly the capabilities it needs to reach its device and
+          nothing more; a filesystem service receives only the storage and channels it was granted.
+          Privilege separation falls out of the same model: because authority travels as explicit,
+          unforgeable tokens, the kernel can confine each component to precisely the set of
+          resources it was given, which is what makes a small TCB and user-space drivers safe to
+          rely on.</p>
+
+        <h2>Memory model</h2>
+        <p>Every process runs in its own <strong>virtual address space</strong>. The
+          <code>mm</code> crate owns virtual memory and the page allocator, and the actual page
+          tables are programmed through the <code>hal</code>, so the same memory model holds across
+          the <code>x86_64</code>, <code>aarch64</code>, and <code>riscv64</code> targets without
+          the higher layers knowing the difference.</p>
+        <p>The boundary between user and kernel is enforced at the pointer level. Any pointer that
+          crosses from user space into the kernel is <strong>validated before it is
+          dereferenced</strong> — the <code>syscall</code> crate checks it at the front door, so no
+          subsystem behind the dispatcher ever trusts a raw user address. Combined with Rust's
+          memory safety, the absence of undefined behaviour, and graceful panic handling, this is
+          how ONCRIX keeps process isolation honest: a process can describe memory to the kernel,
+          but it can never trick the kernel into touching memory it has no right to.</p>
+        <div class="note"><b>Where to go next.</b> The same principles drive the security model —
+          capabilities, privilege separation, and a minimal TCB. See the
+          <a href="/security.html">Security</a> page for how ONCRIX defends the system, or read the
+          design docs in the repository.</div>
+      </div>
+
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/kernalix7/oncrix/tree/main/docs">Read the architecture docs &rarr;</a>
+        <a class="btn" href="/security.html">Explore the security model</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div class="col" style="max-width:300px">
+        <div class="brand"><b>ONCRIX</b></div>
+        <p style="color:var(--faint);margin:10px 0 0;font-size:13px">A capability-based microkernel operating system written in Rust. Not a Copy, Real Independent uniX.</p>
+      </div>
+      <div class="col"><h4>Project</h4><a href="/architecture.html">Architecture</a><a href="/security.html">Security</a><a href="/roadmap.html">Roadmap</a><a href="/docs.html">Docs</a></div>
+      <div class="col"><h4>Source</h4><a href="https://github.com/kernalix7/oncrix">GitHub repository</a><a href="https://github.com/kernalix7/oncrix/tree/main/docs">Documentation</a><a href="https://github.com/kernalix7/oncrix/blob/main/LICENSE">Apache-2.0 License</a></div>
+    </div>
+    <p class="disc">Copyright 2026 ONCRIX Contributors. Licensed under the Apache License 2.0. ONCRIX is an independent project and is not affiliated with or derived from UNIX&reg;, Linux&reg;, or any other operating system.</p>
+  </div>
+</footer>
+
+</body></html>
