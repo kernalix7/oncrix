@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Roadmap — ONCRIX</title>
+<meta name="description" content="Where ONCRIX is today and where it is heading: an early-stage but actively developed microkernel that already boots to a POSIX-style userland." />
+<meta name="theme-color" content="#0a0e16" />
+<link rel="canonical" href="https://www.oncrix.org/roadmap.html" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Roadmap — ONCRIX" />
+<meta property="og:description" content="Where ONCRIX is today and where it is heading: an early-stage but actively developed microkernel that already boots to a POSIX-style userland." />
+<meta property="og:url" content="https://www.oncrix.org/roadmap.html" />
+<meta property="og:site_name" content="ONCRIX" />
+<meta name="twitter:card" content="summary" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="/">
+      <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="2" y="2" width="28" height="28" rx="7" fill="none" stroke="#48e0c0" stroke-width="2"/>
+        <path d="M10 16 L14 20 L22 11" fill="none" stroke="#7aa2ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg><b>ONCRIX</b>
+    </a>
+    <button class="menu-btn" aria-label="Toggle menu" onclick="document.getElementById('nav').classList.toggle('open')">&#8801;</button>
+    <nav class="navlinks" id="nav">
+      <a href="/">Home</a>
+      <a href="/architecture.html">Architecture</a>
+      <a href="/security.html">Security</a>
+      <a href="/roadmap.html" class="active">Roadmap</a>
+      <a href="/docs.html">Docs</a>
+      <a class="gh" href="https://github.com/kernalix7/oncrix">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="phead flush">
+    <div class="wrap">
+      <div class="crumb"><a href="/">Home</a> / Roadmap</div>
+      <h1>Roadmap &amp; status</h1>
+      <p>An early-stage but actively developed microkernel that already boots to a POSIX-style userland.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="prose">
+        <h2>Status today</h2>
+        <p>ONCRIX is <strong>early-stage and under active development</strong>. It is not a finished
+          operating system, and nothing here should be read as production-ready. What it <em>is</em>:
+          a real, from-scratch microkernel that compiles for bare-metal x86_64, boots in QEMU under a
+          CI-gated integration test, and hands control to a small user-space init that launches a shell
+          and a handful of embedded coreutils. The kernel keeps only scheduling, memory management, and
+          IPC; drivers, filesystems, and services live in user space and talk over message passing. The
+          surface area grows steadily — POSIX system calls, virtual filesystem behaviour, and the
+          beginnings of capability-based access control are all being filled in iteratively.</p>
+        <p>The honest summary: the foundations boot and run, but most subsystems are still partial.
+          Treat the lists below as a snapshot of <strong>direction and progress</strong>, not a feature
+          checklist of a complete OS.</p>
+      </div>
+
+      <div class="note">
+        <b>Reading the labels.</b> Throughout this page,
+        <span class="pill done">working</span> means it builds and runs today in CI;
+        <span class="pill wip">in&nbsp;progress</span> means it exists but is incomplete or being
+        actively reshaped; and
+        <span class="pill plan">planned</span> means it is on the roadmap but not yet started in earnest.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">What works</p>
+      <h2 class="sect-title">Boots, runs, and grows</h2>
+      <p class="sect-sub">These pieces exist today and are exercised on every change — the kernel builds
+        for x86_64-unknown-none and boots all the way to a user-space shell in the CI boot test.</p>
+      <table class="tbl">
+        <thead>
+          <tr><th>Capability</th><th>What it covers</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Bare-metal build</strong></td>
+            <td>Compiles for <code>x86_64-unknown-none</code> as a <code>#![no_std]</code> <code>#![no_main]</code> kernel.</td>
+            <td><span class="pill done">working</span></td>
+          </tr>
+          <tr>
+            <td><strong>Boot to userland</strong></td>
+            <td>Boots in QEMU, validated by a CI-gated boot integration test that confirms the kernel reaches user space.</td>
+            <td><span class="pill done">working</span></td>
+          </tr>
+          <tr>
+            <td><strong>POSIX system calls</strong></td>
+            <td>A growing set: file I/O (<code>read</code>, <code>write</code>, <code>open</code>, <code>close</code>, <code>lseek</code>), process control (<code>fork</code>, <code>execve</code>, <code>exit</code>, <code>wait</code>), memory (<code>mmap</code>), plus pipes, signals, and more.</td>
+            <td><span class="pill done">working</span></td>
+          </tr>
+          <tr>
+            <td><strong>Virtual filesystem</strong></td>
+            <td>A VFS layer with an in-memory <code>ramfs</code> backing the early userland.</td>
+            <td><span class="pill done">working</span></td>
+          </tr>
+          <tr>
+            <td><strong>User-space init</strong></td>
+            <td>An init process that launches a shell and a set of embedded coreutils in user space.</td>
+            <td><span class="pill done">working</span></td>
+          </tr>
+          <tr>
+            <td><strong>IPC primitives</strong></td>
+            <td>Channels, shared memory, and message queues — the spine that connects user-space services.</td>
+            <td><span class="pill done">working</span></td>
+          </tr>
+          <tr>
+            <td><strong>Capability foundations</strong></td>
+            <td>The start of capability-based access control — a foundation being built, not a finished model.</td>
+            <td><span class="pill wip">in&nbsp;progress</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="prose">
+        <p>Concretely, a typical session today looks like booting the kernel image under QEMU, watching
+          init come up, and dropping into the shell to run the embedded coreutils against the in-memory
+          filesystem — the same path the CI boot test walks automatically.</p>
+      </div>
+
+      <div class="flow">
+boot image &#8594; <b>kernel</b> (scheduler / mm / IPC) &#8594; <b>init</b> (user space)
+      &#8594; <b>shell</b> + embedded coreutils &#8594; syscalls &#8594; <b>VFS</b> + <i>ramfs</i>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">In progress</p>
+      <h2 class="sect-title">Being filled in right now</h2>
+      <p class="sect-sub">These areas exist in some form but are incomplete, evolving, or actively being
+        reshaped. Expect rough edges and breaking changes.</p>
+      <div class="prose">
+        <ul>
+          <li><span class="pill wip">in&nbsp;progress</span> &nbsp;<strong>Capability-based access control.</strong>
+            The groundwork is in place; the access-control model, capability handles, and privilege
+            separation between user-space services are still being designed and extended.</li>
+          <li><span class="pill wip">in&nbsp;progress</span> &nbsp;<strong>POSIX coverage.</strong>
+            New system calls land continuously, with each one validated against the
+            POSIX.1-2024 interface contract before it is considered usable.</li>
+          <li><span class="pill wip">in&nbsp;progress</span> &nbsp;<strong>VFS depth.</strong>
+            Beyond the in-memory <code>ramfs</code>, the VFS layer is being generalised so additional
+            filesystem backends can plug in cleanly.</li>
+          <li><span class="pill wip">in&nbsp;progress</span> &nbsp;<strong>User-space services.</strong>
+            Moving more functionality out of the kernel and behind IPC, in line with the microkernel
+            goal of a minimal trusted computing base.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Planned</p>
+      <h2 class="sect-title">On the roadmap</h2>
+      <p class="sect-sub">Directions ONCRIX intends to take. These are not started in earnest yet — they
+        describe where the project is heading, not what it does today.</p>
+      <div class="prose">
+        <ul>
+          <li><span class="pill plan">planned</span> &nbsp;<strong>More filesystems.</strong>
+            Additional VFS backends such as <code>ext2</code>, <code>fat32</code>, and <code>tmpfs</code>,
+            running as user-space services on top of the existing VFS layer.</li>
+          <li><span class="pill plan">planned</span> &nbsp;<strong>Maturing network stack.</strong>
+            Growing networking support so user-space applications can communicate over the network.</li>
+          <li><span class="pill plan">planned</span> &nbsp;<strong>More user-space drivers.</strong>
+            Broadening the set of devices handled by isolated, message-passing drivers in user space.</li>
+          <li><span class="pill plan">planned</span> &nbsp;<strong>SMP / multi-core.</strong>
+            Scheduling and synchronisation across multiple cores.</li>
+          <li><span class="pill plan">planned</span> &nbsp;<strong>Demand paging and copy-on-write.</strong>
+            Richer memory management in the <code>mm</code> crate for lazy mapping and efficient
+            <code>fork</code>.</li>
+          <li><span class="pill plan">planned</span> &nbsp;<strong>aarch64 / riscv64 bring-up.</strong>
+            Extending beyond the primary x86_64 target to the secondary
+            <code>aarch64</code> and tertiary <code>riscv64</code> targets, with architecture-specific
+            code kept behind the HAL.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">The trajectory</p>
+      <h2 class="sect-title">From a booting kernel outward</h2>
+      <p class="sect-sub">A rough ordering of how the project is layering up — each stage builds on the one
+        before it.</p>
+      <ul class="timeline">
+        <li>
+          <h3>Foundations <span class="pill done">working</span></h3>
+          <p>Bare-metal x86_64 build, QEMU boot to user space, a CI boot integration test, IPC
+            primitives, a VFS with in-memory ramfs, and an init that launches a shell with embedded
+            coreutils.</p>
+        </li>
+        <li>
+          <h3>POSIX surface <span class="pill wip">in&nbsp;progress</span></h3>
+          <p>An expanding set of POSIX.1-2024-compatible system calls — file I/O, process control,
+            memory, pipes, and signals — landing one validated call at a time.</p>
+        </li>
+        <li>
+          <h3>Capability model <span class="pill wip">in&nbsp;progress</span></h3>
+          <p>Building out capability-based access control and privilege separation between user-space
+            services on top of the existing foundation.</p>
+        </li>
+        <li>
+          <h3>Storage &amp; networking <span class="pill plan">planned</span></h3>
+          <p>More filesystem backends (ext2, fat32, tmpfs), a maturing network stack, and more
+            user-space device drivers behind IPC.</p>
+        </li>
+        <li>
+          <h3>Scale &amp; portability <span class="pill plan">planned</span></h3>
+          <p>SMP / multi-core scheduling, demand paging and copy-on-write in the memory manager, and
+            aarch64 / riscv64 bring-up behind the HAL.</p>
+        </li>
+      </ul>
+
+      <div class="note warn">
+        <b>No dates, no benchmarks.</b> ONCRIX is a from-scratch research and engineering effort with no
+        committed timelines. The ordering above reflects intent and dependency, not a schedule — the most
+        accurate, up-to-date picture always lives in the repository and its commit history.
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap" style="text-align:center">
+      <h2 class="sect-title">Follow the progress</h2>
+      <p class="sect-sub" style="margin:0 auto 26px">The source, the design docs, and the full commit
+        history are public — that is where the roadmap actually moves.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/kernalix7/oncrix">github.com/kernalix7/oncrix</a>
+        <a class="btn" href="/architecture.html">See how it fits together</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div class="col" style="max-width:300px">
+        <div class="brand"><b>ONCRIX</b></div>
+        <p style="color:var(--faint);margin:10px 0 0;font-size:13px">A capability-based microkernel operating system written in Rust. Not a Copy, Real Independent uniX.</p>
+      </div>
+      <div class="col"><h4>Project</h4><a href="/architecture.html">Architecture</a><a href="/security.html">Security</a><a href="/roadmap.html">Roadmap</a><a href="/docs.html">Docs</a></div>
+      <div class="col"><h4>Source</h4><a href="https://github.com/kernalix7/oncrix">GitHub repository</a><a href="https://github.com/kernalix7/oncrix/tree/main/docs">Documentation</a><a href="https://github.com/kernalix7/oncrix/blob/main/LICENSE">Apache-2.0 License</a></div>
+    </div>
+    <p class="disc">Copyright 2026 ONCRIX Contributors. Licensed under the Apache License 2.0. ONCRIX is an independent project and is not affiliated with or derived from UNIX&reg;, Linux&reg;, or any other operating system.</p>
+  </div>
+</footer>
+
+</body></html>

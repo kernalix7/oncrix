@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Docs — ONCRIX</title>
+<meta name="description" content="Build ONCRIX from source, run it in QEMU, find your way around the ten-crate workspace, and learn how to contribute." />
+<meta name="theme-color" content="#0a0e16" />
+<link rel="canonical" href="https://www.oncrix.org/docs.html" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Docs — ONCRIX" />
+<meta property="og:description" content="Build ONCRIX from source, run it in QEMU, find your way around the ten-crate workspace, and learn how to contribute." />
+<meta property="og:url" content="https://www.oncrix.org/docs.html" />
+<meta property="og:site_name" content="ONCRIX" />
+<meta name="twitter:card" content="summary" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="/">
+      <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+        <rect x="2" y="2" width="28" height="28" rx="7" fill="none" stroke="#48e0c0" stroke-width="2"/>
+        <path d="M10 16 L14 20 L22 11" fill="none" stroke="#7aa2ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg><b>ONCRIX</b>
+    </a>
+    <button class="menu-btn" aria-label="Toggle menu" onclick="document.getElementById('nav').classList.toggle('open')">&#8801;</button>
+    <nav class="navlinks" id="nav">
+      <a href="/">Home</a>
+      <a href="/architecture.html">Architecture</a>
+      <a href="/security.html">Security</a>
+      <a href="/roadmap.html">Roadmap</a>
+      <a href="/docs.html" class="active">Docs</a>
+      <a class="gh" href="https://github.com/kernalix7/oncrix">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="phead flush">
+    <div class="wrap">
+      <div class="crumb"><a href="/">Home</a> / Docs</div>
+      <h1>Documentation &amp; getting started</h1>
+      <p>Build ONCRIX from source, run it in QEMU, find your way around the ten-crate workspace, and learn how to contribute.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Before you start</p>
+      <h2 class="sect-title">Prerequisites</h2>
+      <p class="sect-sub">ONCRIX is built with a nightly Rust toolchain and runs on bare-metal targets,
+        so you need the right components, the bare-metal target, and an emulator to run it.</p>
+      <div class="prose">
+        <p>You will need:</p>
+        <ul>
+          <li><strong>Rust nightly</strong> — edition 2024, <code>rust-version</code> 1.85. The kernel is
+            <code>#![no_std]</code> <code>#![no_main]</code> and uses inline assembly for architecture-specific code.</li>
+          <li><strong>Toolchain components</strong> — <code>rustfmt</code>, <code>clippy</code>,
+            <code>rust-src</code> (needed to build <code>core</code>/<code>alloc</code> for a bare-metal
+            target) and <code>llvm-tools</code>.</li>
+          <li><strong>The bare-metal target</strong> — <code>x86_64-unknown-none</code>, the primary build target.</li>
+          <li><strong>QEMU</strong> — to boot the resulting kernel image. (<code>aarch64</code> is a secondary
+            target and <code>riscv64</code> a tertiary one.)</li>
+        </ul>
+      </div>
+      <div class="code">
+        <div class="h">Install the toolchain and target</div>
+<pre><span class="c"># nightly toolchain with the components ONCRIX needs</span>
+<span class="p">$</span> <span class="k">rustup</span> toolchain install nightly <span class="o">--component</span> rustfmt,clippy,rust-src,llvm-tools
+
+<span class="c"># add the primary bare-metal build target</span>
+<span class="p">$</span> <span class="k">rustup</span> target add x86_64-unknown-none</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Get the source</p>
+      <h2 class="sect-title">Clone &amp; build</h2>
+      <p class="sect-sub">Clone the repository and build the whole workspace. Kernel-space crates depend only
+        on <code>core</code> and <code>alloc</code>, so the dependency surface stays small.</p>
+      <div class="code">
+        <div class="h">Clone and build the workspace</div>
+<pre><span class="c"># clone the repository</span>
+<span class="p">$</span> <span class="k">git</span> clone https://github.com/kernalix7/oncrix
+<span class="p">$</span> <span class="k">cd</span> oncrix
+
+<span class="c"># build every crate in the workspace</span>
+<span class="p">$</span> <span class="k">cargo</span> build --workspace</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Quality gate</p>
+      <h2 class="sect-title">Verify</h2>
+      <p class="sect-sub">ONCRIX enforces a zero-warning policy. Formatting, lints, and the build all have to
+        be clean before changes land — run all three with one line.</p>
+      <div class="code">
+        <div class="h">Format check, lint, and build</div>
+<pre><span class="p">$</span> <span class="k">cargo</span> fmt --all -- --check <span class="o">;</span> \
+  <span class="k">cargo</span> clippy --workspace -- <span class="o">-D</span> warnings <span class="o">;</span> \
+  <span class="k">cargo</span> build --workspace</pre>
+      </div>
+      <div class="prose">
+        <p>The <code>cargo clippy --workspace -- -D warnings</code> step is the heart of the
+          <strong>zero-warning policy</strong>: any clippy warning is promoted to a hard error, so the
+          workspace must lint perfectly clean. <code>cargo fmt --all -- --check</code> verifies formatting
+          without rewriting files, and the final build confirms every crate still compiles. This same
+          one-liner runs locally as the pre-commit check and again in CI.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Boot it</p>
+      <h2 class="sect-title">Run in QEMU</h2>
+      <p class="sect-sub">The kernel builds for <code>x86_64-unknown-none</code> and boots to userspace under
+        emulation — the same path CI exercises on every change.</p>
+      <div class="prose">
+        <p>ONCRIX is a microkernel: the kernel keeps only scheduling, memory management, and IPC, while
+          drivers, filesystems, and services run as user-space processes. Building for
+          <code>x86_64-unknown-none</code> produces a bare-metal kernel image that QEMU can boot. CI includes
+          a <strong>QEMU boot integration test</strong> that validates the kernel boots all the way to
+          userspace, so a green pipeline means the system actually starts, not just that it compiles.</p>
+      </div>
+      <div class="note">
+        <p><b>Running locally.</b> The exact QEMU invocation (machine type, image path, and flags) lives in
+          the repository and can change as the boot protocol evolves. Rather than copy a command that may
+          drift, see the <a href="https://github.com/kernalix7/oncrix">repository README</a> and the
+          <a href="https://github.com/kernalix7/oncrix/tree/main/scripts"><code>scripts/</code></a> directory
+          for the current, authoritative run command.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Find your way around</p>
+      <h2 class="sect-title">Project layout</h2>
+      <p class="sect-sub">The workspace is split into ten focused crates. Architecture-specific code stays
+        behind the HAL, and kernel-space crates depend only on <code>core</code> and <code>alloc</code>.</p>
+      <table class="tbl">
+        <thead>
+          <tr><th>Crate</th><th>Directory</th><th>Role</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>kernel</code></td><td><code>crates/kernel/</code></td><td>Microkernel core — scheduler, IPC, memory core</td></tr>
+          <tr><td><code>mm</code></td><td><code>crates/mm/</code></td><td>Virtual memory and the page allocator</td></tr>
+          <tr><td><code>vfs</code></td><td><code>crates/vfs/</code></td><td>Virtual filesystem layer</td></tr>
+          <tr><td><code>process</code></td><td><code>crates/process/</code></td><td>Process and thread management</td></tr>
+          <tr><td><code>ipc</code></td><td><code>crates/ipc/</code></td><td>Channels, shared memory, message queues</td></tr>
+          <tr><td><code>syscall</code></td><td><code>crates/syscall/</code></td><td>POSIX-compatible system call interface</td></tr>
+          <tr><td><code>hal</code></td><td><code>crates/hal/</code></td><td>Hardware abstraction layer</td></tr>
+          <tr><td><code>drivers</code></td><td><code>crates/drivers/</code></td><td>User-space device drivers</td></tr>
+          <tr><td><code>bootloader</code></td><td><code>crates/bootloader/</code></td><td>Boot protocol and early initialization</td></tr>
+          <tr><td><code>lib</code></td><td><code>crates/lib/</code></td><td>Shared libraries and common utilities</td></tr>
+        </tbody>
+      </table>
+      <div class="prose">
+        <p>Project documentation lives in the <code>docs/</code> tree, organized in a Linux-style structure
+          with subfolders for each audience — see the reference links below.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Go deeper</p>
+      <h2 class="sect-title">Reference documentation</h2>
+      <p class="sect-sub">The <code>docs/</code> tree on GitHub is grouped by audience. Start with whichever
+        matches what you are building.</p>
+      <div class="prose">
+        <ul>
+          <li><a href="https://github.com/kernalix7/oncrix/tree/main/docs/admin-guide"><strong>admin-guide</strong></a>
+            — operating and administering an ONCRIX system.</li>
+          <li><a href="https://github.com/kernalix7/oncrix/tree/main/docs/arch"><strong>arch</strong></a>
+            — architecture and design of the microkernel and its subsystems.</li>
+          <li><a href="https://github.com/kernalix7/oncrix/tree/main/docs/core-api"><strong>core-api</strong></a>
+            — the kernel and core-service programming interfaces.</li>
+          <li><a href="https://github.com/kernalix7/oncrix/tree/main/docs/driver-api"><strong>driver-api</strong></a>
+            — writing user-space device drivers against the HAL and IPC.</li>
+          <li><a href="https://github.com/kernalix7/oncrix/tree/main/docs/filesystems"><strong>filesystems</strong></a>
+            — the VFS layer and filesystem implementations.</li>
+        </ul>
+        <p>You can also browse the whole tree at
+          <a href="https://github.com/kernalix7/oncrix/tree/main/docs">github.com/kernalix7/oncrix/tree/main/docs</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <p class="h2">Send a patch</p>
+      <h2 class="sect-title">Contributing</h2>
+      <p class="sect-sub">Contributions follow a small set of conventions so history stays readable and
+        <code>main</code> stays green.</p>
+      <div class="prose">
+        <p><strong>Commit messages</strong> use
+          <a href="https://www.conventionalcommits.org/">Conventional Commits</a> — prefix each subject with
+          <code>feat:</code>, <code>fix:</code>, <code>docs:</code>, <code>refactor:</code>,
+          <code>test:</code>, or <code>chore:</code>.</p>
+        <p><strong>Branches</strong> are named by intent: <code>feature/&lt;name&gt;</code> for new work and
+          <code>fix/&lt;name&gt;</code> for fixes. Pull requests are <strong>squash-merged</strong> into
+          <code>main</code>, which is kept always-stable and passing CI.</p>
+        <p><strong>Before you commit</strong>, run the same checks CI runs:</p>
+        <ul>
+          <li><code>cargo fmt --all -- --check</code> — formatting is clean.</li>
+          <li><code>cargo clippy --workspace -- -D warnings</code> — zero clippy warnings.</li>
+          <li><code>cargo build --workspace</code> — every crate builds.</li>
+        </ul>
+        <p>A few engineering rules apply throughout the codebase: kernel-space crates depend only on
+          <code>core</code> and <code>alloc</code>; every <code>unsafe</code> block is wrapped in a safe
+          abstraction with a documented <code>// SAFETY:</code> invariant; production paths use
+          <code>Result&lt;T, E&gt;</code> with <code>?</code> rather than <code>unwrap()</code> or
+          <code>expect()</code>; and every source file carries the Apache-2.0 license header.</p>
+      </div>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/kernalix7/oncrix">Get the source on GitHub &#8599;</a>
+        <a class="btn" href="/architecture.html">Read the architecture &#8594;</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot">
+      <div class="col" style="max-width:300px">
+        <div class="brand"><b>ONCRIX</b></div>
+        <p style="color:var(--faint);margin:10px 0 0;font-size:13px">A capability-based microkernel operating system written in Rust. Not a Copy, Real Independent uniX.</p>
+      </div>
+      <div class="col"><h4>Project</h4><a href="/architecture.html">Architecture</a><a href="/security.html">Security</a><a href="/roadmap.html">Roadmap</a><a href="/docs.html">Docs</a></div>
+      <div class="col"><h4>Source</h4><a href="https://github.com/kernalix7/oncrix">GitHub repository</a><a href="https://github.com/kernalix7/oncrix/tree/main/docs">Documentation</a><a href="https://github.com/kernalix7/oncrix/blob/main/LICENSE">Apache-2.0 License</a></div>
+    </div>
+    <p class="disc">Copyright 2026 ONCRIX Contributors. Licensed under the Apache License 2.0. ONCRIX is an independent project and is not affiliated with or derived from UNIX&reg;, Linux&reg;, or any other operating system.</p>
+  </div>
+</footer>
+
+</body></html>
