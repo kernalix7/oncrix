@@ -764,7 +764,9 @@ impl InodeOps for Ramfs {
         } = inode_data
         {
             let offset = offset as usize;
-            let end = offset + data.len();
+            let end = offset
+                .checked_add(data.len())
+                .ok_or(Error::InvalidArgument)?;
             if end > MAX_FILE_SIZE {
                 return Err(Error::OutOfMemory);
             }
