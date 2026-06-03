@@ -106,11 +106,16 @@ pub static SYSCALL_SAVED_USER_RIP: AtomicU64 = AtomicU64::new(0);
 /// state without walking a stack frame.
 pub static SYSCALL_SAVED_USER_RFLAGS: AtomicU64 = AtomicU64::new(0);
 
-/// RFLAGS sanitization mask: keeps only safe bits for SYSRETQ.
+/// RFLAGS sanitization mask: an AND-keep whitelist of the only user
+/// status/control flags allowed to survive a return to ring 3.
 ///
-/// Bits kept: CF(0), PF(2), AF(4), ZF(6), SF(7), IF(9), OF(11).
-/// Clears: TF, DF, NT, IOPL, AC, and all other privileged bits.
-const _RFLAGS_SAFE_MASK: u64 = 0x3C7FD7;
+/// Bits kept: CF(0), PF(2), AF(4), ZF(6), SF(7), DF(10), OF(11) = 0xCD5.
+/// Clears TF(8), NT(14), IOPL(12-13), AC(18), RF(16), VM(17) and every
+/// other privileged bit. IF(9) and reserved bit 1 are re-forced by the
+/// subsequent `or 0x202`. The previous value 0x3C7FD7 was far too loose:
+/// it *kept* TF, NT, IOPL and AC, so a user-supplied RFLAGS with NT set
+/// reached the IRETQ fallback and triggered a #GP task-return in ring 0.
+const _RFLAGS_SAFE_MASK: u64 = 0xCD5;
 /// Forced RFLAGS bits: IF=1 (bit 9) + reserved bit 1 = 0x202.
 const _RFLAGS_FORCE_BITS: u64 = 0x202;
 
@@ -360,29 +365,36 @@ pub extern "C" fn syscall_entry() {
             "cmp rcx, r11",
             "ja  2f",
             // --- Normal SYSRET path ---
-            // Load and sanitize the user RFLAGS into r11: clear IOPL, NT,
-            // TF, force IF=1 + reserved bit 1=1. Restore user RSP last.
+            // Load and sanitize the user RFLAGS into r11: keep only the
+            // safe status/control bits (0xCD5), then force IF=1 +
+            // reserved bit 1 (0x202). Restore user RSP last.
             "mov r11, [{saved_user_rflags}]",
-            "and r11, 0x3C7FD7",
+            "and r11, 0xCD5",
             "or  r11, 0x202",
             "mov rsp, [{saved_user_rsp}]",
             "swapgs",
             "sysretq",
             // --- IRETQ fallback for non-canonical RCX ---
-            // Construct an interrupt return frame on the stack and use
-            // IRETQ which validates the target RIP safely. RFLAGS is
-            // sanitized identically to the SYSRET path.
+            // Build the interrupt-return frame on the KERNEL stack (still
+            // live here — RSP was unwound back to it above). IRETQ then
+            // loads the user RSP from the frame and validates the target
+            // RIP safely. We must NOT switch RSP to the user pointer
+            // before the pushes (a hostile/unmapped user RSP would fault
+            // the ring-0 `push` itself), and we must NOT use `push rsp`
+            // to encode the user RSP (PUSH rSP stores RSP *after* its own
+            // decrement, i.e. user_rsp-8, corrupting the user stack
+            // pointer). Push the saved user RSP as a literal memory
+            // operand instead. swapgs immediately precedes iretq.
             "2:",
             "mov r11, [{saved_user_rflags}]",
-            "and r11, 0x3C7FD7",
+            "and r11, 0xCD5",
             "or  r11, 0x202",
-            "mov rsp, [{saved_user_rsp}]",
+            "push {user_ss}",                     // SS
+            "push qword ptr [{saved_user_rsp}]",  // RSP (correct user value)
+            "push r11",                           // RFLAGS (sanitized)
+            "push {user_cs}",                     // CS
+            "push rcx",                           // RIP
             "swapgs",
-            "push {user_ss}",   // SS
-            "push rsp",         // RSP (user stack, placeholder)
-            "push r11",         // RFLAGS (already sanitized)
-            "push {user_cs}",   // CS
-            "push rcx",         // RIP
             "iretq",
         dispatch = sym syscall_dispatch_wrapper,
         saved_user_rsp = sym SYSCALL_SAVED_USER_RSP,
@@ -1743,8 +1755,18 @@ unsafe fn resolve_to_abs<'b>(
 ///
 /// Must be called from the SYSCALL dispatch path.
 unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
-    // Validate the pathname pointer.
-    if pathname_ptr == 0 || pathname_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate the pathname pointer. Check the full scan window, not
+    // just the base: the byte-at-a-time copy below reads up to
+    // MAX_OPEN_PATH bytes, so `pathname_ptr + MAX_OPEN_PATH` must stay
+    // below the non-canonical/kernel boundary or `base.add(i)` would
+    // cross into the hole and a high-half byte would fault in ring 0.
+    // (A canonical-but-unmapped page within the window can still fault;
+    // closing that fully needs a copy-from-user-with-fixup helper.)
+    if pathname_ptr == 0
+        || pathname_ptr
+            .checked_add(MAX_OPEN_PATH as u64)
+            .is_none_or(|end| end > 0xFFFF_8000_0000_0000)
+    {
         return -22; // EINVAL
     }
 

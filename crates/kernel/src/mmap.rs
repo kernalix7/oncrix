@@ -54,6 +54,18 @@ pub struct MmapResult {
 ///
 /// For file-backed mappings, the `fd` and `offset` parameters
 /// specify which file data to map. (Not yet fully implemented.)
+///
+/// # Deviation from POSIX `MAP_FIXED`
+///
+/// POSIX/Linux `MAP_FIXED` replaces any existing mappings that overlap
+/// the requested range. This implementation does **not** yet perform
+/// overlap-replace: the `AddressSpace` API exposes only whole-region
+/// removal by exact start, so atomically splitting/removing partially
+/// overlapping regions cannot be done safely here. A `MAP_FIXED`
+/// request that overlaps an existing region therefore fails with
+/// [`Error::AlreadyExists`] (surfaced as `EEXIST`) from `add_region`,
+/// rather than silently replacing the overlap. Callers must unmap the
+/// target range first.
 pub fn do_mmap(
     space: &mut AddressSpace,
     addr: u64,
@@ -69,7 +81,7 @@ pub fn do_mmap(
     }
 
     // Page-align length upward.
-    let aligned_len = page_align_up(length);
+    let aligned_len = page_align_up(length)?;
 
     // Validate flags — must be either SHARED or PRIVATE, not both.
     let is_private = flags & map_flags::MAP_PRIVATE != 0;
@@ -92,6 +104,10 @@ pub fn do_mmap(
     // Determine the mapping address.
     let map_addr = if is_fixed {
         // MAP_FIXED: use the exact address (must be page-aligned).
+        // NOTE: overlap-replace is not implemented — if this range
+        // overlaps an existing region, `add_region` below returns
+        // `Error::AlreadyExists` (EEXIST). See the function-level
+        // "Deviation from POSIX MAP_FIXED" note.
         let va = VirtAddr::new(addr);
         if !va.is_aligned() {
             return Err(Error::InvalidArgument);
@@ -133,6 +149,13 @@ pub fn do_mmap(
 /// Removes the region from the address space. The caller is
 /// responsible for unmapping the actual page table entries and
 /// freeing physical frames.
+///
+/// Only whole-region unmaps are supported: the `[addr, addr+length)`
+/// range must exactly match an existing region's `start` and
+/// page-aligned `size`. Partial or sub-range unmaps (splitting or
+/// shrinking a region) are **not** supported and are rejected with
+/// [`Error::InvalidArgument`] rather than silently dropping the whole
+/// region, which would break the `VmRegion`/PTE invariant.
 pub fn do_munmap(space: &mut AddressSpace, addr: u64, length: u64) -> Result<()> {
     if length == 0 {
         return Err(Error::InvalidArgument);
@@ -143,9 +166,20 @@ pub fn do_munmap(space: &mut AddressSpace, addr: u64, length: u64) -> Result<()>
         return Err(Error::InvalidArgument);
     }
 
-    // Find and remove the region starting at this address.
-    // Full munmap should handle partial unmaps, but for now
-    // we only support exact region removal.
+    // Page-align the length upward and require the unmap range to be a
+    // whole number of pages within user space. `validate_user_range`
+    // also guards against `addr + len` overflowing `u64`.
+    let aligned_len = page_align_up(length)?;
+    validate_user_range(va, aligned_len)?;
+
+    // Locate the region covering this address and verify the request
+    // targets the whole region exactly. A mismatch indicates a true
+    // partial/sub-range unmap, which is not yet supported.
+    let region = space.find_region(va).ok_or(Error::NotFound)?;
+    if region.start != va || region.size != aligned_len {
+        return Err(Error::InvalidArgument);
+    }
+
     space.remove_region(va)?;
     Ok(())
 }
@@ -166,9 +200,15 @@ fn prot_to_protection(prot_flags: u64) -> Protection {
 }
 
 /// Align a size up to the next page boundary.
-fn page_align_up(size: u64) -> u64 {
+///
+/// Returns [`Error::InvalidArgument`] if rounding up would overflow
+/// `u64` (i.e. `size > u64::MAX - (PAGE_SIZE - 1)`), guarding the
+/// attacker-controlled length path against wraparound.
+fn page_align_up(size: u64) -> Result<u64> {
     let ps = PAGE_SIZE as u64;
-    (size + ps - 1) & !(ps - 1)
+    size.checked_add(ps - 1)
+        .ok_or(Error::InvalidArgument)
+        .map(|v| v & !(ps - 1))
 }
 
 /// Validate that a range falls within user space.

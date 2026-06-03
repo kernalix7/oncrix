@@ -131,9 +131,15 @@ pub struct ForkSnapshot {
 
 impl ForkSnapshot {
     /// Sanitize RFLAGS for ring 3: force `IF=1` and reserved bit 1,
-    /// clear all privileged bits (IOPL, NT, TF, AC, VM, RF).
+    /// and genuinely clear every privileged/control bit (TF, IOPL,
+    /// NT, RF, VM, AC). Only the arithmetic/direction status flags
+    /// survive the mask: `CF|PF|AF|ZF|SF|DF|OF`. This prevents a
+    /// ring-3 process from, e.g., setting `NT=1` before `fork(2)` —
+    /// which would make the child's trampoline `iretq` fault in
+    /// ring 0 (a user-triggerable kernel #GP).
     pub const fn sanitized_rflags(&self) -> u64 {
-        const SAFE_MASK: u64 = 0x003C_7FD7;
+        // CF(0)|PF(2)|AF(4)|ZF(6)|SF(7)|DF(10)|OF(11) = 0x0000_0CD5.
+        const SAFE_MASK: u64 = 0x0000_0CD5;
         (self.user_rflags & SAFE_MASK) | RFLAGS_RESERVED | RFLAGS_IF
     }
 }
@@ -171,9 +177,48 @@ pub fn arch_clone_thread(parent: &Thread, snapshot: &ForkSnapshot) -> Result<Thr
     // POSIX.1-2024: the child inherits the parent's cwd across fork(2).
     child.set_cwd(parent.cwd());
 
+    let rflags = snapshot.sanitized_rflags();
+    let user_rip = snapshot.user_rip;
+    let user_rsp = snapshot.user_rsp;
+
+    let ctx_rsp = {
+        let stack = child.kernel_stack_mut().ok_or(Error::InvalidArgument)?;
+
+        // Seed the iretq frame (high → low).
+        let _ss = stack.write_u64_from_top(0x08, USER_SS)?;
+        let _rsp = stack.write_u64_from_top(0x10, user_rsp)?;
+        let _rfl = stack.write_u64_from_top(0x18, rflags)?;
+        let _cs = stack.write_u64_from_top(0x20, USER_CS)?;
+        let _rip = stack.write_u64_from_top(0x28, user_rip)?;
+
+        // Seed the trampoline return address at top-0x30: this is what
+        // the final `ret` inside `switch_context` pops into RIP.
+        let _tr =
+            stack.write_u64_from_top(TRAMPOLINE_OFFSET, fork_trampoline as *const () as u64)?;
+
+        // Seed 6 zero slots for the callee-saved register pops that
+        // `switch_context` does before `ret`. The lowest word's
+        // address (top-0x60) is what the context-switch loads into
+        // RSP when resuming this thread.
+        let _rbx = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x08, 0)?;
+        let _rbp = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x10, 0)?;
+        let _r12 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x18, 0)?;
+        let _r13 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x20, 0)?;
+        let _r14 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x28, 0)?;
+        stack.write_u64_from_top(SEED_BYTES, 0)?
+    };
+
+    // Everything that can fail (kernel-stack allocation + every `iretq`/
+    // trampoline seed write) has now succeeded. Only here — past the last
+    // `?` in this function — do we deep-copy the fd table and bump the
+    // backing-object refcounts. Performing the bumps earlier would leak a
+    // refcount on every inherited pipe/eventfd/epoll/timerfd/signalfd/socket
+    // whenever a later seed write returned `Err` and `child` was dropped
+    // (nothing in `Drop` rebalances these out-of-band counts).
+    //
     // POSIX.1-2024 fork(3p): "the child inherits copies of the parent's
-    // set of open file descriptors". Deep-copy the fd table; bump pipe
-    // refcounts for each inherited Pipe fd so close semantics remain correct.
+    // set of open file descriptors". Deep-copy the fd table; bump backend
+    // refcounts for each inherited fd so close semantics remain correct.
     child.fd_table = oncrix_process::fd_table::KernelFdTable::new();
     for (fd_idx, handle) in parent.fd_table.iter() {
         // Bump pipe refcounts so close on either thread decrements correctly.
@@ -232,37 +277,6 @@ pub fn arch_clone_thread(parent: &Thread, snapshot: &ForkSnapshot) -> Result<Thr
         // Console, RamfsFile, DevFile, ProcFile: trivial copy, no refcount.
         let _ = child.fd_table.install_at(fd_idx, *handle);
     }
-
-    let rflags = snapshot.sanitized_rflags();
-    let user_rip = snapshot.user_rip;
-    let user_rsp = snapshot.user_rsp;
-
-    let ctx_rsp = {
-        let stack = child.kernel_stack_mut().ok_or(Error::InvalidArgument)?;
-
-        // Seed the iretq frame (high → low).
-        let _ss = stack.write_u64_from_top(0x08, USER_SS)?;
-        let _rsp = stack.write_u64_from_top(0x10, user_rsp)?;
-        let _rfl = stack.write_u64_from_top(0x18, rflags)?;
-        let _cs = stack.write_u64_from_top(0x20, USER_CS)?;
-        let _rip = stack.write_u64_from_top(0x28, user_rip)?;
-
-        // Seed the trampoline return address at top-0x30: this is what
-        // the final `ret` inside `switch_context` pops into RIP.
-        let _tr =
-            stack.write_u64_from_top(TRAMPOLINE_OFFSET, fork_trampoline as *const () as u64)?;
-
-        // Seed 6 zero slots for the callee-saved register pops that
-        // `switch_context` does before `ret`. The lowest word's
-        // address (top-0x60) is what the context-switch loads into
-        // RSP when resuming this thread.
-        let _rbx = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x08, 0)?;
-        let _rbp = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x10, 0)?;
-        let _r12 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x18, 0)?;
-        let _r13 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x20, 0)?;
-        let _r14 = stack.write_u64_from_top(TRAMPOLINE_OFFSET + 0x28, 0)?;
-        stack.write_u64_from_top(SEED_BYTES, 0)?
-    };
 
     let mut ctx = CpuContext::new_kernel(fork_trampoline as *const () as u64, ctx_rsp);
     ctx.cr3 = snapshot.child_cr3;

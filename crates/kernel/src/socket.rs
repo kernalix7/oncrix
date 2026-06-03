@@ -267,38 +267,93 @@ impl SocketRegistry {
         Ok(())
     }
 
+    /// Return `true` if the peer end of socket `unix_id` is still usable.
+    ///
+    /// The peer is open while our socket still names a live peer ID *and* that
+    /// peer slot exists and has not transitioned to `Closed`. Used by `send`
+    /// to surface `EPIPE` instead of spinning on a full buffer whose reader is
+    /// gone.
+    fn peer_open(&self, unix_id: u64) -> bool {
+        match self.unix.get(unix_id).and_then(|s| s.peer_id()) {
+            Some(peer_id) => self
+                .unix
+                .get(peer_id)
+                .is_some_and(|p| p.state() != oncrix_ipc::unix_socket::SocketState::Closed),
+            None => false,
+        }
+    }
+
     /// Send data through a connected socket.
     ///
-    /// Writes data into the **peer's** ring buffer so that the peer
-    /// can read it via [`recv`](Self::recv). Returns the number of
-    /// bytes written, or `WouldBlock` if the peer's buffer is full.
+    /// Writes data into the **peer's** ring buffer so that the peer can read
+    /// it via [`recv`](Self::recv). Returns:
+    /// - `Ok(n)` — bytes buffered for the peer.
+    /// - `Err(WouldBlock)` — the peer's buffer is full; caller may retry or
+    ///   map to `EAGAIN`.
+    /// - `Err(InvalidArgument)` — the socket was never connected (no peer ID).
+    /// - `Err(Busy)` — the peer has closed; the caller maps this to `EPIPE`.
+    ///   `Busy` is reused as the broken-pipe sentinel because the kernel
+    ///   `Error` enum has no dedicated `BrokenPipe` variant and the socket
+    ///   path never otherwise returns `Busy`.
     pub fn send(&mut self, id: usize, data: &[u8]) -> Result<usize> {
         let unix_id = self.resolve(id)?;
 
-        // Get the peer ID from our socket.
+        // A socket that never connected has no peer ID — that is EINVAL, not
+        // EPIPE. Tell the two apart before deciding the peer is gone.
+        let had_peer = self
+            .unix
+            .get(unix_id)
+            .is_some_and(|s| s.peer_id().is_some() || s.peer_closed());
+        if !had_peer {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Peer-gone detection: either our socket was explicitly marked
+        // peer-closed (set by `close` on the other end) or the peer ID no
+        // longer resolves to a live socket. Either way the reading end is
+        // gone, so report a broken pipe rather than EINVAL or an endless spin.
+        let peer_closed = self
+            .unix
+            .get(unix_id)
+            .map(|s| s.peer_closed())
+            .unwrap_or(true);
+        if peer_closed || !self.peer_open(unix_id) {
+            return Err(Error::Busy); // -> EPIPE at the syscall layer
+        }
+
+        // Resolve the peer and deliver into its buffer. `deliver` only requires
+        // the peer to be non-closed (not strictly `Connected`), which keeps the
+        // connected happy path working while also allowing pre-accept and
+        // datagram delivery.
         let peer_unix_id = {
             let sock = self.unix.get(unix_id).ok_or(Error::NotFound)?;
             sock.peer_id().ok_or(Error::InvalidArgument)?
         };
-
-        // Write into the peer's buffer.
         let peer = self.unix.get_mut(peer_unix_id).ok_or(Error::NotFound)?;
-        peer.send(data)
+        peer.deliver(data)
     }
 
     /// Receive data from a connected socket.
     ///
-    /// Reads data from the **local** ring buffer. Returns the number
-    /// of bytes read, or `WouldBlock` if no data is available.
+    /// Reads data from the **local** ring buffer. Returns the number of bytes
+    /// read, `WouldBlock` if the buffer is empty but the peer is still open,
+    /// or `Ok(0)` (EOF) if the buffer is empty and the peer has closed.
     pub fn recv(&mut self, id: usize, buf: &mut [u8]) -> Result<usize> {
         let unix_id = self.resolve(id)?;
         let sock = self.unix.get_mut(unix_id).ok_or(Error::NotFound)?;
-        sock.recv(buf)
+        match sock.recv(buf) {
+            // Empty buffer: distinguish "peer gone -> EOF" from "wait".
+            Err(Error::WouldBlock) if sock.peer_closed() => Ok(0),
+            other => other,
+        }
     }
 
     /// Close a socket and release its resources.
     ///
-    /// The socket is marked as closed and removed from the registry.
+    /// The socket is marked as closed and removed from the registry. Before
+    /// removal, any connected peer is notified via `set_peer_closed` so that a
+    /// subsequent `send` on the survivor observes `EPIPE` and a `recv`
+    /// observes EOF, instead of resolving a now-stale peer ID to `EINVAL`.
     pub fn close(&mut self, id: usize) -> Result<()> {
         let unix_id = self.resolve(id)?;
         // Decrement the alias refcount; only free the underlying Unix socket
@@ -307,9 +362,17 @@ impl SocketRegistry {
             self.refs[id] -= 1;
             return Ok(());
         }
+        // Capture the peer ID (if any) before tearing this socket down.
+        let peer_unix_id = self.unix.get(unix_id).and_then(|s| s.peer_id());
         {
             let sock = self.unix.get_mut(unix_id).ok_or(Error::NotFound)?;
             sock.close();
+        }
+        // Notify the surviving peer that its other end is gone.
+        if let Some(peer_id) = peer_unix_id
+            && let Some(peer) = self.unix.get_mut(peer_id)
+        {
+            peer.set_peer_closed();
         }
         self.unix.remove(unix_id)?;
         self.id_map[id] = None;
@@ -744,10 +807,18 @@ pub unsafe fn sys_sendto(
     sockfd: u64,
     buf_ptr: u64,
     len: u64,
-    _flags: u64,
+    flags: u64,
     _dest: u64,
     _dlen: u64,
 ) -> i64 {
+    /// `MSG_NOSIGNAL` — suppress `SIGPIPE` on a broken-pipe write.
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    /// Upper bound on `WouldBlock` retries before yielding control back to
+    /// the caller as `EAGAIN`. A peer that never drains its buffer must not
+    /// pin this CPU forever (DoS); bounding the spin guarantees forward
+    /// progress for other work.
+    const MAX_SPINS: u32 = 4096;
+
     if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
     }
@@ -756,6 +827,7 @@ pub unsafe fn sys_sendto(
         Some(id) => id,
         None => return -9,
     };
+    let nonblock = socket_fd_nonblock(sockfd);
 
     let mut kbuf = [0u8; 4096];
     // SAFETY: `buf_ptr` validated above; reading `count` bytes.
@@ -766,6 +838,7 @@ pub unsafe fn sys_sendto(
         }
     }
 
+    let mut spins: u32 = 0;
     loop {
         // SAFETY: Single-CPU SYSCALL context.
         let result = unsafe {
@@ -774,9 +847,27 @@ pub unsafe fn sys_sendto(
         };
         match result {
             Ok(n) => return n as i64,
-            Err(Error::WouldBlock) => unsafe {
-                let _ = crate::current::yield_now();
-            },
+            // The peer has closed: raise SIGPIPE (unless suppressed) and fail
+            // with EPIPE rather than spinning on a buffer no one will drain.
+            Err(Error::Busy) => {
+                if flags & MSG_NOSIGNAL == 0 {
+                    raise_sigpipe();
+                }
+                return -32; // EPIPE
+            }
+            Err(Error::WouldBlock) => {
+                if nonblock {
+                    return -11; // EAGAIN
+                }
+                spins = spins.saturating_add(1);
+                if spins >= MAX_SPINS {
+                    return -11; // EAGAIN — bounded spin, surrender the CPU
+                }
+                // SAFETY: SYSCALL context.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
             Err(_) => return -22,
         }
     }
@@ -806,6 +897,7 @@ pub unsafe fn sys_recvfrom(
         Some(id) => id,
         None => return -9,
     };
+    let nonblock = socket_fd_nonblock(sockfd);
 
     let user_ptr = buf_ptr as *mut u8;
     loop {
@@ -825,9 +917,20 @@ pub unsafe fn sys_recvfrom(
                 }
                 return n as i64;
             }
-            Ok(_) | Err(Error::WouldBlock) => unsafe {
-                let _ = crate::current::yield_now();
-            },
+            // `recv` reports `Ok(0)` only when the buffer is empty *and* the
+            // peer has closed: that is end-of-stream, so return EOF instead of
+            // yielding forever.
+            Ok(_) => return 0,
+            // Buffer empty, peer still open: block (or EAGAIN if non-blocking).
+            Err(Error::WouldBlock) => {
+                if nonblock {
+                    return -11; // EAGAIN
+                }
+                // SAFETY: SYSCALL context.
+                unsafe {
+                    let _ = crate::current::yield_now();
+                }
+            }
             Err(_) => return -22,
         }
     }
@@ -848,4 +951,33 @@ fn get_socket_fd(fd: u64) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// Return `true` if `fd` was opened with `O_NONBLOCK`.
+///
+/// Used by `sys_sendto` / `sys_recvfrom` to choose between blocking (yield
+/// and retry) and returning `EAGAIN`. A missing or non-socket fd is treated
+/// as blocking (`false`); the caller has already validated the fd via
+/// [`get_socket_fd`].
+fn socket_fd_nonblock(fd: u64) -> bool {
+    // SAFETY: Single-CPU SYSCALL context.
+    match unsafe { crate::fd_table::fd_get(fd as usize) } {
+        Some(handle) => handle.flags.is_nonblock(),
+        None => false,
+    }
+}
+
+/// Best-effort `SIGPIPE` delivery to the current thread on a broken-pipe
+/// write.
+///
+/// POSIX requires a write to a socket whose reading end has closed to raise
+/// `SIGPIPE` (unless `MSG_NOSIGNAL` is set) in addition to failing with
+/// `EPIPE`. Posting a signal to the current thread requires the signal
+/// subsystem's per-thread pending state, which is owned outside this module;
+/// until that wiring lands this is a deliberate no-op. The `EPIPE` return
+/// value is the load-bearing, in-lane part of the contract and is always
+/// honoured by the caller.
+fn raise_sigpipe() {
+    // Intentionally a no-op: see the doc comment. Kept as a named hook so the
+    // signal owners can wire delivery without touching the send path.
 }
