@@ -293,6 +293,13 @@ pub struct UnixSocket {
     local_addr: SocketAddr,
     /// Connected peer socket ID, if any.
     peer_id: Option<u64>,
+    /// `true` once the connected peer has closed.
+    ///
+    /// Set by the registry when the peer socket is torn down so that a
+    /// subsequent `send` can surface `EPIPE` and a `recv` can surface EOF,
+    /// instead of resolving a stale `peer_id` to an unrelated error or
+    /// spinning forever on a full/empty buffer.
+    peer_closed: bool,
     /// Data ring buffer.
     buffer: RingBuffer,
     /// Listen backlog (only meaningful in `Listening` state).
@@ -307,6 +314,7 @@ impl UnixSocket {
             state: SocketState::Unbound,
             local_addr: SocketAddr::empty(),
             peer_id: None,
+            peer_closed: false,
             buffer: RingBuffer::new(),
             backlog: ListenBacklog::new(),
         }
@@ -330,6 +338,24 @@ impl UnixSocket {
     /// Return the connected peer's socket ID, if any.
     pub fn peer_id(&self) -> Option<u64> {
         self.peer_id
+    }
+
+    /// Return `true` if the connected peer has closed.
+    ///
+    /// When this holds, a write should fail with `EPIPE` and a read that
+    /// finds the local buffer empty should report EOF rather than block.
+    pub fn peer_closed(&self) -> bool {
+        self.peer_closed
+    }
+
+    /// Mark the peer as closed and forget its (now stale) ID.
+    ///
+    /// Called by the registry when this socket's peer is torn down. The
+    /// local buffer is left intact so any already-delivered bytes remain
+    /// readable before the reader observes EOF.
+    pub fn set_peer_closed(&mut self) {
+        self.peer_closed = true;
+        self.peer_id = None;
     }
 
     /// Bind the socket to a local address.
@@ -406,6 +432,7 @@ impl UnixSocket {
             }
         }
         self.peer_id = Some(peer_id);
+        self.peer_closed = false;
         self.state = SocketState::Connected;
         Ok(())
     }
@@ -417,6 +444,30 @@ impl UnixSocket {
     /// ring buffer, or `WouldBlock` if the buffer is full.
     pub fn send(&mut self, data: &[u8]) -> Result<usize> {
         if self.state != SocketState::Connected {
+            return Err(Error::InvalidArgument);
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
+        if !self.buffer.has_space() {
+            return Err(Error::WouldBlock);
+        }
+        Ok(self.buffer.write(data))
+    }
+
+    /// Deliver `data` into this socket's buffer on behalf of a peer.
+    ///
+    /// Unlike [`send`](Self::send), this only requires the socket to not be
+    /// [`Closed`](SocketState::Closed): bytes may be queued for a peer that
+    /// is connected, bound, or still completing its handshake (e.g. a
+    /// server-side socket that has not yet been accepted, or a datagram
+    /// endpoint). The caller (the registry) writes into the *receiver's*
+    /// buffer, so this is the receiver-side view.
+    ///
+    /// Returns the number of bytes buffered, `WouldBlock` if the buffer is
+    /// full, or `InvalidArgument` if the socket is closed.
+    pub fn deliver(&mut self, data: &[u8]) -> Result<usize> {
+        if self.state == SocketState::Closed {
             return Err(Error::InvalidArgument);
         }
         if data.is_empty() {

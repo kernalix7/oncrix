@@ -473,8 +473,15 @@ pub unsafe fn sys_pipe2(fildes_ptr: u64, flags: u64) -> i64 {
     /// `O_CLOEXEC` flag bit (octal 02000000), matching `pipe2(2)`.
     const O_CLOEXEC: u64 = 0o2000000;
 
-    // Validate the user pointer.
-    if fildes_ptr == 0 || fildes_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate the user pointer span. The handler writes two `i32` values
+    // (8 bytes total), so the *whole* range must lie below the kernel
+    // canonical boundary — checking only the base would let a pointer near
+    // the boundary write the upper half into kernel space (OOB write).
+    if fildes_ptr == 0
+        || fildes_ptr
+            .checked_add(8)
+            .is_none_or(|end| end > 0xFFFF_8000_0000_0000)
+    {
         return -14; // EFAULT
     }
     // Unknown flag bits are rejected per POSIX.1-2024 pipe2(2).
