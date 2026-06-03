@@ -341,6 +341,8 @@ pub struct SubmissionQueue {
     tail: u16,
     /// Queue depth.
     depth: u16,
+    /// Number of commands currently in-flight (submitted but not yet completed).
+    inflight: u16,
     /// Next command ID.
     next_cid: u16,
     /// Doorbell register offset from BAR0.
@@ -350,6 +352,13 @@ pub struct SubmissionQueue {
 impl SubmissionQueue {
     /// Create a new submission queue.
     pub const fn new(depth: u16, doorbell_offset: usize) -> Self {
+        // Clamp depth to MAX_SQ_DEPTH at construction time so runtime
+        // callers can never produce an out-of-bounds tail index.
+        let safe_depth = if depth as usize > MAX_SQ_DEPTH {
+            MAX_SQ_DEPTH as u16
+        } else {
+            depth
+        };
         Self {
             entries: [NvmeCommand {
                 cdw0: 0,
@@ -367,7 +376,8 @@ impl SubmissionQueue {
                 cdw15: 0,
             }; MAX_SQ_DEPTH],
             tail: 0,
-            depth,
+            depth: safe_depth,
+            inflight: 0,
             next_cid: 0,
             doorbell_offset,
         }
@@ -377,15 +387,29 @@ impl SubmissionQueue {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::OutOfMemory`] if the queue is full.
+    /// Returns [`Error::Busy`] if the queue is full.
     pub fn submit(&mut self, mut cmd: NvmeCommand) -> Result<u16> {
+        // Full-queue guard: refuse to overwrite an in-flight entry.
+        // Leave one slot free (depth-1 usable entries) to distinguish
+        // full from empty without a separate flag.
+        if self.inflight >= self.depth.saturating_sub(1) {
+            return Err(Error::Busy);
+        }
         let cid = self.next_cid;
         // Patch the CID into CDW0
         cmd.cdw0 = (cmd.cdw0 & 0x0000_ffff) | ((cid as u32) << 16);
         self.entries[self.tail as usize] = cmd;
         self.tail = (self.tail + 1) % self.depth;
         self.next_cid = self.next_cid.wrapping_add(1);
+        self.inflight = self.inflight.saturating_add(1);
         Ok(cid)
+    }
+
+    /// Signal that one in-flight command has completed.
+    ///
+    /// Called by the completion polling path so `submit` can track queue space.
+    pub fn complete_one(&mut self) {
+        self.inflight = self.inflight.saturating_sub(1);
     }
 
     /// Returns the current tail position (for doorbell write).
@@ -586,12 +610,16 @@ impl IdentifyNamespace {
 
         // LBA Format table starts at offset 128, each entry is 4 bytes.
         let fmt_offset = 128 + active_fmt_idx * 4;
-        let lba_shift = if fmt_offset + 4 <= data.len() {
+        let raw_shift = if fmt_offset + 4 <= data.len() {
             // LBADS is bits 23:16 of the LBA format entry.
             data[fmt_offset + 2]
         } else {
             9 // default to 512-byte sectors
         };
+        // Clamp LBADS to a sane range (9..=16 → 512 B to 64 KiB) before storing.
+        // An out-of-range device value (e.g. 31 or 63) would cause `1 << lba_shift`
+        // in block_size() to overflow or panic.
+        let lba_shift = raw_shift.clamp(9, 16);
 
         Ok(Self {
             nsze,
@@ -648,9 +676,14 @@ pub struct IoQueuePair {
 impl NvmeController {
     /// Create a new NVMe controller at the given BAR0 address.
     pub fn new(bar0: usize) -> Self {
-        // Read CAP to determine doorbell stride
+        // Read CAP to determine doorbell stride.
+        // CAP.DSTRD is bits 15:12 (4 bits).  The NVMe spec legal range is 0..=3
+        // (giving strides 4, 8, 16, 32 bytes).  Clamp to 0..=3 so that a
+        // malicious device cannot set DSTRD=0xF (stride = 131072), which would
+        // place every doorbell write far outside the BAR — an arbitrary kernel
+        // memory write.
         let cap_lo = read_mmio32(bar0 + REG_CAP);
-        let dstrd = ((cap_lo >> 12) & 0xf) as usize;
+        let dstrd = (((cap_lo >> 12) & 0x3) as usize).min(3);
         let doorbell_stride = 4 << dstrd;
 
         // Admin SQ doorbell is at offset 0x1000
@@ -788,6 +821,8 @@ impl NvmeController {
         for _ in 0..READY_TIMEOUT {
             if self.admin_cq.has_completion() {
                 let cqe = self.admin_cq.consume()?;
+                // Signal the admin SQ that one in-flight slot is freed.
+                self.admin_sq.complete_one();
                 // Update doorbell
                 write_mmio32(
                     self.bar0 + self.admin_cq.doorbell_offset(),
@@ -894,6 +929,13 @@ impl NvmeNamespace {
             return Err(Error::InvalidArgument);
         }
 
+        // Only two PRP entries (prp1 + prp2) are used; transfers requiring
+        // more than 2*PAGE_SIZE bytes would DMA past prp2 into adjacent memory.
+        // Reject until a PRP-list path is implemented.
+        if needed > 2 * PAGE_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+
         let prp1 = buffer.as_ptr() as u64;
         let prp2 = if needed > PAGE_SIZE {
             prp1 + PAGE_SIZE as u64
@@ -924,6 +966,13 @@ impl NvmeNamespace {
             return Err(Error::InvalidArgument);
         }
         if lba + count as u64 > self.size_blocks {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Only two PRP entries (prp1 + prp2) are used; transfers requiring
+        // more than 2*PAGE_SIZE bytes would DMA past prp2 into adjacent memory.
+        // Reject until a PRP-list path is implemented.
+        if needed > 2 * PAGE_SIZE {
             return Err(Error::InvalidArgument);
         }
 
@@ -968,6 +1017,8 @@ impl NvmeNamespace {
         for _ in 0..READY_TIMEOUT {
             if pair.cq.has_completion() {
                 let cqe = pair.cq.consume()?;
+                // Signal the SQ that one in-flight slot is freed.
+                pair.sq.complete_one();
                 // Ring CQ doorbell
                 write_mmio32(ctrl.bar0 + pair.cq.doorbell_offset(), pair.cq.head() as u32);
                 if cqe.is_success() {
@@ -976,6 +1027,8 @@ impl NvmeNamespace {
                 return Err(Error::IoError);
             }
         }
+        // Timeout — command did not complete; the in-flight slot stays counted
+        // so subsequent submits do not overwrite a potentially-in-progress DMA.
         Err(Error::Busy)
     }
 

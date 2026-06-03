@@ -368,6 +368,14 @@ impl IoQueuePair {
         unsafe {
             let mut spin = 5_000_000u32;
             loop {
+                // Decrement spin on every iteration regardless of phase/CID match.
+                // A malicious device posting phase-correct CQEs with non-matching
+                // CIDs must not be able to loop this function forever (DoS).
+                if spin == 0 {
+                    return Err(Error::Busy);
+                }
+                spin -= 1;
+
                 let entry_addr = self.cq_virt + self.cq_head as u64 * 16;
                 let entry = core::ptr::read_volatile(entry_addr as *const CqEntry);
                 // Phase bit indicates this entry is fresh
@@ -387,13 +395,9 @@ impl IoQueuePair {
                             return Err(Error::IoError);
                         }
                     }
-                    // Different CID: continue polling
+                    // Different CID: continue polling (spin already decremented above)
                     continue;
                 }
-                if spin == 0 {
-                    return Err(Error::Busy);
-                }
-                spin -= 1;
                 core::hint::spin_loop();
             }
         }
