@@ -329,51 +329,60 @@ pub fn do_futex_cmp_requeue(
 
 /// Handler for `futex(FUTEX_CMP_REQUEUE_PI)`.
 ///
-/// Priority-inheritance variant of `FUTEX_CMP_REQUEUE`.  Exactly one
-/// waiter is woken from `uaddr1` (the highest-priority waiter), and the
-/// rest are requeued to the PI-futex `uaddr2`.  This is used when
-/// broadcasting on a PI-mutex-backed condition variable.
+/// Priority-inheritance variant of `FUTEX_CMP_REQUEUE`.  In a correct
+/// implementation exactly one waiter (the highest-priority one) is woken
+/// from the non-PI futex `uaddr1`, and the remaining waiters are requeued
+/// onto the PI-futex `uaddr2` **with the PI owner chain recorded and the
+/// mutex owner's priority boosted** for each requeued waiter.
 ///
-/// In this stub, priority inheritance is not tracked; the implementation
-/// delegates to the same wake/requeue logic.
+/// # Not implemented
+///
+/// The [`Waiter`] struct carries no owner field, and this crate has no
+/// PI owner-chain or priority-boosting infrastructure.  Performing a plain
+/// wake/requeue here would silently misrepresent PI semantics: a
+/// subsequent `FUTEX_UNLOCK_PI` would treat those waiters as ordinary
+/// non-PI waiters, violating lock integrity and defeating priority
+/// inheritance entirely.
+///
+/// Rather than pretend to implement PI, this function returns
+/// [`Error::NotImplemented`] (mapped to `ENOSYS` / -38 at the syscall
+/// boundary).  Callers that need `FUTEX_CMP_REQUEUE_PI` must wait until
+/// owner-chain tracking is added to this crate.
+///
+/// // TODO: implement real FUTEX_CMP_REQUEUE_PI — requires:
+/// //   1. `Waiter` gains an `owner_tid: u32` field.
+/// //   2. A PI owner-chain walker that boosts the mutex owner's effective
+/// //      priority for every requeued waiter (analogous to Linux's
+/// //      `rt_mutex_adjust_prio_chain`).
+/// //   3. `FUTEX_UNLOCK_PI` aware of the requeued waiters.
 ///
 /// # Arguments
 ///
-/// * `table`      — Global futex waiter table.
-/// * `uaddr1`     — Source non-PI futex (the condition variable's internal lock).
-/// * `uaddr2`     — Destination PI futex (the associated mutex).
-/// * `nr_requeue` — Maximum number of waiters to requeue to `uaddr2`.
-/// * `cmpval`     — Expected value of `*uaddr1`.
-/// * `flags`      — Futex flags.
-/// * `current_val` — Current value at `*uaddr1`.
+/// * `table`       — Global futex waiter table (unused; kept for API symmetry).
+/// * `uaddr1`      — Source non-PI futex address.
+/// * `uaddr2`      — Destination PI-futex address.
+/// * `nr_requeue`  — Maximum number of waiters to requeue (unused).
+/// * `cmpval`      — Expected value of `*uaddr1` (unused).
+/// * `flags`       — Futex flags (unused).
+/// * `current_val` — Current value at `*uaddr1` (unused).
 ///
 /// # Errors
 ///
-/// - [`Error::WouldBlock`]      — `*uaddr1 != cmpval`.
-/// - [`Error::InvalidArgument`] — Bad arguments.
+/// - [`Error::NotImplemented`] — always; PI owner-chain tracking is not
+///   yet available in this crate (maps to `ENOSYS` / -38).
 pub fn do_futex_cmp_requeue_pi(
-    table: &mut WaiterTable,
-    uaddr1: u64,
-    uaddr2: u64,
-    nr_requeue: u32,
-    cmpval: u32,
-    flags: u32,
-    current_val: u32,
+    _table: &mut WaiterTable,
+    _uaddr1: u64,
+    _uaddr2: u64,
+    _nr_requeue: u32,
+    _cmpval: u32,
+    _flags: u32,
+    _current_val: u32,
 ) -> Result<RequeueResult> {
-    validate_flags(flags)?;
-    validate_addr(uaddr1)?;
-    validate_addr(uaddr2)?;
-    validate_distinct_addrs(uaddr1, uaddr2)?;
-
-    if current_val != cmpval {
-        return Err(Error::WouldBlock);
-    }
-
-    // PI requeue: wake exactly 1, requeue the rest.
-    let woken = table.wake(uaddr1, 1);
-    let requeued = table.requeue(uaddr1, uaddr2, nr_requeue);
-
-    Ok(RequeueResult { woken, requeued })
+    // PI requeue requires owner-chain tracking and priority boosting that
+    // this stub does not implement.  Silently falling back to a plain
+    // requeue would corrupt PI semantics, so we surface ENOSYS instead.
+    Err(Error::NotImplemented)
 }
 
 // ---------------------------------------------------------------------------
@@ -508,25 +517,38 @@ mod tests {
     }
 
     // --- do_futex_cmp_requeue_pi ---
+    //
+    // FUTEX_CMP_REQUEUE_PI is not implemented: the Waiter struct has no owner
+    // field and there is no PI owner-chain / priority-boosting infrastructure.
+    // All call sites must receive ENOSYS (Error::NotImplemented) until full PI
+    // support is added.
 
     #[test]
-    fn cmp_requeue_pi_wakes_one_requeues_rest() {
+    fn cmp_requeue_pi_returns_not_implemented() {
         let mut t = WaiterTable::new();
         add_waiters(&mut t, 0xC000, 5);
 
-        let res = do_futex_cmp_requeue_pi(&mut t, 0xC000, 0xD000, 4, 7, FUTEX_SIZE_U32, 7).unwrap();
-        assert_eq!(res.woken, 1);
-        assert_eq!(res.requeued, 4);
+        // Any valid call must return NotImplemented (ENOSYS), not silently
+        // perform a plain requeue that violates PI semantics.
+        assert_eq!(
+            do_futex_cmp_requeue_pi(&mut t, 0xC000, 0xD000, 4, 7, FUTEX_SIZE_U32, 7),
+            Err(Error::NotImplemented)
+        );
+        // Waiters must be untouched — no spurious wake or move occurred.
+        assert_eq!(t.count_on(0xC000), 5);
+        assert_eq!(t.count_on(0xD000), 0);
     }
 
     #[test]
-    fn cmp_requeue_pi_value_mismatch_fails() {
+    fn cmp_requeue_pi_value_mismatch_also_returns_not_implemented() {
         let mut t = WaiterTable::new();
         add_waiters(&mut t, 0xC000, 3);
 
+        // Even a mismatched cmpval gets NotImplemented — the PI path is
+        // rejected before any cmpval check.
         assert_eq!(
             do_futex_cmp_requeue_pi(&mut t, 0xC000, 0xD000, 3, 5, FUTEX_SIZE_U32, 99),
-            Err(Error::WouldBlock)
+            Err(Error::NotImplemented)
         );
     }
 
