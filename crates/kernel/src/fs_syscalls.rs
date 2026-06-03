@@ -54,17 +54,29 @@ const DT_UNKNOWN: u8 = 0;
 /// accessible; we only check that the pointer is non-null and not in
 /// kernel canonical space.
 unsafe fn copy_user_path(user_ptr: u64, buf: &mut [u8; PATH_BUF_LEN]) -> Result<usize, i64> {
-    if user_ptr == 0 || user_ptr >= 0xFFFF_8000_0000_0000 {
+    if user_ptr == 0 {
         return Err(-14); // EFAULT
     }
-    let base = user_ptr as *const u8;
+    // Verify each 4 KiB page is backed before reading from it, one page at
+    // a time, so a NULL / non-canonical / unbacked path pointer returns
+    // EFAULT instead of faulting in ring 0 (which would halt the kernel).
+    let mut verified_until = user_ptr;
     let mut i = 0usize;
     loop {
         if i >= MAX_PATH {
             return Err(-36); // ENAMETOOLONG
         }
-        // SAFETY: pointer validated above; volatile to prevent reordering.
-        let byte = unsafe { base.add(i).read_volatile() };
+        let addr = user_ptr.checked_add(i as u64).ok_or(-14_i64)?;
+        if addr >= verified_until {
+            let page_end = (addr & !0xFFF) + 0x1000;
+            if crate::uaccess::verify_user_access(addr, page_end - addr, false).is_err() {
+                return Err(-14); // EFAULT — unbacked page
+            }
+            verified_until = page_end;
+        }
+        // SAFETY: the page containing `addr` was just proven backed for
+        // reading; volatile to prevent reordering.
+        let byte = unsafe { (addr as *const u8).read_volatile() };
         if byte == 0 {
             break;
         }

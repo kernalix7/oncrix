@@ -876,32 +876,30 @@ unsafe fn collect_user_argv(
     strs: &mut [[u8; MAX_ARG_STR]; MAX_ARGV],
     lens: &mut [usize; MAX_ARGV],
 ) -> usize {
-    if ptr_array == 0 || ptr_array >= 0xFFFF_8000_0000_0000 {
+    if ptr_array == 0 {
         return 0;
     }
     let mut count = 0usize;
-    let base = ptr_array as *const u64;
     while count < MAX_ARGV {
-        // SAFETY: reading one char* from the user-space array.
-        let str_ptr = unsafe { base.add(count).read_volatile() };
+        // Verify the 8-byte array slot is backed before reading the char*.
+        let slot_addr = match ptr_array.checked_add((count as u64) * 8) {
+            Some(a) => a,
+            None => break,
+        };
+        if crate::uaccess::verify_user_access(slot_addr, 8, false).is_err() {
+            break; // unbacked / non-canonical array slot
+        }
+        // SAFETY: the slot's page was just proven backed for reading.
+        let str_ptr = unsafe { (slot_addr as *const u64).read_volatile() };
         if str_ptr == 0 {
             break; // NULL terminator
         }
-        if str_ptr >= 0xFFFF_8000_0000_0000 {
-            break; // invalid pointer
+        // Copy the string with per-page backed verification; a bad/unbacked
+        // argv string stops collection rather than faulting in ring 0.
+        match unsafe { crate::uaccess::copy_user_cstr(&mut strs[count], str_ptr, MAX_ARG_STR) } {
+            Ok(n) => lens[count] = n,
+            Err(_) => break,
         }
-        let s = str_ptr as *const u8;
-        let mut i = 0usize;
-        while i < MAX_ARG_STR {
-            // SAFETY: reading one byte from user space string.
-            let byte = unsafe { s.add(i).read_volatile() };
-            if byte == 0 {
-                break;
-            }
-            strs[count][i] = byte;
-            i += 1;
-        }
-        lens[count] = i;
         count += 1;
     }
     count
@@ -1188,16 +1186,30 @@ fn copy_user_string(ptr: u64, max_len: usize) -> Option<&'static [u8]> {
     // SAFETY: single-CPU SYSCALL context; no aliased access to PATH_BUF.
     #[allow(static_mut_refs)]
     let buf = unsafe { &mut PATH_BUF };
-    let base = ptr as *const u8;
+    if ptr == 0 {
+        return None;
+    }
+    // Verify each 4 KiB page is backed before reading it, one page at a
+    // time, so a bad/unbacked pathname pointer returns None (→ EFAULT)
+    // rather than faulting in ring 0 (which would halt the kernel).
+    let mut verified_until = ptr;
     let mut i = 0usize;
 
     loop {
         if i >= max_len {
             return None; // Too long.
         }
-        // SAFETY: ptr is user-space (caller checked); we read one byte
-        // at a time with volatile to avoid compiler reordering.
-        let byte = unsafe { base.add(i).read_volatile() };
+        let addr = ptr.checked_add(i as u64)?;
+        if addr >= verified_until {
+            let page_end = (addr & !0xFFF) + 0x1000;
+            if crate::uaccess::verify_user_access(addr, page_end - addr, false).is_err() {
+                return None; // unbacked page
+            }
+            verified_until = page_end;
+        }
+        // SAFETY: the page containing `addr` was just proven backed for
+        // reading; volatile to avoid compiler reordering.
+        let byte = unsafe { (addr as *const u8).read_volatile() };
         if byte == 0 {
             break;
         }
