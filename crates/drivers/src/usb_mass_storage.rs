@@ -649,11 +649,19 @@ impl UsbMscDevice {
     /// Uses READ(10) for LBAs up to `u32::MAX` (blocks ≤ 65535).
     /// `buf` must be at least `count * block_size` bytes.
     pub fn read_blocks(&mut self, lun: u8, lba: u32, count: u16, buf: &mut [u8]) -> Result<()> {
+        // Reject an out-of-range LUN before indexing the fixed-size array.
+        if lun as usize >= MAX_LUNS {
+            return Err(Error::InvalidArgument);
+        }
         let lun_info = self.luns[lun as usize];
         if !lun_info.ready {
             return Err(Error::Busy);
         }
-        let expected = count as usize * lun_info.block_size as usize;
+        // Use checked arithmetic: a device-supplied block_size of u32::MAX
+        // combined with any non-zero count overflows a plain multiplication.
+        let expected = (count as u32)
+            .checked_mul(lun_info.block_size)
+            .ok_or(Error::InvalidArgument)? as usize;
         if buf.len() < expected {
             return Err(Error::InvalidArgument);
         }
@@ -690,6 +698,10 @@ impl UsbMscDevice {
     ///
     /// Uses WRITE(10). `buf` must contain at least `count * block_size` bytes.
     pub fn write_blocks(&mut self, lun: u8, lba: u32, count: u16, buf: &mut [u8]) -> Result<()> {
+        // Reject an out-of-range LUN before indexing the fixed-size array.
+        if lun as usize >= MAX_LUNS {
+            return Err(Error::InvalidArgument);
+        }
         let lun_info = self.luns[lun as usize];
         if !lun_info.ready {
             return Err(Error::Busy);
@@ -697,7 +709,11 @@ impl UsbMscDevice {
         if lun_info.write_protected {
             return Err(Error::PermissionDenied);
         }
-        let expected = count as usize * lun_info.block_size as usize;
+        // Use checked arithmetic: a device-supplied block_size of u32::MAX
+        // combined with any non-zero count overflows a plain multiplication.
+        let expected = (count as u32)
+            .checked_mul(lun_info.block_size)
+            .ok_or(Error::InvalidArgument)? as usize;
         if buf.len() < expected {
             return Err(Error::InvalidArgument);
         }
@@ -734,6 +750,10 @@ impl UsbMscDevice {
     ///
     /// Populates `self.luns[0..=max_lun]` with geometry and vendor info.
     pub fn init(&mut self) -> Result<()> {
+        // max_lun is device-supplied (GET_MAX_LUN); cap it so the loop can
+        // never produce an index >= MAX_LUNS regardless of what the device
+        // reports.
+        self.max_lun = self.max_lun.min((MAX_LUNS - 1) as u8);
         for lun_idx in 0..=self.max_lun {
             let lun = lun_idx;
 

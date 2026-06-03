@@ -428,14 +428,25 @@ impl E1000e {
     /// # Parameters
     /// - `rx_ring`: Reference to the RX descriptor ring.
     ///
-    /// Returns the descriptor index and packet length, or `None` if no packet is ready.
+    /// Returns the descriptor index and packet length (clamped to
+    /// `BUFFER_SIZE`), or `None` if no packet is ready or if the
+    /// descriptor error bits are set (malicious/buggy device guard).
     ///
     /// # Safety
     /// RX ring must have been initialized and all buffers programmed.
     pub unsafe fn recv_packet(&mut self, rx_ring: &[RxDesc; RING_SIZE]) -> Option<(usize, u16)> {
         let idx = self.rx_head;
         if rx_ring[idx].status & RX_STATUS_DD != 0 {
-            let len = rx_ring[idx].length;
+            // Descriptors with error bits set indicate a corrupted or
+            // maliciously crafted frame — discard them.
+            if rx_ring[idx].errors != 0 {
+                self.rx_head = (idx + 1) % RING_SIZE;
+                return None;
+            }
+            // `length` is device-written and may be attacker-controlled
+            // (up to 65535). Clamp to the physical buffer size so callers
+            // cannot perform an out-of-bounds read of the 2 KiB buffer.
+            let len = rx_ring[idx].length.min(BUFFER_SIZE as u16);
             let slot = idx;
             self.rx_head = (idx + 1) % RING_SIZE;
             Some((slot, len))

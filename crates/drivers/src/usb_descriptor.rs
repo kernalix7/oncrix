@@ -520,7 +520,13 @@ impl<'a> DescriptorParser<'a> {
                         continue;
                     }
                     let iface = self.parse_interface()?;
-                    let ep_count = iface.num_endpoints as usize;
+                    // bNumEndpoints is device-supplied; a malicious device may
+                    // set it to 255, which would cause up to 255 parse/skip
+                    // calls per interface (2040 total at 8 interfaces) in
+                    // ring-0 context. Cap to MAX_ENDPOINTS so the loop
+                    // terminates promptly after processing the actual endpoints
+                    // we can store.
+                    let ep_count = (iface.num_endpoints as usize).min(MAX_ENDPOINTS);
                     let mut parsed = ParsedInterface::EMPTY;
                     parsed.descriptor = iface;
 

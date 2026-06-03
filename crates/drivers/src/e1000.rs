@@ -623,7 +623,8 @@ impl E1000Device {
     /// If a completed receive descriptor is available, returns
     /// `Some((descriptor_index, length))`. The caller can then read
     /// the packet data from the corresponding receive buffer.
-    /// Returns `None` if no packet is ready.
+    /// Returns `None` if no packet is ready or if the descriptor
+    /// reports a zero-length or oversized frame (malicious device guard).
     pub fn receive(&mut self) -> Option<(usize, usize)> {
         if !self.initialized {
             return None;
@@ -635,7 +636,22 @@ impl E1000Device {
             return None;
         }
 
-        let length = self.rx_ring[idx].length as usize;
+        // The `length` field is written by the hardware/device and may be
+        // attacker-controlled (malicious or buggy NIC). Cap it to BUF_SIZE
+        // to prevent any caller from performing an out-of-bounds read of the
+        // 2 KiB receive buffer. Also reject length == 0: a valid RX
+        // completion always carries at least a minimal Ethernet frame.
+        let raw_len = self.rx_ring[idx].length as usize;
+        if raw_len == 0 {
+            // Malformed descriptor — recycle it silently.
+            self.rx_ring[idx].status = 0;
+            self.rx_ring[idx].length = 0;
+            self.rx_tail = (idx + 1) % RX_DESC_COUNT;
+            self.write_reg(REG_RDT, idx as u32);
+            return None;
+        }
+        // Clamp to the actual buffer size; excess bytes are discarded.
+        let length = raw_len.min(BUF_SIZE);
 
         // Reset the descriptor for reuse.
         self.rx_ring[idx].status = 0;

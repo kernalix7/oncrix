@@ -227,7 +227,17 @@ impl Virtqueue {
     }
 
     /// Free a descriptor back to the free list.
+    ///
+    /// Silently ignores indices that are out of range; such values can
+    /// originate from device-controlled descriptor chain `.next` fields
+    /// and must not be used to index the descriptor table.
     pub fn free_desc(&mut self, idx: u16) {
+        // Guard against device-supplied out-of-range indices.
+        // A malicious device can write any value into `.next`; using it
+        // without validation would produce an OOB write into kernel memory.
+        if idx as usize >= MAX_QUEUE_SIZE {
+            return;
+        }
         self.desc[idx as usize].next = self.free_head;
         self.free_head = idx;
     }
@@ -243,7 +253,8 @@ impl Virtqueue {
     /// Pop a completed request from the used ring.
     ///
     /// Returns `(desc_chain_head, bytes_written)` or `None` if no
-    /// new completions.
+    /// new completions or if the device-supplied descriptor id is out
+    /// of range (spurious/malicious completion guard).
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         if self.last_used_idx == self.used_idx {
             return None;
@@ -251,6 +262,15 @@ impl Virtqueue {
         let idx = self.last_used_idx as usize % MAX_QUEUE_SIZE;
         let elem = self.used_ring[idx];
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
+
+        // `elem.id` is written by the device (DMA) and is therefore
+        // attacker-controlled. Validate it against MAX_QUEUE_SIZE before
+        // returning it as a descriptor-table index. An out-of-range id
+        // would otherwise allow the caller to index past the 128-entry
+        // `desc` array, causing kernel memory corruption or a panic.
+        if elem.id as usize >= MAX_QUEUE_SIZE {
+            return None;
+        }
         Some((elem.id as u16, elem.len))
     }
 }

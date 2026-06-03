@@ -229,7 +229,12 @@ impl BtUsb {
             }
         }
         // Event format: 0x04, event_code, plen, params...
-        if self.event_len >= 2 {
+        // We need at least 3 bytes (packet-type, event-code, plen) before
+        // reading index 2. A guard of >= 2 would read event_buf[2] when
+        // event_len == 2, accessing a stale byte from a prior (or
+        // zero-initialized) event and potentially injecting a phantom event
+        // code or de-syncing the HCI stream.
+        if self.event_len >= 3 {
             let plen = self.event_buf[2] as usize;
             if self.event_len >= 3 + plen {
                 let code = self.event_buf[1];

@@ -312,8 +312,12 @@ impl AhciHbaRegs {
     }
 
     /// Return the number of command slots supported (from CAP).
+    ///
+    /// CAP bits 12:8 encode NCS (0-based), clamped to the [1, MAX_CMD_SLOTS]
+    /// range so a malicious device cannot produce an out-of-bounds slot index.
     pub fn num_cmd_slots(&self) -> u32 {
-        ((self.cap() >> 8) & 0x1F) + 1
+        let raw = ((self.cap() >> 8) & 0x1F) + 1;
+        raw.min(MAX_CMD_SLOTS as u32)
     }
 
     /// Return the number of ports supported (from CAP).
@@ -919,8 +923,17 @@ impl AhciPort {
     ///
     /// - `hba_base` — virtual base address of HBA register space
     /// - `port_num` — port index (0..31)
-    /// - `num_cmd_slots` — from HBA CAP register
+    /// - `num_cmd_slots` — from HBA CAP register; clamped to MAX_CMD_SLOTS
     pub const fn new(hba_base: usize, port_num: u32, num_cmd_slots: u32) -> Self {
+        // SAFETY invariant: clamp so find_free_slot never returns an index
+        // that would exceed the fixed-size cmd_table_phys array.
+        let num_cmd_slots = if num_cmd_slots > MAX_CMD_SLOTS as u32 {
+            MAX_CMD_SLOTS as u32
+        } else if num_cmd_slots == 0 {
+            1
+        } else {
+            num_cmd_slots
+        };
         Self {
             regs: AhciPortRegs::new(hba_base, port_num),
             port_num,
@@ -1364,6 +1377,11 @@ impl AhciDisk {
         cmd_table_phys: &[u64],
         cmd_table_virt: &[usize],
     ) -> Self {
+        // Clamp num_cmd_slots to the fixed array bound so find_free_slot
+        // never produces an index >= MAX_CMD_SLOTS even if the caller
+        // forwards a raw device-supplied value.
+        let num_cmd_slots = num_cmd_slots.min(MAX_CMD_SLOTS as u32).max(1);
+
         let mut ct_phys = [0u64; MAX_CMD_SLOTS];
         let mut ct_virt = [0usize; MAX_CMD_SLOTS];
         let n = core::cmp::min(
@@ -1581,7 +1599,17 @@ impl AhciDisk {
         self.write_fis_to_table(ct_virt, &fis);
 
         // Set up the single PRDT entry.
-        let byte_count = (count as u32).saturating_mul(SECTOR_SIZE as u32);
+        // AHCI 1.3.1 §4.2.3: one PRDT entry's DBC field is 22 bits
+        // (zero-based), so the maximum transfer is 4 MiB (0x400000 bytes).
+        // A device-controlled count of > 8192 sectors would exceed this limit
+        // and cause the HBA to silently truncate the transfer, producing silent
+        // data corruption. Reject before issuing the command.
+        let byte_count = (count as u32)
+            .checked_mul(SECTOR_SIZE as u32)
+            .ok_or(Error::InvalidArgument)?;
+        if byte_count > 4 * 1024 * 1024 {
+            return Err(Error::InvalidArgument);
+        }
         self.setup_prdt_entry(ct_virt, 0, buf_phys, byte_count);
 
         self.issue_and_wait(slot)

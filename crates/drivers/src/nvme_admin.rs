@@ -337,9 +337,26 @@ impl AdminQueuePair {
     }
 
     /// Marks a command ID as completed (frees the slot).
-    pub fn complete_cid(&mut self, cid: u16) {
-        let idx = (cid as usize) % ADMIN_QUEUE_DEPTH;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `cid` is out of range or was not
+    /// actually in-flight.  A device returning a spoofed CID must not be able to
+    /// silently corrupt the pending map or free a slot that belongs to a
+    /// different command.
+    pub fn complete_cid(&mut self, cid: u16) -> Result<()> {
+        // Reject device-supplied CIDs outside the queue depth entirely.
+        if cid as usize >= ADMIN_QUEUE_DEPTH {
+            return Err(Error::InvalidArgument);
+        }
+        let idx = cid as usize;
+        // Require the slot to have been genuinely allocated; clearing an
+        // unallocated slot would allow alloc_cid to hand out a duplicate CID.
+        if !self.pending[idx] {
+            return Err(Error::InvalidArgument);
+        }
         self.pending[idx] = false;
+        Ok(())
     }
 
     /// Rings the SQ doorbell to notify the controller of new entries.
@@ -658,7 +675,17 @@ impl IdentifyNamespace {
             self.raw[lbaf_offset + 3],
         ]);
         let lbads = ((lbaf >> 16) & 0xFF) as u32;
-        if lbads == 0 { 512 } else { 1u32 << lbads }
+        // Clamp LBADS to 9..=16 (512 B to 64 KiB) before shifting.
+        // A device can write any value in bits [23:16]; without the clamp
+        // `1u32 << lbads` panics in debug (shift overflow) or wraps to 0
+        // in release for lbads >= 32.
+        if lbads == 0 {
+            512
+        } else if lbads < 9 || lbads > 16 {
+            512 // unsupported / malicious value — fall back to 512-byte sectors
+        } else {
+            1u32 << lbads
+        }
     }
 }
 
@@ -741,12 +768,18 @@ impl NvmeAdminManager {
     }
 
     /// Records a completed admin command, incrementing counters.
-    pub fn record_completion(&mut self, cqe: &NvmeCqe) {
-        self.admin_queue.complete_cid(cqe.cid());
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the CQE carries a CID that is out
+    /// of range or was not actually in-flight (device protocol error).
+    pub fn record_completion(&mut self, cqe: &NvmeCqe) -> Result<()> {
+        self.admin_queue.complete_cid(cqe.cid())?;
         self.commands_completed += 1;
         if !cqe.is_success() {
             self.command_errors += 1;
         }
+        Ok(())
     }
 
     /// Records a submitted command, incrementing the counter.

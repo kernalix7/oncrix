@@ -413,11 +413,18 @@ pub fn build_set_features(fid: u8, cdw11: u32) -> AdminSqe {
 
 /// Parse identify controller bytes from a raw 4096-byte buffer.
 ///
+/// The NVMe spec (Section 5.17.2) defines the Identify Controller data
+/// structure as exactly 4096 bytes.  In particular, the Number of Namespaces
+/// (NN) field lives at bytes 519:516 — requiring a minimum of 520 bytes.
+/// We enforce the full 4096-byte size so that every spec-defined field can
+/// be accessed safely without the `% buf.len()` wrap that would silently
+/// read the wrong byte when the device returns a short buffer.
+///
 /// # Errors
 ///
-/// Returns [`Error::InvalidArgument`] if `buf` is shorter than 256 bytes.
+/// Returns [`Error::InvalidArgument`] if `buf` is shorter than 4096 bytes.
 pub fn parse_identify_ctrl(buf: &[u8]) -> Result<IdentifyController> {
-    if buf.len() < 256 {
+    if buf.len() < 4096 {
         return Err(Error::InvalidArgument);
     }
     let mut ctrl = IdentifyController::default();
@@ -427,6 +434,8 @@ pub fn parse_identify_ctrl(buf: &[u8]) -> Result<IdentifyController> {
     ctrl.mn.copy_from_slice(&buf[24..64]);
     ctrl.fr.copy_from_slice(&buf[64..72]);
     ctrl.mdts = buf[77];
-    ctrl.nn = u32::from_le_bytes([buf[516 % buf.len()], 0, 0, 0]);
+    // NN is a 4-byte little-endian value at bytes 519:516 (NVMe spec §5.17.2).
+    // Access directly — the length guard above guarantees buf.len() >= 4096.
+    ctrl.nn = u32::from_le_bytes([buf[516], buf[517], buf[518], buf[519]]);
     Ok(ctrl)
 }
