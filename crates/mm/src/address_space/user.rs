@@ -453,6 +453,15 @@ impl UserAddressSpace {
 
             // Copy each in-use mmap page.
             for page_index in 0..used {
+                // Keep `mmap_used_pages` consistent with the pages already
+                // processed so that, if a later iteration's
+                // `allocate_frame` fails, `child.release(alloc)` reclaims
+                // every frame committed so far instead of leaking them
+                // (ring-3-triggerable frame-exhaustion DoS otherwise).
+                // `release` skips not-present PTEs, so covering skipped
+                // (non-present) pages here is harmless, and the final
+                // value matches `self.mmap_used_pages`.
+                child.mmap_used_pages = (page_index as u32).saturating_add(1);
                 // Read parent PTE.
                 // SAFETY: parent_pt_phys is page-aligned and exclusively
                 // accessed via phys_to_virt during this single-CPU call.
@@ -485,7 +494,9 @@ impl UserAddressSpace {
                     *child_pt.add(page_index) = new_frame.start_addr().as_u64() | flags_only;
                 }
             }
-            child.mmap_used_pages = self.mmap_used_pages;
+            // `mmap_used_pages` was advanced incrementally inside the loop
+            // (see comment above); after the final iteration it equals
+            // `self.mmap_used_pages`, so no post-loop assignment is needed.
         }
 
         Ok(child)

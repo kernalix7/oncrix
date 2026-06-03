@@ -234,7 +234,16 @@ pub unsafe fn sys_fork() -> i64 {
         if let Some(child_thread) = sched.get_mut(child_tid) {
             child_thread.user_address_space = Some(child_uas);
         } else {
-            // Should not happen — fork_current just inserted child_tid.
+            // Should not happen — fork_current just inserted child_tid. If it
+            // did, pull the orphaned child back out and undo the fd-backend
+            // refcount bumps `arch_clone_thread` applied to its inherited
+            // handles before dropping it, otherwise those out-of-band counts
+            // leak permanently (nothing in `Thread::Drop` rebalances them).
+            if let Ok(orphan) = sched.remove(child_tid) {
+                for (_fd, handle) in orphan.fd_table.iter() {
+                    crate::fd_table::undo_backend_refcount_bump(handle.backend);
+                }
+            }
             let alloc = crate::frame_alloc::frame_alloc();
             child_uas.release(alloc);
             return -12; // ENOMEM
@@ -284,7 +293,12 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
     // Validate the status pointer BEFORE reaping any zombie. A bad pointer
     // must fail with -EFAULT without consuming the child (otherwise the
     // status is lost irrecoverably). `0` means "no status wanted".
-    if wstatus_ptr != 0 && wstatus_ptr >= 0xFFFF_8000_0000_0000 {
+    //
+    // Reserve the full 4-byte `i32` width: a pointer in [boundary-3,
+    // boundary-1] would straddle the kernel half on the write below, so the
+    // base-only check is widened by `- 4` (mirrors sys_waitid's
+    // `- SIGINFO_SIZE`).
+    if wstatus_ptr != 0 && wstatus_ptr >= 0xFFFF_8000_0000_0000 - 4 {
         return -14; // EFAULT
     }
 
@@ -328,10 +342,13 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
 
         if let Some((zombie_pid, exit_code)) = found {
             // Write wstatus to user space if pointer is non-null and valid.
-            if wstatus_ptr != 0 && wstatus_ptr < 0xFFFF_8000_0000_0000 {
+            // The `- 4` reserves the full i32 width so the write cannot
+            // straddle the kernel half (mirrors the pre-check above).
+            if wstatus_ptr != 0 && wstatus_ptr < 0xFFFF_8000_0000_0000 - 4 {
                 // SAFETY: Phase 10c assumes cooperative userspace. The pointer
-                // is non-null and below the kernel canonical half. Full
-                // validation (page presence, alignment) is deferred.
+                // is non-null and the full 4-byte write stays below the kernel
+                // canonical half. Full validation (page presence, alignment)
+                // is deferred.
                 unsafe {
                     (wstatus_ptr as *mut i32).write_volatile(exit_code << 8);
                 }

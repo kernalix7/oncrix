@@ -157,8 +157,31 @@ pub unsafe fn sync_tss_rsp0_with_current() {
 pub unsafe fn fork_current(snapshot: ForkSnapshot) -> Result<Tid> {
     let parent = current_thread().ok_or(Error::NotFound)?;
     let child = arch_clone_thread(parent, &snapshot)?;
-    let tid = child.tid();
+
+    // `arch_clone_thread` has already bumped the fd-backend refcounts of every
+    // inherited handle. If `spawn_thread` fails (e.g. the scheduler table is
+    // full → `OutOfMemory`), `child` is moved into `add` and dropped without
+    // any `Drop` impl rebalancing those out-of-band counts. Snapshot the
+    // inherited backends now so the error path can release each bump.
+    let mut inherited = [None; oncrix_process::fd_table::MAX_FDS];
+    let mut n_inherited = 0usize;
+    for (_fd, handle) in child.fd_table.iter() {
+        inherited[n_inherited] = Some(handle.backend);
+        n_inherited += 1;
+    }
+
     // SAFETY: module-level invariants.
-    unsafe { spawn_thread(child)? };
-    Ok(tid)
+    match unsafe { spawn_thread(child) } {
+        Ok(tid) => Ok(tid),
+        Err(e) => {
+            // Undo each inherited backend bump before propagating the error;
+            // `child` is already gone, so we use the pre-snapshotted list.
+            for backend in inherited.iter().take(n_inherited).flatten() {
+                // SAFETY: single-CPU SYSCALL context; backends came from the
+                // child table whose refcounts `arch_clone_thread` bumped.
+                unsafe { crate::fd_table::undo_backend_refcount_bump(*backend) };
+            }
+            Err(e)
+        }
+    }
 }

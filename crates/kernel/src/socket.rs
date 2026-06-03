@@ -546,9 +546,10 @@ const SOCK_PATH_MAX: usize = 108;
 ///
 /// `path_ptr` must point into user-space (checked against canonical boundary).
 unsafe fn copy_socket_path(path_ptr: u64, buf: &mut [u8; SOCK_PATH_MAX]) -> Result<usize> {
-    if path_ptr == 0 || path_ptr >= 0xFFFF_8000_0000_0000 {
-        return Err(Error::InvalidArgument);
-    }
+    // Validate the full span we may read so a low/non-canonical/boundary
+    // pointer faults here as EINVAL rather than triggering a #GP or a ring-0
+    // fault inside the byte loop below.
+    crate::uaccess::validate_user_range(path_ptr, SOCK_PATH_MAX as u64)?;
     // SAFETY: caller guarantees `path_ptr` is below the kernel canonical boundary.
     unsafe {
         let base = path_ptr as *const u8;
@@ -628,7 +629,8 @@ pub unsafe fn sys_socket(domain: u64, sock_type: u64, _protocol: u64) -> i64 {
 ///
 /// Must be called from the SYSCALL dispatch path.
 pub unsafe fn sys_bind(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
-    if addr_ptr == 0 || addr_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate the 2-byte family read before dereferencing.
+    if crate::uaccess::validate_user_range(addr_ptr, 2).is_err() {
         return -14; // EFAULT
     }
 
@@ -639,10 +641,15 @@ pub unsafe fn sys_bind(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
         return -97; // EAFNOSUPPORT
     }
 
-    // Read the Unix path (bytes 2..2+SOCK_PATH_MAX).
+    // Read the Unix path (bytes 2..2+SOCK_PATH_MAX). Use checked_add so the
+    // path base cannot wrap past the address space.
+    let path_ptr = match addr_ptr.checked_add(2) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
     let mut path_buf = [0u8; SOCK_PATH_MAX];
     let path_len = unsafe {
-        match copy_socket_path(addr_ptr + 2, &mut path_buf) {
+        match copy_socket_path(path_ptr, &mut path_buf) {
             Ok(n) => n,
             Err(_) => return -22, // EINVAL
         }
@@ -757,7 +764,8 @@ pub unsafe fn sys_accept(sockfd: u64, _addr_ptr: u64, _addrlen_ptr: u64) -> i64 
 ///
 /// Must be called from the SYSCALL dispatch path.
 pub unsafe fn sys_connect(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
-    if addr_ptr == 0 || addr_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate the 2-byte family read before dereferencing.
+    if crate::uaccess::validate_user_range(addr_ptr, 2).is_err() {
         return -14; // EFAULT
     }
 
@@ -768,9 +776,14 @@ pub unsafe fn sys_connect(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
         return -97; // EAFNOSUPPORT
     }
 
+    // Use checked_add so the path base cannot wrap past the address space.
+    let path_ptr = match addr_ptr.checked_add(2) {
+        Some(p) => p,
+        None => return -14, // EFAULT
+    };
     let mut path_buf = [0u8; SOCK_PATH_MAX];
     let path_len = unsafe {
-        match copy_socket_path(addr_ptr + 2, &mut path_buf) {
+        match copy_socket_path(path_ptr, &mut path_buf) {
             Ok(n) => n,
             Err(_) => return -22,
         }
@@ -819,10 +832,12 @@ pub unsafe fn sys_sendto(
     /// progress for other work.
     const MAX_SPINS: u32 = 4096;
 
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    let count = (len as usize).min(4096);
+    // Validate exactly the span we will read so a low/non-canonical/boundary
+    // pointer faults here as EFAULT rather than in the byte loop.
+    if crate::uaccess::validate_user_range(buf_ptr, count as u64).is_err() {
         return -14; // EFAULT
     }
-    let count = (len as usize).min(4096);
     let handle_id = match get_socket_fd(sockfd) {
         Some(id) => id,
         None => return -9,
@@ -889,10 +904,13 @@ pub unsafe fn sys_recvfrom(
     _src: u64,
     _slen: u64,
 ) -> i64 {
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    let count = (len as usize).min(4096);
+    // Validate exactly the span we may write so a low/non-canonical/boundary
+    // pointer faults here as EFAULT rather than in the write loop. At most
+    // `count` bytes (`n <= count`) are written, so this span fully covers it.
+    if crate::uaccess::validate_user_range(buf_ptr, count as u64).is_err() {
         return -14; // EFAULT
     }
-    let count = (len as usize).min(4096);
     let handle_id = match get_socket_fd(sockfd) {
         Some(id) => id,
         None => return -9,

@@ -426,9 +426,13 @@ pub fn parse_ipv4(data: &[u8]) -> Result<(Ipv4Header, &[u8])> {
         dst_addr: [data[16], data[17], data[18], data[19]],
     };
 
-    // Determine actual payload range.
+    // Determine actual payload range.  A crafted frame can carry a
+    // `total_len` smaller than the header it declares (large IHL plus a
+    // tiny non-zero `total_len`); clamping must keep
+    // `hdr_len <= payload_end <= data.len()` so the slice below never has
+    // start > end (which would panic).
     let total = header.total_len as usize;
-    let payload_end = if total > 0 && total <= data.len() {
+    let payload_end = if total >= hdr_len && total <= data.len() {
         total
     } else {
         data.len()

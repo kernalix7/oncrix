@@ -31,10 +31,70 @@ use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
 use oncrix_lib::{Error, Result};
 
+use crate::uaccess::validate_user_range;
+
 // Re-export the data types from oncrix_process so callers only import from here.
 pub use oncrix_process::fd_table::{
     DevFileKind, FileBackend, FileHandle, HandleFlags, KernelFdTable, MAX_FDS, ProcFileKind,
 };
+
+/// Undo a single inherited fd-backend reference-count bump.
+///
+/// `arch_clone_thread` bumps the backing-object refcount of every inherited
+/// pipe / socketpair / eventfd / epoll / timerfd / signalfd / socket fd so
+/// that `close(2)` on either the parent or child decrements correctly. When a
+/// fork fails *after* those bumps but *before* the child becomes a reachable,
+/// reapable process, nothing in `Thread::Drop` rebalances the out-of-band
+/// counts. The fork failure paths call this helper for each inherited handle
+/// to release the bump with the matching close function, mirroring the bump
+/// set in [`crate::arch::x86_64::clone::arch_clone_thread`].
+///
+/// Backends without an out-of-band refcount (`Console`, `RamfsFile`,
+/// `DevFile`, `ProcFile`) are a no-op, exactly as they are skipped on the
+/// bump side.
+///
+/// # Safety
+///
+/// Must be called from the SYSCALL dispatch path (single-CPU, interrupts
+/// disabled) — the sole-accessor invariant of every backend table. The
+/// `backend` must come from a child fd table whose refcounts were bumped by a
+/// matching `arch_clone_thread` call; calling it for any other reason would
+/// under-count and free a still-referenced object.
+pub unsafe fn undo_backend_refcount_bump(backend: FileBackend) {
+    // SAFETY: caller upholds the single-CPU SYSCALL-context invariant for
+    // every backend table touched below.
+    unsafe {
+        match backend {
+            FileBackend::Pipe {
+                ring_id,
+                is_write_end,
+            } => {
+                if is_write_end {
+                    crate::pipe::pipe_close_write(ring_id);
+                } else {
+                    crate::pipe::pipe_close_read(ring_id);
+                }
+            }
+            FileBackend::SocketPair {
+                read_ring,
+                write_ring,
+            } => {
+                crate::pipe::pipe_close_read(read_ring);
+                crate::pipe::pipe_close_write(write_ring);
+            }
+            FileBackend::EventFd { id } => eventfd_close(id),
+            FileBackend::EpollInstance { id } => epoll_close(id),
+            FileBackend::TimerFd { id } => timerfd_close(id),
+            FileBackend::SignalFd { id } => signalfd_close(id),
+            FileBackend::Socket { handle_id } => crate::socket::socket_close(handle_id),
+            // No out-of-band refcount; nothing to undo (matches the bump side).
+            FileBackend::Console
+            | FileBackend::RamfsFile { .. }
+            | FileBackend::DevFile { .. }
+            | FileBackend::ProcFile { .. } => {}
+        }
+    }
+}
 
 // ── eventfd backing store ─────────────────────────────────────────
 
@@ -563,7 +623,10 @@ pub unsafe fn sys_epoll_ctl(epfd: usize, op: i32, fd: usize, event_ptr: u64) -> 
 
     // Read the epoll_event for ADD/MOD (packed: events @0 u32, data @4 u64).
     let (events, data) = if op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD {
-        if event_ptr == 0 || event_ptr >= 0xFFFF_8000_0000_0000 {
+        // Validate the full 12-byte packed `epoll_event` span — not just the
+        // base — so the `u64 data` read at offset 4 cannot straddle the
+        // user/kernel boundary.
+        if validate_user_range(event_ptr, 12).is_err() {
             return -14; // EFAULT
         }
         // SAFETY: pointer validated user-canonical above; unaligned packed read.
@@ -657,7 +720,13 @@ pub unsafe fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: i32, timeo
     if maxevents <= 0 {
         return -22; // EINVAL
     }
-    if events_ptr == 0 || events_ptr >= 0xFFFF_8000_0000_0000 {
+    let maxevents = maxevents as usize;
+    // The write loop emits at most `min(maxevents, MAX_EPOLL_INTERESTS)`
+    // entries of 12 bytes each. Validate the whole span up front so a later
+    // entry cannot straddle into the kernel half (base-only validation let
+    // entries past the first overrun the boundary).
+    let max_written = maxevents.min(MAX_EPOLL_INTERESTS);
+    if validate_user_range(events_ptr, (max_written as u64) * 12).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: single-CPU SYSCALL context.
@@ -665,7 +734,6 @@ pub unsafe fn sys_epoll_wait(epfd: usize, events_ptr: u64, maxevents: i32, timeo
         Some(id) => id,
         None => return -9, // EBADF
     };
-    let maxevents = maxevents as usize;
 
     let deadline = if timeout_ms > 0 {
         let ticks = (timeout_ms as u64).saturating_mul(POLL_TIMER_HZ) / 1000;
@@ -1077,10 +1145,12 @@ pub unsafe fn sys_timerfd_settime(fd: usize, flags: i32, new_ptr: u64, old_ptr: 
     if flags & !TFD_TIMER_ABSTIME != 0 {
         return -22; // EINVAL
     }
-    if new_ptr == 0 || new_ptr >= 0xFFFF_8000_0000_0000 {
+    // `read_itimerspec`/`write_itimerspec` touch the full 32-byte struct;
+    // validate the whole span so the tail field cannot cross the boundary.
+    if validate_user_range(new_ptr, 32).is_err() {
         return -14; // EFAULT
     }
-    if old_ptr != 0 && old_ptr >= 0xFFFF_8000_0000_0000 {
+    if old_ptr != 0 && validate_user_range(old_ptr, 32).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: single-CPU SYSCALL context.
@@ -1148,7 +1218,9 @@ pub unsafe fn sys_timerfd_settime(fd: usize, flags: i32, new_ptr: u64, old_ptr: 
 ///
 /// Must be called from the SYSCALL dispatch path.
 pub unsafe fn sys_timerfd_gettime(fd: usize, cur_ptr: u64) -> i64 {
-    if cur_ptr == 0 || cur_ptr >= 0xFFFF_8000_0000_0000 {
+    // `write_itimerspec` writes the full 32-byte struct; validate the whole
+    // span so the tail field cannot cross the user/kernel boundary.
+    if validate_user_range(cur_ptr, 32).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: single-CPU SYSCALL context.
@@ -2267,7 +2339,11 @@ pub unsafe fn sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> i64 {
     if nfds > POLL_MAX_FDS {
         return -22; // EINVAL
     }
-    if fds_ptr == 0 || fds_ptr >= 0xFFFF_8000_0000_0000 {
+    // Each `pollfd` is 8 bytes; the read (fd@0, events@4) and the write-back
+    // (revents@6) both stay within `nfds * 8` bytes. Validate the full span so
+    // the last entry cannot straddle into the kernel half. `nfds <=
+    // POLL_MAX_FDS` keeps the multiply far from overflow.
+    if validate_user_range(fds_ptr, (nfds as u64) * 8).is_err() {
         return -14; // EFAULT
     }
 
