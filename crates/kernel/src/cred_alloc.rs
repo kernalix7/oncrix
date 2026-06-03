@@ -281,10 +281,23 @@ impl CredAllocator {
     }
 
     /// Prepare new credentials by copying the task's current ones.
+    ///
+    /// Enforces a single outstanding prepared credential per task: if
+    /// a prior `prepare_creds` was never committed or aborted, its
+    /// orphaned slot is reclaimed before a new one is allocated. This
+    /// prevents pool exhaustion (denial of service) when a task calls
+    /// `prepare_creds` repeatedly without an intervening commit/abort.
     pub fn prepare_creds(&mut self, task_id: u64) -> Result<u64> {
         let tidx = task_id as usize;
         if tidx >= MAX_TASKS || !self.tasks[tidx].in_use {
             return Err(Error::NotFound);
+        }
+        // Reclaim any stale prepared slot so it cannot be orphaned.
+        // The normal prepare->commit flow leaves this at 0 (no-op).
+        let stale_id = self.tasks[tidx].prepared_cred_id;
+        if stale_id != 0 {
+            let _ = self.abort_creds(stale_id);
+            self.tasks[tidx].prepared_cred_id = 0;
         }
         let active_id = self.tasks[tidx].active_cred_id as usize;
         let cred_copy = self.slots[active_id].cred;
@@ -310,12 +323,27 @@ impl CredAllocator {
         if self.tasks[tidx].prepared_cred_id != cred_id {
             return Err(Error::InvalidArgument);
         }
-        // Retire old credential.
+        // A prepared slot is bound to exactly one task (enforced by
+        // the single-outstanding invariant in `prepare_creds` and the
+        // `prepared_cred_id` check above), and `get_cred_ref` only
+        // bumps Active slots, so it must carry no prior references.
+        // Fail closed if that invariant is violated rather than
+        // silently overwriting the count.
+        if self.slots[new_idx].ref_count != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Release this task's reference to the outgoing credential.
+        // If the old slot was shared (ref_count > 1) it drops to a
+        // Retired state and each remaining sharer keeps its own
+        // reference, releasing it via its own `put_cred`.
         let old_idx = self.tasks[tidx].active_cred_id as usize;
         self.put_cred(old_idx);
-        // Activate the new credential.
+        // Activate the new credential. Derive the count from the
+        // slot's real value via a single reference acquisition so
+        // ref_count accounting stays authoritative (0 -> 1) instead
+        // of being hard-set.
         self.slots[new_idx].state = CredState::Active;
-        self.slots[new_idx].ref_count = 1;
+        self.slots[new_idx].ref_count = self.slots[new_idx].ref_count.saturating_add(1);
         self.tasks[tidx].active_cred_id = cred_id;
         self.tasks[tidx].prepared_cred_id = 0;
         self.stats.total_commits += 1;
