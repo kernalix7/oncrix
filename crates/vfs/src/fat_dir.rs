@@ -57,6 +57,9 @@ pub const FAT_ATTR_VOLID: u8 = 0x08;
 /// LFN characters per slot (13 UCS-2 code units).
 pub const LFN_CHARS_PER_SLOT: usize = 13;
 
+/// Maximum number of LFN slots per entry (255-character LFN / 13 chars per slot, rounded up).
+pub const MAX_LFN_ENTRIES: usize = 20;
+
 /// Maximum number of directory entries per in-memory snapshot.
 const MAX_ENTRIES: usize = 512;
 
@@ -333,6 +336,13 @@ impl FatDir {
                 if let Ok(lfn) = FatLfnEntry::from_bytes(slot) {
                     let chars = lfn.name_chars();
                     let order = (lfn.order & 0x3F) as usize;
+                    // order == 0 is invalid per spec and would underflow on
+                    // (order - 1); order > MAX_LFN_ENTRIES means the base
+                    // index would exceed the 255-char lfn_buf.
+                    if order == 0 || order > MAX_LFN_ENTRIES {
+                        i += 1;
+                        continue;
+                    }
                     let base = (order - 1) * LFN_CHARS_PER_SLOT;
                     if base + LFN_CHARS_PER_SLOT > 255 {
                         i += 1;
