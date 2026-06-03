@@ -30,12 +30,42 @@
 //!
 //! # Simplifications
 //!
-//! - Crypto uses placeholder XOR operations.
-//! - HMAC uses a simple hash for demonstration.
+//! - Confidentiality (ESP cipher) uses placeholder XOR operations.
+//! - Integrity (ESP/AH ICV) uses real HMAC-SHA256-96 (RFC 4868).
 //! - No IKE/IKEv2 integration (SAs are manually configured).
 //! - IPv4 only (IPv6 support is future work).
 
+use crate::crypto::Hmac256;
 use oncrix_lib::{Error, Result};
+
+/// Compute the ESP/AH ICV as HMAC-SHA256-96 (RFC 4868).
+///
+/// Keys an HMAC-SHA256 with the SA's authentication key, feeds the
+/// authenticated byte span, and truncates the 32-byte tag to the
+/// first [`ICV_LEN`] bytes.
+fn compute_icv(auth_key: &[u8], authenticated: &[u8]) -> [u8; ICV_LEN] {
+    let mut mac = Hmac256::new(auth_key);
+    mac.update(authenticated);
+    let tag = mac.finalize();
+    let mut icv = [0u8; ICV_LEN];
+    icv.copy_from_slice(&tag[..ICV_LEN]);
+    icv
+}
+
+/// Constant-time equality over [`ICV_LEN`] bytes.
+///
+/// Compares two ICVs without short-circuiting: the loop runs a fixed
+/// number of iterations and OR-accumulates the per-byte XOR
+/// differences, so the running time does not depend on where (or
+/// whether) the values first differ. Returns `true` iff every byte
+/// matches.
+fn icv_eq_constant_time(a: &[u8; ICV_LEN], b: &[u8; ICV_LEN]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..ICV_LEN {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
 
 // =========================================================================
 // Constants
@@ -182,7 +212,7 @@ pub enum CipherAlg {
 pub enum AuthAlg {
     /// No authentication.
     None,
-    /// HMAC-SHA256-128 (truncated to 128 bits).
+    /// HMAC-SHA256 truncated to 96 bits (12-byte ICV).
     #[default]
     HmacSha256,
     /// HMAC-SHA1-96 (truncated to 96 bits).
@@ -861,18 +891,10 @@ impl XfrmEngine {
             out[ESP_HEADER_LEN + i] = b ^ sa.cipher_key[i % CIPHER_KEY_SIZE];
         }
 
-        // Compute simple ICV (XOR of auth key with data hash)
+        // Compute the ICV as HMAC-SHA256-96 (RFC 4868) over the
+        // ESP header + ciphertext.
         let icv_offset = ESP_HEADER_LEN + cleartext.len();
-        let mut icv = [0u8; ICV_LEN];
-        let mut hash: u32 = 0;
-        for &b in &out[..icv_offset] {
-            hash = hash.wrapping_add(b as u32);
-            hash = hash.wrapping_mul(31);
-        }
-        let hash_bytes = hash.to_le_bytes();
-        for i in 0..ICV_LEN {
-            icv[i] = hash_bytes[i % 4] ^ sa.auth_key[i % AUTH_KEY_SIZE];
-        }
+        let icv = compute_icv(&sa.auth_key, &out[..icv_offset]);
         out[icv_offset..icv_offset + ICV_LEN].copy_from_slice(&icv);
 
         sa.account(cleartext.len() as u64);
@@ -922,19 +944,13 @@ impl XfrmEngine {
             return Err(Error::InvalidArgument);
         }
 
-        // Verify ICV
+        // Verify the ICV by recomputing HMAC-SHA256-96 over the
+        // ESP header + ciphertext and comparing in constant time.
         let icv_offset = ESP_HEADER_LEN + payload_len;
-        let mut hash: u32 = 0;
-        for &b in &packet[..icv_offset] {
-            hash = hash.wrapping_add(b as u32);
-            hash = hash.wrapping_mul(31);
-        }
-        let hash_bytes = hash.to_le_bytes();
-        let mut expected_icv = [0u8; ICV_LEN];
-        for i in 0..ICV_LEN {
-            expected_icv[i] = hash_bytes[i % 4] ^ sa.auth_key[i % AUTH_KEY_SIZE];
-        }
-        if packet[icv_offset..icv_offset + ICV_LEN] != expected_icv {
+        let expected_icv = compute_icv(&sa.auth_key, &packet[..icv_offset]);
+        let mut received_icv = [0u8; ICV_LEN];
+        received_icv.copy_from_slice(&packet[icv_offset..icv_offset + ICV_LEN]);
+        if !icv_eq_constant_time(&received_icv, &expected_icv) {
             return Err(Error::PermissionDenied);
         }
 
@@ -1000,21 +1016,15 @@ impl XfrmEngine {
         // Copy payload
         out[AH_HEADER_LEN..total].copy_from_slice(payload);
 
-        // Compute ICV over header (with zeroed ICV field) +
-        // payload
-        let mut hash: u32 = 0;
-        for i in 0..12 {
-            hash = hash.wrapping_add(out[i] as u32);
-            hash = hash.wrapping_mul(31);
-        }
-        for &b in payload {
-            hash = hash.wrapping_add(b as u32);
-            hash = hash.wrapping_mul(31);
-        }
-        let hash_bytes = hash.to_le_bytes();
-        for i in 0..ICV_LEN {
-            out[12 + i] = hash_bytes[i % 4] ^ sa.auth_key[i % AUTH_KEY_SIZE];
-        }
+        // Compute the ICV as HMAC-SHA256-96 (RFC 4868) over the
+        // AH header (with the ICV field treated as zero, i.e. the
+        // 12 bytes preceding it) plus the payload. The 12-byte ICV
+        // field at out[12..24] is excluded from the MAC input.
+        let mut mac = Hmac256::new(&sa.auth_key);
+        mac.update(&out[0..12]);
+        mac.update(payload);
+        let tag = mac.finalize();
+        out[12..12 + ICV_LEN].copy_from_slice(&tag[..ICV_LEN]);
 
         sa.account(payload.len() as u64);
 
@@ -1057,22 +1067,18 @@ impl XfrmEngine {
             return Err(Error::InvalidArgument);
         }
 
-        // Recompute ICV
-        let mut hash: u32 = 0;
-        for i in 0..12 {
-            hash = hash.wrapping_add(packet[i] as u32);
-            hash = hash.wrapping_mul(31);
-        }
-        for &b in payload {
-            hash = hash.wrapping_add(b as u32);
-            hash = hash.wrapping_mul(31);
-        }
-        let hash_bytes = hash.to_le_bytes();
+        // Recompute the ICV as HMAC-SHA256-96 (RFC 4868) over the
+        // AH header (ICV field excluded, i.e. the 12 bytes before
+        // it) plus the payload, and compare in constant time.
+        let mut mac = Hmac256::new(&sa.auth_key);
+        mac.update(&packet[0..12]);
+        mac.update(payload);
+        let tag = mac.finalize();
         let mut expected_icv = [0u8; ICV_LEN];
-        for i in 0..ICV_LEN {
-            expected_icv[i] = hash_bytes[i % 4] ^ sa.auth_key[i % AUTH_KEY_SIZE];
-        }
-        if packet[12..12 + ICV_LEN] != expected_icv {
+        expected_icv.copy_from_slice(&tag[..ICV_LEN]);
+        let mut received_icv = [0u8; ICV_LEN];
+        received_icv.copy_from_slice(&packet[12..12 + ICV_LEN]);
+        if !icv_eq_constant_time(&received_icv, &expected_icv) {
             return Err(Error::PermissionDenied);
         }
 
