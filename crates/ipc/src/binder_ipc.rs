@@ -52,6 +52,12 @@ pub const BINDER_MAX_INLINE_DATA: usize = 256;
 /// Maximum number of object offsets in a single transaction.
 pub const BINDER_MAX_OFFSETS: usize = 8;
 
+/// Size of a `flat_binder_object` as defined in the Binder UAPI.
+///
+/// A client-supplied offset must satisfy `offset + FLAT_BINDER_OBJECT_SIZE <= data_size`
+/// so that the entire object lies within the inline data buffer.
+pub const FLAT_BINDER_OBJECT_SIZE: u32 = 16;
+
 // ---------------------------------------------------------------------------
 // Identity types
 // ---------------------------------------------------------------------------
@@ -238,11 +244,18 @@ pub struct BinderTransaction {
     /// Inline data payload.
     pub data: [u8; BINDER_MAX_INLINE_DATA],
     /// Number of valid bytes in `data`.
-    pub data_size: u32,
+    ///
+    /// Private: only settable through [`write_data`](Self::write_data), which enforces
+    /// the `BINDER_MAX_INLINE_DATA` bound and prevents panic-slicing in
+    /// [`data_slice`](Self::data_slice).
+    data_size: u32,
     /// Offsets of embedded Binder objects within `data`.
     pub offsets: [u32; BINDER_MAX_OFFSETS],
     /// Number of valid entries in `offsets`.
-    pub offsets_count: u32,
+    ///
+    /// Private: only incremented through [`add_offset`](Self::add_offset), which
+    /// uses `checked_add` and guards the array bound.
+    offsets_count: u32,
     /// Whether this is a one-way (fire-and-forget) transaction.
     pub one_way: bool,
 }
@@ -296,6 +309,16 @@ impl BinderTransaction {
         }
     }
 
+    /// Return the number of valid bytes in `data`.
+    pub const fn data_size(&self) -> u32 {
+        self.data_size
+    }
+
+    /// Return the number of valid entries in `offsets`.
+    pub const fn offsets_count(&self) -> u32 {
+        self.offsets_count
+    }
+
     /// Write `payload` into the inline data buffer.
     ///
     /// Returns `Err(InvalidArgument)` if the payload exceeds the buffer capacity.
@@ -310,27 +333,43 @@ impl BinderTransaction {
 
     /// Add a Binder object offset into the offsets table.
     ///
-    /// `offset` must be aligned to 4 bytes and within `data_size`.
-    /// Returns `Err(InvalidArgument)` if the offset is out of bounds or
+    /// `offset` must be 4-byte aligned and the full `flat_binder_object` starting
+    /// at `offset` must lie entirely within `data_size` (i.e.
+    /// `offset + FLAT_BINDER_OBJECT_SIZE <= data_size`).
+    ///
+    /// Returns `Err(InvalidArgument)` if the alignment or bounds check fails, or
     /// `Err(OutOfMemory)` if the offsets table is full.
     pub fn add_offset(&mut self, offset: u32) -> Result<()> {
         if offset % 4 != 0 {
             return Err(Error::InvalidArgument);
         }
-        if offset >= self.data_size {
+        // Verify that the *entire* flat_binder_object fits within data_size.
+        let end = offset
+            .checked_add(FLAT_BINDER_OBJECT_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        if end > self.data_size {
             return Err(Error::InvalidArgument);
         }
         if self.offsets_count as usize >= BINDER_MAX_OFFSETS {
             return Err(Error::OutOfMemory);
         }
         self.offsets[self.offsets_count as usize] = offset;
-        self.offsets_count += 1;
+        // SAFETY: checked above that offsets_count < BINDER_MAX_OFFSETS (≤ 8 ≤ u32::MAX).
+        self.offsets_count = self
+            .offsets_count
+            .checked_add(1)
+            .ok_or(Error::InvalidArgument)?;
         Ok(())
     }
 
     /// Return the inline data slice (valid bytes only).
+    ///
+    /// The slice length is always clamped to `BINDER_MAX_INLINE_DATA` regardless
+    /// of the stored `data_size` value, preventing any panic from an out-of-range
+    /// index even if `data_size` were somehow inconsistent.
     pub fn data_slice(&self) -> &[u8] {
-        &self.data[..self.data_size as usize]
+        let sz = (self.data_size as usize).min(BINDER_MAX_INLINE_DATA);
+        &self.data[..sz]
     }
 }
 
@@ -538,7 +577,9 @@ impl BinderProcess {
             is_context_manager: false,
             nodes: [const { None }; BINDER_MAX_NODES_PER_PROC],
             refs: [const { None }; BINDER_MAX_REFS_PER_PROC],
-            next_handle: 1, // 0 is reserved for context manager
+            // Handle 0 is permanently reserved for the context manager
+            // (BinderHandle::CONTEXT_MANAGER).  Dynamic handles start at 1.
+            next_handle: 1,
             threads: [const { None }; 8],
             thread_count: 0,
             death_notifs: [const { None }; BINDER_MAX_DEATH_NOTIFS],
@@ -583,15 +624,37 @@ impl BinderProcess {
     }
 
     /// Mark a node as dead (owner process is going away).
+    ///
+    /// If no client still holds a strong reference, the slot is reaped
+    /// immediately; otherwise the node stays (marked dead) until the last
+    /// reference is dropped via [`BinderRegistry::handle_release`], which
+    /// reaps it at zero.
     pub fn kill_node(&mut self, ptr: BinderPtr) -> Result<()> {
-        let node = self.find_node_mut(ptr).ok_or(Error::NotFound)?;
-        node.dead = true;
+        let unreferenced = {
+            let node = self.find_node_mut(ptr).ok_or(Error::NotFound)?;
+            node.dead = true;
+            node.strong_refs == 0
+        };
+        if unreferenced {
+            for slot in self.nodes.iter_mut() {
+                if slot.as_ref().map(|n| n.ptr == ptr).unwrap_or(false) {
+                    *slot = None;
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 
     // --- reference operations ---
 
     /// Create a new handle for a remote node in this process.
+    ///
+    /// Handle 0 is permanently reserved for the context manager and is never
+    /// allocated here.  `next_handle` starts at 1 and is advanced with
+    /// `checked_add`; if it would overflow `u32::MAX` (wrapping back through 0)
+    /// this method returns `Err(OutOfMemory)` instead of producing a handle-0
+    /// collision.
     ///
     /// Returns the assigned [`BinderHandle`].
     pub fn create_ref(
@@ -605,11 +668,20 @@ impl BinderProcess {
                 return Ok(r.handle);
             }
         }
-        let handle = BinderHandle::new(self.next_handle);
+        // Reject allocation when the counter is at u32::MAX to prevent wrapping
+        // to 0 (BinderHandle::CONTEXT_MANAGER) on the next increment.
+        let raw = self.next_handle;
+        if raw == 0 {
+            // Should never happen (initialised to 1) but fail-safe.
+            return Err(Error::OutOfMemory);
+        }
+        let handle = BinderHandle::new(raw);
         for slot in self.refs.iter_mut() {
             if slot.is_none() {
                 *slot = Some(BinderRef::new(handle, self.pid, node_ptr, node_owner));
-                self.next_handle += 1;
+                // Advance with checked_add; Err on overflow so next_handle never
+                // wraps back through 0 / CONTEXT_MANAGER territory.
+                self.next_handle = self.next_handle.checked_add(1).ok_or(Error::OutOfMemory)?;
                 return Ok(handle);
             }
         }
@@ -623,14 +695,21 @@ impl BinderProcess {
             .find_map(|s| s.as_ref().filter(|r| r.handle == handle))
     }
 
-    /// Remove a reference by handle.
+    /// Remove a reference by handle and return the node identity it pointed to.
+    ///
+    /// The caller **must** use the returned `(node_ptr, node_owner)` to locate
+    /// the server-side [`BinderNode`] and call [`BinderNode::release`] on it so
+    /// that the node's strong reference count is decremented.  Failing to do so
+    /// leaks a phantom strong reference and prevents the node from ever reaching
+    /// [`BinderNode::is_unreferenced`].
     ///
     /// Returns `Err(NotFound)` if the handle does not exist.
-    pub fn remove_ref(&mut self, handle: BinderHandle) -> Result<()> {
+    pub fn remove_ref(&mut self, handle: BinderHandle) -> Result<(BinderPtr, BinderPid)> {
         for slot in self.refs.iter_mut() {
             if slot.as_ref().map(|r| r.handle == handle).unwrap_or(false) {
+                let info = slot.as_ref().map(|r| (r.node_ptr, r.node_owner)).unwrap();
                 *slot = None;
-                return Ok(());
+                return Ok(info);
             }
         }
         Err(Error::NotFound)
@@ -899,9 +978,23 @@ impl BinderRegistry {
 
     /// Register `pid` as the context manager (service manager).
     ///
-    /// Only one process may be the context manager at a time.
-    /// Returns `Err(Busy)` if one is already registered.
-    pub fn become_context_manager(&mut self, pid: BinderPid) -> Result<()> {
+    /// This is a privileged operation: the caller must hold a kernel-verified
+    /// credential granting the right to act as the system service manager.
+    /// At the syscall layer the `is_privileged` flag must be derived from the
+    /// authenticated caller's capability set (e.g. `CAP_SYS_ADMIN` or a
+    /// Binder-specific capability) — it must **never** be supplied by the
+    /// userspace caller directly.
+    ///
+    /// Only one context manager may be registered at a time.
+    ///
+    /// Returns `Err(PermissionDenied)` if `is_privileged` is false (fail-closed).
+    /// Returns `Err(Busy)` if a context manager is already registered.
+    /// Returns `Err(NotFound)` if `pid` has not called [`open`](Self::open).
+    pub fn become_context_manager(&mut self, pid: BinderPid, is_privileged: bool) -> Result<()> {
+        // Fail-closed: reject immediately if the caller is not privileged.
+        if !is_privileged {
+            return Err(Error::PermissionDenied);
+        }
         if self.context_manager.is_some() {
             return Err(Error::Busy);
         }
@@ -913,7 +1006,46 @@ impl BinderRegistry {
 
     // --- command dispatch ---
 
+    /// Validate that `sender_pid` is a registered process that owns `sender_tid`.
+    ///
+    /// This is the strongest identity check reachable at this layer.  In a fully
+    /// wired system the syscall entry point would supply a kernel-maintained
+    /// `BinderPid` derived from the calling process's credential record, making
+    /// spoofing impossible.  Until that wiring exists, this check at least ensures
+    /// that the named `sender_pid` actually has a registered thread with the given
+    /// `sender_tid`, so commands cannot be dispatched as an arbitrary third-party
+    /// process's identity.
+    ///
+    /// Returns `Err(PermissionDenied)` if the process or thread is not found.
+    fn validate_sender(&self, sender_pid: BinderPid, sender_tid: u32) -> Result<()> {
+        let proc = self
+            .find_process(sender_pid)
+            .ok_or(Error::PermissionDenied)?;
+        // Verify that sender_tid is registered under sender_pid, confirming
+        // that the caller did not supply a victim PID with a fabricated TID.
+        proc.threads
+            .iter()
+            .flatten()
+            .find(|t| t.tid == sender_tid)
+            .map(|_| ())
+            .ok_or(Error::PermissionDenied)
+    }
+
     /// Process a [`BinderCommand`] from `sender_pid` on `sender_tid`.
+    ///
+    /// # Sender identity
+    ///
+    /// `sender_pid` and `sender_tid` are treated as caller-supplied values.
+    /// Before any command that touches another process's handle table or ref
+    /// counts is executed, `sender_pid`/`sender_tid` are validated against the
+    /// registry with [`validate_sender`](Self::validate_sender) to ensure the
+    /// named process owns the named thread.
+    ///
+    /// **TODO (syscall layer)**: once this registry is wired to the live syscall
+    /// path, `sender_pid` must be derived from the kernel's authenticated
+    /// per-fd process record — not accepted as a userspace argument — so that
+    /// the `validate_sender` check can be removed in favour of a kernel-enforced
+    /// binding.
     ///
     /// Returns the [`BinderReturn`] that should be queued back to the
     /// sender thread, or propagates an error.
@@ -923,6 +1055,23 @@ impl BinderRegistry {
         sender_tid: u32,
         cmd: BinderCommand,
     ) -> Result<BinderReturn> {
+        // Validate sender identity before processing any command.
+        // BcRegisterLooper is the bootstrap command that registers the thread;
+        // at that point the thread does not yet exist, so we only check the PID.
+        match &cmd {
+            BinderCommand::BcRegisterLooper => {
+                // Thread is being registered — only verify the process exists.
+                if self.find_process(sender_pid).is_none() {
+                    return Err(Error::PermissionDenied);
+                }
+            }
+            _ => {
+                // For all other commands the sending thread must already be
+                // registered under the named process.
+                self.validate_sender(sender_pid, sender_tid)?;
+            }
+        }
+
         match cmd {
             BinderCommand::BcRegisterLooper => {
                 let proc = self.find_process_mut(sender_pid).ok_or(Error::NotFound)?;
@@ -985,6 +1134,10 @@ impl BinderRegistry {
     }
 
     /// Handle BC_ACQUIRE: increment strong ref count on the referenced node.
+    ///
+    /// Returns `Err(NotFound)` if the node has already been marked dead — dead
+    /// nodes must not receive new strong references, as the owning process has
+    /// already been torn down.
     fn handle_acquire(
         &mut self,
         client_pid: BinderPid,
@@ -1011,6 +1164,11 @@ impl BinderRegistry {
             return Ok(BinderReturn::BrNoop);
         }
         let node = server.find_node_mut(node_ptr).ok_or(Error::NotFound)?;
+        // Reject acquire on a dead node: the server process has already exited.
+        // Returning NotFound prevents information leakage of the dead node's cookie.
+        if node.dead {
+            return Err(Error::NotFound);
+        }
         node.acquire()?;
         Ok(BinderReturn::BrAcquire {
             ptr: node_ptr,
@@ -1019,6 +1177,10 @@ impl BinderRegistry {
     }
 
     /// Handle BC_RELEASE: decrement strong ref count on the referenced node.
+    ///
+    /// Returns `Err(NotFound)` if the node is dead.  After decrement, if the
+    /// node is both dead and fully unreferenced, the node slot is reaped so
+    /// the memory is not leaked indefinitely.
     fn handle_release(
         &mut self,
         client_pid: BinderPid,
@@ -1039,12 +1201,35 @@ impl BinderRegistry {
         if handle == BinderHandle::CONTEXT_MANAGER {
             return Ok(BinderReturn::BrNoop);
         }
-        let node = server.find_node_mut(node_ptr).ok_or(Error::NotFound)?;
-        node.release()?;
-        Ok(BinderReturn::BrRelease {
-            ptr: node_ptr,
-            cookie: node.cookie,
-        })
+        // A dead node still lets the client drop its strong ref (so the node
+        // can be reaped) but must NOT disclose the cookie — repeated
+        // acquire/release on a dead node would otherwise leak the server's
+        // cookie. The live path returns BrRelease (with cookie); the dead
+        // path returns BrNoop and reaps the slot once unreferenced.
+        let reap = {
+            let node = server.find_node_mut(node_ptr).ok_or(Error::NotFound)?;
+            if !node.dead {
+                node.release()?;
+                let cookie = node.cookie;
+                return Ok(BinderReturn::BrRelease {
+                    ptr: node_ptr,
+                    cookie,
+                });
+            }
+            // Drop the ref without leaking the cookie; ignore an underflow on
+            // an already-zero count.
+            let _ = node.release();
+            node.strong_refs == 0
+        };
+        if reap {
+            for slot in server.nodes.iter_mut() {
+                if slot.as_ref().map(|n| n.ptr == node_ptr).unwrap_or(false) {
+                    *slot = None;
+                    break;
+                }
+            }
+        }
+        Ok(BinderReturn::BrNoop)
     }
 
     /// Handle BC_TRANSACTION: route the transaction to the target.
@@ -1145,8 +1330,15 @@ mod tests {
     #[test]
     fn context_manager_exclusive() {
         let mut reg = registry_with_two_procs();
-        reg.become_context_manager(PID_A).unwrap();
-        assert_eq!(reg.become_context_manager(PID_B), Err(Error::Busy));
+        // Unprivileged call must be denied (fail-closed).
+        assert_eq!(
+            reg.become_context_manager(PID_A, false),
+            Err(Error::PermissionDenied)
+        );
+        // Privileged call succeeds.
+        reg.become_context_manager(PID_A, true).unwrap();
+        // Second privileged registration must fail (already set).
+        assert_eq!(reg.become_context_manager(PID_B, true), Err(Error::Busy));
     }
 
     #[test]
@@ -1193,6 +1385,11 @@ mod tests {
             let proc_a = reg.find_process_mut(PID_A).unwrap();
             proc_a.create_ref(NODE_PTR, PID_B).unwrap()
         };
+        // Register a thread for PID_A so dispatch can validate sender identity.
+        {
+            let pa = reg.find_process_mut(PID_A).unwrap();
+            pa.register_thread(1).unwrap();
+        }
         let ret = reg
             .dispatch(PID_A, 1, BinderCommand::BcAcquire(handle))
             .unwrap();
@@ -1294,6 +1491,11 @@ mod tests {
             let pa = reg.find_process_mut(PID_A).unwrap();
             pa.create_ref(NODE_PTR, PID_B).unwrap()
         };
+        // Register a thread for PID_A so dispatch can validate sender identity.
+        {
+            let pa = reg.find_process_mut(PID_A).unwrap();
+            pa.register_thread(1).unwrap();
+        }
         // Register death notification.
         let ret = reg
             .dispatch(

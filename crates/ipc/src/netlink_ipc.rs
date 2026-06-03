@@ -56,6 +56,17 @@ const MAX_QUEUED_MESSAGES: usize = 64;
 /// Netlink header alignment (4 bytes, matching `NLMSG_ALIGN`).
 const NLMSG_ALIGNTO: usize = 4;
 
+/// Privileged user id (root).  Required to join a multicast group on a
+/// privileged family (see [`family_is_privileged`]) or to emit a
+/// kernel-origin (pid 0) message.
+pub const NETLINK_PRIV_UID: u32 = 0;
+
+/// Reserved source port id meaning "from the kernel".
+///
+/// User callers must never be able to stamp this onto a message; only the
+/// registry's internal control paths (ACK / error / dump-done) may.
+pub const NETLINK_KERNEL_PID: u32 = 0;
+
 // ---------------------------------------------------------------------------
 // Netlink families
 // ---------------------------------------------------------------------------
@@ -89,6 +100,20 @@ pub const NETLINK_SCSITRANSPORT: u16 = 18;
 
 /// Connector (kernel/userspace notification).
 pub const NETLINK_CONNECTOR: u16 = 11;
+
+/// Return `true` if joining/broadcasting on `family` is a privileged
+/// operation that requires [`NETLINK_PRIV_UID`].
+///
+/// These families carry sensitive kernel notifications (audit records,
+/// SELinux/firewall events) whose multicast groups must not be readable or
+/// injectable by unprivileged processes.  Mirrors the Linux convention that
+/// binding such listener groups requires `CAP_NET_ADMIN`/`CAP_AUDIT_*`.
+pub const fn family_is_privileged(family: u16) -> bool {
+    matches!(
+        family,
+        NETLINK_AUDIT | NETLINK_SELINUX | NETLINK_FIREWALL | NETLINK_NETFILTER
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Standard message types
@@ -592,11 +617,21 @@ impl NetlinkRegistry {
     // ---------------------------------------------------------------
 
     /// Join a multicast group.
-    pub fn join_group(&mut self, id: u64, group: u32) -> Result<()> {
+    ///
+    /// `owner_uid` is the authenticated caller credential.  Subscribing to a
+    /// group on a privileged family (see [`family_is_privileged`]) requires
+    /// [`NETLINK_PRIV_UID`] (fail-closed), preventing an unprivileged
+    /// process from eavesdropping on sensitive kernel multicast
+    /// notifications (audit / SELinux / firewall).  The syscall layer must
+    /// pass the authenticated caller uid.
+    pub fn join_group(&mut self, id: u64, owner_uid: u32, group: u32) -> Result<()> {
         if group == 0 || group > MAX_MULTICAST_GROUPS as u32 {
             return Err(Error::InvalidArgument);
         }
         let sock = self.find_mut(id)?;
+        if family_is_privileged(sock.family) && owner_uid != NETLINK_PRIV_UID {
+            return Err(Error::PermissionDenied);
+        }
         sock.multicast_groups |= 1 << (group - 1);
         Ok(())
     }
@@ -615,18 +650,28 @@ impl NetlinkRegistry {
     // Send / receive
     // ---------------------------------------------------------------
 
-    /// Send a message to a specific socket by ID.
+    /// Send a message from one socket to another, both identified by ID.
+    ///
+    /// The source port id stamped into the delivered message is derived
+    /// from the **authenticated sending socket** (`src_id`), not supplied by
+    /// the caller.  This prevents source-PID spoofing — in particular a
+    /// caller can no longer forge a kernel-origin (pid 0) message.  The
+    /// syscall layer must pass the socket id the calling process actually
+    /// owns as `src_id`.
     pub fn send_to(
         &mut self,
+        src_id: u64,
         dst_id: u64,
         msg_type: u16,
         flags: u16,
         payload: &[u8],
-        src_pid: u32,
     ) -> Result<()> {
         if payload.len() > NLMSG_MAX_PAYLOAD {
             return Err(Error::InvalidArgument);
         }
+
+        // Authenticate the source: derive its port id from the live socket.
+        let src_pid = self.find(src_id)?.port_id;
 
         let dst = self.find_mut(dst_id)?;
         let seq = dst.next_sequence();
@@ -635,20 +680,27 @@ impl NetlinkRegistry {
     }
 
     /// Send an ACK response to a socket.
+    ///
+    /// This is a registry-internal kernel-origin control message, so the
+    /// source pid is [`NETLINK_KERNEL_PID`] (0) by design.  It only ever
+    /// produces an `NLMSG_ERROR` ACK and is not a general send path.
     pub fn send_ack(&mut self, dst_id: u64, original: &NlMsgHdr) -> Result<()> {
         let err_msg = NlErrMsg::ack(*original);
         let payload_bytes = err_msg.error.to_ne_bytes();
         let dst = self.find_mut(dst_id)?;
-        let header = NlMsgHdr::new(NLMSG_ERROR, 0, original.nlmsg_seq, 0, 4);
-        dst.enqueue(header, &payload_bytes, 0)
+        let header = NlMsgHdr::new(NLMSG_ERROR, 0, original.nlmsg_seq, NETLINK_KERNEL_PID, 4);
+        dst.enqueue(header, &payload_bytes, NETLINK_KERNEL_PID)
     }
 
     /// Send an error response to a socket.
+    ///
+    /// Registry-internal kernel-origin control message; source pid is
+    /// [`NETLINK_KERNEL_PID`] (0) by design.
     pub fn send_error(&mut self, dst_id: u64, original: &NlMsgHdr, errno: i32) -> Result<()> {
         let payload_bytes = errno.to_ne_bytes();
         let dst = self.find_mut(dst_id)?;
-        let header = NlMsgHdr::new(NLMSG_ERROR, 0, original.nlmsg_seq, 0, 4);
-        dst.enqueue(header, &payload_bytes, 0)
+        let header = NlMsgHdr::new(NLMSG_ERROR, 0, original.nlmsg_seq, NETLINK_KERNEL_PID, 4);
+        dst.enqueue(header, &payload_bytes, NETLINK_KERNEL_PID)
     }
 
     /// Receive a message from a socket.
@@ -661,20 +713,38 @@ impl NetlinkRegistry {
 
     /// Broadcast a message to all sockets in a multicast group.
     ///
+    /// The broadcast family and source port id are derived from the
+    /// **authenticated sending socket** (`src_id`); a caller can only
+    /// broadcast on its own family and cannot forge the source pid.
+    /// `owner_uid` is the authenticated caller credential: broadcasting on a
+    /// privileged family (see [`family_is_privileged`]) requires
+    /// [`NETLINK_PRIV_UID`] (fail-closed).  The syscall layer must pass the
+    /// owning socket id and caller uid.
+    ///
     /// Returns the number of sockets that received the message.
     pub fn multicast(
         &mut self,
-        family: u16,
+        src_id: u64,
+        owner_uid: u32,
         group: u32,
         msg_type: u16,
         payload: &[u8],
-        src_pid: u32,
     ) -> Result<u32> {
         if group == 0 || group > MAX_MULTICAST_GROUPS as u32 {
             return Err(Error::InvalidArgument);
         }
         if payload.len() > NLMSG_MAX_PAYLOAD {
             return Err(Error::InvalidArgument);
+        }
+
+        // Authenticate the source: family and port id come from the socket.
+        let (family, src_pid) = {
+            let src = self.find(src_id)?;
+            (src.family, src.port_id)
+        };
+        // Fail-closed credential gate for sensitive families.
+        if family_is_privileged(family) && owner_uid != NETLINK_PRIV_UID {
+            return Err(Error::PermissionDenied);
         }
 
         let group_bit = 1u32 << (group - 1);
@@ -704,10 +774,13 @@ impl NetlinkRegistry {
     }
 
     /// Send a dump-done message to indicate end of dump sequence.
+    ///
+    /// Registry-internal kernel-origin control message; source pid is
+    /// [`NETLINK_KERNEL_PID`] (0) by design.
     pub fn send_dump_done(&mut self, dst_id: u64, seq: u32) -> Result<()> {
         let dst = self.find_mut(dst_id)?;
-        let header = NlMsgHdr::new(NLMSG_DONE, NLM_F_MULTI, seq, 0, 0);
-        dst.enqueue(header, &[], 0)
+        let header = NlMsgHdr::new(NLMSG_DONE, NLM_F_MULTI, seq, NETLINK_KERNEL_PID, 0);
+        dst.enqueue(header, &[], NETLINK_KERNEL_PID)
     }
 
     /// Poll a socket for readiness.
@@ -851,10 +924,34 @@ mod tests {
         let mut r = NetlinkRegistry::new();
         let id = r.create(NETLINK_ROUTE, 1, true).unwrap();
         let payload = [1u8, 2, 3, 4];
-        let _ = r.send_to(id, NLMSG_MIN_TYPE, NLM_F_REQUEST, &payload, 0);
+        let _ = r.send_to(id, id, NLMSG_MIN_TYPE, NLM_F_REQUEST, &payload);
         let (hdr, len) = r.recv(id).unwrap();
         assert_eq!(hdr.nlmsg_type, NLMSG_MIN_TYPE);
         assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn send_to_stamps_authenticated_src_pid() {
+        // The delivered message must carry the sender socket's real
+        // port_id, never a caller-chosen (e.g. forged kernel pid 0) value.
+        let mut r = NetlinkRegistry::new();
+        let src = r.create(NETLINK_ROUTE, 1, true).unwrap();
+        let dst = r.create(NETLINK_ROUTE, 2, true).unwrap();
+        let src_port = r.find(src).unwrap().port_id();
+        assert_ne!(src_port, NETLINK_KERNEL_PID);
+        r.send_to(src, dst, NLMSG_MIN_TYPE, 0, &[1]).unwrap();
+        let (hdr, _) = r.recv(dst).unwrap();
+        assert_eq!(hdr.nlmsg_pid, src_port);
+    }
+
+    #[test]
+    fn send_to_unknown_source_rejected() {
+        let mut r = NetlinkRegistry::new();
+        let dst = r.create(NETLINK_ROUTE, 1, true).unwrap();
+        assert_eq!(
+            r.send_to(9999, dst, NLMSG_MIN_TYPE, 0, &[1]),
+            Err(Error::NotFound)
+        );
     }
 
     #[test]
@@ -869,12 +966,11 @@ mod tests {
         let mut r = NetlinkRegistry::new();
         let id1 = r.create(NETLINK_ROUTE, 1, false).unwrap();
         let id2 = r.create(NETLINK_ROUTE, 2, false).unwrap();
-        let _ = r.join_group(id1, 1);
-        let _ = r.join_group(id2, 1);
+        // NETLINK_ROUTE is unprivileged: any uid may join/broadcast.
+        let _ = r.join_group(id1, 1000, 1);
+        let _ = r.join_group(id2, 1000, 1);
 
-        let delivered = r
-            .multicast(NETLINK_ROUTE, 1, NLMSG_MIN_TYPE, &[0xAA], 0)
-            .unwrap();
+        let delivered = r.multicast(id1, 1000, 1, NLMSG_MIN_TYPE, &[0xAA]).unwrap();
         assert_eq!(delivered, 2);
 
         // Both should have a message.
@@ -886,12 +982,10 @@ mod tests {
     fn leave_group() {
         let mut r = NetlinkRegistry::new();
         let id = r.create(NETLINK_ROUTE, 1, false).unwrap();
-        let _ = r.join_group(id, 1);
+        let _ = r.join_group(id, 1000, 1);
         let _ = r.leave_group(id, 1);
 
-        let delivered = r
-            .multicast(NETLINK_ROUTE, 1, NLMSG_MIN_TYPE, &[0xBB], 0)
-            .unwrap();
+        let delivered = r.multicast(id, 1000, 1, NLMSG_MIN_TYPE, &[0xBB]).unwrap();
         assert_eq!(delivered, 0);
     }
 
@@ -899,8 +993,29 @@ mod tests {
     fn invalid_group_rejected() {
         let mut r = NetlinkRegistry::new();
         let id = r.create(NETLINK_ROUTE, 1, false).unwrap();
-        assert_eq!(r.join_group(id, 0), Err(Error::InvalidArgument));
-        assert_eq!(r.join_group(id, 99), Err(Error::InvalidArgument));
+        assert_eq!(r.join_group(id, 1000, 0), Err(Error::InvalidArgument));
+        assert_eq!(r.join_group(id, 1000, 99), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn join_privileged_group_requires_root() {
+        // An unprivileged uid cannot subscribe to an AUDIT multicast group.
+        let mut r = NetlinkRegistry::new();
+        let id = r.create(NETLINK_AUDIT, 1, false).unwrap();
+        assert_eq!(r.join_group(id, 1000, 1), Err(Error::PermissionDenied));
+        // Root succeeds.
+        assert_eq!(r.join_group(id, NETLINK_PRIV_UID, 1), Ok(()));
+    }
+
+    #[test]
+    fn multicast_privileged_family_requires_root() {
+        // Forged broadcast injection on AUDIT is denied for non-root.
+        let mut r = NetlinkRegistry::new();
+        let id = r.create(NETLINK_AUDIT, 1, false).unwrap();
+        assert_eq!(
+            r.multicast(id, 1000, 1, NLMSG_MIN_TYPE, &[0xAA]),
+            Err(Error::PermissionDenied)
+        );
     }
 
     #[test]
@@ -939,7 +1054,7 @@ mod tests {
         let mut r = NetlinkRegistry::new();
         let id = r.create(NETLINK_ROUTE, 1, false).unwrap();
         assert_eq!(r.poll(id), Ok(0));
-        let _ = r.send_to(id, NLMSG_NOOP, 0, &[], 0);
+        let _ = r.send_to(id, id, NLMSG_NOOP, 0, &[]);
         assert_eq!(r.poll(id), Ok(0x01));
     }
 
@@ -1023,7 +1138,7 @@ mod tests {
         let id = r.create(NETLINK_ROUTE, 1, false).unwrap();
         let big = [0u8; NLMSG_MAX_PAYLOAD + 1];
         assert_eq!(
-            r.send_to(id, NLMSG_MIN_TYPE, 0, &big, 0),
+            r.send_to(id, id, NLMSG_MIN_TYPE, 0, &big),
             Err(Error::InvalidArgument)
         );
     }
