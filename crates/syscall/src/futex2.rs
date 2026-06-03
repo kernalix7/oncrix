@@ -210,8 +210,15 @@ pub struct FutexWaiter {
     pub bucket: BucketIndex,
     /// Flags with which the wait was registered.
     pub flags: u32,
-    /// Synthetic thread id of the waiting thread.
+    /// Real thread id of the waiting thread.
     pub tid: u32,
+    /// Index of this entry within a `futex_waitv` vector (0 for single waits).
+    ///
+    /// Together with `tid` this forms a unique key `(tid, entry_idx)` that
+    /// identifies a specific sub-waiter inside one `do_futex_waitv` call, so
+    /// no two threads can accidentally share the same waiter identity even when
+    /// `uaddr` happens to collide.
+    pub entry_idx: u8,
     /// Whether this waiter has been woken.
     pub woken: bool,
 }
@@ -245,12 +252,17 @@ impl FutexTable {
         Err(Error::OutOfMemory)
     }
 
-    /// Remove the waiter for `tid` on `uaddr`.
-    pub fn remove(&mut self, tid: u32, uaddr: u64) {
+    /// Remove the waiter identified by `(tid, entry_idx)` on `uaddr`.
+    ///
+    /// The `entry_idx` is 0 for single-futex waits and the vector position
+    /// for `futex_waitv` sub-waiters, ensuring that waiters belonging to
+    /// different threads or different entries of the same vector are never
+    /// confused.
+    pub fn remove(&mut self, tid: u32, entry_idx: u8, uaddr: u64) {
         for slot in self.waiters.iter_mut() {
             if slot
                 .as_ref()
-                .map(|w| w.tid == tid && w.uaddr == uaddr)
+                .map(|w| w.tid == tid && w.entry_idx == entry_idx && w.uaddr == uaddr)
                 .unwrap_or(false)
             {
                 *slot = None;
@@ -279,12 +291,13 @@ impl FutexTable {
         woken
     }
 
-    /// Return whether a specific waiter (tid, uaddr) has been woken.
-    pub fn is_woken(&self, tid: u32, uaddr: u64) -> bool {
+    /// Return whether the waiter identified by `(tid, entry_idx)` on `uaddr`
+    /// has been woken.
+    pub fn is_woken(&self, tid: u32, entry_idx: u8, uaddr: u64) -> bool {
         self.waiters
             .iter()
             .filter_map(|s| s.as_ref())
-            .any(|w| w.tid == tid && w.uaddr == uaddr && w.woken)
+            .any(|w| w.tid == tid && w.entry_idx == entry_idx && w.uaddr == uaddr && w.woken)
     }
 
     /// Return the total number of waiters currently in the table.
@@ -385,6 +398,7 @@ pub fn do_futex_wait(
         bucket,
         flags,
         tid,
+        entry_idx: 0,
         woken: false,
     };
     table.insert(waiter)
@@ -512,22 +526,27 @@ pub fn do_futex_waitv(
         }
     }
 
-    // Enqueue one waiter per entry using a per-entry tid offset.
-    let base_tid = tid.wrapping_mul(1000);
+    // Enqueue one waiter per entry.  Each waiter carries the real `tid` plus
+    // its position `entry_idx` in the vector.  The pair `(tid, entry_idx)` is
+    // the unique identity for wake/remove/is_woken lookups — no arithmetic on
+    // the tid is needed and no aliasing is possible between threads.
     for (i, w) in waiters.iter().enumerate() {
         let bucket = hash_futex(w.uaddr, w.flags, 0);
+        // FUTEX_WAITV_MAX == 128 <= u8::MAX, so the cast is safe.
+        let entry_idx = i as u8;
         let waiter = FutexWaiter {
             uaddr: w.uaddr,
             expected_val: w.val,
             bucket,
             flags: w.flags,
-            tid: base_tid.wrapping_add(i as u32),
+            tid,
+            entry_idx,
             woken: false,
         };
         if let Err(e) = table.insert(waiter) {
-            // Clean up already-inserted waiters on failure.
+            // Roll back already-inserted sub-waiters for this thread.
             for j in 0..i {
-                table.remove(base_tid.wrapping_add(j as u32), waiters[j].uaddr);
+                table.remove(tid, j as u8, waiters[j].uaddr);
             }
             return Err(e);
         }
@@ -663,7 +682,7 @@ mod tests {
         do_futex_wait(&mut t, 0x1000, 1, 0, FUTEX_SIZE_U32, None, 7, 1).unwrap();
         let n = do_futex_wake(&mut t, 0x1000, 0, 1, FUTEX_SIZE_U32).unwrap();
         assert_eq!(n, 1);
-        assert!(t.is_woken(7, 0x1000));
+        assert!(t.is_woken(7, 0, 0x1000));
     }
 
     #[test]

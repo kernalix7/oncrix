@@ -20,6 +20,13 @@ use oncrix_lib::{Error, Result};
 /// Maximum timers in the heap per clock base.
 pub const HRTIMER_MAX_TIMERS: usize = 256;
 
+/// Maximum number of timer firings serviced in a single `process_expired`
+/// call. Bounds the work done in tick context so a pathological queue (for
+/// example, many short-interval periodic timers, or timers re-armed after a
+/// large clock jump) cannot live-lock the tick handler. Any timers still due
+/// when the cap is reached stay queued and are serviced on the next tick.
+pub const MAX_FIRES_PER_TICK: usize = 1024;
+
 /// Clock base identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -190,9 +197,16 @@ impl HrTimerQueue {
     /// Fires all timers whose expiry is ≤ `now_ns`.
     ///
     /// Returns the number of timers that fired.
+    ///
+    /// At most [`MAX_FIRES_PER_TICK`] timers are serviced per call; any timers
+    /// still due beyond that bound remain queued for the next tick. This caps
+    /// the work done in tick context so the loop cannot live-lock timekeeping.
+    /// Periodic timers are re-armed to the first period strictly after
+    /// `now_ns` in a single step (see [`Self::next_period_after`]), so a
+    /// re-armed timer never re-qualifies immediately.
     pub fn process_expired(&mut self, now_ns: u64) -> usize {
         let mut fired = 0usize;
-        loop {
+        while fired < MAX_FIRES_PER_TICK {
             if self.count == 0 {
                 break;
             }
@@ -220,8 +234,12 @@ impl HrTimerQueue {
             if restart == TimerRestart::Restart
                 || (timer.interval_ns > 0 && restart == TimerRestart::NoRestart)
             {
+                // For a periodic timer, jump straight to the first period
+                // strictly after `now_ns` so it cannot fire again this call
+                // and cannot wrap. For a callback-driven (non-periodic)
+                // restart, keep the expiry the callback set.
                 let next_expiry = if timer.interval_ns > 0 {
-                    timer.expiry_ns.wrapping_add(timer.interval_ns)
+                    Self::next_period_after(timer.expiry_ns, timer.interval_ns, now_ns)
                 } else {
                     timer.expiry_ns
                 };
@@ -236,6 +254,28 @@ impl HrTimerQueue {
             fired += 1;
         }
         fired
+    }
+
+    /// Computes the first periodic expiry strictly greater than `now_ns`.
+    ///
+    /// Given a base expiry and a non-zero `interval_ns`, advances `expiry_ns`
+    /// by whole intervals in one step so the result is `> now_ns`. All
+    /// arithmetic is saturating, so the result never wraps; in the worst case
+    /// it saturates to `u64::MAX` (a timer effectively far in the future)
+    /// rather than wrapping back to a tiny value that would re-qualify and
+    /// live-lock the tick loop.
+    ///
+    /// `interval_ns` is assumed non-zero (the only caller guards this). If the
+    /// base `expiry_ns` is already `> now_ns`, it is returned unchanged.
+    fn next_period_after(expiry_ns: u64, interval_ns: u64, now_ns: u64) -> u64 {
+        if expiry_ns > now_ns {
+            return expiry_ns;
+        }
+        // Number of whole intervals from `expiry_ns` up to `now_ns`, then one
+        // more so the result lands strictly after `now_ns`.
+        let elapsed = now_ns - expiry_ns;
+        let periods = (elapsed / interval_ns).saturating_add(1);
+        expiry_ns.saturating_add(interval_ns.saturating_mul(periods))
     }
 
     /// Returns the expiry of the next timer, or `None` if queue is empty.
