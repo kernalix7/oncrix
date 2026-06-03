@@ -588,16 +588,38 @@ pub fn msgrcv(
 // msgctl
 // ---------------------------------------------------------------------------
 
+/// Maximum value to which an unprivileged caller may set `msg_qbytes`.
+///
+/// Privileged callers (superuser / `CAP_SYS_RESOURCE`) may raise the
+/// limit further, but even they are capped at this constant to prevent
+/// the byte-quota check (`current_bytes > max_bytes`) from being
+/// defeated by a `u64::MAX` assignment.
+const MSG_MAX_QBYTES: u64 = MSG_DEFAULT_MAX_BYTES * 16;
+
 /// Perform a control operation on a message queue.
 ///
 /// Returns 0 on success for most commands; for `IPC_INFO` / `MSG_INFO`
 /// returns the number of active queues.
+///
+/// # Arguments
+///
+/// * `caller_uid` — effective UID of the calling process.
+/// * `caller_gid` — effective GID of the calling process.
+/// * `is_privileged` — true if the caller has superuser/capability
+///   privilege (e.g., `CAP_IPC_OWNER` / `CAP_SYS_RESOURCE`).
 pub fn msgctl(
     registry: &mut MsgRegistry,
     msqid: usize,
     cmd: i32,
     new_ds: Option<&MsqDs>,
+    caller_uid: u32,
+    caller_gid: u32,
+    is_privileged: bool,
 ) -> Result<i32> {
+    // Suppress unused-variable warning for caller_gid; it is accepted for
+    // future group-ownership checks and API consistency with shmctl/semctl.
+    let _ = caller_gid;
+
     match cmd {
         IPC_RMID => {
             if msqid >= MSG_REGISTRY_MAX {
@@ -606,7 +628,11 @@ pub fn msgctl(
             if registry.queues[msqid].is_none() {
                 return Err(Error::NotFound);
             }
+            // POSIX: IPC_RMID restricted to owner, creator, or privileged.
             if let Some(ref q) = registry.queues[msqid] {
+                if !is_privileged && caller_uid != q.perm.uid && caller_uid != q.perm.cuid {
+                    return Err(Error::PermissionDenied);
+                }
                 registry.stats.bytes_in_queues = registry
                     .stats
                     .bytes_in_queues
@@ -629,11 +655,29 @@ pub fn msgctl(
         IPC_SET => {
             registry.check_msqid(msqid)?;
             if let Some(ds) = new_ds {
+                // POSIX: IPC_SET restricted to owner, creator, or privileged.
+                {
+                    let q = registry.queues[msqid].as_ref().ok_or(Error::NotFound)?;
+                    if !is_privileged && caller_uid != q.perm.uid && caller_uid != q.perm.cuid {
+                        return Err(Error::PermissionDenied);
+                    }
+                }
                 let queue = registry.queues[msqid].as_mut().ok_or(Error::NotFound)?;
                 queue.perm.uid = ds.msg_perm.uid;
                 queue.perm.gid = ds.msg_perm.gid;
                 queue.perm.mode = ds.msg_perm.mode & 0o777;
                 if ds.msg_qbytes > 0 {
+                    // Clamp to the system maximum.  Unprivileged callers cannot
+                    // raise msg_qbytes above the default; privileged callers are
+                    // capped at MSG_MAX_QBYTES so the byte-limit remains meaningful.
+                    let cap = if is_privileged {
+                        MSG_MAX_QBYTES
+                    } else {
+                        MSG_DEFAULT_MAX_BYTES
+                    };
+                    if ds.msg_qbytes > cap {
+                        return Err(Error::InvalidArgument);
+                    }
                     queue.max_bytes = ds.msg_qbytes;
                 }
                 queue.ctime = queue.ctime.wrapping_add(1);
