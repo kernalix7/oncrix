@@ -68,17 +68,19 @@ unsafe fn xorshift64_next() -> u64 {
 ///
 /// # Errors
 ///
-/// Returns `-14` (`EFAULT`) when `buf_ptr` is NULL or falls within the
-/// kernel canonical-address range (`>= 0xFFFF_8000_0000_0000`).
+/// Returns `-14` (`EFAULT`) when the `buflen`-byte span at `buf_ptr` is not
+/// a writable user-space region (NULL, non-canonical, below the user base,
+/// straddling into kernel space, or unmapped).
 pub unsafe fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> i64 {
-    // ── Validate user pointer ────────────────────────────────────────
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
-        return -14; // EFAULT
-    }
-
     let len = buflen as usize;
     if len == 0 {
         return 0;
+    }
+
+    // ── Validate user pointer ────────────────────────────────────────
+    // Span-check the exact `len` bytes the kernel is about to write.
+    if crate::uaccess::verify_user_access(buf_ptr, len as u64, true).is_err() {
+        return -14; // EFAULT
     }
 
     // ── Mix in PIT tick counter for extra variation ──────────────────

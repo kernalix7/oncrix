@@ -213,10 +213,10 @@ pub unsafe fn sys_sched_setscheduler(_pid: i64, policy: i64, param: u64) -> i64 
 
     // Optionally read sched_priority from the param struct.
     let new_priority = if param != 0 {
-        // Only the leading 4-byte `int sched_priority` is read; span-validate
-        // exactly those bytes (rejects the non-canonical hole and below-user
-        // addresses the base-only check used to admit).
-        if crate::uaccess::validate_user_range(param, 4).is_err() {
+        // Only the leading 4-byte `int sched_priority` is read; span- and
+        // backed-window-validate exactly those bytes (rejects the
+        // non-canonical hole, below-user, and unmapped pages).
+        if crate::uaccess::verify_user_access(param, 4, false).is_err() {
             return -14; // EFAULT
         }
         // SAFETY: `param`'s leading 4 bytes were validated above. The first
@@ -254,9 +254,9 @@ pub unsafe fn sys_sched_setscheduler(_pid: i64, policy: i64, param: u64) -> i64 
 ///
 /// See [`sys_sched_setscheduler`] regarding the `param` pointer.
 pub unsafe fn sys_sched_getparam(_pid: i64, param: u64) -> i64 {
-    // Only the leading 4-byte `int sched_priority` is written; span-validate
-    // exactly those bytes before the write.
-    if crate::uaccess::validate_user_range(param, 4).is_err() {
+    // Only the leading 4-byte `int sched_priority` is written; span- and
+    // backed-window-validate exactly those bytes before the write.
+    if crate::uaccess::verify_user_access(param, 4, true).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
@@ -282,9 +282,9 @@ pub unsafe fn sys_sched_getparam(_pid: i64, param: u64) -> i64 {
 ///
 /// See [`sys_sched_setscheduler`] regarding the `param` pointer.
 pub unsafe fn sys_sched_setparam(_pid: i64, param: u64) -> i64 {
-    // Only the leading 4-byte `int sched_priority` is read; span-validate
-    // exactly those bytes before the read.
-    if crate::uaccess::validate_user_range(param, 4).is_err() {
+    // Only the leading 4-byte `int sched_priority` is read; span- and
+    // backed-window-validate exactly those bytes before the read.
+    if crate::uaccess::verify_user_access(param, 4, false).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: `param`'s leading 4 bytes were validated above; read 4 bytes only.
@@ -337,11 +337,6 @@ unsafe fn global_ticks() -> u64 {
     }
 }
 
-/// Reject obviously non-canonical / kernel-half user pointers.
-fn bad_user_ptr(p: u64) -> bool {
-    p == 0 || p >= 0xFFFF_8000_0000_0000
-}
-
 /// Upper bound on `cpusetsize` accepted by `sched_{get,set}affinity`.
 ///
 /// A Linux `cpu_set_t` is 128 bytes (1024 CPUs); ONCRIX is single-CPU and
@@ -370,8 +365,9 @@ const CPU_SET_MAX_BYTES: u64 = 128;
 /// pointer; non-canonical addresses are rejected and unmapped-canonical
 /// accesses fault into the user handler (SIGSEGV).
 pub unsafe fn sys_times(buffer: u64) -> i64 {
-    // Span-validate the full 32-byte `struct tms` write (four i64s).
-    if crate::uaccess::validate_user_range(buffer, 32).is_err() {
+    // Span- and backed-window-validate the full 32-byte `struct tms`
+    // write (four i64s).
+    if crate::uaccess::verify_user_access(buffer, 32, true).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
@@ -415,8 +411,9 @@ pub unsafe fn sys_getrusage(who: i64, r_usage: u64) -> i64 {
     if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
         return -22; // EINVAL
     }
-    // Span-validate the full 144-byte `struct rusage` write (18 i64s).
-    if crate::uaccess::validate_user_range(r_usage, 144).is_err() {
+    // Span- and backed-window-validate the full 144-byte `struct rusage`
+    // write (18 i64s).
+    if crate::uaccess::verify_user_access(r_usage, 144, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -476,9 +473,10 @@ pub unsafe fn sys_sched_getaffinity(_pid: i64, cpusetsize: u64, mask: u64) -> i6
     if cpusetsize == 0 || cpusetsize % 8 != 0 || cpusetsize > CPU_SET_MAX_BYTES {
         return -22; // EINVAL
     }
-    // Span-validate the entire `cpusetsize`-byte zero-fill write below so a
-    // bounded-but-large request cannot scribble past the user buffer.
-    if crate::uaccess::validate_user_range(mask, cpusetsize).is_err() {
+    // Span- and backed-window-validate the entire `cpusetsize`-byte
+    // zero-fill write below so a bounded-but-large request cannot scribble
+    // past the user buffer (and cannot hit an unmapped page in ring 0).
+    if crate::uaccess::verify_user_access(mask, cpusetsize, true).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
@@ -497,7 +495,7 @@ pub unsafe fn sys_sched_getaffinity(_pid: i64, cpusetsize: u64, mask: u64) -> i6
             0
         };
         // SAFETY: i < cpusetsize and the full [mask, mask+cpusetsize) span
-        // was validated above via validate_user_range, so each byte write
+        // was validated above via verify_user_access, so each byte write
         // stays within the user buffer (faulting to SIGSEGV if unmapped).
         unsafe {
             core::ptr::write_unaligned((mask as *mut u8).add(i), byte);
@@ -526,8 +524,9 @@ pub unsafe fn sys_sched_setaffinity(_pid: i64, cpusetsize: u64, mask: u64) -> i6
     if cpusetsize == 0 || cpusetsize % 8 != 0 || cpusetsize > CPU_SET_MAX_BYTES {
         return -22; // EINVAL
     }
-    // Only the low 8 bytes are read below; span-validate exactly those.
-    if crate::uaccess::validate_user_range(mask, 8).is_err() {
+    // Only the low 8 bytes are read below; span- and backed-window-validate
+    // exactly those.
+    if crate::uaccess::verify_user_access(mask, 8, false).is_err() {
         return -14; // EFAULT
     }
 
@@ -536,7 +535,7 @@ pub unsafe fn sys_sched_setaffinity(_pid: i64, cpusetsize: u64, mask: u64) -> i6
     let mut low: u64 = 0;
     for i in 0..8usize {
         // SAFETY: the 8-byte span [mask, mask+8) was validated above via
-        // validate_user_range, so each in-range read stays within user space.
+        // verify_user_access, so each in-range read stays within user space.
         let byte = unsafe { core::ptr::read_unaligned((mask as *const u8).add(i)) };
         low |= (byte as u64) << (i * 8);
     }
@@ -689,7 +688,9 @@ pub unsafe fn sys_getitimer(which: i64, curr_value: u64) -> i64 {
     if which != ITIMER_REAL {
         return -22; // EINVAL
     }
-    if bad_user_ptr(curr_value) {
+    // The full 32-byte `struct itimerval` (four i64s) is written below;
+    // span- and backed-window-validate exactly that write.
+    if crate::uaccess::verify_user_access(curr_value, 32, true).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: SYSCALL context — see fn-level note.
@@ -728,10 +729,14 @@ pub unsafe fn sys_setitimer(which: i64, new_value: u64, old_value: u64) -> i64 {
     if which != ITIMER_REAL {
         return -22; // EINVAL
     }
-    if bad_user_ptr(new_value) {
+    // `new_value` is read as a 32-byte `struct itimerval` (four i64s);
+    // span- and backed-window-validate exactly that read.
+    if crate::uaccess::verify_user_access(new_value, 32, false).is_err() {
         return -14; // EFAULT
     }
-    if old_value != 0 && bad_user_ptr(old_value) {
+    // `old_value` is the optional previous-setting out-param: NULL means
+    // "don't report", which is valid; otherwise 32 bytes are written.
+    if old_value != 0 && crate::uaccess::verify_user_access(old_value, 32, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -840,10 +845,13 @@ pub unsafe fn sys_rt_sigaction(sig: i64, act: u64, oact: u64, sigsetsize: u64) -
         return -22; // EINVAL
     }
     let signum = Signal(sig as u8);
-    if act != 0 && bad_user_ptr(act) {
+    // `act`/`oact` are read/written as a 32-byte `struct sigaction`
+    // (RawSigaction); both are NULL-optional (NULL = no install / no
+    // report). Span- and backed-window-validate exactly 32 bytes per side.
+    if act != 0 && crate::uaccess::verify_user_access(act, 32, false).is_err() {
         return -14; // EFAULT
     }
-    if oact != 0 && bad_user_ptr(oact) {
+    if oact != 0 && crate::uaccess::verify_user_access(oact, 32, true).is_err() {
         return -14; // EFAULT
     }
     if act == 0 && oact == 0 {
@@ -932,10 +940,13 @@ pub unsafe fn sys_rt_sigprocmask(how: i64, set: u64, oldset: u64, sigsetsize: u6
     if sigsetsize != 8 {
         return -22; // EINVAL
     }
-    if set != 0 && bad_user_ptr(set) {
+    // `set`/`oldset` are read/written as an 8-byte `sigset_t` word; both
+    // are NULL-optional (NULL = no change / no report). Span- and
+    // backed-window-validate exactly 8 bytes per side.
+    if set != 0 && crate::uaccess::verify_user_access(set, 8, false).is_err() {
         return -14; // EFAULT
     }
-    if oldset != 0 && bad_user_ptr(oldset) {
+    if oldset != 0 && crate::uaccess::verify_user_access(oldset, 8, true).is_err() {
         return -14; // EFAULT
     }
     let how_i32 = how as i32;
@@ -1218,11 +1229,12 @@ unsafe fn rlimit_op(target: u64, resource: u64, new_ptr: u64, old_ptr: u64) -> i
         return -22; // EINVAL
     }
     // Each non-null pointer is dereferenced as a 16-byte `rlimit` below;
-    // span-validate the exact access length before any read/write.
-    if old_ptr != 0 && crate::uaccess::validate_user_range(old_ptr, 16).is_err() {
+    // span- and backed-window-validate the exact access before any
+    // read/write. NULL is the valid "absent" case for each side.
+    if old_ptr != 0 && crate::uaccess::verify_user_access(old_ptr, 16, true).is_err() {
         return -14; // EFAULT
     }
-    if new_ptr != 0 && crate::uaccess::validate_user_range(new_ptr, 16).is_err() {
+    if new_ptr != 0 && crate::uaccess::verify_user_access(new_ptr, 16, false).is_err() {
         return -14; // EFAULT
     }
     let target_pid = match resolve_target_pid(target) {
@@ -1359,9 +1371,10 @@ pub unsafe fn sys_umask(mask: u64) -> i64 {
 /// 4 bytes each, relying on the user page-fault handler to convert an
 /// unmapped-but-canonical access into a `SIGSEGV`.
 pub unsafe fn sys_getcpu(cpu: u64, node: u64, _tcache: u64) -> i64 {
-    // Validate cpu_ptr when non-null: span-validate the exact 4-byte write.
+    // Validate cpu_ptr when non-null: span- and backed-window-validate the
+    // exact 4-byte write (NULL = "don't report", which is valid).
     if cpu != 0 {
-        if crate::uaccess::validate_user_range(cpu, 4).is_err() {
+        if crate::uaccess::verify_user_access(cpu, 4, true).is_err() {
             return -14; // EFAULT
         }
         // SAFETY: the 4-byte span at `cpu` was validated above. We write
@@ -1370,9 +1383,10 @@ pub unsafe fn sys_getcpu(cpu: u64, node: u64, _tcache: u64) -> i64 {
         unsafe { core::ptr::write_unaligned(cpu as *mut u32, 0u32) };
     }
 
-    // Validate node_ptr when non-null: span-validate the exact 4-byte write.
+    // Validate node_ptr when non-null: span- and backed-window-validate the
+    // exact 4-byte write (NULL = "don't report", which is valid).
     if node != 0 {
-        if crate::uaccess::validate_user_range(node, 4).is_err() {
+        if crate::uaccess::verify_user_access(node, 4, true).is_err() {
             return -14; // EFAULT
         }
         // SAFETY: same reasoning as cpu_ptr write above.
@@ -1445,11 +1459,12 @@ pub unsafe fn sys_sched_get_priority_min(policy: i64) -> i64 {
 /// Called exclusively from the single-CPU SYSCALL dispatch path.
 /// `tp` is a raw user-space pointer; the caller must ensure it is mapped
 /// and writable before invoking this function (the 16-byte span is
-/// validated here via `validate_user_range`).
+/// validated here via `verify_user_access`).
 pub unsafe fn sys_sched_rr_get_interval(pid: u64, tp: u64) -> i64 {
     // Two i64s are written at tp and tp+8 (16-byte `struct timespec`);
-    // span-validate the full 16-byte range before any write.
-    if crate::uaccess::validate_user_range(tp, 16).is_err() {
+    // span- and backed-window-validate the full 16-byte range before any
+    // write.
+    if crate::uaccess::verify_user_access(tp, 16, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -1527,8 +1542,9 @@ pub unsafe fn sys_sched_setattr(_pid: i64, attr: u64, flags: i64) -> i64 {
     if flags != 0 {
         return -22; // EINVAL
     }
-    // Span-validate the full 48-byte `struct sched_attr` read.
-    if crate::uaccess::validate_user_range(attr, SCHED_ATTR_SIZE_V0 as u64).is_err() {
+    // Span- and backed-window-validate the full 48-byte `struct sched_attr`
+    // read.
+    if crate::uaccess::verify_user_access(attr, SCHED_ATTR_SIZE_V0 as u64, false).is_err() {
         return -14; // EFAULT
     }
 
@@ -1583,8 +1599,9 @@ pub unsafe fn sys_sched_getattr(_pid: i64, attr: u64, size: u64, flags: i64) -> 
     if size < SCHED_ATTR_SIZE_V0 as u64 {
         return -22; // EINVAL
     }
-    // Span-validate the full 48-byte `struct sched_attr` write.
-    if crate::uaccess::validate_user_range(attr, SCHED_ATTR_SIZE_V0 as u64).is_err() {
+    // Span- and backed-window-validate the full 48-byte `struct sched_attr`
+    // write.
+    if crate::uaccess::verify_user_access(attr, SCHED_ATTR_SIZE_V0 as u64, true).is_err() {
         return -14; // EFAULT
     }
 

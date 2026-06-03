@@ -546,10 +546,11 @@ const SOCK_PATH_MAX: usize = 108;
 ///
 /// `path_ptr` must point into user-space (checked against canonical boundary).
 unsafe fn copy_socket_path(path_ptr: u64, buf: &mut [u8; SOCK_PATH_MAX]) -> Result<usize> {
-    // Validate the full span we may read so a low/non-canonical/boundary
-    // pointer faults here as EINVAL rather than triggering a #GP or a ring-0
-    // fault inside the byte loop below.
-    crate::uaccess::validate_user_range(path_ptr, SOCK_PATH_MAX as u64)?;
+    // Span-verify the full window we may read against the process's backed
+    // user mapping so a low/non-canonical/boundary pointer faults here as
+    // EINVAL rather than triggering a #GP or a ring-0 fault inside the byte
+    // loop below. The kernel only reads here, so `write = false`.
+    crate::uaccess::verify_user_access(path_ptr, SOCK_PATH_MAX as u64, false)?;
     // SAFETY: caller guarantees `path_ptr` is below the kernel canonical boundary.
     unsafe {
         let base = path_ptr as *const u8;
@@ -629,8 +630,9 @@ pub unsafe fn sys_socket(domain: u64, sock_type: u64, _protocol: u64) -> i64 {
 ///
 /// Must be called from the SYSCALL dispatch path.
 pub unsafe fn sys_bind(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
-    // Validate the 2-byte family read before dereferencing.
-    if crate::uaccess::validate_user_range(addr_ptr, 2).is_err() {
+    // Span-verify the 2-byte family read against the backed user mapping
+    // before dereferencing. The kernel reads here, so `write = false`.
+    if crate::uaccess::verify_user_access(addr_ptr, 2, false).is_err() {
         return -14; // EFAULT
     }
 
@@ -764,8 +766,9 @@ pub unsafe fn sys_accept(sockfd: u64, _addr_ptr: u64, _addrlen_ptr: u64) -> i64 
 ///
 /// Must be called from the SYSCALL dispatch path.
 pub unsafe fn sys_connect(sockfd: u64, addr_ptr: u64, _addrlen: u64) -> i64 {
-    // Validate the 2-byte family read before dereferencing.
-    if crate::uaccess::validate_user_range(addr_ptr, 2).is_err() {
+    // Span-verify the 2-byte family read against the backed user mapping
+    // before dereferencing. The kernel reads here, so `write = false`.
+    if crate::uaccess::verify_user_access(addr_ptr, 2, false).is_err() {
         return -14; // EFAULT
     }
 
@@ -833,9 +836,11 @@ pub unsafe fn sys_sendto(
     const MAX_SPINS: u32 = 4096;
 
     let count = (len as usize).min(4096);
-    // Validate exactly the span we will read so a low/non-canonical/boundary
-    // pointer faults here as EFAULT rather than in the byte loop.
-    if crate::uaccess::validate_user_range(buf_ptr, count as u64).is_err() {
+    // Span-verify exactly the clamped window we will read against the backed
+    // user mapping so a low/non-canonical/boundary pointer faults here as
+    // EFAULT rather than in the byte loop. The kernel reads here (`write =
+    // false`).
+    if crate::uaccess::verify_user_access(buf_ptr, count as u64, false).is_err() {
         return -14; // EFAULT
     }
     let handle_id = match get_socket_fd(sockfd) {
@@ -905,10 +910,12 @@ pub unsafe fn sys_recvfrom(
     _slen: u64,
 ) -> i64 {
     let count = (len as usize).min(4096);
-    // Validate exactly the span we may write so a low/non-canonical/boundary
-    // pointer faults here as EFAULT rather than in the write loop. At most
-    // `count` bytes (`n <= count`) are written, so this span fully covers it.
-    if crate::uaccess::validate_user_range(buf_ptr, count as u64).is_err() {
+    // Span-verify exactly the clamped window we may write against the backed
+    // user mapping so a low/non-canonical/boundary pointer faults here as
+    // EFAULT rather than in the write loop. At most `count` bytes (`n <=
+    // count`) are written, so this span fully covers it. The kernel writes
+    // here (`write = true`).
+    if crate::uaccess::verify_user_access(buf_ptr, count as u64, true).is_err() {
         return -14; // EFAULT
     }
     let handle_id = match get_socket_fd(sockfd) {

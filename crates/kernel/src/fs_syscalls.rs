@@ -497,7 +497,11 @@ pub unsafe fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> i64 {
 /// must be a NUL-terminated path; `buf_ptr..buf_ptr+bufsiz` must be
 /// writable user memory.
 pub unsafe fn sys_readlink(pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    // The kernel writes at most `cap` bytes (clamped to the staging buffer)
+    // into buf_ptr in ring 0. Verify exactly that span up front; a base-only
+    // check would miss the non-canonical hole and a near-boundary straddle.
+    let cap = (bufsiz as usize).min(PATH_BUF_LEN);
+    if crate::uaccess::verify_user_access(buf_ptr, cap as u64, true).is_err() {
         return -14; // EFAULT
     }
     static mut RL_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
@@ -521,8 +525,7 @@ pub unsafe fn sys_readlink(pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 
         }
     };
 
-    // Read the link target into a kernel staging buffer.
-    let cap = (bufsiz as usize).min(PATH_BUF_LEN);
+    // Read the link target into a kernel staging buffer (`cap` validated above).
     // SAFETY: RL_ABS[..abs_len] written above; RL_OUT exclusively owned.
     #[allow(static_mut_refs)]
     let result = unsafe {
@@ -863,8 +866,10 @@ pub unsafe fn sys_chown(pathname_ptr: u64, uid: u64, gid: u64) -> i64 {
 /// Must be called from the single-CPU SYSCALL dispatch path.  `buf_ptr`
 /// must point to at least `buf_len` writable bytes in user space.
 pub unsafe fn sys_getdents64(fd: usize, buf_ptr: u64, buf_len: u64) -> i64 {
-    // Validate user buffer.
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    // Exact-span check: the kernel writes dirent records anywhere within
+    // buf_ptr..buf_ptr+buf_len in ring 0 (each record bounded by
+    // written + reclen <= buf_len), so verify the whole declared window.
+    if crate::uaccess::verify_user_access(buf_ptr, buf_len, true).is_err() {
         return -14; // EFAULT
     }
     let buf_len = buf_len as usize;
@@ -1078,8 +1083,10 @@ unsafe fn fill_stat_buf(buf: *mut u8, inode: &oncrix_vfs::inode::Inode) {
 ///
 /// Must be called from the single-CPU SYSCALL dispatch path.
 pub unsafe fn sys_stat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
-    // Validate statbuf pointer.
-    if statbuf_ptr == 0 || statbuf_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate statbuf pointer for the exact STAT_SIZE write the kernel will
+    // perform in ring 0 (closes the non-canonical-hole / straddle DoS that a
+    // base-only check misses).
+    if crate::uaccess::verify_user_access(statbuf_ptr, STAT_SIZE as u64, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -1136,7 +1143,8 @@ pub unsafe fn sys_stat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
 /// Must be called from the single-CPU SYSCALL dispatch path. `statbuf_ptr`
 /// must point to >= 144 writable user bytes.
 pub unsafe fn sys_lstat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
-    if statbuf_ptr == 0 || statbuf_ptr >= 0xFFFF_8000_0000_0000 {
+    // Exact-span check for the STAT_SIZE write the kernel performs in ring 0.
+    if crate::uaccess::verify_user_access(statbuf_ptr, STAT_SIZE as u64, true).is_err() {
         return -14; // EFAULT
     }
     static mut LSTAT_PATH: [u8; PATH_BUF_LEN] = [0u8; PATH_BUF_LEN];
@@ -1191,7 +1199,8 @@ pub unsafe fn sys_lstat(path_ptr: u64, statbuf_ptr: u64) -> i64 {
 ///
 /// Must be called from the single-CPU SYSCALL dispatch path.
 pub unsafe fn sys_fstat(fd: i32, statbuf_ptr: u64) -> i64 {
-    if statbuf_ptr == 0 || statbuf_ptr >= 0xFFFF_8000_0000_0000 {
+    // Exact-span check: every branch below writes STAT_SIZE bytes in ring 0.
+    if crate::uaccess::verify_user_access(statbuf_ptr, STAT_SIZE as u64, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -1740,10 +1749,15 @@ unsafe fn fill_statfs_buf(buf: *mut u8, used_inodes: i64) {
 /// `pathname_ptr` must be a null-terminated user-space string.
 /// `buf_ptr` must point to at least 120 writable user-space bytes.
 pub unsafe fn sys_statfs(pathname_ptr: u64, buf_ptr: u64) -> i64 {
+    // pathname_ptr is a variable-length NUL-terminated string: copy_user_path
+    // page-scans it byte-by-byte, so a fixed-span check would over-reject a
+    // short path near a window edge. Keep the base-only guard here until a
+    // page-scanning copy_user_cstr lands (deferred).
     if pathname_ptr == 0 || pathname_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
     }
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    // buf_ptr: exact-span check for the STATFS_SIZE write the kernel performs.
+    if crate::uaccess::verify_user_access(buf_ptr, STATFS_SIZE as u64, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -1809,7 +1823,8 @@ pub unsafe fn sys_statfs(pathname_ptr: u64, buf_ptr: u64) -> i64 {
 /// Must be called from the single-CPU SYSCALL dispatch path.
 /// `buf_ptr` must point to at least 120 writable user-space bytes.
 pub unsafe fn sys_fstatfs(fd: i32, buf_ptr: u64) -> i64 {
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    // Exact-span check for the STATFS_SIZE write the kernel performs in ring 0.
+    if crate::uaccess::verify_user_access(buf_ptr, STATFS_SIZE as u64, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -1864,8 +1879,10 @@ const SYSINFO_TOTAL_RAM: u64 = 96 * 1024 * 1024;
 /// writable bytes in user space; non-canonical addresses are rejected with
 /// `-14` (`EFAULT`).
 pub unsafe fn sys_sysinfo(info: u64) -> i64 {
-    // Reject null or kernel-half pointers.
-    if info == 0 || info >= 0xFFFF_8000_0000_0000 {
+    // Exact-span check: the kernel writes exactly 112 bytes (struct sysinfo)
+    // in ring 0; a base-only check would miss the non-canonical hole and a
+    // near-boundary straddle into the kernel half.
+    if crate::uaccess::verify_user_access(info, 112, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -2123,8 +2140,9 @@ pub unsafe fn sys_fallocate(fd: i32, mode: i32, offset: u64, len: u64) -> i64 {
 ///
 /// Must be called from the single-CPU SYSCALL dispatch path.
 pub unsafe fn sys_capget(header_ptr: u64, data_ptr: u64) -> i64 {
-    // Validate the mandatory header pointer.
-    if header_ptr == 0 || header_ptr >= 0xFFFF_8000_0000_0000 {
+    // The kernel reads exactly 4 bytes (the version u32) from the header in
+    // ring 0; verify that exact span (read).
+    if crate::uaccess::verify_user_access(header_ptr, 4, false).is_err() {
         return -14; // EFAULT
     }
 
@@ -2140,8 +2158,10 @@ pub unsafe fn sys_capget(header_ptr: u64, data_ptr: u64) -> i64 {
     let data_len: usize = if version == CAP_V1 { 12 } else { 24 };
 
     // data_ptr may be null (caller only querying the version in the header).
-    // If non-null it must be a valid user address for the whole data block.
-    if data_ptr != 0 && data_ptr >= 0xFFFF_8000_0000_0000 - data_len as u64 {
+    // If non-null, the kernel zero-fills exactly data_len bytes in ring 0;
+    // verify that exact span (write). NULL stays valid (absent out-param).
+    if data_ptr != 0 && crate::uaccess::verify_user_access(data_ptr, data_len as u64, true).is_err()
+    {
         return -14; // EFAULT
     }
 
@@ -2310,9 +2330,10 @@ pub unsafe fn sys_personality(_persona: u64) -> i64 {
 ///
 /// Must be called from the single-CPU SYSCALL dispatch path.
 pub unsafe fn sys_sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64) -> i64 {
-    // Validate the optional offset pointer: if non-null it must be a
-    // readable/writable user-space address.
-    if offset_ptr != 0 && offset_ptr >= 0xFFFF_8000_0000_0000 {
+    // Optional offset pointer: if non-null the kernel reads then writes back
+    // exactly 8 bytes (i64) in ring 0. Verify that exact span (write covers
+    // both directions). NULL stays valid (use the handle position instead).
+    if offset_ptr != 0 && crate::uaccess::verify_user_access(offset_ptr, 8, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -2476,11 +2497,13 @@ pub unsafe fn sys_copy_file_range(
         return -22; // EINVAL
     }
 
-    // Validate optional offset pointers.
-    if off_in_ptr != 0 && off_in_ptr >= 0xFFFF_8000_0000_0000 {
+    // Optional offset pointers: if non-null the kernel reads then writes back
+    // exactly 8 bytes (i64) in ring 0. Verify each exact span (write covers
+    // both directions). NULL stays valid (use the handle position instead).
+    if off_in_ptr != 0 && crate::uaccess::verify_user_access(off_in_ptr, 8, true).is_err() {
         return -14; // EFAULT
     }
-    if off_out_ptr != 0 && off_out_ptr >= 0xFFFF_8000_0000_0000 {
+    if off_out_ptr != 0 && crate::uaccess::verify_user_access(off_out_ptr, 8, true).is_err() {
         return -14; // EFAULT
     }
 

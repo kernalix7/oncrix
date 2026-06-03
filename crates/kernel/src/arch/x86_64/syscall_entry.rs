@@ -1755,42 +1755,41 @@ unsafe fn resolve_to_abs<'b>(
 ///
 /// Must be called from the SYSCALL dispatch path.
 unsafe fn sys_open(pathname_ptr: u64, flags: u64, mode: u64) -> i64 {
-    // Validate the pathname pointer. Check the full scan window, not
-    // just the base: the byte-at-a-time copy below reads up to
-    // MAX_OPEN_PATH bytes, so `pathname_ptr + MAX_OPEN_PATH` must stay
-    // below the non-canonical/kernel boundary or `base.add(i)` would
-    // cross into the hole and a high-half byte would fault in ring 0.
-    // (A canonical-but-unmapped page within the window can still fault;
-    // closing that fully needs a copy-from-user-with-fixup helper.)
-    if pathname_ptr == 0
-        || pathname_ptr
-            .checked_add(MAX_OPEN_PATH as u64)
-            .is_none_or(|end| end > 0xFFFF_8000_0000_0000)
-    {
-        return -22; // EINVAL
+    // Reject an obviously-bad pointer up front so the NULL case maps to
+    // EFAULT rather than ENAMETOOLONG.
+    if pathname_ptr == 0 {
+        return -22; // EFAULT (this handler uses -22 for bad pointers)
     }
 
-    // Copy the null-terminated path from user space (bounded copy).
+    // Copy the null-terminated path from user space. `copy_user_cstr`
+    // verifies each 4 KiB page is backed *before* reading it, so the scan
+    // cannot fault in ring 0, and it stops at the first NUL — no full-MAX
+    // span pre-check that would over-reject a short string near a window
+    // edge.
     static mut PATH_BUF: [u8; MAX_OPEN_PATH] = [0u8; MAX_OPEN_PATH];
     static mut ABS_BUF: [u8; MAX_OPEN_PATH] = [0u8; MAX_OPEN_PATH];
     // SAFETY: single-CPU SYSCALL context; PATH_BUF/ABS_BUF exclusively owned here.
     #[allow(static_mut_refs)]
     let abs_path: &[u8] = unsafe {
         let buf = &mut PATH_BUF;
-        let base = pathname_ptr as *const u8;
-        let mut i = 0usize;
-        loop {
-            if i >= MAX_OPEN_PATH - 1 {
-                return -36; // ENAMETOOLONG
+        // Reserve one byte so the longest accepted path is MAX_OPEN_PATH-1,
+        // matching resolve_to_abs's MAX_OPEN_PATH-1 cap.
+        let path_len = match crate::uaccess::copy_user_cstr(buf, pathname_ptr, MAX_OPEN_PATH - 1) {
+            Ok(n) => n,
+            // No NUL within the cap → ENAMETOOLONG; an unbacked/bad page →
+            // EFAULT. Distinguish by re-probing the scan window: if it is
+            // backed, the string was simply too long.
+            Err(_) => {
+                let backed = crate::uaccess::verify_user_access(
+                    pathname_ptr,
+                    (MAX_OPEN_PATH - 1) as u64,
+                    false,
+                )
+                .is_ok();
+                return if backed { -36 } else { -22 };
             }
-            let byte = base.add(i).read_volatile();
-            if byte == 0 {
-                break;
-            }
-            buf[i] = byte;
-            i += 1;
-        }
-        let path_bytes = &buf[..i];
+        };
+        let path_bytes = &buf[..path_len];
         match resolve_to_abs(path_bytes, &mut ABS_BUF) {
             Some(p) => p,
             None => return -36, // ENAMETOOLONG or empty
