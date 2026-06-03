@@ -93,6 +93,32 @@ pub fn verify_user_span(addr: u64, len: u64, write: bool) -> Result<()> {
     Err(Error::InvalidArgument)
 }
 
+/// Validate a user-pointer access, preferring the exact backed-window
+/// check but falling back to the canonical-range check when there is no
+/// current process address space.
+///
+/// [`verify_user_span`] requires a live [`UserAddressSpace`] and rejects
+/// the access otherwise. That is correct for syscalls reached from a
+/// running process, but some kernel paths touch user-supplied pointers
+/// *before* any process exists — e.g. early-boot console writes through
+/// `dispatch_write`, or kernel threads. For those, consult the live
+/// address space when present (exact, closes the unmapped-page DoS) and
+/// otherwise fall back to [`validate_user_range`] (canonical-range only —
+/// there is simply no per-process mapping to check yet).
+///
+/// This is the helper to call at a raw user-pointer deref site. Returns
+/// `Err(InvalidArgument)` (→ `EFAULT`) on failure.
+pub fn verify_user_access(addr: u64, len: u64, write: bool) -> Result<()> {
+    let has_uas = crate::current::current_thread()
+        .and_then(|t| t.user_address_space.as_ref())
+        .is_some();
+    if has_uas {
+        verify_user_span(addr, len, write)
+    } else {
+        validate_user_range(addr, len)
+    }
+}
+
 /// Validate a user-space string pointer (null-terminated).
 ///
 /// Walks the string up to `max_len` bytes looking for a null

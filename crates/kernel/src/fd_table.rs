@@ -31,7 +31,7 @@ use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
 use oncrix_lib::{Error, Result};
 
-use crate::uaccess::validate_user_range;
+use crate::uaccess::{validate_user_range, verify_user_access};
 
 // Re-export the data types from oncrix_process so callers only import from here.
 pub use oncrix_process::fd_table::{
@@ -317,7 +317,8 @@ pub unsafe fn sys_socketpair(domain: i64, type_: i64, _protocol: i64, sv_ptr: u6
     if type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != SOCK_STREAM {
         return -22; // EINVAL — only SOCK_STREAM is supported
     }
-    if sv_ptr == 0 || sv_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate the full 8-byte write span (two i32 fds written on success).
+    if verify_user_access(sv_ptr, 8, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -1477,10 +1478,11 @@ pub unsafe fn sys_signalfd4(fd: i32, mask_ptr: u64, sigsetsize: u64, flags: i32)
     if flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
         return -22; // EINVAL
     }
-    if mask_ptr == 0 || mask_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate the full 8-byte read span (one u64 signal mask).
+    if verify_user_access(mask_ptr, 8, false).is_err() {
         return -14; // EFAULT
     }
-    // SAFETY: `mask_ptr` validated user-canonical above; reads 8 bytes.
+    // SAFETY: `mask_ptr` verified for full 8-byte read span above.
     let mask = unsafe { (mask_ptr as *const u64).read_volatile() };
 
     if fd >= 0 {
@@ -2506,11 +2508,19 @@ pub unsafe fn sys_select(
     }
     let nfds = nfds as usize;
 
-    // Reject non-null but non-canonical user pointers.
-    for &p in &[readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ptr] {
-        if p != 0 && p >= 0xFFFF_8000_0000_0000 {
+    // Each fd_set is read in (fdset_read) and written back (fdset_write)
+    // over FD_SET_WORDS u64 words = 128 bytes; a NULL set means "ignore"
+    // and is valid. Validate the full span so a near-boundary pointer
+    // cannot straddle the 128-byte access into the kernel half.
+    for &p in &[readfds_ptr, writefds_ptr, exceptfds_ptr] {
+        if p != 0 && verify_user_access(p, FD_SET_WORDS as u64 * 8, true).is_err() {
             return -14; // EFAULT
         }
+    }
+    // The timeout is two i64 fields (16 bytes); NULL means block forever
+    // and is valid — skip the span check in that case.
+    if timeout_ptr != 0 && verify_user_access(timeout_ptr, 16, false).is_err() {
+        return -14; // EFAULT
     }
 
     // Snapshot the input sets once (POSIX: only ready bits remain on output).
@@ -2613,12 +2623,13 @@ pub unsafe fn sys_select(
 /// Must be called from the SYSCALL dispatch path. `buf_ptr` must be
 /// a non-null user-space address readable for at least `count` bytes.
 pub unsafe fn dispatch_write(fd: usize, buf_ptr: u64, count: u64) -> i64 {
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
-        return -14; // EFAULT
-    }
     let count = count.min(4096) as usize;
     if count == 0 {
         return 0;
+    }
+    // Verify the full effective read span (kernel reads user buffer).
+    if verify_user_access(buf_ptr, count as u64, false).is_err() {
+        return -14; // EFAULT
     }
 
     // SAFETY: fd_get is safe to call from SYSCALL dispatch.
@@ -2895,21 +2906,27 @@ unsafe fn read_iovec(iov_ptr: u64, index: usize) -> (u64, u64) {
 /// Must be called from the SYSCALL dispatch path (single-CPU). `iov` must
 /// reference `iovcnt` valid `iovec`s.
 pub unsafe fn dispatch_readv(fd: usize, iov_ptr: u64, iovcnt: u64) -> i64 {
-    if iov_ptr == 0 || iov_ptr >= 0xFFFF_8000_0000_0000 {
-        return -14; // EFAULT
-    }
     let iovcnt = iovcnt as usize;
     if iovcnt > IOV_MAX {
         return -22; // EINVAL
     }
+    // (7a) Verify the full iovec array span (iovcnt × 16 bytes, READ).
+    if verify_user_access(iov_ptr, iovcnt as u64 * 16, false).is_err() {
+        return -14; // EFAULT
+    }
     let mut total: i64 = 0;
     for i in 0..iovcnt {
-        // SAFETY: i < iovcnt and iov_ptr validated above.
+        // SAFETY: i < iovcnt and iov_ptr verified for the full array span above.
         let (base, len) = unsafe { read_iovec(iov_ptr, i) };
         if len == 0 {
             continue;
         }
-        // SAFETY: single-CPU SYSCALL context; dispatch_read validates base.
+        // (7b) Verify each data buffer span (kernel writes user buffer, READ from
+        // the iovec perspective means the kernel scatters data INTO the buffer).
+        if verify_user_access(base, len.min(4096), true).is_err() {
+            return -14; // EFAULT
+        }
+        // SAFETY: single-CPU SYSCALL context; dispatch_read re-validates base.
         let n = unsafe { dispatch_read(fd, base, len) };
         if n < 0 {
             return if total > 0 { total } else { n };
@@ -2933,21 +2950,27 @@ pub unsafe fn dispatch_readv(fd: usize, iov_ptr: u64, iovcnt: u64) -> i64 {
 /// Must be called from the SYSCALL dispatch path (single-CPU). `iov` must
 /// reference `iovcnt` valid `iovec`s.
 pub unsafe fn dispatch_writev(fd: usize, iov_ptr: u64, iovcnt: u64) -> i64 {
-    if iov_ptr == 0 || iov_ptr >= 0xFFFF_8000_0000_0000 {
-        return -14; // EFAULT
-    }
     let iovcnt = iovcnt as usize;
     if iovcnt > IOV_MAX {
         return -22; // EINVAL
     }
+    // (7a) Verify the full iovec array span (iovcnt × 16 bytes, READ).
+    if verify_user_access(iov_ptr, iovcnt as u64 * 16, false).is_err() {
+        return -14; // EFAULT
+    }
     let mut total: i64 = 0;
     for i in 0..iovcnt {
-        // SAFETY: i < iovcnt and iov_ptr validated above.
+        // SAFETY: i < iovcnt and iov_ptr verified for the full array span above.
         let (base, len) = unsafe { read_iovec(iov_ptr, i) };
         if len == 0 {
             continue;
         }
-        // SAFETY: single-CPU SYSCALL context; dispatch_write validates base.
+        // (7b) Verify each data buffer span (kernel reads user buffer for writing
+        // to the fd — write=false because the kernel is READING from this buffer).
+        if verify_user_access(base, len.min(4096), false).is_err() {
+            return -14; // EFAULT
+        }
+        // SAFETY: single-CPU SYSCALL context; dispatch_write re-validates base.
         let n = unsafe { dispatch_write(fd, base, len) };
         if n < 0 {
             return if total > 0 { total } else { n };
@@ -3045,12 +3068,13 @@ pub unsafe fn dispatch_pwrite(fd: usize, buf_ptr: u64, count: u64, offset: u64) 
 /// Must be called from the SYSCALL dispatch path (single-CPU). `buf_ptr`
 /// must reference `count` writable user bytes.
 pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
-        return -14; // EFAULT
-    }
     let count = count.min(4096) as usize;
     if count == 0 {
         return 0;
+    }
+    // Verify the full effective write span (kernel writes to user buffer).
+    if verify_user_access(buf_ptr, count as u64, true).is_err() {
+        return -14; // EFAULT
     }
 
     // SAFETY: fd_get is safe from SYSCALL dispatch.
