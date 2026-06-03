@@ -163,6 +163,22 @@ impl SeccompData {
         }
     }
 
+    /// Create a fully-populated `SeccompData` from the syscall number,
+    /// architecture, the six syscall arguments, and the instruction
+    /// pointer captured at the syscall.
+    ///
+    /// This is what filter evaluation must use: a filter that inspects
+    /// arguments (the common case) loads them from this structure, so the
+    /// real register values have to be threaded in rather than left zero.
+    pub const fn with_args(nr: i32, arch: u32, args: [u64; 6], instruction_pointer: u64) -> Self {
+        Self {
+            nr,
+            arch,
+            instruction_pointer,
+            args,
+        }
+    }
+
     /// Read a 32-bit word at `offset` bytes into the structure.
     ///
     /// This emulates the BPF `LD ABS` instruction against the
@@ -537,15 +553,28 @@ impl SeccompState {
     /// everything else returns [`SeccompAction::Kill`].
     ///
     /// In filter mode, all installed BPF programs are evaluated
-    /// against a [`SeccompData`] constructed from `syscall_nr` and
-    /// `arch`. The most restrictive action (lowest priority) wins.
+    /// against a [`SeccompData`] constructed from `syscall_nr`,
+    /// `arch`, the six syscall `args`, and the instruction pointer
+    /// `ip`. The most restrictive action (lowest priority) wins.
+    ///
+    /// The real argument values **must** be supplied: a filter that
+    /// inspects arguments (e.g. restricting `ioctl` by command, or
+    /// `socket` by address family) loads them from the seccomp data,
+    /// so passing the actual registers is what makes argument-based
+    /// policy effective rather than a silent allow.
     ///
     /// If seccomp is disabled, returns [`SeccompAction::Allow`].
-    pub fn check_syscall(&self, syscall_nr: u64, arch: u32) -> SeccompAction {
+    pub fn check_syscall(
+        &self,
+        syscall_nr: u64,
+        arch: u32,
+        args: [u64; 6],
+        ip: u64,
+    ) -> SeccompAction {
         match self.mode {
             SECCOMP_MODE_DISABLED => SeccompAction::Allow,
             SECCOMP_MODE_STRICT => Self::check_strict(syscall_nr),
-            SECCOMP_MODE_FILTER => self.check_filters(syscall_nr, arch),
+            SECCOMP_MODE_FILTER => self.check_filters(syscall_nr, arch, args, ip),
             _ => SeccompAction::Kill,
         }
     }
@@ -562,10 +591,12 @@ impl SeccompState {
 
     /// Evaluate all installed BPF filters and return the most
     /// restrictive action.
-    fn check_filters(&self, syscall_nr: u64, arch: u32) -> SeccompAction {
+    fn check_filters(&self, syscall_nr: u64, arch: u32, args: [u64; 6], ip: u64) -> SeccompAction {
         // Truncate syscall_nr to i32 (matching seccomp_data.nr).
         let nr = syscall_nr as i32;
-        let data = SeccompData::new(nr, arch);
+        // Build the seccomp data with the real arguments and instruction
+        // pointer so argument-inspecting filters evaluate correctly.
+        let data = SeccompData::with_args(nr, arch, args, ip);
 
         let mut result = SeccompAction::Allow;
 

@@ -404,10 +404,17 @@ pub enum NdpOption {
 }
 
 /// Parses NDP options from a byte slice, appending to `out`. Returns count.
+///
+/// The write index is bounded by both the caller-supplied `max` budget and
+/// the actual length of `out`, so an `out[count]` store can never run past
+/// the destination buffer even if `max` exceeds `out.len()`.
 pub fn parse_ndp_options(data: &[u8], out: &mut [NdpOption], max: usize) -> usize {
     let mut offset = 0;
     let mut count = 0;
-    while offset + 2 <= data.len() && count < max {
+    // Never trust `max` alone: clamp to the real destination length so the
+    // `out[count]` writes below are provably in bounds (mirrors parse_ipv4).
+    let limit = max.min(out.len());
+    while offset + 2 <= data.len() && count < limit {
         let opt_type = data[offset];
         let opt_len_units = data[offset + 1] as usize;
         if opt_len_units == 0 {

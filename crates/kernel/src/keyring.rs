@@ -353,19 +353,55 @@ impl KeyringRegistry {
         Ok(id)
     }
 
+    /// Returns `true` if a key is currently inaccessible because it is
+    /// revoked or its expiry time has passed.
+    ///
+    /// Expiry is enforced here (in addition to the lazy [`expire_keys`] sweep)
+    /// so that an expired-but-not-yet-swept key is never read or returned by a
+    /// search.
+    fn is_inaccessible(key: &Key, now_ns: u64) -> bool {
+        key.revoked || (key.expiry_ns > 0 && key.expiry_ns <= now_ns)
+    }
+
+    /// Select the effective permission role byte for `caller_uid` against a
+    /// key, then test it with `check`.
+    ///
+    /// The possessor and group roles require a per-process possessed-keyring
+    /// set and group list that this registry does not currently track, so only
+    /// the `user` (owner-uid match) and `other` roles are evaluated. Because
+    /// the possessor/group bits can only *add* rights in the real model,
+    /// omitting them is fail-closed: access is never granted where the full
+    /// check would deny it.
+    fn perm_allows(key: &Key, caller_uid: u32, check: fn(&KeyPermission, u8) -> bool) -> bool {
+        let role = if key.uid == caller_uid {
+            key.perm.user
+        } else {
+            key.perm.other
+        };
+        check(&key.perm, role)
+    }
+
     /// Search for a key by type and description.
     ///
-    /// Returns the key ID of the first matching active,
-    /// non-revoked key, or `Err(Error::NotFound)`.
-    pub fn request_key(&self, key_type: KeyType, desc: &[u8]) -> Result<u32> {
+    /// Only keys that are accessible (not revoked, not expired) and that grant
+    /// `KEY_POS_SEARCH` to `caller_uid` are matched. Returns the key ID of the
+    /// first such key, or `Err(Error::NotFound)`.
+    pub fn request_key(
+        &self,
+        key_type: KeyType,
+        desc: &[u8],
+        caller_uid: u32,
+        now_ns: u64,
+    ) -> Result<u32> {
         let mut i = 0;
         while i < MAX_KEYS {
             let key = &self.keys[i];
             if key.active
-                && !key.revoked
+                && !Self::is_inaccessible(key, now_ns)
                 && key.key_type == key_type
                 && key.desc_len == desc.len()
                 && key.description[..key.desc_len] == *desc
+                && Self::perm_allows(key, caller_uid, KeyPermission::can_search)
             {
                 return Ok(key.id);
             }
@@ -376,12 +412,23 @@ impl KeyringRegistry {
 
     /// Read the payload of a key into `buf`.
     ///
-    /// Returns the number of bytes copied, or
-    /// `Err(Error::NotFound)` if the key does not exist, or
-    /// `Err(Error::PermissionDenied)` if the key is revoked.
-    pub fn read_key(&self, id: u32, buf: &mut [u8]) -> Result<usize> {
+    /// Enforces, in order: the key exists; it is not revoked or expired
+    /// (`now_ns`); its type is readable from user space (`Logon` and
+    /// `Encrypted` payloads are never returned); and `caller_uid` is granted
+    /// `KEY_POS_READ`.
+    ///
+    /// Returns the number of bytes copied, `Err(Error::NotFound)` if the key
+    /// does not exist, or `Err(Error::PermissionDenied)` if any check fails.
+    pub fn read_key(&self, id: u32, buf: &mut [u8], caller_uid: u32, now_ns: u64) -> Result<usize> {
         let key = self.find_key(id)?;
-        if key.revoked {
+        if Self::is_inaccessible(key, now_ns) {
+            return Err(Error::PermissionDenied);
+        }
+        // Logon and Encrypted key payloads must never be read from user space.
+        if matches!(key.key_type, KeyType::Logon | KeyType::Encrypted) {
+            return Err(Error::PermissionDenied);
+        }
+        if !Self::perm_allows(key, caller_uid, KeyPermission::can_read) {
             return Err(Error::PermissionDenied);
         }
         let copy_len = buf.len().min(key.data_len);
@@ -391,15 +438,21 @@ impl KeyringRegistry {
 
     /// Update the payload of an existing key.
     ///
-    /// Returns `Err(Error::InvalidArgument)` if the data exceeds
-    /// the maximum size, or `Err(Error::PermissionDenied)` if the
-    /// key is revoked.
-    pub fn update_key(&mut self, id: u32, data: &[u8]) -> Result<()> {
+    /// Enforces the data-size limit, that the key is not revoked or expired,
+    /// and that `caller_uid` is granted `KEY_POS_WRITE`.
+    ///
+    /// Returns `Err(Error::InvalidArgument)` if the data exceeds the maximum
+    /// size, or `Err(Error::PermissionDenied)` if the key is inaccessible or
+    /// the caller lacks write permission.
+    pub fn update_key(&mut self, id: u32, data: &[u8], caller_uid: u32, now_ns: u64) -> Result<()> {
         if data.len() > MAX_KEY_DATA {
             return Err(Error::InvalidArgument);
         }
         let key = self.find_key_mut(id)?;
-        if key.revoked {
+        if Self::is_inaccessible(key, now_ns) {
+            return Err(Error::PermissionDenied);
+        }
+        if !Self::perm_allows(key, caller_uid, KeyPermission::can_write) {
             return Err(Error::PermissionDenied);
         }
         key.data[..data.len()].copy_from_slice(data);
@@ -478,13 +531,19 @@ impl KeyringRegistry {
 
     /// Link a key into a keyring.
     ///
+    /// Requires the key to grant `KEY_POS_LINK` to `caller_uid`.
+    ///
     /// Returns `Err(Error::NotFound)` if either the key or
-    /// keyring does not exist, `Err(Error::AlreadyExists)` if
-    /// the key is already linked, or `Err(Error::OutOfMemory)`
+    /// keyring does not exist, `Err(Error::PermissionDenied)` if
+    /// the caller lacks link permission, `Err(Error::AlreadyExists)`
+    /// if the key is already linked, or `Err(Error::OutOfMemory)`
     /// if the keyring is full.
-    pub fn link_to_keyring(&mut self, key_id: u32, ring_id: u32) -> Result<()> {
-        // Verify the key exists.
-        let _ = self.find_key(key_id)?;
+    pub fn link_to_keyring(&mut self, key_id: u32, ring_id: u32, caller_uid: u32) -> Result<()> {
+        // Verify the key exists and grants link permission to the caller.
+        let key = self.find_key(key_id)?;
+        if !Self::perm_allows(key, caller_uid, KeyPermission::can_link) {
+            return Err(Error::PermissionDenied);
+        }
 
         let ring = self.find_ring_mut(ring_id)?;
 
