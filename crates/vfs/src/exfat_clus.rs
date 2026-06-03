@@ -193,6 +193,11 @@ impl FatCache {
 ///
 /// Calls `f(cluster)` for each cluster in the chain.
 /// Returns the total number of clusters visited.
+///
+/// The iteration count is bounded by `cache.len` (the number of cached FAT
+/// entries).  A crafted cyclic chain whose entries all fit in the cache would
+/// otherwise loop forever.  Once `count` exceeds `cache.len` the chain is
+/// structurally invalid and `Err(IoError)` is returned.
 pub fn walk_chain<F>(cache: &FatCache, start_cluster: u32, mut f: F) -> Result<u32>
 where
     F: FnMut(u32) -> Result<()>,
@@ -206,6 +211,12 @@ where
         }
         f(current)?;
         count += 1;
+
+        // A valid chain cannot visit more clusters than the cache holds.
+        // Exceeding this indicates a cycle or a corrupt FAT.
+        if count as usize > cache.len {
+            return Err(Error::IoError);
+        }
 
         let next = cache.get(current).ok_or(Error::NotFound)?;
         if is_eoc(next) {
@@ -244,9 +255,19 @@ impl Default for AllocationBitmap {
 
 impl AllocationBitmap {
     /// Initializes the bitmap from raw data.
+    ///
+    /// `cluster_count` comes from the on-disk boot sector and is untrusted.
+    /// We use checked arithmetic to avoid u32 wrap when computing `bytes_needed`,
+    /// and we cap against the fixed 8192-byte array before accepting the value.
     pub fn load(&mut self, data: &[u8], cluster_count: u32) -> Result<()> {
-        let bytes_needed = ((cluster_count + 7) / 8) as usize;
-        if data.len() < bytes_needed || bytes_needed > 8192 {
+        // Cap cluster_count to the maximum the fixed bits array can represent
+        // (8192 bytes * 8 bits/byte = 65536 clusters).
+        if cluster_count as usize > 8192 * 8 {
+            return Err(Error::InvalidArgument);
+        }
+        // Safe: cluster_count <= 65536, so cluster_count + 7 <= 65543, no wrap.
+        let bytes_needed = ((cluster_count as usize) + 7) / 8;
+        if data.len() < bytes_needed {
             return Err(Error::InvalidArgument);
         }
         self.bits[..bytes_needed].copy_from_slice(&data[..bytes_needed]);
@@ -257,11 +278,19 @@ impl AllocationBitmap {
 
     fn is_allocated(&self, cluster: u32) -> bool {
         let idx = cluster as usize;
+        // Guard against any cluster index that falls outside the loaded bitmap.
+        if idx / 8 >= self.bits.len() {
+            return false;
+        }
         (self.bits[idx / 8] >> (idx % 8)) & 1 != 0
     }
 
     fn set_allocated(&mut self, cluster: u32, allocated: bool) {
         let idx = cluster as usize;
+        // Guard against any cluster index that falls outside the loaded bitmap.
+        if idx / 8 >= self.bits.len() {
+            return;
+        }
         if allocated {
             self.bits[idx / 8] |= 1 << (idx % 8);
         } else {

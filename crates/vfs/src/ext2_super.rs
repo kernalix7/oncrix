@@ -182,6 +182,11 @@ pub fn parse_super(buf: &[u8; SUPERBLOCK_SIZE]) -> Result<ParsedSuper> {
         return Err(Error::InvalidArgument);
     }
     let log_block_size = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+    // Guard against shift-by-too-many panic (u64 shift by >= 64 is UB/panic).
+    // Valid ext2 values are 0 (1 KiB), 1 (2 KiB), 2 (4 KiB).
+    if log_block_size > 2 {
+        return Err(Error::InvalidArgument);
+    }
     let block_size = BASE_BLOCK_SIZE << log_block_size;
     if block_size > MAX_BLOCK_SIZE {
         return Err(Error::InvalidArgument);
@@ -195,7 +200,13 @@ pub fn parse_super(buf: &[u8; SUPERBLOCK_SIZE]) -> Result<ParsedSuper> {
     if blocks_per_group == 0 || inodes_per_group == 0 {
         return Err(Error::InvalidArgument);
     }
-    let group_count = (blocks_count_lo + blocks_per_group - 1) / blocks_per_group;
+    // Use checked arithmetic to avoid u32 overflow when computing the
+    // ceiling-division group count from disk-supplied values.
+    let group_count = blocks_count_lo
+        .checked_add(blocks_per_group)
+        .and_then(|v| v.checked_sub(1))
+        .map(|v| v / blocks_per_group)
+        .ok_or(Error::InvalidArgument)?;
 
     let inode_size = u16::from_le_bytes([buf[88], buf[89]]);
     let inode_size = if inode_size == 0 { 128 } else { inode_size };

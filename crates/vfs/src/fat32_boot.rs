@@ -156,8 +156,20 @@ pub struct Fat32Layout {
 
 impl Fat32Layout {
     /// Converts a cluster number to its starting sector.
-    pub fn cluster_to_sector(&self, cluster: u32) -> u32 {
-        self.data_start_sector + (cluster - 2) * self.sectors_per_cluster
+    ///
+    /// Returns `Err(InvalidArgument)` for reserved cluster numbers (< 2) or if
+    /// the arithmetic overflows u32 (indicates a structurally invalid layout or
+    /// an attacker-controlled cluster value).
+    pub fn cluster_to_sector(&self, cluster: u32) -> Result<u32> {
+        if cluster < 2 {
+            return Err(Error::InvalidArgument);
+        }
+        let offset = (cluster - 2)
+            .checked_mul(self.sectors_per_cluster)
+            .ok_or(Error::InvalidArgument)?;
+        self.data_start_sector
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Returns whether a cluster number is valid (not free, bad, or reserved).
@@ -309,6 +321,10 @@ pub fn validate_bpb(bpb: &BpbFat32) -> Result<()> {
 }
 
 /// Computes the derived layout from a valid BPB.
+///
+/// All arithmetic on disk-supplied fields uses checked operations so that a
+/// crafted image cannot cause integer overflow and silently produce wrong
+/// sector offsets.
 pub fn compute_layout(bpb: &BpbFat32) -> Result<Fat32Layout> {
     let bps = bpb.bytes_per_sector as u32;
     let spc = bpb.sectors_per_cluster as u32;
@@ -318,7 +334,12 @@ pub fn compute_layout(bpb: &BpbFat32) -> Result<Fat32Layout> {
     let total = bpb.total_sectors_32;
 
     let fat_start = rsvd;
-    let data_start = rsvd + nfats * fat_sz;
+
+    // nfats and fat_sz both come from disk; multiply with overflow check.
+    let fat_region = nfats.checked_mul(fat_sz).ok_or(Error::InvalidArgument)?;
+
+    // data_start = reserved_sectors + (num_fats * fat_size_sectors).
+    let data_start = rsvd.checked_add(fat_region).ok_or(Error::InvalidArgument)?;
 
     if data_start >= total {
         return Err(Error::InvalidArgument);
@@ -326,10 +347,13 @@ pub fn compute_layout(bpb: &BpbFat32) -> Result<Fat32Layout> {
     let data_secs = total - data_start;
     let total_clusters = data_secs / spc;
 
+    // bytes_per_cluster: bps and spc both come from (validated) disk fields.
+    let bytes_per_cluster = bps.checked_mul(spc).ok_or(Error::InvalidArgument)?;
+
     Ok(Fat32Layout {
         bytes_per_sector: bps,
         sectors_per_cluster: spc,
-        bytes_per_cluster: bps * spc,
+        bytes_per_cluster,
         fat_start_sector: fat_start,
         fat_size_sectors: fat_sz,
         data_start_sector: data_start,
