@@ -247,6 +247,12 @@ pub enum MapError {
     AlreadyMapped,
     /// No physical frames available for page table allocation.
     OutOfFrames,
+    /// A huge page (2 MiB PD / 1 GiB PDPT entry) was encountered where
+    /// an intermediate page table was expected. The walk cannot descend
+    /// through a leaf huge mapping without first splitting it, so the
+    /// map is refused rather than reinterpreting the huge frame address
+    /// as a sub-table pointer (which would corrupt the mapped region).
+    HugePageInWalk,
 }
 
 impl core::fmt::Display for MapError {
@@ -254,6 +260,7 @@ impl core::fmt::Display for MapError {
         match self {
             Self::AlreadyMapped => write!(f, "virtual address already mapped"),
             Self::OutOfFrames => write!(f, "no physical frames available"),
+            Self::HugePageInWalk => write!(f, "huge page encountered during table walk"),
         }
     }
 }
@@ -278,6 +285,13 @@ unsafe fn next_table_or_create(
         let table = unsafe { &mut *(frame.start_addr().as_u64() as *mut PageTable) };
         table.clear();
         Ok(table)
+    } else if entry.is_huge() {
+        // A present huge entry maps a 2 MiB / 1 GiB leaf, not a sub-table.
+        // Its stored address is the huge frame base; treating it as a
+        // `*mut PageTable` and writing into it would corrupt the mapped
+        // region. Refuse the walk (mirrors the `!is_huge()` guard in
+        // `next_table`).
+        Err(MapError::HugePageInWalk)
     } else {
         // SAFETY: Entry is present and points to a valid page table.
         // Aliasing safety: see function-level doc.
