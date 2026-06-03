@@ -510,10 +510,33 @@ impl BuddyZone {
         Ok(current_pfn)
     }
 
+    /// Returns `true` if a block starting at `pfn` already appears on
+    /// any order's free list. Used to reject double-frees before they
+    /// corrupt the free graph.
+    fn is_already_free(&self, pfn: u64) -> bool {
+        let mut o = 0usize;
+        while o < ORDER_LEVELS {
+            if self.free_lists[o].contains(pfn) {
+                return true;
+            }
+            o += 1;
+        }
+        false
+    }
+
     /// Frees a block at `pfn` of the given order, coalescing with
     /// buddies.
     fn free_pages_at(&mut self, pfn: u64, order: usize) -> Result<()> {
-        if !self.active || !self.contains_pfn(pfn) {
+        if !self.active || !self.contains_pfn(pfn) || order >= ORDER_LEVELS {
+            return Err(Error::InvalidArgument);
+        }
+        // Reject double-free: if a block starting at `pfn` is already on
+        // a free list (this order or — after a prior coalesce — a higher
+        // one), freeing again would either push a duplicate PFN (so a
+        // later allocation hands the same frame to two owners -> UAF) or
+        // merge away a legitimately-free neighbour. Refuse instead of
+        // corrupting the free graph.
+        if self.is_already_free(pfn) {
             return Err(Error::InvalidArgument);
         }
         let mut current_pfn = pfn;

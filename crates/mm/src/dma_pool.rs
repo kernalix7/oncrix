@@ -193,6 +193,10 @@ pub struct DmaPool {
     initialized: bool,
     /// Next simulated physical address for page allocation.
     next_phys: u64,
+    /// Unique pool identifier, stamped into every allocation's
+    /// `pool_idx` so frees can be rejected if the allocation does not
+    /// belong to this pool. `u32::MAX` until assigned by the manager.
+    pool_id: u32,
 }
 
 impl DmaPool {
@@ -226,7 +230,16 @@ impl DmaPool {
             stats: DmaPoolStats::default(),
             initialized: false,
             next_phys: 0x1000_0000,
+            pool_id: u32::MAX,
         }
+    }
+
+    /// Set this pool's unique identifier.
+    ///
+    /// Called by the manager at creation time. The id is stamped into
+    /// every allocation so a free can verify pool ownership.
+    pub fn set_pool_id(&mut self, id: u32) {
+        self.pool_id = id;
     }
 
     /// Initialize the pool with a base DMA address.
@@ -284,7 +297,7 @@ impl DmaPool {
             vaddr: block.vaddr,
             dma_addr: block.dma_addr,
             size: self.block_size,
-            pool_idx: 0,
+            pool_idx: self.pool_id,
             block_idx: idx as u32,
             valid: true,
         })
@@ -301,16 +314,30 @@ impl DmaPool {
             return Err(Error::InvalidArgument);
         }
 
+        // Reject allocations that did not come from this pool. Without
+        // this, a `DmaAllocation` from pool A could be freed against pool
+        // B (if its block_idx happens to be in range), marking a live B
+        // block free and corrupting B's free list (use-after-free).
+        if self.pool_id != u32::MAX && alloc.pool_idx != self.pool_id {
+            return Err(Error::InvalidArgument);
+        }
+
         let idx = alloc.block_idx as usize;
         if idx >= self.block_count {
             return Err(Error::InvalidArgument);
         }
 
-        let block = &mut self.blocks[idx];
+        // Cross-check the allocation against the block it claims to own,
+        // so a forged or stale alloc cannot free an unrelated block.
+        let block = &self.blocks[idx];
         if !block.allocated {
             return Err(Error::InvalidArgument);
         }
+        if alloc.vaddr != block.vaddr || alloc.dma_addr != block.dma_addr {
+            return Err(Error::InvalidArgument);
+        }
 
+        let block = &mut self.blocks[idx];
         block.allocated = false;
         block.next_free = self.free_head;
         self.free_head = idx as u32;
@@ -484,6 +511,9 @@ impl DmaPoolManager {
         pool.init(base)?;
 
         let idx = self.pool_count;
+        // Stamp the pool's slot index as its unique id so allocations
+        // carry pool ownership and frees can validate it.
+        pool.set_pool_id(idx as u32);
         self.pools[idx] = Some(pool);
         self.pool_count += 1;
 

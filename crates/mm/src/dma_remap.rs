@@ -46,6 +46,11 @@ const MAX_DOMAINS: usize = 64;
 /// DMA address space start.
 const DMA_ADDR_START: u64 = 0x0000_0000_1000_0000;
 
+/// DMA address space ceiling (exclusive upper bound for IOVA
+/// allocation). The allocator must never advance past this, otherwise
+/// it could wrap and alias an already-issued DMA range.
+const DMA_ADDR_CEILING: u64 = 0x0000_1000_0000_0000;
+
 /// Page size for DMA mappings.
 const PAGE_SIZE: u64 = 4096;
 
@@ -230,9 +235,25 @@ impl DmaRemapDomain {
             return Err(Error::OutOfMemory);
         }
 
-        let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // Round up with checked math: a `size` near u64::MAX would
+        // otherwise wrap `aligned_size` to a tiny value, handing the
+        // device a window far smaller than requested.
+        let aligned_size = size
+            .checked_add(PAGE_SIZE - 1)
+            .map(|v| v & !(PAGE_SIZE - 1))
+            .ok_or(Error::InvalidArgument)?;
         let dma_addr = self.next_dma_addr;
-        self.next_dma_addr += aligned_size;
+        // Advance the IOVA allocator with checked math and refuse to wrap
+        // past the domain ceiling, which would alias an already-issued
+        // range (cross-device DMA aliasing).
+        let next = self
+            .next_dma_addr
+            .checked_add(aligned_size)
+            .ok_or(Error::OutOfMemory)?;
+        if next > DMA_ADDR_CEILING {
+            return Err(Error::OutOfMemory);
+        }
+        self.next_dma_addr = next;
 
         self.mappings[self.count] =
             DmaRemapEntry::new(dma_addr, phys_addr, aligned_size, direction);

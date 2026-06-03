@@ -99,11 +99,24 @@ pub unsafe fn handle_cow_fault(
     let indices = virt.page_table_indices();
 
     // Walk the page table to find the PTE.
+    //
+    // At every non-leaf level we must reject huge entries before
+    // descending: a present entry with `HUGE_PAGE` set maps a 1 GiB
+    // (PDPT) or 2 MiB (PD) data frame, not a sub-table. Its stored
+    // address is the huge frame base, so casting it to `*mut PageTable`
+    // and indexing `entries[..]` would interpret attacker-mapped data
+    // as PTEs and later write an 8-byte "PTE" into that data frame at a
+    // CR2-controlled offset. This mirrors the `!is_huge()` guard used by
+    // `next_table()`/`next_table_or_create()` in `page_table.rs`. Huge
+    // CoW mappings are not handled here; defer to the generic handler.
     // SAFETY: Caller guarantees pml4 is valid and exclusively accessed.
     let pte = unsafe {
         let pml4e = &pml4.entries[indices[0]];
         if !pml4e.is_present() {
             return Ok(PageFaultAction::NotMapped);
+        }
+        if pml4e.is_huge() {
+            return Ok(PageFaultAction::NotCow);
         }
         let pdpt = &mut *(pml4e.addr().as_u64() as *mut PageTable);
 
@@ -111,11 +124,19 @@ pub unsafe fn handle_cow_fault(
         if !pdpte.is_present() {
             return Ok(PageFaultAction::NotMapped);
         }
+        if pdpte.is_huge() {
+            // 1 GiB huge mapping — not a CoW 4 KiB page.
+            return Ok(PageFaultAction::NotCow);
+        }
         let pd = &mut *(pdpte.addr().as_u64() as *mut PageTable);
 
         let pde = &pd.entries[indices[2]];
         if !pde.is_present() {
             return Ok(PageFaultAction::NotMapped);
+        }
+        if pde.is_huge() {
+            // 2 MiB huge mapping — not a CoW 4 KiB page.
+            return Ok(PageFaultAction::NotCow);
         }
         let pt = &mut *(pde.addr().as_u64() as *mut PageTable);
 
@@ -154,11 +175,24 @@ pub unsafe fn handle_cow_fault(
     let new_flags = (old_flags | flags::WRITABLE) & !COW_BIT;
     pte.set(new_frame.start_addr(), new_flags);
 
+    // Safety invariant: this handler ALWAYS copies. The faulting PTE is
+    // repointed at the freshly allocated `new_frame`; the shared frame
+    // `old_phys` is never made writable for this mapping. Therefore a
+    // still-shared page can never be handed out writable, even though
+    // this signature cannot reach the per-frame `PageRefPool` to learn
+    // whether `old_phys` is now privately owned.
+    //
     // The caller is responsible for:
-    // 1. Flushing the TLB entry for this address
-    // 2. Decrementing the CoW reference count for old_phys
-    // 3. If the old frame's ref count reaches 1, upgrading the
-    //    remaining mapping to writable (removing COW_BIT)
+    // 1. Flushing the TLB entry for this address.
+    // 2. Decrementing the CoW reference count for `old_phys` (the frame
+    //    this mapping no longer references). When that drop leaves the
+    //    refcount at 1, the caller should upgrade the sole remaining
+    //    mapping to writable (clearing COW_BIT) so it stops re-copying.
+    // 3. Initialising the new frame's refcount to 1.
+    //
+    // Because the refcount pool is not threaded through this signature,
+    // (2)/(3) live with the caller; conservatively always copying keeps
+    // this path memory-safe regardless.
 
     Ok(PageFaultAction::Resolved)
 }
@@ -196,6 +230,12 @@ pub unsafe fn mark_region_cow(pml4: &mut PageTable, start: u64, size: u64) -> us
         .saturating_add(PAGE_SIZE as u64 - 1))
         & !(PAGE_SIZE as u64 - 1);
 
+    // Huge-page strides: a PD entry with HUGE_PAGE maps 2 MiB, a PDPT
+    // entry with HUGE_PAGE maps 1 GiB.
+    const PAGES_PER_TABLE: u64 = 512;
+    const HUGE_2M_STRIDE: u64 = PAGES_PER_TABLE * PAGE_SIZE as u64;
+    const HUGE_1G_STRIDE: u64 = PAGES_PER_TABLE * HUGE_2M_STRIDE;
+
     let mut marked = 0;
     let mut addr = page_start;
 
@@ -204,11 +244,16 @@ pub unsafe fn mark_region_cow(pml4: &mut PageTable, start: u64, size: u64) -> us
         let indices = virt.page_table_indices();
 
         // Walk through the page table levels. If any level is
-        // not present, skip this page.
+        // not present, skip this page. A huge entry at any non-leaf
+        // level maps a 2 MiB/1 GiB data frame, not a sub-table:
+        // descending into it would reinterpret that data as 512 PTEs
+        // and clobber WRITABLE bits inside the mapped frame. Skip the
+        // whole huge region (advance by its stride), mirroring the
+        // `!is_huge()` guard in `next_table()`.
         // SAFETY: Caller guarantees pml4 is valid.
         let pte = unsafe {
             let pml4e = &pml4.entries[indices[0]];
-            if !pml4e.is_present() {
+            if !pml4e.is_present() || pml4e.is_huge() {
                 addr = addr.saturating_add(PAGE_SIZE as u64);
                 continue;
             }
@@ -219,11 +264,25 @@ pub unsafe fn mark_region_cow(pml4: &mut PageTable, start: u64, size: u64) -> us
                 addr = addr.saturating_add(PAGE_SIZE as u64);
                 continue;
             }
+            if pdpte.is_huge() {
+                // 1 GiB huge mapping: advance past it, aligned down to
+                // the 1 GiB boundary so the next iteration lands on the
+                // following region.
+                let next = (addr & !(HUGE_1G_STRIDE - 1)).saturating_add(HUGE_1G_STRIDE);
+                addr = next.max(addr.saturating_add(PAGE_SIZE as u64));
+                continue;
+            }
             let pd = &mut *(pdpte.addr().as_u64() as *mut PageTable);
 
             let pde = &pd.entries[indices[2]];
             if !pde.is_present() {
                 addr = addr.saturating_add(PAGE_SIZE as u64);
+                continue;
+            }
+            if pde.is_huge() {
+                // 2 MiB huge mapping: advance past it.
+                let next = (addr & !(HUGE_2M_STRIDE - 1)).saturating_add(HUGE_2M_STRIDE);
+                addr = next.max(addr.saturating_add(PAGE_SIZE as u64));
                 continue;
             }
             let pt = &mut *(pde.addr().as_u64() as *mut PageTable);

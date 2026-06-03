@@ -670,7 +670,13 @@ impl BuddyAllocCore {
                 Error::OutOfMemory
             })?;
 
-        self.zones[zone_idx].free_pages -= 1u64 << fo;
+        // Guarded decrement: never underflow `free_pages`. A wrapped
+        // (near-`u64::MAX`) value would make the zone look effectively
+        // infinite and permanently defeat the watermark reserves, since
+        // every gate is `watermarks.check(free_pages.saturating_sub(..))`.
+        let popped_pages = 1u64 << fo;
+        self.zones[zone_idx].free_pages =
+            self.zones[zone_idx].free_pages.saturating_sub(popped_pages);
 
         // Split down to requested order.
         let mut current_order = fo;
@@ -727,7 +733,12 @@ impl BuddyAllocCore {
             }
             // Remove buddy from free list.
             self.zones[zone_idx].free_areas[current_order].remove(buddy_pfn, migrate);
-            self.zones[zone_idx].free_pages -= 1u64 << current_order;
+            // Guarded decrement: an underflow here would wrap `free_pages`
+            // to a near-`u64::MAX` value and defeat the watermark reserves
+            // (reserve bypass / DoS), so saturate instead of wrapping.
+            let merged_pages = 1u64 << current_order;
+            self.zones[zone_idx].free_pages =
+                self.zones[zone_idx].free_pages.saturating_sub(merged_pages);
 
             current_pfn = core::cmp::min(current_pfn, buddy_pfn);
             current_order += 1;
