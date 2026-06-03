@@ -32,6 +32,8 @@
 //! | [`TfoStats`]      | Global TFO statistics counters                |
 //! | [`TfoRegistry`]   | Registry of TFO-enabled listening sockets     |
 
+use crate::crypto::Hmac256;
+use crate::tcp::kernel_random_bytes;
 use oncrix_lib::{Error, Result};
 
 // =========================================================================
@@ -58,6 +60,29 @@ const SEND_BUF_SIZE: usize = 4096;
 
 /// Maximum number of bytes in the receive buffer.
 const RECV_BUF_SIZE: usize = 4096;
+
+// =========================================================================
+// Helpers
+// =========================================================================
+
+/// Compare two equal-length byte slices in constant time.
+///
+/// Accumulates the bitwise differences across all bytes and only then
+/// checks for equality, so the running time does not depend on the
+/// position of the first differing byte.  Returns `false` immediately
+/// if the lengths differ (a length mismatch is not secret here).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < a.len() {
+        diff |= a[i] ^ b[i];
+        i += 1;
+    }
+    diff == 0
+}
 
 // =========================================================================
 // TfoState
@@ -109,42 +134,31 @@ impl TfoCookie {
 
     /// Generate a TFO cookie from a client IP address and a secret key.
     ///
-    /// Uses a simplified HMAC-like hash: the IP bytes and the secret key
-    /// are mixed through repeated XOR and rotate operations to produce
-    /// an 8-byte cookie.  This is not cryptographically strong but
-    /// serves as a placeholder for a real HMAC-SipHash implementation.
+    /// Computes a keyed MAC over the client address as required by
+    /// RFC 7413 for anti-spoofing: `cookie = HMAC-SHA256(secret,
+    /// client_ip)[:8]`.  Because the secret is a per-boot CSPRNG key
+    /// (see [`TfoCookieJar::reseed_secret`]) and HMAC-SHA256 is a PRF,
+    /// the cookie is unforgeable by an attacker who can only observe
+    /// `(IP, cookie)` pairs.
     pub fn generate(client_ip: &[u8; 4], secret: &[u8; 16]) -> Self {
-        let mut state: u64 = 0;
+        let mut mac = Hmac256::new(secret);
+        mac.update(client_ip);
+        let tag = mac.finalize();
 
-        // Mix the secret key into the state.
-        let k0 = u64::from_le_bytes([
-            secret[0], secret[1], secret[2], secret[3], secret[4], secret[5], secret[6], secret[7],
-        ]);
-        let k1 = u64::from_le_bytes([
-            secret[8], secret[9], secret[10], secret[11], secret[12], secret[13], secret[14],
-            secret[15],
-        ]);
-        state = state.wrapping_add(k0);
-        state ^= k1;
-
-        // Mix the client IP into the state.
-        let ip_val = u32::from_be_bytes(*client_ip) as u64;
-        state = state.wrapping_add(ip_val);
-        state ^= state.rotate_left(13);
-        state = state.wrapping_mul(0x5bd1_e995_5bd1_e995);
-        state ^= state.rotate_right(7);
-
-        Self {
-            bytes: state.to_le_bytes(),
-        }
+        let mut bytes = [0u8; TFO_COOKIE_LEN];
+        bytes.copy_from_slice(&tag[..TFO_COOKIE_LEN]);
+        Self { bytes }
     }
 
     /// Validate this cookie against a freshly computed one.
     ///
     /// Returns `true` if the cookies match and the stored timestamp
-    /// is within [`TFO_COOKIE_EXPIRY_TICKS`] of `current_tick`.
+    /// is within [`TFO_COOKIE_EXPIRY_TICKS`] of `current_tick`.  The
+    /// byte comparison is constant-time so it leaks no timing
+    /// information about how many leading bytes of a forged cookie are
+    /// correct.
     pub fn validate(&self, expected: &TfoCookie, stored_tick: u64, current_tick: u64) -> bool {
-        if self.bytes != expected.bytes {
+        if !ct_eq(&self.bytes, &expected.bytes) {
             return false;
         }
         let age = current_tick.saturating_sub(stored_tick);
@@ -198,6 +212,19 @@ pub struct TfoCookieJar {
     prev_secret: [u8; 16],
     /// Tick at which the current secret was installed.
     secret_rotation_tick: u64,
+    /// Whether the secret has been seeded from the kernel CSPRNG.
+    ///
+    /// A jar constructed via [`new`](Self::new) starts with whatever
+    /// caller-supplied (possibly all-zero) secret; cookies must not be
+    /// issued until [`ensure_secret`](Self::ensure_secret) replaces it
+    /// with CSPRNG entropy.
+    secret_seeded: bool,
+    /// Whether `prev_secret` holds a real previously-rotated key.
+    ///
+    /// False until the first [`rotate_secret`](Self::rotate_secret), so
+    /// the rotation grace path never honors the all-zero placeholder
+    /// previous key.
+    prev_secret_valid: bool,
 }
 
 impl Default for TfoCookieJar {
@@ -208,24 +235,59 @@ impl Default for TfoCookieJar {
 
 impl TfoCookieJar {
     /// Create a new cookie jar with the given initial secret key.
+    ///
+    /// The secret is replaced by a CSPRNG-derived key on first use (see
+    /// [`ensure_secret`](Self::ensure_secret)); the caller-supplied
+    /// value is only a placeholder so this can remain a `const fn`
+    /// usable in static initializers.
     pub const fn new(secret: [u8; 16]) -> Self {
         Self {
             entries: [TfoCookieEntry::EMPTY; TFO_COOKIE_JAR_SIZE],
             secret,
             prev_secret: [0u8; 16],
             secret_rotation_tick: 0,
+            secret_seeded: false,
+            prev_secret_valid: false,
         }
     }
 
-    /// Rotate the server secret key.
+    /// Ensure the server secret is seeded from the kernel CSPRNG.
+    ///
+    /// Called before any cookie is generated or validated.  Returns
+    /// `true` once a CSPRNG-derived secret is installed; returns
+    /// `false` only if the CSPRNG could not be drawn from, in which
+    /// case callers must fail closed rather than issue forgeable
+    /// cookies keyed on a predictable secret.
+    pub fn ensure_secret(&mut self) -> bool {
+        if self.secret_seeded {
+            return true;
+        }
+        let mut key = [0u8; 16];
+        if !kernel_random_bytes(&mut key) {
+            return false;
+        }
+        self.secret = key;
+        self.secret_seeded = true;
+        true
+    }
+
+    /// Rotate the server secret key, drawing a fresh CSPRNG value.
     ///
     /// The previous key is retained so that cookies generated just
-    /// before rotation remain valid for the remainder of their
-    /// expiry window.
-    pub fn rotate_secret(&mut self, new_secret: [u8; 16], current_tick: u64) {
+    /// before rotation remain valid for the remainder of their expiry
+    /// window.  Returns `false` (leaving the secret unchanged) if the
+    /// CSPRNG could not be drawn from.
+    pub fn rotate_secret(&mut self, current_tick: u64) -> bool {
+        let mut new_secret = [0u8; 16];
+        if !kernel_random_bytes(&mut new_secret) {
+            return false;
+        }
         self.prev_secret = self.secret;
+        self.prev_secret_valid = self.secret_seeded;
         self.secret = new_secret;
         self.secret_rotation_tick = current_tick;
+        self.secret_seeded = true;
+        true
     }
 
     /// Generate and store a cookie for the given client IP.
@@ -293,12 +355,15 @@ impl TfoCookieJar {
                 return true;
             }
 
-            // Try previous secret (rotation grace period):
-            // regenerate what the cookie would have been under the
-            // old key and compare.
-            let expected_prev = TfoCookie::generate(client_ip, &self.prev_secret);
-            if presented.validate(&expected_prev, self.entries[i].created_tick, current_tick) {
-                return true;
+            // Try previous secret (rotation grace period): regenerate
+            // what the cookie would have been under the old key and
+            // compare.  Only honored once a real key has been rotated
+            // out, so the all-zero placeholder is never accepted.
+            if self.prev_secret_valid {
+                let expected_prev = TfoCookie::generate(client_ip, &self.prev_secret);
+                if presented.validate(&expected_prev, self.entries[i].created_tick, current_tick) {
+                    return true;
+                }
             }
 
             return false;
@@ -623,7 +688,9 @@ impl TfoRegistry {
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] if TFO is not enabled for
-/// `server_port` in the given registry.
+/// `server_port` in the given registry, or [`Error::WouldBlock`] if the
+/// kernel CSPRNG is not yet seeded so no unforgeable secret is
+/// available (fail closed rather than issue a predictable cookie).
 pub fn tfo_create_cookie(
     registry: &mut TfoRegistry,
     client_ip: &[u8; 4],
@@ -632,6 +699,9 @@ pub fn tfo_create_cookie(
 ) -> Result<TfoCookie> {
     if !registry.is_enabled(server_port) {
         return Err(Error::InvalidArgument);
+    }
+    if !registry.cookie_jar.ensure_secret() {
+        return Err(Error::WouldBlock);
     }
     registry.stats.requests_received += 1;
     let cookie = registry.cookie_jar.generate(client_ip, current_tick);
@@ -659,6 +729,14 @@ pub fn tfo_validate_cookie(
         return Err(Error::InvalidArgument);
     }
     registry.stats.requests_received += 1;
+
+    // If the CSPRNG never seeded the secret, no legitimate cookie could
+    // have been issued, so reject (fail closed) instead of comparing
+    // against a predictable secret.
+    if !registry.cookie_jar.ensure_secret() {
+        registry.stats.cookies_expired += 1;
+        return Ok(false);
+    }
 
     let valid = registry
         .cookie_jar
