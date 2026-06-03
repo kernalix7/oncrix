@@ -12,7 +12,344 @@
 //! [`u32::wrapping_sub`] to correctly handle 32-bit wrap-around as
 //! required by RFC 793 section 3.3.
 
+use crate::crypto::Hmac256;
+use crate::random_kern::RandomSubsystem;
 use oncrix_lib::{Error, Result};
+
+// =========================================================================
+// Kernel CSPRNG singleton
+// =========================================================================
+//
+// The TCP stack needs unpredictable random material for two security
+// properties:
+//
+//   * Initial Sequence Number selection (RFC 6528), to defeat off-path
+//     blind injection / RST / connection-spoofing attacks.
+//   * The per-boot TCP Fast Open cookie secret (RFC 7413), so that
+//     anti-spoofing cookies are unforgeable.
+//
+// No kernel-global CSPRNG accessor exists in-crate, so one is provided
+// here. It wraps the ChaCha20 [`RandomSubsystem`] behind a spinlock and
+// is lazily seeded from a hardware entropy source on first use.
+
+/// Lazily-seeded kernel-global CSPRNG, guarded by a spinlock.
+///
+/// `SeqCst` on the lock flag pairs with the data writes to `RNG` so a
+/// thread that observes the lock released also observes the seeded RNG.
+static RNG_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The global ChaCha20 CSPRNG instance.
+///
+/// Access is serialized exclusively through [`with_kernel_rng`], which
+/// holds [`RNG_LOCK`]; no other code may reference this static.
+static mut RNG: RandomSubsystem = RandomSubsystem::new();
+
+/// Read a hardware-derived 64-bit entropy word.
+///
+/// Prefers the on-die RNG (`RDSEED`, then `RDRAND`) when the CPU
+/// advertises it via CPUID, mixing in the timestamp counter regardless.
+/// Falls back to `RDTSC` alone on CPUs without an on-die RNG or on
+/// non-x86 targets.  This is best-effort boot entropy used to seed the
+/// CSPRNG; the CSPRNG (ChaCha20) provides the cryptographic strength.
+fn hw_entropy_word() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let tsc = {
+            let lo: u32;
+            let hi: u32;
+            // SAFETY: `rdtsc` is always available on x86_64, reads only
+            // the timestamp counter, and has no memory side effects.
+            unsafe {
+                core::arch::asm!(
+                    "rdtsc",
+                    out("eax") lo,
+                    out("edx") hi,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            ((hi as u64) << 32) | (lo as u64)
+        };
+
+        let mut word = tsc;
+        if let Some(hw) = x86_rdseed_or_rdrand() {
+            word ^= hw;
+        }
+        word
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // No hardware entropy source on this target; the caller mixes
+        // several of these words together as a weak fallback seed.
+        0x9E37_79B9_7F4A_7C15
+    }
+}
+
+/// Attempt to read a 64-bit value from the x86 on-die RNG.
+///
+/// Returns `Some(value)` if CPUID reports `RDSEED` (EBX bit 18 of leaf
+/// 7) or `RDRAND` (ECX bit 30 of leaf 1) and the instruction signals
+/// success, otherwise `None`.
+#[cfg(target_arch = "x86_64")]
+fn x86_rdseed_or_rdrand() -> Option<u64> {
+    let (rdseed, rdrand) = x86_rng_support();
+
+    if rdseed {
+        // Retry a bounded number of times; RDSEED may transiently fail
+        // when the entropy source is momentarily exhausted.
+        for _ in 0..32 {
+            let val: u64;
+            let ok: u8;
+            // SAFETY: `rdseed` is gated on the CPUID feature bit above;
+            // it writes a 64-bit result and sets CF (captured via setc)
+            // to indicate success, with no memory side effects.
+            unsafe {
+                core::arch::asm!(
+                    "rdseed {v}",
+                    "setc {c}",
+                    v = out(reg) val,
+                    c = out(reg_byte) ok,
+                    options(nomem, nostack),
+                );
+            }
+            if ok != 0 {
+                return Some(val);
+            }
+        }
+    }
+
+    if rdrand {
+        for _ in 0..32 {
+            let val: u64;
+            let ok: u8;
+            // SAFETY: `rdrand` is gated on the CPUID feature bit above;
+            // it writes a 64-bit result and sets CF (captured via setc)
+            // to indicate success, with no memory side effects.
+            unsafe {
+                core::arch::asm!(
+                    "rdrand {v}",
+                    "setc {c}",
+                    v = out(reg) val,
+                    c = out(reg_byte) ok,
+                    options(nomem, nostack),
+                );
+            }
+            if ok != 0 {
+                return Some(val);
+            }
+        }
+    }
+
+    None
+}
+
+/// Execute CPUID for `leaf`/`subleaf`, returning `(eax, ebx, ecx, edx)`.
+///
+/// EBX is reserved by LLVM as the PIC base register, so it is saved and
+/// restored around the instruction via a scratch register and `xchg`.
+#[cfg(target_arch = "x86_64")]
+fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+    let eax: u32;
+    let ebx: u32;
+    let ecx: u32;
+    let edx: u32;
+    // SAFETY: CPUID is supported on every x86_64 CPU and has no memory
+    // side effects. EBX is swapped into a scratch register before the
+    // instruction and swapped back afterwards so LLVM's reserved PIC
+    // base register is preserved.
+    unsafe {
+        core::arch::asm!(
+            "xchg {ebx_tmp:r}, rbx",
+            "cpuid",
+            "xchg {ebx_tmp:r}, rbx",
+            ebx_tmp = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") subleaf => ecx,
+            out("edx") edx,
+            options(nostack, preserves_flags),
+        );
+    }
+    (eax, ebx, ecx, edx)
+}
+
+/// Query CPUID for on-die RNG support, returning `(rdseed, rdrand)`.
+#[cfg(target_arch = "x86_64")]
+fn x86_rng_support() -> (bool, bool) {
+    // RDRAND: CPUID leaf 1, ECX bit 30.
+    let (_, _, ecx1, _) = cpuid(1, 0);
+    let rdrand = ecx1 & (1 << 30) != 0;
+
+    // RDSEED: CPUID leaf 7, sub-leaf 0, EBX bit 18.
+    let (max_leaf, ..) = cpuid(0, 0);
+    let rdseed = if max_leaf >= 7 {
+        let (_, ebx7, _, _) = cpuid(7, 0);
+        ebx7 & (1 << 18) != 0
+    } else {
+        false
+    };
+
+    (rdseed, rdrand)
+}
+
+/// Acquire the CSPRNG lock, lazily seed the RNG, and run `f`.
+///
+/// On first use (and again if the pool ever falls below threshold) the
+/// entropy pool is filled from [`hw_entropy_word`] until the ChaCha20
+/// CRNG seeds, so callers never observe an unseeded generator.
+fn with_kernel_rng<T>(f: impl FnOnce(&mut RandomSubsystem) -> T) -> T {
+    use core::sync::atomic::Ordering;
+
+    // Spin until we own the lock.
+    while RNG_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+
+    // SAFETY: RNG_LOCK is held, granting exclusive access to RNG for the
+    // duration of this critical section. The reference does not escape.
+    let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) };
+
+    if !rng.is_seeded() {
+        // Mix hardware entropy until the ChaCha20 CRNG auto-seeds.
+        // Each word is credited 32 bits; the pool needs 256 bits.
+        for _ in 0..64 {
+            if rng.is_seeded() {
+                break;
+            }
+            rng.add_entropy(hw_entropy_word(), 32);
+        }
+    }
+
+    let result = f(rng);
+
+    RNG_LOCK.store(false, Ordering::Release);
+    result
+}
+
+/// Fill `out` with random bytes from the kernel CSPRNG.
+///
+/// Returns `true` on success.  On the (practically unreachable) failure
+/// to seed, `out` is left untouched and `false` is returned so the
+/// caller can fail closed rather than use predictable bytes.
+pub(crate) fn kernel_random_bytes(out: &mut [u8]) -> bool {
+    with_kernel_rng(|rng| rng.get_random_bytes(out).is_ok())
+}
+
+// =========================================================================
+// Initial Sequence Number selection (RFC 6528)
+// =========================================================================
+
+/// Per-boot secret keying the ISN generator, drawn from the CSPRNG.
+static ISN_SECRET_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`ISN_SECRET`] has been initialized from the CSPRNG.
+static ISN_SECRET_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// 32-byte secret mixed into every ISN via HMAC-SHA256.
+///
+/// Initialized once from the CSPRNG; only [`isn_secret`] touches it.
+static mut ISN_SECRET: [u8; 32] = [0u8; 32];
+
+/// Return a reference to the per-boot ISN secret, seeding it on first
+/// use from the kernel CSPRNG.
+fn isn_secret() -> [u8; 32] {
+    use core::sync::atomic::Ordering;
+
+    if !ISN_SECRET_READY.load(Ordering::Acquire) {
+        while ISN_SECRET_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        if !ISN_SECRET_READY.load(Ordering::Relaxed) {
+            let mut key = [0u8; 32];
+            if kernel_random_bytes(&mut key) {
+                // SAFETY: the ISN_SECRET_LOCK is held, so this is the
+                // only writer; the value is published via the Release
+                // store to ISN_SECRET_READY below.
+                unsafe {
+                    *core::ptr::addr_of_mut!(ISN_SECRET) = key;
+                }
+                ISN_SECRET_READY.store(true, Ordering::Release);
+            } else {
+                // CSPRNG not yet seeded (practically unreachable). Do NOT
+                // publish an all-zero key — a zero-keyed HMAC ISN would be
+                // attacker-predictable. Return a best-effort hardware-entropy
+                // key for THIS call without latching, so a later call upgrades
+                // to the real CSPRNG key (self-healing).
+                ISN_SECRET_LOCK.store(false, Ordering::Release);
+                let mut k = [0u8; 32];
+                for chunk in k.chunks_mut(8) {
+                    let w = hw_entropy_word().to_le_bytes();
+                    chunk.copy_from_slice(&w[..chunk.len()]);
+                }
+                return k;
+            }
+        }
+        ISN_SECRET_LOCK.store(false, Ordering::Release);
+    }
+
+    // SAFETY: once ISN_SECRET_READY is observed true the secret is
+    // immutable for the rest of the boot, so this read races with no
+    // writer (the only failure path returns early above without latching).
+    unsafe { *core::ptr::addr_of!(ISN_SECRET) }
+}
+
+/// Read a monotonic 4-microsecond timer value for the ISN base `M`.
+///
+/// RFC 6528 specifies adding a timer ticking roughly every 4 µs so that
+/// sequence numbers for successive connections on the same 4-tuple do
+/// not collide.  Derived from the TSC; the exact rate is not critical.
+fn isn_timer() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let lo: u32;
+        let hi: u32;
+        // SAFETY: `rdtsc` is always available on x86_64 and only reads
+        // the timestamp counter.
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        let tsc = ((hi as u64) << 32) | (lo as u64);
+        // Approximate a ~4 µs tick assuming a multi-GHz TSC by shifting
+        // off the low bits; truncate to 32 bits per RFC 793 sequence
+        // space.
+        (tsc >> 12) as u32
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+/// Compute an Initial Sequence Number for the given 4-tuple per RFC 6528.
+///
+/// `ISN = M + HMAC-SHA256(secret, local_ip ++ local_port ++ remote_ip
+/// ++ remote_port)[:4]`, where `M` is a 4-µs timer and `secret` is a
+/// per-boot CSPRNG-derived key.  This makes the ISN unpredictable to
+/// off-path attackers (defeating blind injection / RST / spoofing)
+/// while keeping it monotone per 4-tuple to avoid old-segment confusion.
+fn generate_isn(local_ip: [u8; 4], local_port: u16, remote_ip: [u8; 4], remote_port: u16) -> u32 {
+    let secret = isn_secret();
+    let mut mac = Hmac256::new(&secret);
+    mac.update(&local_ip);
+    mac.update(&local_port.to_be_bytes());
+    mac.update(&remote_ip);
+    mac.update(&remote_port.to_be_bytes());
+    let tag = mac.finalize();
+    let hashed = u32::from_be_bytes([tag[0], tag[1], tag[2], tag[3]]);
+    isn_timer().wrapping_add(hashed)
+}
 
 // =========================================================================
 // TCP flag constants
@@ -316,15 +653,18 @@ impl TcpConnection {
         self.remote_ip = remote_ip;
         self.remote_port = remote_port;
 
-        // Choose an initial sequence number.
-        // In a real implementation this would be randomised.
-        self.send_next = 1;
-        self.send_unack = 0;
+        // Choose an unpredictable Initial Sequence Number (RFC 6528) to
+        // defeat off-path blind injection / RST / spoofing attacks. The
+        // SYN occupies one sequence number, so SND.UNA = ISN and
+        // SND.NXT = ISN + 1 once it is sent.
+        let isn = generate_isn(self.local_ip, self.local_port, remote_ip, remote_port);
+        self.send_unack = isn;
+        self.send_next = isn.wrapping_add(1);
         self.state = TcpState::SynSent;
 
         Ok(TcpAction::SendSegment {
             flags: TCP_SYN,
-            seq: 0,
+            seq: isn,
             ack: 0,
             payload_len: 0,
         })
@@ -368,14 +708,22 @@ impl TcpConnection {
         self.recv_next = header.seq_num.wrapping_add(1);
         self.send_window = header.window_size;
 
-        // Choose an initial sequence number for our side.
-        self.send_unack = 100;
-        self.send_next = 101;
+        // Choose an unpredictable Initial Sequence Number (RFC 6528) for
+        // our side of the connection. The SYN+ACK occupies one sequence
+        // number, so SND.UNA = ISN and SND.NXT = ISN + 1 once sent.
+        let isn = generate_isn(
+            self.local_ip,
+            self.local_port,
+            self.remote_ip,
+            header.source_port,
+        );
+        self.send_unack = isn;
+        self.send_next = isn.wrapping_add(1);
         self.state = TcpState::SynReceived;
 
         Ok(TcpAction::SendSegment {
             flags: TCP_SYN | TCP_ACK,
-            seq: 100,
+            seq: isn,
             ack: self.recv_next,
             payload_len: 0,
         })

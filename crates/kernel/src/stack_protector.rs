@@ -35,14 +35,26 @@
 //! # Canary Format
 //!
 //! The canary is a 64-bit value with the following structure:
-//! - Bits 63..8: random value (from kernel entropy pool)
+//! - Bits 63..8: random value (from the kernel CSPRNG)
 //! - Bits  7..0: null byte (0x00) — terminates string copies
+//!
+//! # Entropy
+//!
+//! Each per-thread canary is derived with HMAC-SHA256 keyed by a
+//! per-boot secret drawn from the kernel CSPRNG
+//! ([`crate::random_syscall::fill_random`]), with the thread ID as the
+//! message. The secret key never leaves the kernel, so leaking one
+//! thread's canary reveals neither the key nor any other thread's
+//! canary — unlike the previous affine `XOR`/`rotate` mix, where one
+//! leaked canary let an attacker solve for the master seed and forge
+//! every other canary. Verification is constant-time.
 //!
 //! # Reference
 //!
 //! Linux `include/linux/stackprotector.h`,
 //! `arch/x86/include/asm/stackprotector.h`.
 
+use crate::crypto::{Hmac256, constant_time_eq};
 use oncrix_lib::{Error, Result};
 
 // ======================================================================
@@ -60,6 +72,9 @@ const GUARD_PAGE_SIZE: usize = 4096;
 
 /// Canary null terminator mask (low byte = 0).
 const CANARY_NULL_MASK: u64 = 0xFFFF_FFFF_FFFF_FF00;
+
+/// Length of the per-boot HMAC-SHA256 canary secret key (bytes).
+const CANARY_SECRET_LEN: usize = 32;
 
 /// Maximum violation log entries.
 const MAX_VIOLATIONS: usize = 64;
@@ -109,8 +124,11 @@ impl CanaryValue {
     }
 
     /// Verify that the canary matches the expected value.
+    ///
+    /// Uses a constant-time comparison so a partial-overwrite attacker
+    /// cannot time-probe the canary byte by byte.
     pub fn verify(&self, expected: &CanaryValue) -> bool {
-        self.value == expected.value
+        constant_time_eq(&self.value.to_le_bytes(), &expected.value.to_le_bytes())
     }
 }
 
@@ -338,8 +356,12 @@ pub struct StackGuard {
     violation_head: usize,
     /// Statistics.
     stats: StackProtectorStats,
-    /// Master canary seed (from entropy pool).
-    master_seed: u64,
+    /// Per-boot HMAC-SHA256 secret key for canary derivation.
+    ///
+    /// Drawn from the kernel CSPRNG; never exposed outside the kernel.
+    secret: [u8; CANARY_SECRET_LEN],
+    /// Whether [`Self::secret`] has been seeded from the CSPRNG.
+    secret_ready: bool,
     /// Current monotonic tick.
     current_tick: u64,
     /// Tick at which the last audit ran.
@@ -356,39 +378,111 @@ impl StackGuard {
             violations: [const { ViolationRecord::empty() }; MAX_VIOLATIONS],
             violation_head: 0,
             stats: StackProtectorStats::new(),
-            master_seed: 0,
+            secret: [0u8; CANARY_SECRET_LEN],
+            secret_ready: false,
             current_tick: 0,
             last_audit_tick: 0,
         }
     }
 
-    /// Initialise the stack protector with a random seed.
-    pub fn init(&mut self, seed: u64, config: StackCheckConfig) {
-        self.master_seed = seed;
+    /// Initialise the stack protector.
+    ///
+    /// Draws a fresh per-boot HMAC-SHA256 secret key from the kernel
+    /// CSPRNG; `extra_seed` is mixed in as supplementary entropy but is
+    /// **not** trusted as the sole source. The secret is what makes
+    /// every per-thread canary unforgeable.
+    ///
+    /// # Safety
+    ///
+    /// Must run on the single-CPU early-init / SYSCALL path on which the
+    /// kernel-global CSPRNG is mutated (see
+    /// [`crate::random_syscall::fill_random`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::WouldBlock`] if the CSPRNG could not be seeded;
+    /// the protector then refuses to issue canaries (fail closed).
+    pub unsafe fn init(&mut self, extra_seed: u64, config: StackCheckConfig) -> Result<()> {
         self.config = config;
+        // SAFETY: forwarded single-CPU-path guarantee from the caller.
+        unsafe { self.seed_secret(extra_seed) }
     }
 
-    /// Generate a per-thread canary from the master seed and TID.
-    fn generate_canary(&self, tid: u64) -> CanaryValue {
-        // Simple hash: XOR + rotate.  In a real kernel this would
-        // use a cryptographic PRNG.
-        let mixed = self.master_seed ^ tid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let rotated = mixed.rotate_left(13) ^ mixed.rotate_right(7);
-        CanaryValue::from_seed(rotated)
+    /// Draw (or re-draw) the per-boot canary secret from the CSPRNG.
+    ///
+    /// # Safety
+    ///
+    /// Single-CPU CSPRNG-path requirement, as for [`Self::init`].
+    unsafe fn seed_secret(&mut self, extra_seed: u64) -> Result<()> {
+        let mut key = [0u8; CANARY_SECRET_LEN];
+        // SAFETY: forwarded single-CPU-path guarantee from the caller.
+        unsafe { crate::random_syscall::fill_random(&mut key)? };
+        // Fold the supplementary seed into the first 8 bytes; even if it
+        // is low-entropy it can only add, never remove, unpredictability.
+        let extra = extra_seed.to_le_bytes();
+        for i in 0..8 {
+            key[i] ^= extra[i];
+        }
+        self.secret = key;
+        self.secret_ready = true;
+        Ok(())
+    }
+
+    /// Ensure the per-boot secret is seeded, drawing it lazily if a
+    /// caller reached a canary path without an explicit `init`.
+    ///
+    /// # Safety
+    ///
+    /// Single-CPU CSPRNG-path requirement, as for [`Self::init`].
+    unsafe fn ensure_secret(&mut self) -> Result<()> {
+        if self.secret_ready {
+            return Ok(());
+        }
+        // SAFETY: forwarded single-CPU-path guarantee from the caller.
+        unsafe { self.seed_secret(0) }
+    }
+
+    /// Derive a per-thread canary as HMAC-SHA256(secret, tid).
+    ///
+    /// The low byte is forced to `0x00` (string terminator). Because the
+    /// secret is a CSPRNG key never exposed to userspace, the canary is
+    /// a pseudo-random function of the TID: leaking one canary does not
+    /// reveal the key or any other thread's canary.
+    fn derive_canary(&self, tid: u64) -> CanaryValue {
+        let mut mac = Hmac256::new(&self.secret);
+        mac.update(&tid.to_le_bytes());
+        let tag = mac.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&tag[..8]);
+        CanaryValue::from_seed(u64::from_le_bytes(bytes))
     }
 
     /// Initialise a canary for a new thread stack.
     ///
     /// Registers the stack region and returns the canary value that
     /// must be written at the stack frame boundary.
-    pub fn init_canary(
+    ///
+    /// # Safety
+    ///
+    /// Must run on the single-CPU early-init / SYSCALL path on which the
+    /// kernel-global CSPRNG is mutated (the per-boot secret is seeded
+    /// lazily from it on first use).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] when canaries are disabled — there
+    ///   is no constant-canary fallback; the caller must enable the
+    ///   protection or accept that no canary is issued (fail closed).
+    /// - [`Error::WouldBlock`] when the CSPRNG secret cannot be seeded.
+    pub unsafe fn init_canary(
         &mut self,
         tid: u64,
         stack_base: u64,
         stack_size: usize,
     ) -> Result<CanaryValue> {
         if !self.config.canary_enabled {
-            return Ok(CanaryValue::from_seed(0));
+            // Fail closed: never hand back a predictable constant canary.
+            return Err(Error::PermissionDenied);
         }
         if self.num_entries >= MAX_STACKS {
             return Err(Error::OutOfMemory);
@@ -397,7 +491,9 @@ impl StackGuard {
             return Err(Error::InvalidArgument);
         }
 
-        let canary = self.generate_canary(tid);
+        // SAFETY: forwarded single-CPU CSPRNG-path guarantee.
+        unsafe { self.ensure_secret()? };
+        let canary = self.derive_canary(tid);
         let stack_top = stack_base + stack_size as u64;
 
         // Find a free slot.

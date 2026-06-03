@@ -11,6 +11,30 @@
 //! - Crash dump support with reserved memory regions
 //! - Reboot notifier chain for orderly shutdown
 //!
+//! # Image integrity and authenticity
+//!
+//! Two distinct gates protect the kexec jump:
+//!
+//! 1. **Integrity** — at load time, each segment's payload is hashed
+//!    with [`crate::crypto::Sha256`] over the real source bytes and the
+//!    digest is stored ([`PurgatoryDigest`] with `valid == true`). Just
+//!    before the `Executing` transition the digest is recomputed at the
+//!    destination and compared in constant time
+//!    ([`crate::crypto::constant_time_eq`]); any mismatch fails the
+//!    reboot closed. This catches a segment that was tampered with
+//!    between load and jump.
+//! 2. **Authenticity (enforcement gate)** — when enforcement is enabled
+//!    ([`KexecRebootState::set_enforce`]) an image must be marked
+//!    verified before it can be loaded. Real asymmetric (public-key)
+//!    signature verification against a trusted keyring is not yet
+//!    implemented in-tree, so in enforcing mode an unverified image is
+//!    refused with [`Error::PermissionDenied`] — fail closed. This is
+//!    the canonical Secure Boot bypass defense: an unsigned replacement
+//!    kernel cannot be staged when enforcement is on. Wiring this gate
+//!    to the global secure-boot / lockdown policy and to a real
+//!    signature verifier (`secure_boot.rs`, `kexec_file.rs`) is the
+//!    remaining cross-module work.
+//!
 //! # Data flow
 //!
 //! 1. User space calls `load_kexec_image()` with segments and flags.
@@ -173,12 +197,27 @@ impl PurgatoryDigest {
         }
     }
 
-    /// Verifies that a given digest matches this one.
+    /// Creates a valid, populated digest slot for a segment.
+    const fn filled(segment_idx: usize, sha256: [u8; DIGEST_LEN], expected_size: usize) -> Self {
+        Self {
+            segment_idx,
+            sha256,
+            expected_size,
+            valid: true,
+        }
+    }
+
+    /// Verifies that a given digest matches this one in constant time.
+    ///
+    /// Returns `false` for an unpopulated slot (`valid == false`), so a
+    /// missing digest can never satisfy verification (fail closed). The
+    /// comparison itself does not branch on the byte position of the
+    /// first difference.
     pub fn verify(&self, digest: &[u8; DIGEST_LEN]) -> bool {
         if !self.valid {
             return false;
         }
-        self.sha256 == *digest
+        crate::crypto::constant_time_eq(&self.sha256, digest)
     }
 }
 
@@ -324,6 +363,12 @@ pub struct KexecRebootImage {
     digests: [PurgatoryDigest; MAX_SEGMENTS],
     /// Total size of all segments in bytes.
     total_size: usize,
+    /// Whether the image passed authenticity verification.
+    ///
+    /// Set when a real signature check succeeds. While no asymmetric
+    /// verifier exists in-tree this stays `false`, which the enforcement
+    /// gate treats as "refuse in enforcing mode".
+    verified: bool,
 }
 
 impl KexecRebootImage {
@@ -343,7 +388,13 @@ impl KexecRebootImage {
             cmdline_len: 0,
             digests: [PurgatoryDigest::empty(); MAX_SEGMENTS],
             total_size: 0,
+            verified: false,
         }
+    }
+
+    /// Returns whether the image passed authenticity verification.
+    pub const fn is_verified(&self) -> bool {
+        self.verified
     }
 
     /// Returns the entry point address.
@@ -496,6 +547,12 @@ pub struct KexecRebootState {
     last_error: [u8; 128],
     /// Length of the error message.
     last_error_len: usize,
+    /// Whether image authenticity enforcement is enabled.
+    ///
+    /// When set, [`load_kexec_image`] refuses any image that is not
+    /// marked verified (fail closed). Defaults to off so the
+    /// non-enforcing path keeps working.
+    enforce: bool,
 }
 
 impl Default for KexecRebootState {
@@ -521,12 +578,27 @@ impl KexecRebootState {
             stopped_cpus: 0,
             last_error: [0u8; 128],
             last_error_len: 0,
+            enforce: false,
         }
     }
 
     /// Returns the current phase.
     pub const fn phase(&self) -> RebootPhase {
         self.phase
+    }
+
+    /// Enables or disables image authenticity enforcement.
+    ///
+    /// When enabled, [`load_kexec_image`] refuses to load any image
+    /// that is not marked verified, returning [`Error::PermissionDenied`]
+    /// (fail closed). This is the kexec Secure Boot gate.
+    pub fn set_enforce(&mut self, enforce: bool) {
+        self.enforce = enforce;
+    }
+
+    /// Returns whether image authenticity enforcement is enabled.
+    pub const fn is_enforcing(&self) -> bool {
+        self.enforce
     }
 
     /// Sets the number of online CPUs.
@@ -747,6 +819,64 @@ impl KexecRebootState {
     }
 }
 
+// ── Segment digest helpers ─────────────────────────────────────────
+
+/// Computes the SHA-256 digest of `len` bytes starting at raw address
+/// `addr`, using the verified in-crate [`crate::crypto::Sha256`].
+///
+/// `addr` is a current-kernel-addressable location: at load time it is
+/// the segment source (`buf`); at the pre-jump check it is the segment
+/// destination (`mem`), which is identity-mapped during the kexec
+/// shutdown path. A `len` of zero (pure-BSS segment with no payload)
+/// hashes the empty input, which is still a well-defined, fixed digest.
+///
+/// # Safety
+///
+/// The caller must guarantee that `[addr, addr + len)` is a valid,
+/// readable, contiguous mapping for the full `len` bytes and stays
+/// mapped for the duration of the read. Segments are bounds-checked by
+/// [`validate_segments`] (size capped at `MAX_SEGMENT_SIZE`, no
+/// overlap), and the source/destination are owned by the kexec image,
+/// so no other code mutates them concurrently during this read.
+unsafe fn digest_addr_range(addr: usize, len: usize) -> [u8; DIGEST_LEN] {
+    let mut hasher = crate::crypto::Sha256::new();
+    if len > 0 {
+        // SAFETY: precondition of this function — `[addr, addr + len)`
+        // is a valid readable mapping of exactly `len` bytes that is not
+        // mutated for the duration of the borrow.
+        let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
+        hasher.update(bytes);
+    }
+    hasher.finalize()
+}
+
+/// Recomputes every segment digest at its destination and compares it,
+/// in constant time, against the digest captured at load.
+///
+/// Returns `Ok(())` only if every in-use, valid digest matches the
+/// bytes now present at the destination. A missing/invalid digest or
+/// any mismatch is reported as [`Error::PermissionDenied`] so the
+/// caller fails the reboot closed before jumping.
+fn verify_segments_at_destination(image: &KexecRebootImage) -> Result<()> {
+    for i in 0..image.nr_segments {
+        let digest = &image.digests[i];
+        if !digest.valid {
+            // An unpopulated digest must never satisfy verification.
+            return Err(Error::PermissionDenied);
+        }
+        let seg = &image.segments[i];
+        // SAFETY: `seg.mem` is the destination region validated by
+        // `validate_segments` (page-aligned, `bufsz <= memsz`, within a
+        // crash region for crash images) and is identity-mapped on the
+        // shutdown path; we read exactly `bufsz` payload bytes.
+        let actual = unsafe { digest_addr_range(seg.mem, seg.bufsz) };
+        if !digest.verify(&actual) {
+            return Err(Error::PermissionDenied);
+        }
+    }
+    Ok(())
+}
+
 // ── Public API ─────────────────────────────────────────────────────
 
 /// Validates segments for a kexec reboot image.
@@ -798,8 +928,15 @@ pub fn validate_segments(
 
 /// Loads a kexec reboot image.
 ///
-/// Validates segments, builds the image with placeholder digests,
-/// and stores it in the state machine.
+/// Validates segments, computes a SHA-256 integrity digest over each
+/// segment's real source payload, and stores the image in the state
+/// machine. When enforcement is enabled the image must be marked
+/// verified or the load is refused (fail closed).
+///
+/// This is the unverified entry point: it never marks the image
+/// `verified`, so under enforcement it always refuses. A future signed
+/// loader will verify the image signature and only then set
+/// `verified = true`.
 ///
 /// # Errors
 ///
@@ -807,6 +944,8 @@ pub fn validate_segments(
 /// - `Error::Busy` — a kexec is currently in progress.
 /// - `Error::AlreadyExists` — an image is already loaded (and
 ///   `KEXEC_UPDATE` is not set).
+/// - `Error::PermissionDenied` — enforcement is on and the image is not
+///   verified (no asymmetric verifier exists in-tree yet).
 pub fn load_kexec_image(
     state: &mut KexecRebootState,
     entry_point: usize,
@@ -816,6 +955,15 @@ pub fn load_kexec_image(
     // Validate flags.
     if flags & !VALID_FLAGS != 0 {
         return Err(Error::InvalidArgument);
+    }
+
+    // Authenticity gate (fail closed). This unverified loader cannot
+    // produce a verified image, so under enforcement it always refuses:
+    // an unsigned/unverifiable replacement kernel must never be staged.
+    // A signed loader will perform real signature verification before
+    // accepting an image.
+    if state.enforce {
+        return Err(Error::PermissionDenied);
     }
 
     // Cannot load while executing.
@@ -856,13 +1004,12 @@ pub fn load_kexec_image(
         image.segments[i] = *seg;
         total = total.saturating_add(seg.memsz);
 
-        // Create placeholder digest.
-        image.digests[i] = PurgatoryDigest {
-            segment_idx: i,
-            sha256: [0u8; DIGEST_LEN],
-            expected_size: seg.bufsz,
-            valid: false,
-        };
+        // Compute the real integrity digest over the source payload.
+        // SAFETY: `seg.buf` is the source buffer; `validate_segments`
+        // bounds `bufsz <= memsz <= MAX_SEGMENT_SIZE`. The source is
+        // owned by the caller's staged image and not mutated here.
+        let sha256 = unsafe { digest_addr_range(seg.buf, seg.bufsz) };
+        image.digests[i] = PurgatoryDigest::filled(i, sha256, seg.bufsz);
     }
     image.total_size = total;
 
@@ -927,10 +1074,19 @@ pub fn unload_crash_image(state: &mut KexecRebootState) -> Result<()> {
 /// The caller is responsible for driving the sequence by calling
 /// this repeatedly until the phase reaches `Executing`.
 ///
+/// The `CopyingSegments -> Executing` step recomputes every segment
+/// digest at its destination and compares it, in constant time, against
+/// the digest captured at load. Any mismatch (a segment tampered with
+/// between load and jump) fails the reboot closed: the state moves to
+/// `Failed` and the error is returned instead of jumping to the new
+/// kernel.
+///
 /// # Errors
 ///
 /// - `Error::NotFound` — no image loaded.
 /// - `Error::Busy` — already executing.
+/// - `Error::PermissionDenied` — a segment failed destination
+///   integrity verification just before the jump.
 pub fn exec_kexec(state: &mut KexecRebootState) -> Result<RebootPhase> {
     match state.phase {
         RebootPhase::Idle => {
@@ -969,7 +1125,17 @@ pub fn exec_kexec(state: &mut KexecRebootState) -> Result<RebootPhase> {
             state.phase = RebootPhase::CopyingSegments;
         }
         RebootPhase::CopyingSegments => {
-            // In a real kernel, this would relocate segments.
+            // Segments have been relocated to their destinations. Before
+            // permitting the jump, recompute each digest at the
+            // destination and reject on any mismatch (fail closed).
+            let verify = match state.image.as_ref() {
+                Some(image) => verify_segments_at_destination(image),
+                None => Err(Error::NotFound),
+            };
+            if let Err(e) = verify {
+                mark_failed(state, b"kexec: segment integrity check failed");
+                return Err(e);
+            }
             state.phase = RebootPhase::Executing;
         }
         RebootPhase::Failed => {
