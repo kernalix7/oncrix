@@ -551,14 +551,32 @@ impl ShmRegistry {
     /// - [`ShmCtlCmd::IpcStat`] — fills `buf` with the segment
     ///   descriptor.
     /// - [`ShmCtlCmd::IpcSet`] — updates `uid`, `gid`, and `mode`
-    ///   from `buf`.
+    ///   from `buf`.  Only the segment owner (`perm.uid`), creator
+    ///   (`perm.cuid`), or a privileged caller may use this command
+    ///   (POSIX.1-2024, `shmctl` IPC_SET semantics).
     /// - [`ShmCtlCmd::IpcRmid`] — marks the segment for removal.
     ///   If `nattch` is 0, the segment is destroyed immediately.
+    ///   Same ownership/privilege restriction as `IpcSet`.
+    ///
+    /// # Arguments
+    ///
+    /// * `caller_uid` — effective UID of the calling process.
+    /// * `is_privileged` — true if the caller has superuser/capability
+    ///   privilege (e.g., `CAP_IPC_OWNER`).
     ///
     /// # Errors
     ///
     /// - [`Error::NotFound`] if no segment with `id` exists.
-    pub fn shmctl(&mut self, id: i32, cmd: ShmCtlCmd, buf: &mut ShmInfo) -> Result<()> {
+    /// - [`Error::PermissionDenied`] if the caller is not the owner,
+    ///   creator, or privileged for a mutating command.
+    pub fn shmctl(
+        &mut self,
+        id: i32,
+        cmd: ShmCtlCmd,
+        buf: &mut ShmInfo,
+        caller_uid: u32,
+        is_privileged: bool,
+    ) -> Result<()> {
         let idx = self.find_by_id(id).ok_or(Error::NotFound)?;
 
         match cmd {
@@ -566,12 +584,22 @@ impl ShmRegistry {
                 *buf = self.segments[idx].info();
             }
             ShmCtlCmd::IpcSet => {
+                // POSIX: only owner UID, creator UID, or privileged caller.
+                let seg = &self.segments[idx];
+                if !is_privileged && caller_uid != seg.perm.uid && caller_uid != seg.perm.cuid {
+                    return Err(Error::PermissionDenied);
+                }
                 self.segments[idx].perm.uid = buf.perm.uid;
                 self.segments[idx].perm.gid = buf.perm.gid;
                 self.segments[idx].perm.mode = buf.perm.mode;
                 self.segments[idx].ctime = 0; // Placeholder.
             }
             ShmCtlCmd::IpcRmid => {
+                // Same ownership restriction as IpcSet.
+                let seg = &self.segments[idx];
+                if !is_privileged && caller_uid != seg.perm.uid && caller_uid != seg.perm.cuid {
+                    return Err(Error::PermissionDenied);
+                }
                 self.segments[idx].marked_for_removal = true;
                 if self.segments[idx].nattch == 0 {
                     self.segments[idx] = ShmSegment::empty();

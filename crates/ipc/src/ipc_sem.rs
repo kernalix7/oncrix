@@ -263,10 +263,11 @@ impl SemArray {
 
     /// Attempt a single `Sembuf` operation.
     ///
-    /// Returns `WouldBlock` if the operation would block (semaphore not
-    /// ready) and `IPC_NOWAIT` is set.  In a full kernel, blocking would
-    /// be handled by a wait queue; this implementation returns `WouldBlock`
-    /// to signal that the caller must retry or fail.
+    /// Returns `WouldBlock` if the semaphore is not immediately available.
+    /// The caller is responsible for all-or-nothing atomicity — this method
+    /// never increments `semncnt`/`semzcnt`; those counters reflect truly
+    /// blocked kernel waiters and must only be updated in the actual
+    /// wait-queue enqueue path (not during a transient feasibility check).
     fn try_operation(&mut self, op: &Sembuf, pid: u32) -> Result<()> {
         let idx = op.sem_num as usize;
         self.check_sem_num(idx)?;
@@ -286,12 +287,11 @@ impl SemArray {
             sem.sempid = pid;
         } else if op.sem_op < 0 {
             // Acquire: subtract from semaphore.
-            let needed = -op.sem_op as i32;
+            // Cast to i32 BEFORE negating to avoid i16::MIN overflow.
+            let needed = -(op.sem_op as i32);
             if sem.value < needed {
-                if op.flags().is_nowait() {
-                    return Err(Error::WouldBlock);
-                }
-                sem.semncnt = sem.semncnt.saturating_add(1);
+                // semncnt is NOT incremented here; that only happens when
+                // the caller is actually enqueued on a wait queue.
                 return Err(Error::WouldBlock);
             }
             sem.value -= needed;
@@ -299,10 +299,7 @@ impl SemArray {
         } else {
             // Wait for zero.
             if sem.value != 0 {
-                if op.flags().is_nowait() {
-                    return Err(Error::WouldBlock);
-                }
-                sem.semzcnt = sem.semzcnt.saturating_add(1);
+                // semzcnt is NOT incremented here for the same reason.
                 return Err(Error::WouldBlock);
             }
             sem.sempid = pid;
@@ -544,12 +541,13 @@ pub fn semop(registry: &mut SemRegistry, sem_id: usize, sops: &[Sembuf], pid: u3
         }
     }
 
-    // Attempt all operations.  On `WouldBlock`, we abort without applying
-    // partial changes (we re-check from the beginning using snapshots).
-    // Since we cannot roll back in-place without a snapshot, we check
-    // feasibility first, then apply.  The feasibility check is done in a
-    // separate scope so that the immutable borrow ends before we mutate
-    // `registry.stats` or `registry.arrays`.
+    // Feasibility pre-check: if any IPC_NOWAIT operation cannot be satisfied
+    // immediately, bail out before touching any semaphore values.
+    //
+    // i16::MIN guard: sem_op == i16::MIN (-32768) is rejected outright because
+    // -(i16::MIN as i32) == 32768 > SEMVMX (32767), so it can never succeed.
+    // This also eliminates the i16 negation overflow (-(i16::MIN) wraps to
+    // i16::MIN) that would otherwise produce a wrong `needed` value.
     let would_block = {
         let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
         let mut blocked = false;
@@ -557,7 +555,13 @@ pub fn semop(registry: &mut SemRegistry, sem_id: usize, sops: &[Sembuf], pid: u3
             let idx = op.sem_num as usize;
             let sem = &array.sems[idx];
             if op.sem_op < 0 {
-                let needed = -(op.sem_op) as i32;
+                if op.sem_op == i16::MIN {
+                    // Would require adding 32768 — always exceeds SEMVMX; fail fast.
+                    blocked = true;
+                    break;
+                }
+                // Cast to i32 BEFORE negating to avoid i16 overflow.
+                let needed = -(op.sem_op as i32);
                 if sem.value < needed && op.flags().is_nowait() {
                     blocked = true;
                     break;
@@ -574,14 +578,66 @@ pub fn semop(registry: &mut SemRegistry, sem_id: usize, sops: &[Sembuf], pid: u3
         return Err(Error::WouldBlock);
     }
 
-    // Apply all operations.
-    for op in sops {
-        let array = registry.arrays[sem_id].as_mut().ok_or(Error::NotFound)?;
-        array.try_operation(op, pid)?;
+    // Pre-check undo-table capacity BEFORE applying any operation, so the
+    // SEM_UNDO recording below cannot fail with OutOfMemory *after* the
+    // array mutations are committed (which would leave a partial, non-atomic
+    // application visible to the caller). record_undo merges into an existing
+    // (pid, sem_id, sem_num) entry or allocates a free slot, so only a
+    // genuinely-new entry consumes capacity.
+    {
+        let free = registry.undos.iter().filter(|e| !e.is_active()).count();
+        let mut need = 0usize;
+        for (k, op) in sops.iter().enumerate() {
+            if !op.flags().is_undo() {
+                continue;
+            }
+            let sem_num = op.sem_num as usize;
+            let merges = registry.undos.iter().any(|e| {
+                e.is_active() && e.pid == pid && e.sem_id == sem_id && e.sem_num == sem_num
+            });
+            let counted_earlier = sops[..k]
+                .iter()
+                .any(|o| o.flags().is_undo() && o.sem_num as usize == sem_num);
+            if !merges && !counted_earlier {
+                need += 1;
+            }
+        }
+        if need > free {
+            return Err(Error::OutOfMemory);
+        }
+    }
 
+    // Snapshot the entire semaphore array so we can roll back atomically if
+    // any operation fails mid-way (e.g., overflow on a positive op, or a
+    // non-IPC_NOWAIT op that would block).  POSIX requires all-or-nothing.
+    let snapshot: [Semaphore; SEM_ARRAY_MAX] = {
+        let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+        array.sems
+    };
+
+    // Apply all operations; on any error restore the snapshot.
+    let apply_result: Result<()> = (|| {
+        for op in sops {
+            let array = registry.arrays[sem_id].as_mut().ok_or(Error::NotFound)?;
+            array.try_operation(op, pid)?;
+        }
+        Ok(())
+    })();
+
+    if apply_result.is_err() {
+        // Restore pre-operation state — no partial mutation visible.
+        if let Some(ref mut array) = registry.arrays[sem_id] {
+            array.sems = snapshot;
+        }
+        registry.stats.blocks = registry.stats.blocks.saturating_add(1);
+        return apply_result;
+    }
+
+    // All operations succeeded; now record any SEM_UNDO adjustments.
+    for op in sops {
         if op.flags().is_undo() {
-            // Record the inverse adjustment.
-            let adjustment = -(op.sem_op) as i16;
+            // Cast to i32 first to avoid i16::MIN overflow before narrowing back.
+            let adjustment = (-(op.sem_op as i32)) as i16;
             registry.record_undo(pid, sem_id, op.sem_num as usize, adjustment)?;
         }
     }

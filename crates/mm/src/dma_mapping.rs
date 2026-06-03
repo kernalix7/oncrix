@@ -186,7 +186,7 @@ impl DmaMapping {
 
     /// Page count.
     pub const fn page_count(&self) -> u64 {
-        (self.size + PAGE_SIZE - 1) / PAGE_SIZE
+        self.size.div_ceil(PAGE_SIZE)
     }
 }
 
@@ -325,7 +325,12 @@ impl DmaMappingTable {
         }
 
         let mid = self.next_id;
-        let bounce = cpu_addr + size > dma_limit;
+        // Reject ranges whose upper bound overflows the address space:
+        // an unchecked `cpu_addr + size` could wrap to a tiny value and
+        // make a limited-range device appear to reach a high CPU address,
+        // bypassing the bounce-buffer guard.
+        let end = cpu_addr.checked_add(size).ok_or(Error::InvalidArgument)?;
+        let bounce = end > dma_limit;
         let dma_addr = if bounce { 0 } else { cpu_addr };
 
         let mut mapping = DmaMapping::new(
@@ -370,9 +375,14 @@ impl DmaMappingTable {
     pub fn dma_to_cpu(&self, dma_addr: u64) -> Option<u64> {
         for idx in 0..self.count {
             let m = &self.mappings[idx];
-            if m.active() && dma_addr >= m.dma_addr() && dma_addr < m.dma_addr() + m.size() {
-                let offset = dma_addr - m.dma_addr();
-                return Some(m.cpu_addr() + offset);
+            if !m.active() || dma_addr < m.dma_addr() {
+                continue;
+            }
+            // Compare via the offset so the window upper bound never
+            // overflows (`dma_addr() + size()` could wrap for huge size).
+            let offset = dma_addr - m.dma_addr();
+            if offset < m.size() {
+                return m.cpu_addr().checked_add(offset);
             }
         }
         None

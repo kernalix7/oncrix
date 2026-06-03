@@ -577,36 +577,25 @@ impl ImaSubsystem {
 // Helpers
 // -------------------------------------------------------------------
 
-/// Compute a template hash from PCR index, digest, and filename.
+/// Compute a template hash binding the PCR index, file digest, and
+/// filename of a measurement entry.
 ///
-/// Uses a simple XOR-fold scheme suitable for `#![no_std]`
-/// environments without pulling in the full SHA-256 implementation.
+/// Uses the verified, in-crate [`crate::crypto::Sha256`] (NIST
+/// FIPS 180-4) over the canonical concatenation `pcr || digest ||
+/// filename[..name_len]`. A real cryptographic hash is required: a
+/// collision-trivial XOR-fold provides no tamper-evidence for the
+/// measurement log / PCR-extend binding used in remote attestation.
 fn compute_template_hash(
     pcr: u8,
     digest: &[u8; DIGEST_SIZE],
     filename: &[u8],
 ) -> [u8; DIGEST_SIZE] {
-    let mut hash = [0u8; DIGEST_SIZE];
-
-    // Fold the digest into the template hash.
-    let mut i = 0;
-    while i < DIGEST_SIZE {
-        hash[i] = digest[i];
-        i += 1;
-    }
-
-    // Mix in PCR index.
-    hash[0] ^= pcr;
-
-    // Mix in filename bytes via XOR rotation.
     let name_len = filename.len().min(IMA_FILENAME_LEN);
-    let mut j = 0;
-    while j < name_len {
-        hash[j % DIGEST_SIZE] ^= filename[j];
-        j += 1;
-    }
-
-    hash
+    let mut h = crate::crypto::Sha256::new();
+    h.update(&[pcr]);
+    h.update(digest);
+    h.update(&filename[..name_len]);
+    h.finalize()
 }
 
 /// Constant-time byte slice comparison.

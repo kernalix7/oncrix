@@ -366,25 +366,62 @@ impl LandlockSubsystem {
 
     /// Check if a filesystem access is allowed for a process.
     ///
-    /// Returns `Ok(true)` if allowed, `Ok(false)` if denied.
+    /// Landlock rulesets are *stackable*: a process may enforce several
+    /// rulesets, each tightening the sandbox. Enforcement is therefore the
+    /// intersection of every active domain — the access must be permitted by
+    /// **all** rulesets the process has enforced. This iterates over every
+    /// enforced domain for `pid` (not just the first), so a later, more
+    /// restrictive ruleset cannot be bypassed by an earlier permissive one.
+    ///
+    /// Returns `Ok(true)` if allowed, `Ok(false)` if denied. Fails closed: if
+    /// an active domain references a ruleset that no longer exists, the access
+    /// is denied (`Ok(false)`) rather than propagating an error that a caller
+    /// might mistake for "permit".
     pub fn check_fs_access(&mut self, pid: u64, access: u64, object_id: u64) -> Result<bool> {
         self.stats.total_access_checks += 1;
 
-        let dom = match self.find_domain(pid) {
-            Some(idx) => idx,
-            None => return Ok(true), // Not sandboxed.
-        };
+        let mut i = 0;
+        while i < MAX_DOMAINS {
+            let dom = self.domains[i];
+            i += 1;
 
-        let ruleset_id = self.domains[dom].ruleset_id;
-        let rs_slot = self.find_ruleset(ruleset_id)?;
-        let ruleset = &self.rulesets[rs_slot];
+            if !dom.enforced || dom.pid != pid {
+                continue;
+            }
 
-        // If this access type is not handled, allow it.
-        if (ruleset.handled_access_fs & access) == 0 {
-            return Ok(true);
+            // Resolve the ruleset for this domain. A missing ruleset for an
+            // active domain is an inconsistent state — deny rather than error.
+            let rs_slot = match self.find_ruleset(dom.ruleset_id) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    self.stats.total_denials += 1;
+                    return Ok(false);
+                }
+            };
+
+            if !Self::ruleset_allows(&self.rulesets[rs_slot], access, object_id) {
+                self.stats.total_denials += 1;
+                return Ok(false);
+            }
         }
 
-        // Check rules for a matching allow.
+        // Either not sandboxed by any domain (unrestricted) or every active
+        // domain allowed the access — both are "allow".
+        Ok(true)
+    }
+
+    /// Returns `true` if a single ruleset permits `access` to `object_id`.
+    ///
+    /// An access type the ruleset does not handle is permitted by that ruleset
+    /// (other stacked rulesets may still restrict it). A handled access type
+    /// requires a matching active `PathBeneath` rule granting all requested
+    /// bits.
+    fn ruleset_allows(ruleset: &Ruleset, access: u64, object_id: u64) -> bool {
+        // If this access type is not handled, this ruleset allows it.
+        if (ruleset.handled_access_fs & access) == 0 {
+            return true;
+        }
+
         for i in 0..ruleset.rule_count {
             let rule = &ruleset.rules[i];
             if rule.active
@@ -392,12 +429,11 @@ impl LandlockSubsystem {
                 && rule.object_id == object_id
                 && (rule.allowed_access & access) == access
             {
-                return Ok(true);
+                return true;
             }
         }
 
-        self.stats.total_denials += 1;
-        Ok(false)
+        false
     }
 
     // ── Query ────────────────────────────────────────────────
@@ -438,9 +474,5 @@ impl LandlockSubsystem {
             .iter()
             .position(|d| !d.enforced)
             .ok_or(Error::OutOfMemory)
-    }
-
-    fn find_domain(&self, pid: u64) -> Option<usize> {
-        self.domains.iter().position(|d| d.enforced && d.pid == pid)
     }
 }

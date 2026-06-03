@@ -563,7 +563,14 @@ impl SemRegistry {
             Ok(idx) => idx,
             Err(e) => {
                 // Roll back named + slot allocation.
+                // Clear all named-entry fields so the slot is reusable with
+                // a clean ref_count; a stale ref_count of 1 would prevent
+                // release_named_entry from ever freeing the entry.
                 self.named[ni].active = false;
+                self.named[ni].ref_count = 0;
+                self.named[ni].name_len = 0;
+                self.named[ni].sem_index = 0;
+                self.named[ni].unlinked = false;
                 self.slots[si].active = false;
                 return Err(e);
             }

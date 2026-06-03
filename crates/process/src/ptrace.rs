@@ -549,6 +549,30 @@ pub fn ptrace_poke(_tracee: Pid, addr: u64, _value: u64) -> Result<()> {
 /// # Returns
 ///
 /// A `u64` result value (request-specific, 0 on success for most).
+/// Decide whether a tracer may attach to a tracee, mirroring the Linux
+/// `ptrace_may_access` policy (PTRACE_MODE_ATTACH).
+///
+/// The caller (which owns the live credential structs, unreachable from
+/// this crate) supplies the resolved scalars: its own real uid and
+/// whether it holds `CAP_SYS_PTRACE`, plus the tracee's real uid and
+/// whether the tracee is dumpable. `CAP_SYS_PTRACE` bypasses the uid /
+/// dumpable checks; otherwise the tracer must share the tracee's real
+/// uid AND the tracee must be dumpable.
+pub fn ptrace_may_access(
+    caller_uid: u32,
+    caller_cap_sys_ptrace: bool,
+    tracee_uid: u32,
+    tracee_dumpable: bool,
+) -> Result<()> {
+    if caller_cap_sys_ptrace {
+        return Ok(());
+    }
+    if caller_uid != tracee_uid || !tracee_dumpable {
+        return Err(Error::PermissionDenied);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn do_ptrace(
     registry: &mut PtraceRegistry,
@@ -557,6 +581,10 @@ pub fn do_ptrace(
     tracee_pid: Pid,
     addr: u64,
     data: u64,
+    caller_uid: u32,
+    caller_cap_sys_ptrace: bool,
+    tracee_uid: u32,
+    tracee_dumpable: bool,
 ) -> Result<u64> {
     match request {
         PtraceRequest::TraceMe => {
@@ -567,6 +595,17 @@ pub fn do_ptrace(
         }
 
         PtraceRequest::Attach => {
+            // Authorization gate: an unprivileged tracer may only attach
+            // to a same-uid, dumpable tracee; CAP_SYS_PTRACE bypasses.
+            // Without this any process could attach to (and then
+            // peek/poke) a more-privileged one. Subsequent requests are
+            // already gated by `validate_tracer`.
+            ptrace_may_access(
+                caller_uid,
+                caller_cap_sys_ptrace,
+                tracee_uid,
+                tracee_dumpable,
+            )?;
             registry.attach(caller, tracee_pid)?;
             // In real kernel: send SIGSTOP to tracee
             ptrace_stop(

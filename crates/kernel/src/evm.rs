@@ -505,40 +505,17 @@ impl EvmSubsystem {
 // Helpers
 // -------------------------------------------------------------------
 
-/// Lightweight HMAC-SHA256 using XOR-fold for `#![no_std]`.
+/// Compute HMAC-SHA256 over `data` keyed by `key`.
 ///
-/// This is a simplified HMAC suitable for the kernel environment
-/// without pulling in the full `crypto` crate dependency. For a
-/// standards-compliant HMAC-SHA256, see [`crate::crypto::Hmac256`].
+/// Delegates to the verified, in-crate [`crate::crypto::Hmac256`]
+/// (RFC 2104 / FIPS 198-1 over a NIST-validated SHA-256 core). The
+/// EVM integrity tag MUST be a real keyed MAC: a collision-trivial or
+/// key-recoverable construction would let an attacker who can write
+/// inode metadata forge a tag and bypass `verify_inode`.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; HMAC_SIZE] {
-    let mut hash = [0u8; HMAC_SIZE];
-
-    // Mix key bytes into the hash via XOR rotation.
-    let mut i = 0;
-    while i < key.len() {
-        hash[i % HMAC_SIZE] ^= key[i];
-        i += 1;
-    }
-
-    // Mix data bytes.
-    let mut j = 0;
-    while j < data.len() {
-        hash[j % HMAC_SIZE] ^= data[j];
-        // Simple diffusion: rotate the accumulator byte.
-        hash[j % HMAC_SIZE] = hash[j % HMAC_SIZE].wrapping_mul(0x9e).wrapping_add(0x37);
-        j += 1;
-    }
-
-    // Final diffusion pass.
-    let mut k = 0;
-    while k < HMAC_SIZE {
-        hash[k] = hash[k]
-            .wrapping_mul(0x6d)
-            .wrapping_add(hash[(k + 1) % HMAC_SIZE]);
-        k += 1;
-    }
-
-    hash
+    let mut mac = crate::crypto::Hmac256::new(key);
+    mac.update(data);
+    mac.finalize()
 }
 
 /// Constant-time byte array comparison.

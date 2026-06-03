@@ -525,9 +525,26 @@ impl MprotectRangeManager {
             return Err(Error::InvalidArgument);
         }
 
+        // Reject a length whose page-rounding would overflow: otherwise
+        // `aligned_len` shrinks to a tiny page multiple and the operation
+        // silently mis-scopes, leaving most of the requested span at its
+        // old protection. POSIX mprotect must fail (EINVAL) here.
+        if len > u64::MAX - (PAGE_SIZE - 1) {
+            self.stats.failed += 1;
+            return Err(Error::InvalidArgument);
+        }
+
         let prot = ProtFlags::from_raw(new_prot)?;
         let aligned_len = page_align_up(len);
-        let end = addr.saturating_add(aligned_len);
+        // Bound the end against the address space; a wrap here would
+        // collapse the reprotected range back toward `addr`.
+        let end = match addr.checked_add(aligned_len) {
+            Some(e) => e,
+            None => {
+                self.stats.failed += 1;
+                return Err(Error::InvalidArgument);
+            }
+        };
 
         // Check that at least one range covers the target area.
         let has_coverage = self
@@ -856,6 +873,9 @@ impl MprotectRangeManager {
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Align a value up to the next page boundary.
+///
+/// Saturating so a value within `PAGE_SIZE - 1` of `u64::MAX` rounds up
+/// to `u64::MAX & PAGE_MASK` instead of wrapping to a tiny page count.
 const fn page_align_up(val: u64) -> u64 {
-    (val + PAGE_SIZE - 1) & PAGE_MASK
+    (val.saturating_add(PAGE_SIZE - 1)) & PAGE_MASK
 }

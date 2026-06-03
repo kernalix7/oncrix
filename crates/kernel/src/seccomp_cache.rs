@@ -184,20 +184,43 @@ impl SeccompCache {
     }
 
     /// Look up a cached decision for a syscall.
-    pub fn lookup(&mut self, pid: u64, syscall_nr: usize) -> Result<CachedAction> {
+    ///
+    /// `filter_hash` identifies the caller's *current* seccomp filter chain.
+    /// A cached entry is only honoured when its stored hash matches: if the
+    /// process has since installed/replaced its filter (new hash), or a
+    /// recycled PID now belongs to a different filter chain, the stale entry
+    /// is discarded and the caller is told to re-evaluate the BPF program.
+    /// This prevents a stale `Allow` from a prior filter (or a prior owner of
+    /// the PID) from short-circuiting the current, possibly stricter, policy.
+    pub fn lookup(
+        &mut self,
+        pid: u64,
+        filter_hash: u64,
+        syscall_nr: usize,
+    ) -> Result<CachedAction> {
         if !self.enabled {
             return Ok(CachedAction::Evaluate);
         }
 
         self.stats.total_lookups += 1;
 
-        let entry = match self.entries.iter_mut().find(|e| e.valid && e.pid == pid) {
-            Some(e) => e,
+        let slot = match self.entries.iter().position(|e| e.valid && e.pid == pid) {
+            Some(idx) => idx,
             None => {
                 self.stats.total_misses += 1;
                 return Ok(CachedAction::Evaluate);
             }
         };
+
+        // Fail closed on a filter-generation mismatch: drop the stale entry and
+        // force BPF re-evaluation rather than trusting an old verdict.
+        if self.entries[slot].filter_hash != filter_hash {
+            self.invalidate(pid);
+            self.stats.total_misses += 1;
+            return Ok(CachedAction::Evaluate);
+        }
+
+        let entry = &mut self.entries[slot];
 
         if entry.is_allowed(syscall_nr) {
             entry.hit_count += 1;
@@ -252,14 +275,20 @@ impl SeccompCache {
             None => return Ok(()),
         };
 
+        // Only cache verdicts that the two bitmaps can represent *exactly*.
+        // `LogAllow` carries an audit side-effect and `Errno` returns a
+        // specific errno without terminating the task; collapsing either into a
+        // plain allow/deny bit would rewrite the verdict (drop the log, or turn
+        // an EPERM into a kill). Leave those — and `Evaluate` — uncached so the
+        // BPF program runs each time and produces the correct action.
         match action {
-            CachedAction::Allow | CachedAction::LogAllow => {
+            CachedAction::Allow => {
                 entry.set_allowed(syscall_nr);
             }
-            CachedAction::Kill | CachedAction::Errno => {
+            CachedAction::Kill => {
                 entry.set_denied(syscall_nr);
             }
-            CachedAction::Evaluate => {}
+            CachedAction::Errno | CachedAction::LogAllow | CachedAction::Evaluate => {}
         }
         Ok(())
     }

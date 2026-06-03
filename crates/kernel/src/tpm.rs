@@ -294,15 +294,16 @@ impl TpmDevice {
 
         let pcr = &mut self.pcrs[idx as usize];
 
-        // Compute new_digest = simple_hash(old || new).
-        // In a real TPM this would be a proper SHA-256 extend;
-        // here we XOR-fold for the software abstraction.
+        // TPM PCR extend: PCR_new = SHA-256(PCR_old || measurement).
+        // This is one-way and order-dependent, preserving the
+        // append-only property that measured boot, sealing, and
+        // remote attestation rely on. A commutative/self-inverse
+        // mix (e.g. XOR) would let an attacker reach any target PCR.
         let copy_len = digest.len().min(DIGEST_SIZE);
-        let mut i = 0usize;
-        while i < copy_len {
-            pcr.digest[i] ^= digest[i];
-            i += 1;
-        }
+        let mut h = crate::crypto::Sha256::new();
+        h.update(&pcr.digest);
+        h.update(&digest[..copy_len]);
+        pcr.digest = h.finalize();
 
         pcr.algo = algo;
         pcr.valid = true;
@@ -328,16 +329,21 @@ impl TpmDevice {
 
     /// Request random bytes from the TPM hardware RNG.
     ///
-    /// Fills as much of `buf` as possible and returns the number
-    /// of bytes written. In this software abstraction, fills with
-    /// a deterministic pattern derived from the locality and
-    /// buffer length (a real implementation would read from the
-    /// TPM's hardware RNG).
+    /// This software abstraction is NOT backed by a hardware RNG and
+    /// has no access to the kernel CSPRNG, so it fails closed rather
+    /// than returning predictable bytes. Returning a deterministic
+    /// stream (e.g. an LCG seeded only by locality) under the guise
+    /// of `TPM2_GetRandom` would let callers trust it for keys,
+    /// nonces, salts, or attestation challenges and enable
+    /// prediction/replay. Until backed by a real TPM hardware RNG,
+    /// `buf` is left untouched and an error is returned.
     ///
     /// # Errors
     ///
     /// - `IoError` if the device is not initialized.
     /// - `InvalidArgument` if `buf` is empty.
+    /// - `NotImplemented` always (no hardware/CSPRNG entropy source
+    ///   is reachable from this device abstraction).
     pub fn get_random(&mut self, buf: &mut [u8]) -> Result<usize> {
         if !self.initialized {
             return Err(Error::IoError);
@@ -346,26 +352,18 @@ impl TpmDevice {
             return Err(Error::InvalidArgument);
         }
 
-        // Software stub: fill with pseudo-random bytes.
-        // A real implementation sends TPM2_GetRandom.
-        self.command_buf = TpmCommand::new(TPM_CC_GET_RANDOM);
-
-        let mut seed: u32 = 0x5EED_0000 | (self.locality as u32);
-        let mut i = 0usize;
-        while i < buf.len() {
-            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
-            buf[i] = (seed >> 16) as u8;
-            i += 1;
-        }
-
-        Ok(buf.len())
+        // No trustworthy entropy source is reachable here. Do NOT
+        // emit deterministic bytes that callers would treat as
+        // CSPRNG-grade. A real implementation sends TPM2_GetRandom
+        // to hardware or sources from the kernel CSPRNG.
+        Err(Error::NotImplemented)
     }
 
     /// Compute a hash of `data` using the specified algorithm.
     ///
-    /// Writes the digest into `out` and returns the number of
-    /// bytes written. Currently only SHA-256 produces a real
-    /// digest; other algorithms store a truncated XOR-fold as
+    /// Writes the SHA-256 digest of `data` into `out` (truncated to
+    /// `out.len()` if shorter than 32 bytes) and returns the number of
+    /// bytes written. This is a real, collision-resistant SHA-256, not
     /// a placeholder.
     ///
     /// # Errors
@@ -383,14 +381,11 @@ impl TpmDevice {
 
         self.command_buf = TpmCommand::new(TPM_CC_HASH);
 
-        // Software stub: simple XOR-fold hash into DIGEST_SIZE bytes.
+        // Real SHA-256 (the only TPM 2.0 PCR bank this stub implements).
         let digest_len = out.len().min(DIGEST_SIZE);
-        let mut digest = [0u8; DIGEST_SIZE];
-        let mut i = 0usize;
-        while i < data.len() {
-            digest[i % DIGEST_SIZE] ^= data[i];
-            i += 1;
-        }
+        let mut h = crate::crypto::Sha256::new();
+        h.update(data);
+        let digest = h.finalize();
 
         out[..digest_len].copy_from_slice(&digest[..digest_len]);
         Ok(digest_len)
@@ -595,13 +590,13 @@ impl TpmSubsystem {
             return Err(Error::InvalidArgument);
         }
 
-        // Compute a digest from the data (XOR-fold into 32 bytes).
-        let mut digest = [0u8; DIGEST_SIZE];
-        let mut i = 0usize;
-        while i < data.len() {
-            digest[i % DIGEST_SIZE] ^= data[i];
-            i += 1;
-        }
+        // Compute a real SHA-256 digest of the measured data so the
+        // extend below cannot be second-preimaged by crafted `data`.
+        let digest = {
+            let mut h = crate::crypto::Sha256::new();
+            h.update(data);
+            h.finalize()
+        };
 
         // Extend PCR 0 with the digest.
         self.device.pcr_extend(0, &digest, TpmAlgorithm::Sha256)?;
