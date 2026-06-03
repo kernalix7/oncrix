@@ -64,6 +64,10 @@ pub const VMADDR_PORT_ANY: u32 = u32::MAX;
 /// AF_VSOCK address family identifier (mirrors Linux `AF_VSOCK = 40`).
 pub const AF_VSOCK: u16 = 40;
 
+/// Privileged user id (root).  Only this principal may bind a port below
+/// [`VSOCK_MIN_DYNAMIC_PORT`].
+pub const VSOCK_PRIV_UID: u32 = 0;
+
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
@@ -211,6 +215,13 @@ impl VsockMessage {
 pub struct VsockSocket {
     /// Unique socket identifier (index into the registry).
     pub id: usize,
+    /// Owning principal (user id) recorded at creation.
+    ///
+    /// Every lifecycle and data operation must present this same `owner`
+    /// value; the registry rejects operations on a socket the caller does
+    /// not own.  This binds the caller-supplied `socket_id` to an identity
+    /// instead of trusting it blindly.
+    owner: u32,
     /// Socket type.
     pub sock_type: VsockSocketType,
     /// Current connection state.
@@ -230,10 +241,11 @@ pub struct VsockSocket {
 }
 
 impl VsockSocket {
-    /// Create a new socket with the given ID and type.
-    pub fn new(id: usize, sock_type: VsockSocketType) -> Self {
+    /// Create a new socket with the given ID, owner, and type.
+    pub fn new(id: usize, owner: u32, sock_type: VsockSocketType) -> Self {
         Self {
             id,
+            owner,
             sock_type,
             state: VsockState::Closed,
             local: VsockAddr::new(VMADDR_CID_ANY, VMADDR_PORT_ANY),
@@ -245,9 +257,23 @@ impl VsockSocket {
         }
     }
 
+    /// Returns the owning principal (user id) of this socket.
+    pub fn owner(&self) -> u32 {
+        self.owner
+    }
+
     /// Returns `true` if the receive queue has pending messages.
     pub fn has_data(&self) -> bool {
         self.recv_count > 0
+    }
+
+    /// Returns `true` if the socket is in a state that accepts inbound
+    /// local datagrams (bound, listening, or fully connected).
+    fn is_deliverable(&self) -> bool {
+        matches!(
+            self.state,
+            VsockState::Bound | VsockState::Listening | VsockState::Connected
+        )
     }
 
     /// Enqueue a message into the socket's receive buffer.
@@ -309,6 +335,43 @@ impl VsockRegistry {
     }
 
     // -----------------------------------------------------------------------
+    // Bounds-checked + ownership-checked slot accessors
+    // -----------------------------------------------------------------------
+
+    /// Resolve a caller-supplied `socket_id` to an owned socket slot.
+    ///
+    /// Rejects out-of-range ids (no direct indexing — prevents an OOB
+    /// panic in ring 0) and rejects access to a socket whose recorded
+    /// `owner` does not match `owner`.  This stops a caller from operating
+    /// on a `socket_id` it does not own (foreign-handle hijack).
+    fn owned_slot_mut(&mut self, socket_id: usize, owner: u32) -> Result<&mut VsockSocket> {
+        let socket = self
+            .sockets
+            .get_mut(socket_id)
+            .ok_or(Error::InvalidArgument)?
+            .as_mut()
+            .ok_or(Error::InvalidArgument)?;
+        if socket.owner != owner {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(socket)
+    }
+
+    /// Shared-reference counterpart to [`Self::owned_slot_mut`].
+    fn owned_slot(&self, socket_id: usize, owner: u32) -> Result<&VsockSocket> {
+        let socket = self
+            .sockets
+            .get(socket_id)
+            .ok_or(Error::InvalidArgument)?
+            .as_ref()
+            .ok_or(Error::InvalidArgument)?;
+        if socket.owner != owner {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(socket)
+    }
+
+    // -----------------------------------------------------------------------
     // Port allocation
     // -----------------------------------------------------------------------
 
@@ -339,10 +402,13 @@ impl VsockRegistry {
     // Socket lifecycle
     // -----------------------------------------------------------------------
 
-    /// Create a new vsock socket and return its ID.
+    /// Create a new vsock socket owned by `owner` and return its ID.
+    ///
+    /// The returned id is only usable by a caller presenting the same
+    /// `owner` on subsequent operations.
     ///
     /// Returns `Err(OutOfMemory)` when the registry is full.
-    pub fn socket(&mut self, sock_type: VsockSocketType) -> Result<usize> {
+    pub fn socket(&mut self, owner: u32, sock_type: VsockSocketType) -> Result<usize> {
         if self.count >= VSOCK_MAX_SOCKETS {
             return Err(Error::OutOfMemory);
         }
@@ -352,7 +418,7 @@ impl VsockRegistry {
             .iter()
             .position(|s| s.is_none())
             .ok_or(Error::OutOfMemory)?;
-        self.sockets[id] = Some(VsockSocket::new(id, sock_type));
+        self.sockets[id] = Some(VsockSocket::new(id, owner, sock_type));
         self.count += 1;
         Ok(id)
     }
@@ -361,17 +427,29 @@ impl VsockRegistry {
     ///
     /// If `addr.port` is [`VMADDR_PORT_ANY`], a dynamic port is assigned.
     /// `addr.cid` must be either the local CID or `VMADDR_CID_ANY`.
-    pub fn bind(&mut self, socket_id: usize, mut addr: VsockAddr) -> Result<()> {
+    ///
+    /// `owner` is the authenticated principal of the caller; it must match
+    /// the socket's recorded owner.  Binding an explicit port below
+    /// [`VSOCK_MIN_DYNAMIC_PORT`] requires `owner == VSOCK_PRIV_UID`
+    /// (fail-closed), mirroring `CAP_NET_BIND_SERVICE`.  The syscall layer
+    /// must pass the authenticated caller uid here.
+    pub fn bind(&mut self, socket_id: usize, owner: u32, mut addr: VsockAddr) -> Result<()> {
         let cid = self.local_cid;
-        let socket = self.sockets[socket_id]
-            .as_mut()
-            .ok_or(Error::InvalidArgument)?;
+
+        // Reject foreign socket_id and out-of-range ids before any indexing.
+        let socket = self.owned_slot_mut(socket_id, owner)?;
 
         if socket.state != VsockState::Closed {
             return Err(Error::InvalidArgument);
         }
         if !addr.is_cid_any() && addr.cid != cid {
             return Err(Error::InvalidArgument);
+        }
+        // Privileged-port gate: an explicit well-known port requires root.
+        // The wildcard port is allocated dynamically (>= MIN_DYNAMIC_PORT)
+        // below and is therefore unprivileged.
+        if !addr.is_port_any() && addr.port < VSOCK_MIN_DYNAMIC_PORT && owner != VSOCK_PRIV_UID {
+            return Err(Error::PermissionDenied);
         }
         if addr.is_cid_any() {
             addr.cid = cid;
@@ -383,9 +461,7 @@ impl VsockRegistry {
             addr.port = self.alloc_port()?;
         }
 
-        let socket = self.sockets[socket_id]
-            .as_mut()
-            .ok_or(Error::InvalidArgument)?;
+        let socket = self.owned_slot_mut(socket_id, owner)?;
         socket.local = addr;
         socket.state = VsockState::Bound;
         Ok(())
@@ -393,11 +469,10 @@ impl VsockRegistry {
 
     /// Put a stream socket into the listening state.
     ///
-    /// `_backlog` is accepted but ignored in this stub implementation.
-    pub fn listen(&mut self, socket_id: usize, _backlog: i32) -> Result<()> {
-        let socket = self.sockets[socket_id]
-            .as_mut()
-            .ok_or(Error::InvalidArgument)?;
+    /// `owner` must match the socket's recorded owner.  `_backlog` is
+    /// accepted but ignored in this stub implementation.
+    pub fn listen(&mut self, socket_id: usize, owner: u32, _backlog: i32) -> Result<()> {
+        let socket = self.owned_slot_mut(socket_id, owner)?;
         if socket.sock_type != VsockSocketType::Stream {
             return Err(Error::NotImplemented);
         }
@@ -410,13 +485,12 @@ impl VsockRegistry {
 
     /// Initiate a connection to a remote address.
     ///
-    /// The socket transitions to `Connecting`; full handshake completion
-    /// requires the virtio-vsock transport layer (stub).
-    pub fn connect(&mut self, socket_id: usize, peer: VsockAddr) -> Result<()> {
+    /// `owner` must match the socket's recorded owner.  The socket
+    /// transitions to `Connecting`; full handshake completion requires the
+    /// virtio-vsock transport layer (stub).
+    pub fn connect(&mut self, socket_id: usize, owner: u32, peer: VsockAddr) -> Result<()> {
         let local_cid = self.local_cid;
-        let socket = self.sockets[socket_id]
-            .as_mut()
-            .ok_or(Error::InvalidArgument)?;
+        let socket = self.owned_slot_mut(socket_id, owner)?;
         if socket.sock_type != VsockSocketType::Stream {
             return Err(Error::NotImplemented);
         }
@@ -431,15 +505,11 @@ impl VsockRegistry {
         if socket.local.port == VMADDR_PORT_ANY {
             let _ = socket;
             let port = self.alloc_port()?;
-            let socket = self.sockets[socket_id]
-                .as_mut()
-                .ok_or(Error::InvalidArgument)?;
+            let socket = self.owned_slot_mut(socket_id, owner)?;
             socket.local = VsockAddr::new(local_cid, port);
         }
 
-        let socket = self.sockets[socket_id]
-            .as_mut()
-            .ok_or(Error::InvalidArgument)?;
+        let socket = self.owned_slot_mut(socket_id, owner)?;
         socket.peer = Some(peer);
         socket.state = VsockState::Connecting;
 
@@ -449,13 +519,15 @@ impl VsockRegistry {
     }
 
     /// Close and release a socket.
-    pub fn close(&mut self, socket_id: usize) -> Result<()> {
-        let socket = self.sockets[socket_id]
-            .as_mut()
-            .ok_or(Error::InvalidArgument)?;
+    ///
+    /// `owner` must match the socket's recorded owner; a caller cannot
+    /// close a socket it does not own.
+    pub fn close(&mut self, socket_id: usize, owner: u32) -> Result<()> {
+        // Validates bounds + ownership; on Ok, `socket_id` is in range.
+        let socket = self.owned_slot_mut(socket_id, owner)?;
         socket.state = VsockState::Closed;
         self.sockets[socket_id] = None;
-        self.count -= 1;
+        self.count = self.count.saturating_sub(1);
         Ok(())
     }
 
@@ -463,25 +535,49 @@ impl VsockRegistry {
     // Data transfer
     // -----------------------------------------------------------------------
 
-    /// Send a message from `socket_id` to the address in `msg.dst`.
+    /// Send a message from `socket_id` to the address in `dst`.
+    ///
+    /// `owner` must match the sending socket's recorded owner; a caller
+    /// cannot send from a `socket_id` it does not own (this also stamps a
+    /// trustworthy source address rather than one the caller spoofed).
     ///
     /// For local CID destinations the message is delivered directly to the
-    /// matching bound socket's receive queue.  For remote CIDs the message
-    /// is forwarded to the virtio-vsock transport (stub).
-    pub fn send(&mut self, socket_id: usize, data: &[u8], dst: VsockAddr) -> Result<usize> {
-        let src = {
-            let socket = self.sockets[socket_id]
-                .as_ref()
-                .ok_or(Error::InvalidArgument)?;
-            socket.local
-        };
+    /// matching bound socket's receive queue.  A target qualifies only when
+    /// its CID **and** port match `dst` and it is in a deliverable state —
+    /// preventing cross-CID hijack and delivery into wildcard/unbound
+    /// sockets.  For remote CIDs the message is forwarded to the
+    /// virtio-vsock transport (stub).
+    pub fn send(
+        &mut self,
+        socket_id: usize,
+        owner: u32,
+        data: &[u8],
+        dst: VsockAddr,
+    ) -> Result<usize> {
+        // Reject foreign/out-of-range socket_id; derive an authentic source.
+        let src = self.owned_slot(socket_id, owner)?.local;
         let msg = VsockMessage::new(src, dst, data)?;
 
-        if dst.cid == self.local_cid || dst.cid == VMADDR_CID_LOCAL {
-            // Local delivery: find the listening/connected socket.
+        // Local delivery only when the destination CID is *this* registry's
+        // CID.  `VMADDR_CID_LOCAL` (loopback) is local only when we are that
+        // CID; it must not alias an arbitrary host/guest registry.
+        let is_local = dst.cid == self.local_cid
+            || (dst.cid == VMADDR_CID_LOCAL && self.local_cid == VMADDR_CID_LOCAL);
+        if is_local {
+            // A wildcard destination CID/port can never name a concrete
+            // listener; reject rather than fan out to every socket.
+            if dst.is_cid_any() || dst.is_port_any() {
+                return Err(Error::NotFound);
+            }
+            // Match on the full (cid, port) tuple, an accepting state, and
+            // exclude the sender itself.
             let target = self.sockets.iter_mut().find(|s| {
-                s.as_ref()
-                    .map_or(false, |s| s.local.port == dst.port && s.id != socket_id)
+                s.as_ref().is_some_and(|s| {
+                    s.id != socket_id
+                        && s.local.port == dst.port
+                        && s.local.cid == dst.cid
+                        && s.is_deliverable()
+                })
             });
             if let Some(Some(target_sock)) = target {
                 target_sock.enqueue(msg)?;
@@ -497,12 +593,13 @@ impl VsockRegistry {
 
     /// Receive a message into `buf` from the socket's queue.
     ///
+    /// `owner` must match the socket's recorded owner; a caller cannot
+    /// drain a queue it does not own.
+    ///
     /// Returns the number of bytes copied into `buf`, or
     /// `Err(WouldBlock)` if the queue is empty.
-    pub fn recv(&mut self, socket_id: usize, buf: &mut [u8]) -> Result<usize> {
-        let socket = self.sockets[socket_id]
-            .as_mut()
-            .ok_or(Error::InvalidArgument)?;
+    pub fn recv(&mut self, socket_id: usize, owner: u32, buf: &mut [u8]) -> Result<usize> {
+        let socket = self.owned_slot_mut(socket_id, owner)?;
         let msg = socket.dequeue().ok_or(Error::WouldBlock)?;
         let n = msg.len.min(buf.len());
         buf[..n].copy_from_slice(&msg.payload[..n]);
@@ -518,8 +615,12 @@ impl VsockRegistry {
         self.sockets.get(socket_id)?.as_ref()
     }
 
-    /// Look up a socket by ID (mutable).
-    pub fn get_mut(&mut self, socket_id: usize) -> Option<&mut VsockSocket> {
+    /// Look up a socket by ID (mutable), crate-internal only.
+    ///
+    /// NOT public: a mutable handle that skipped the `owner` check would let
+    /// a caller bypass ownership. External mutation must go through the
+    /// owner-checked lifecycle/data ops (`bind`/`connect`/`send`/...).
+    fn get_mut(&mut self, socket_id: usize) -> Option<&mut VsockSocket> {
         self.sockets.get_mut(socket_id)?.as_mut()
     }
 

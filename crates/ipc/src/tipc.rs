@@ -61,6 +61,14 @@ pub const TIPC_MAX_MSG_SIZE: usize = 256;
 /// Maximum number of messages in a socket's receive queue.
 pub const TIPC_RECV_QUEUE_DEPTH: usize = 16;
 
+/// Maximum span of a service instance range accepted by `bind`/`unbind`.
+///
+/// A caller-supplied range `[lower, upper]` with `upper - lower > TIPC_MAX_RANGE_SPAN`
+/// is rejected with `InvalidArgument`. Without this cap the notification loop
+/// `for inst in range.lower..=range.upper` would iterate up to 2^32 times in
+/// ring-0, permanently hanging the kernel on a single syscall.
+pub const TIPC_MAX_RANGE_SPAN: u32 = 4096;
+
 // ---------------------------------------------------------------------------
 // Address constants
 // ---------------------------------------------------------------------------
@@ -150,12 +158,19 @@ impl TipcServiceRange {
         }
     }
 
-    /// Validate: service type non-zero and `lower <= upper`.
+    /// Validate: service type non-zero, `lower <= upper`, and span within cap.
+    ///
+    /// Rejects ranges whose span exceeds [`TIPC_MAX_RANGE_SPAN`] to prevent
+    /// unbounded notification loops in `bind` and `unbind`.
     pub fn validate(&self) -> Result<()> {
         if self.service_type == 0 {
             return Err(Error::InvalidArgument);
         }
         if self.lower > self.upper {
+            return Err(Error::InvalidArgument);
+        }
+        // Guard against a huge range that would drive an O(2^32) loop in ring-0.
+        if self.upper - self.lower > TIPC_MAX_RANGE_SPAN {
             return Err(Error::InvalidArgument);
         }
         Ok(())

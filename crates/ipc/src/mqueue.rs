@@ -252,18 +252,35 @@ impl MessageQueue {
     }
 
     /// Return `true` if the queue is full.
+    ///
+    /// Uses the compile-time constant [`MQ_MAX_MESSAGES`] as the hard upper
+    /// bound rather than `attrs.mq_maxmsg`, which is a `pub` field that could
+    /// be mutated after creation.  This prevents an out-of-bounds write into
+    /// the fixed-size `messages` array if `mq_maxmsg` were set above the
+    /// compile-time limit.
     pub fn is_full(&self) -> bool {
-        self.count >= self.attrs.mq_maxmsg as usize
+        self.count >= MQ_MAX_MESSAGES
     }
 
     /// Insert a message in priority-sorted order.
     ///
-    /// Returns `WouldBlock` if the queue is full.
+    /// Returns `WouldBlock` if the queue is full.  The full-check uses the
+    /// compile-time constant `MQ_MAX_MESSAGES` (see [`Self::is_full`]) so the
+    /// bound is independent of `attrs.mq_maxmsg`.  `msg_len` is clamped to
+    /// `MQ_MSG_MAX_SIZE` (the fixed slot size) to avoid any OOB copy.
     fn push(&mut self, data: &[u8], len: usize, priority: u32) -> Result<()> {
         if self.is_full() {
             return Err(Error::WouldBlock);
         }
-        let actual_len = len.min(self.attrs.mq_msgsize as usize);
+        // Hard invariant: self.count must be within the fixed array bounds.
+        // This fires in debug builds if any future path bypasses is_full().
+        debug_assert!(
+            self.count < MQ_MAX_MESSAGES,
+            "mqueue: count exceeds MQ_MAX_MESSAGES"
+        );
+        // Clamp to the compile-time maximum slot size, independent of the
+        // mutable mq_msgsize attribute, to prevent out-of-bounds data copies.
+        let actual_len = len.min(MQ_MSG_MAX_SIZE).min(self.attrs.mq_msgsize as usize);
 
         // Find insertion point: keep descending priority order.
         let mut pos = self.count;

@@ -337,11 +337,47 @@ impl RpmsgDevice {
         }
     }
 
-    /// Allocate a dynamic endpoint address.
-    fn alloc_addr(&mut self) -> u32 {
-        let addr = self.next_addr;
-        self.next_addr = self.next_addr.wrapping_add(1);
-        addr
+    /// Allocate a unique dynamic endpoint address.
+    ///
+    /// Scans forward from `next_addr` (starting at `RPMSG_DYNAMIC_ADDR_START`)
+    /// to find an address that is not already in use.  Returns `None` when the
+    /// entire dynamic range `[RPMSG_DYNAMIC_ADDR_START, u32::MAX]` has been
+    /// exhausted without finding a free slot.
+    ///
+    /// The counter never wraps below `RPMSG_DYNAMIC_ADDR_START`, preventing
+    /// aliasing with the fixed-address namespace `[0, RPMSG_DYNAMIC_ADDR_START - 1]`
+    /// that includes well-known addresses such as `RPMSG_NS_ADDR = 53`.
+    fn alloc_addr(&mut self) -> Option<u32> {
+        // Linear scan of at most (u32::MAX - RPMSG_DYNAMIC_ADDR_START + 1)
+        // addresses.  In practice the endpoint table is tiny (MAX_ENDPOINTS=64)
+        // so the scan terminates quickly.
+        let start = self.next_addr;
+        loop {
+            let candidate = self.next_addr;
+            // Advance; saturate at u32::MAX rather than wrapping into fixed range.
+            self.next_addr = self.next_addr.saturating_add(1);
+            if self.next_addr < RPMSG_DYNAMIC_ADDR_START {
+                // saturating_add would only keep us at u32::MAX, but guard anyway.
+                self.next_addr = RPMSG_DYNAMIC_ADDR_START;
+            }
+
+            if self.find_endpoint(candidate).is_err() {
+                // Address is free.
+                return Some(candidate);
+            }
+
+            // If we've scanned the entire dynamic range without finding a free
+            // address, give up.  next_addr stalled at u32::MAX means full.
+            if self.next_addr == candidate {
+                // Saturated — no room.
+                return None;
+            }
+            // Detect a full wrap back to start (should not happen given tiny table,
+            // but be defensive).
+            if self.next_addr == start {
+                return None;
+            }
+        }
     }
 
     /// Find a free endpoint slot.
@@ -394,7 +430,7 @@ impl RpmsgDevice {
         }
 
         let actual_addr = if addr == RPMSG_ADDR_ANY {
-            self.alloc_addr()
+            self.alloc_addr().ok_or(Error::OutOfMemory)?
         } else {
             // Check for address collision.
             if self.find_endpoint(addr).is_ok() {
