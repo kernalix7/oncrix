@@ -161,7 +161,18 @@ impl ExtentNode {
     /// Returns the index into `extents` and the matching extent, or
     /// `Err(NotFound)` if `lblock` is not mapped.
     pub fn lookup(&self, lblock: u32) -> Result<(usize, Ext4Extent)> {
-        let count = self.header.entries as usize;
+        // Reject nodes whose header magic is wrong.
+        if !self.header.is_valid() {
+            return Err(Error::InvalidArgument);
+        }
+        // `header.entries` and `header.max_entries` both originate from disk and
+        // are attacker-controlled.  Cap them against the compile-time array bound
+        // before any indexing so that no `mid` in the binary search below can
+        // ever exceed EXT4_EXTENTS_PER_BLOCK - 1.
+        if self.header.max_entries as usize > EXT4_EXTENTS_PER_BLOCK {
+            return Err(Error::InvalidArgument);
+        }
+        let count = (self.header.entries as usize).min(EXT4_EXTENTS_PER_BLOCK);
         // Binary search over sorted extents.
         let mut lo = 0usize;
         let mut hi = count;

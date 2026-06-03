@@ -373,8 +373,14 @@ pub fn ext2_remove_entry(block: &mut DirBlock, name: &[u8]) -> Result<u32> {
                     let removed_ino = entry.inode;
                     if let Some(poff) = prev_off {
                         // Merge with previous: extend prev rec_len.
+                        // Both values come from disk; validate that their sum
+                        // neither overflows u16 nor pushes past the block end.
                         let prev_rec = block.read_u16(poff + 4);
-                        block.write_u16(poff + 4, prev_rec + entry.rec_len);
+                        let merged = prev_rec.checked_add(entry.rec_len).ok_or(Error::IoError)?;
+                        if poff + merged as usize > DIR_BLOCK_SIZE {
+                            return Err(Error::IoError);
+                        }
+                        block.write_u16(poff + 4, merged);
                     } else {
                         // First entry: just zero the inode.
                         block.write_u32(off, 0);
