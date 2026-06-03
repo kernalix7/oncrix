@@ -281,6 +281,13 @@ pub unsafe fn sys_fork() -> i64 {
 pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u64) -> i64 {
     let mut serial = Uart16550::new(COM1);
 
+    // Validate the status pointer BEFORE reaping any zombie. A bad pointer
+    // must fail with -EFAULT without consuming the child (otherwise the
+    // status is lost irrecoverably). `0` means "no status wanted".
+    if wstatus_ptr != 0 && wstatus_ptr >= 0xFFFF_8000_0000_0000 {
+        return -14; // EFAULT
+    }
+
     // Determine the caller's PID (for child-of check).
     let caller_pid = match crate::current::current_thread() {
         Some(t) => t.pid(),
@@ -296,13 +303,19 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
         return -22;
     };
 
-    // Check that the caller actually has children.
+    // Check that the caller has a child matching the request. For a specific
+    // target_pid, that pid must actually be a child of the caller — otherwise
+    // POSIX requires ECHILD, not an indefinite block (which the old "any
+    // child" check caused when the caller had *other* children).
     // SAFETY: single-CPU SYSCALL context.
-    let has_children = unsafe {
+    let has_target = unsafe {
         #[allow(static_mut_refs)]
-        PROCESS_TABLE.children(caller_pid).next().is_some()
+        match target_pid {
+            Some(tp) => PROCESS_TABLE.children(caller_pid).any(|e| e.pid() == tp),
+            None => PROCESS_TABLE.children(caller_pid).next().is_some(),
+        }
     };
-    if !has_children {
+    if !has_target {
         return -10; // ECHILD
     }
 
@@ -457,7 +470,10 @@ pub unsafe fn sys_waitid(idtype: u64, id: u64, infop: u64, options: u64) -> i64 
     if options & WEXITED == 0 {
         return -22; // EINVAL
     }
-    if infop != 0 && infop >= 0xFFFF_8000_0000_0000 {
+    // Validate the FULL 128-byte span, not just the start: a pointer just
+    // below the kernel boundary would let the tail of the siginfo write
+    // spill across it.
+    if infop != 0 && infop >= 0xFFFF_8000_0000_0000 - SIGINFO_SIZE as u64 {
         return -14; // EFAULT
     }
 
@@ -476,13 +492,18 @@ pub unsafe fn sys_waitid(idtype: u64, id: u64, infop: u64, options: u64) -> i64 
         _ => return -22, // EINVAL — unknown idtype
     };
 
-    // The caller must have at least one matching child.
+    // The caller must have a matching child. For P_PID, the specific id must
+    // be a child of the caller — otherwise return ECHILD instead of blocking
+    // forever when the caller has other (non-matching) children.
     // SAFETY: single-CPU SYSCALL context.
-    let has_children = unsafe {
+    let has_target = unsafe {
         #[allow(static_mut_refs)]
-        PROCESS_TABLE.children(caller_pid).next().is_some()
+        match target_pid {
+            Some(tp) => PROCESS_TABLE.children(caller_pid).any(|e| e.pid() == tp),
+            None => PROCESS_TABLE.children(caller_pid).next().is_some(),
+        }
     };
-    if !has_children {
+    if !has_target {
         return -10; // ECHILD
     }
 
@@ -956,7 +977,8 @@ pub unsafe fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
     if sigsetsize != 8 {
         return -22; // EINVAL
     }
-    if set_ptr == 0 || set_ptr >= 0xFFFF_8000_0000_0000 {
+    // Validate the full 8-byte span (tail must not cross the kernel split).
+    if set_ptr == 0 || set_ptr >= 0xFFFF_8000_0000_0000 - 8 {
         return -14; // EFAULT
     }
     let pid = match crate::current::current_pid() {
@@ -993,7 +1015,8 @@ pub unsafe fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> i64 {
         return -14; // EFAULT
     }
     if old_ss_ptr != 0 {
-        if old_ss_ptr >= 0xFFFF_8000_0000_0000 {
+        // Validate the full 24-byte stack_t span (tail must not cross split).
+        if old_ss_ptr >= 0xFFFF_8000_0000_0000 - 24 {
             return -14; // EFAULT
         }
         // stack_t { ss_sp: u64 @0, ss_flags: i32 @8, _pad: u32 @12, ss_size: u64 @16 }

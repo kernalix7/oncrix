@@ -85,7 +85,13 @@ fn resolve_path_abs(path: &[u8], abs_buf: &mut [u8; PATH_BUF_LEN]) -> Result<usi
         return Err(-2); // ENOENT
     }
     if path[0] == b'/' {
-        let len = path.len().min(MAX_PATH);
+        // Reject rather than silently truncate an over-long absolute path: a
+        // truncated path can resolve to a *different* existing file, so
+        // unlink/rename/chmod could operate on the wrong target.
+        if path.len() > MAX_PATH {
+            return Err(-36); // ENAMETOOLONG
+        }
+        let len = path.len();
         abs_buf[..len].copy_from_slice(&path[..len]);
         abs_buf[len] = 0;
         return Ok(len);
@@ -107,12 +113,15 @@ fn resolve_path_abs(path: &[u8], abs_buf: &mut [u8; PATH_BUF_LEN]) -> Result<usi
         abs_buf[out] = b'/';
         out += 1;
     }
-    let copy_path = path.len().min(MAX_PATH - out);
-    abs_buf[out..out + copy_path].copy_from_slice(&path[..copy_path]);
-    out += copy_path;
-    if out > MAX_PATH {
+    // Reject when cwd + '/' + path would overflow, instead of clamping
+    // copy_path (which made the `out > MAX_PATH` guard below dead code and
+    // silently truncated the tail). Compute the full required length first.
+    let need = out.saturating_add(path.len());
+    if need > MAX_PATH {
         return Err(-36); // ENAMETOOLONG
     }
+    abs_buf[out..out + path.len()].copy_from_slice(path);
+    out += path.len();
     abs_buf[out] = 0;
     Ok(out)
 }
@@ -2119,17 +2128,28 @@ pub unsafe fn sys_capget(header_ptr: u64, data_ptr: u64) -> i64 {
         return -14; // EFAULT
     }
 
+    // The capability-set ABI version selects the data-block size:
+    //   _LINUX_CAPABILITY_VERSION_1 (0x19980330) -> ONE cap_user_data_t (12 B)
+    //   v2 (0x20071026) / v3 (0x20080522)        -> TWO entries (24 B)
+    // A v1 caller allocates only 12 bytes, so unconditionally writing 24
+    // would overflow its buffer. Read the version before sizing the write.
+    /// `_LINUX_CAPABILITY_VERSION_1` — single 12-byte data block.
+    const CAP_V1: u32 = 0x1998_0330;
+    // SAFETY: header_ptr validated non-null/user above; reading 4 bytes.
+    let version = unsafe { core::ptr::read_unaligned(header_ptr as *const u32) };
+    let data_len: usize = if version == CAP_V1 { 12 } else { 24 };
+
     // data_ptr may be null (caller only querying the version in the header).
-    // If non-null it must be a valid user address.
-    if data_ptr != 0 && data_ptr >= 0xFFFF_8000_0000_0000 {
+    // If non-null it must be a valid user address for the whole data block.
+    if data_ptr != 0 && data_ptr >= 0xFFFF_8000_0000_0000 - data_len as u64 {
         return -14; // EFAULT
     }
 
     if data_ptr != 0 {
-        // Zero-fill the two cap_user_data_t entries (6 × u32 = 24 bytes).
-        // SAFETY: validated above; writing within user-accessible address range.
+        // Zero-fill the cap_user_data_t block (no capabilities held).
+        // SAFETY: validated above; data_len (12 or 24) bytes within user range.
         unsafe {
-            core::ptr::write_bytes(data_ptr as *mut u8, 0, 24);
+            core::ptr::write_bytes(data_ptr as *mut u8, 0, data_len);
         }
     }
 

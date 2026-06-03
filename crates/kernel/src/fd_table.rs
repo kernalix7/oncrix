@@ -1661,9 +1661,12 @@ pub unsafe fn fd_dup2(oldfd: usize, newfd: usize) -> i64 {
             // SAFETY: single-CPU SYSCALL context.
             unsafe { signalfd_dup(id) }
         }
+        FileBackend::Socket { handle_id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { crate::socket::socket_dup(handle_id) }
+        }
         FileBackend::Console
         | FileBackend::RamfsFile { .. }
-        | FileBackend::Socket { .. }
         | FileBackend::DevFile { .. }
         | FileBackend::ProcFile { .. } => {}
     }
@@ -1957,9 +1960,12 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                         crate::pipe::pipe_dup_write(write_ring);
                     }
                 }
+                FileBackend::Socket { handle_id } => {
+                    // SAFETY: single-CPU SYSCALL context.
+                    unsafe { crate::socket::socket_dup(handle_id) }
+                }
                 FileBackend::Console
                 | FileBackend::RamfsFile { .. }
-                | FileBackend::Socket { .. }
                 | FileBackend::DevFile { .. }
                 | FileBackend::ProcFile { .. } => {}
             }
@@ -2024,6 +2030,10 @@ pub unsafe fn sys_fcntl(fd: usize, cmd: i32, arg: u64) -> i64 {
                                 crate::pipe::pipe_close_read(read_ring);
                                 crate::pipe::pipe_close_write(write_ring);
                             }
+                        }
+                        FileBackend::Socket { handle_id } => {
+                            // SAFETY: single-CPU SYSCALL context.
+                            unsafe { crate::socket::socket_close(handle_id) }
                         }
                         _ => {}
                     }
@@ -3465,9 +3475,12 @@ pub unsafe fn sys_dup(oldfd: usize) -> i64 {
         }
         // Console / RamfsFile / Socket / DevFile / ProcFile carry no
         // independent refcount; the handle copy is sufficient.
+        FileBackend::Socket { handle_id } => {
+            // SAFETY: single-CPU SYSCALL context.
+            unsafe { crate::socket::socket_dup(handle_id) }
+        }
         FileBackend::Console
         | FileBackend::RamfsFile { .. }
-        | FileBackend::Socket { .. }
         | FileBackend::DevFile { .. }
         | FileBackend::ProcFile { .. } => {}
     }
