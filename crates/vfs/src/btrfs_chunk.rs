@@ -136,16 +136,22 @@ impl ChunkItem {
 
     /// Return the stripe index for a given logical offset within this chunk
     /// (simple round-robin over `num_stripes`).
+    ///
+    /// `num_stripes` is disk-derived. The result is capped to
+    /// `MAX_STRIPES_PER_CHUNK - 1` so it can never exceed the bounds of the
+    /// fixed `stripes` array regardless of the on-disk value.
     pub fn stripe_for_offset(&self, offset_in_chunk: u64) -> usize {
         if self.num_stripes == 0 {
             return 0;
         }
+        // Clamp the effective divisor so the modulo result stays in bounds.
+        let effective = (self.num_stripes as usize).min(MAX_STRIPES_PER_CHUNK) as u64;
         let stripe_len = if self.stripe_len == 0 {
             65536
         } else {
             self.stripe_len
         };
-        ((offset_in_chunk / stripe_len) % self.num_stripes as u64) as usize
+        ((offset_in_chunk / stripe_len) % effective) as usize
     }
 }
 
@@ -194,8 +200,14 @@ impl ChunkTree {
     /// Translate a logical byte address to (stripe_index, device_offset).
     ///
     /// Returns `Err(NotFound)` if no chunk covers `logical`.
+    /// Returns `Err(InvalidArgument)` if the chunk's `num_stripes` field
+    /// (disk-derived) exceeds `MAX_STRIPES_PER_CHUNK`.
     pub fn logical_to_physical(&self, logical: u64) -> Result<(usize, u64)> {
         let chunk = self.find_chunk(logical)?;
+        // Reject malformed chunks whose num_stripes exceeds the fixed array.
+        if chunk.num_stripes as usize > MAX_STRIPES_PER_CHUNK {
+            return Err(Error::InvalidArgument);
+        }
         let offset_in_chunk = logical - chunk.logical_start;
         let stripe_idx = chunk.stripe_for_offset(offset_in_chunk);
 

@@ -233,8 +233,11 @@ impl BtrfsNode {
 
     /// Binary-search leaf items for `key`. Returns the index of the first
     /// item with key >= `key`, or `nritems` if all items are smaller.
+    ///
+    /// `header.nritems` is disk-derived; cap it to `MAX_LEAF_ITEMS` before
+    /// use so that no `mid` value can exceed the bounds of `leaf_items`.
     fn leaf_search(&self, key: &BtrfsKey) -> usize {
-        let n = self.header.nritems as usize;
+        let n = (self.header.nritems as usize).min(MAX_LEAF_ITEMS);
         let mut lo = 0usize;
         let mut hi = n;
         while lo < hi {
@@ -252,8 +255,11 @@ impl BtrfsNode {
     }
 
     /// Binary-search internal key pointers for a child that may contain `key`.
+    ///
+    /// `header.nritems` is disk-derived; cap it to `MAX_KEYS_PER_NODE` before
+    /// use so that no `mid` value can exceed the bounds of `key_ptrs`.
     fn internal_search(&self, key: &BtrfsKey) -> usize {
-        let n = self.header.nritems as usize;
+        let n = (self.header.nritems as usize).min(MAX_KEYS_PER_NODE);
         if n == 0 {
             return 0;
         }
@@ -488,6 +494,11 @@ impl BtrfsTree {
         let item = leaf.leaf_items[path.leaf_slot]
             .as_ref()
             .ok_or(Error::NotFound)?;
+        // data_size is disk-derived; reject values that exceed the fixed backing
+        // array to prevent an index-out-of-bounds panic in the kernel.
+        if item.data_size as usize > MAX_ITEM_DATA {
+            return Err(Error::InvalidArgument);
+        }
         Ok(leaf.leaf_data[path.leaf_slot][..item.data_size as usize].to_vec())
     }
 

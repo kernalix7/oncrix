@@ -480,13 +480,18 @@ fn lzo_decompress(input: &[u8], out: &mut [u8]) -> Result<usize> {
             let mut ml = ((tok >> 4) as usize) + LZO_MIN_MATCH;
             if (tok >> 4) == 15 {
                 // Extended match length.
+                // Cap accumulation against out.len() to prevent usize overflow
+                // from a crafted stream that supplies arbitrarily many 0xFF bytes.
                 loop {
                     if ip >= input.len() {
                         return Err(Error::InvalidArgument);
                     }
                     let ext = input[ip] as usize;
                     ip += 1;
-                    ml += ext;
+                    ml = ml.checked_add(ext).ok_or(Error::InvalidArgument)?;
+                    if ml > out.len() {
+                        return Err(Error::InvalidArgument);
+                    }
                     if ext < 255 {
                         break;
                     }
@@ -505,6 +510,11 @@ fn lzo_decompress(input: &[u8], out: &mut [u8]) -> Result<usize> {
                 if op >= out.len() {
                     return Err(Error::InvalidArgument);
                 }
+                // Bounds-check the read side: a crafted stream can set offset=1
+                // so match_start grows with op, potentially reaching out.len().
+                if match_start + k >= out.len() {
+                    return Err(Error::InvalidArgument);
+                }
                 out[op] = out[match_start + k];
                 op += 1;
             }
@@ -513,6 +523,8 @@ fn lzo_decompress(input: &[u8], out: &mut [u8]) -> Result<usize> {
             let mut lit_len = ((tok >> 4) & 0x0F) as usize;
             if lit_len == 15 {
                 // Extended literal length.
+                // Cap accumulation against out.len() to prevent usize overflow
+                // from a crafted stream that supplies arbitrarily many 0xFF bytes.
                 lit_len += 15;
                 loop {
                     if ip >= input.len() {
@@ -520,7 +532,10 @@ fn lzo_decompress(input: &[u8], out: &mut [u8]) -> Result<usize> {
                     }
                     let ext = input[ip] as usize;
                     ip += 1;
-                    lit_len += ext;
+                    lit_len = lit_len.checked_add(ext).ok_or(Error::InvalidArgument)?;
+                    if lit_len > out.len() {
+                        return Err(Error::InvalidArgument);
+                    }
                     if ext < 255 {
                         break;
                     }
