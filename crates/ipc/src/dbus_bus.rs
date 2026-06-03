@@ -93,6 +93,16 @@ pub const DBUS_FLAG_NO_AUTO_START: u8 = 0x2;
 /// Maximum number of connections on the bus.
 const MAX_CONNECTIONS: usize = 128;
 
+/// Well-known name prefixes that require uid 0 to claim.
+///
+/// Any name whose bytes start with one of these prefixes is considered
+/// privileged.  `request_name` rejects the call with `PermissionDenied`
+/// unless the requesting connection's `credentials.uid == 0`.
+///
+/// The syscall layer is expected to populate connection credentials from
+/// the authenticated kernel task context, making the uid trustworthy.
+const PRIVILEGED_NAME_PREFIXES: &[&[u8]] = &[b"org.freedesktop.", b"org.dbus.", b"com.systemd."];
+
 /// Maximum number of well-known names.
 const MAX_WELL_KNOWN_NAMES: usize = 256;
 
@@ -571,12 +581,37 @@ impl DbusBus {
     }
 
     /// Request a well-known name for a connection.
+    ///
+    /// # Privilege check
+    ///
+    /// Names that begin with a privileged prefix (see [`PRIVILEGED_NAME_PREFIXES`])
+    /// may only be claimed by connections whose `credentials.uid == 0`.  Any
+    /// attempt by an unprivileged connection to claim such a name returns
+    /// `PermissionDenied`.  This prevents service impersonation (e.g. a
+    /// uid-1000 process squatting `org.freedesktop.PolicyKit`).
+    ///
+    /// The syscall layer is responsible for setting `credentials.uid` from the
+    /// authenticated kernel task; `request_name` treats it as trusted.
     pub fn request_name(&mut self, conn_index: usize, name: &BusName) -> Result<()> {
         if conn_index >= MAX_CONNECTIONS {
             return Err(Error::InvalidArgument);
         }
         if self.connections[conn_index].is_none() {
             return Err(Error::NotFound);
+        }
+
+        // Privilege check: reject unprivileged connections claiming privileged names.
+        let caller_uid = self.connections[conn_index]
+            .as_ref()
+            .map(|c| c.credentials.uid)
+            .unwrap_or(u32::MAX);
+        let name_bytes = name.as_bytes();
+        if caller_uid != 0 {
+            for prefix in PRIVILEGED_NAME_PREFIXES {
+                if name_bytes.starts_with(prefix) {
+                    return Err(Error::PermissionDenied);
+                }
+            }
         }
 
         // Check if name is already taken.
@@ -645,17 +680,39 @@ impl DbusBus {
     }
 
     /// Send a unicast message to a specific destination.
+    ///
+    /// # Security contract
+    ///
+    /// `sender_index` MUST be the connection index that the syscall layer
+    /// resolved from the calling process's kernel-managed file descriptor.
+    /// The syscall layer must NOT allow the calling process to supply an
+    /// arbitrary index — doing so would permit one connection to impersonate
+    /// another.
+    ///
+    /// `caller_uid` must be the authenticated UID of the calling process
+    /// (obtained from the kernel task struct, not from userspace).  It is
+    /// cross-checked against the stored credentials of `sender_index`; a
+    /// mismatch returns `PermissionDenied`, providing a fail-closed guard
+    /// for the period before full fd-to-index binding is wired up.
     pub fn send_unicast(
         &mut self,
         sender_index: usize,
+        caller_uid: u32,
         dest_name: &BusName,
         data: &[u8],
     ) -> Result<()> {
         if sender_index >= MAX_CONNECTIONS {
             return Err(Error::InvalidArgument);
         }
-        if self.connections[sender_index].is_none() {
-            return Err(Error::NotFound);
+        // Ownership check: the caller's authenticated uid must match the uid
+        // stored for this connection slot when the connection was established.
+        match &self.connections[sender_index] {
+            Some(conn) if conn.active => {
+                if conn.credentials.uid != caller_uid {
+                    return Err(Error::PermissionDenied);
+                }
+            }
+            _ => return Err(Error::NotFound),
         }
 
         // Resolve destination: try well-known name first, then unique name.
@@ -673,9 +730,18 @@ impl DbusBus {
     /// Broadcast a signal to all connections with matching rules.
     ///
     /// `iface_hash` and `member_hash` are used for match rule filtering.
+    ///
+    /// # Security contract
+    ///
+    /// `sender_index` and `caller_uid` have the same contract as in
+    /// [`Self::send_unicast`]: the syscall layer must resolve the index from
+    /// the calling process's fd and supply the authenticated UID.  A
+    /// mismatch between `caller_uid` and the connection's stored uid returns
+    /// `PermissionDenied`.
     pub fn broadcast_signal(
         &mut self,
         sender_index: usize,
+        caller_uid: u32,
         data: &[u8],
         iface_hash: u64,
         member_hash: u64,
@@ -683,8 +749,14 @@ impl DbusBus {
         if sender_index >= MAX_CONNECTIONS {
             return Err(Error::InvalidArgument);
         }
-        if self.connections[sender_index].is_none() {
-            return Err(Error::NotFound);
+        // Ownership check: authenticated uid must match the connection's uid.
+        match &self.connections[sender_index] {
+            Some(conn) if conn.active => {
+                if conn.credentials.uid != caller_uid {
+                    return Err(Error::PermissionDenied);
+                }
+            }
+            _ => return Err(Error::NotFound),
         }
 
         // Collect matching connection indices first to avoid
@@ -882,7 +954,8 @@ mod tests {
         let i1 = bus.connect(creds(100)).unwrap();
         let i2 = bus.connect(creds(200)).unwrap();
         let dest_name = *bus.get_unique_name(i2).unwrap();
-        assert!(bus.send_unicast(i1, &dest_name, b"hello").is_ok());
+        // caller_uid must match the uid stored for connection i1 (uid=1000 from creds()).
+        assert!(bus.send_unicast(i1, 1000, &dest_name, b"hello").is_ok());
         let msg = bus.recv(i2).unwrap();
         assert_eq!(&msg, b"hello");
     }
@@ -894,9 +967,23 @@ mod tests {
         let i2 = bus.connect(creds(200)).unwrap();
         let name = wk_name(b"org.test.Service");
         bus.request_name(i2, &name).unwrap();
-        assert!(bus.send_unicast(i1, &name, b"method_call").is_ok());
+        assert!(bus.send_unicast(i1, 1000, &name, b"method_call").is_ok());
         let msg = bus.recv(i2).unwrap();
         assert_eq!(&msg, b"method_call");
+    }
+
+    #[test]
+    fn test_send_unicast_spoofed_sender() {
+        // Verify that passing a wrong uid is rejected.
+        let mut bus = DbusBus::new();
+        let i1 = bus.connect(creds(100)).unwrap(); // uid=1000
+        let i2 = bus.connect(creds(200)).unwrap();
+        let dest_name = *bus.get_unique_name(i2).unwrap();
+        // Pass uid=0 (not matching i1's uid=1000) — should fail.
+        assert_eq!(
+            bus.send_unicast(i1, 0, &dest_name, b"spoofed").unwrap_err(),
+            Error::PermissionDenied
+        );
     }
 
     #[test]
@@ -917,7 +1004,10 @@ mod tests {
         bus.add_match_rule(r1, MatchRule::signals_only()).unwrap();
         bus.add_match_rule(r2, MatchRule::match_all()).unwrap();
 
-        let delivered = bus.broadcast_signal(sender, b"signal_data", 0, 0).unwrap();
+        // caller_uid=1000 matches the uid stored for `sender` (from creds()).
+        let delivered = bus
+            .broadcast_signal(sender, 1000, b"signal_data", 0, 0)
+            .unwrap();
         assert_eq!(delivered, 2);
         assert!(bus.recv(r1).is_ok());
         assert!(bus.recv(r2).is_ok());
@@ -929,8 +1019,40 @@ mod tests {
         let sender = bus.connect(creds(100)).unwrap();
         let _r1 = bus.connect(creds(200)).unwrap();
         // r1 has no match rules.
-        let delivered = bus.broadcast_signal(sender, b"signal", 0, 0).unwrap();
+        let delivered = bus.broadcast_signal(sender, 1000, b"signal", 0, 0).unwrap();
         assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn test_broadcast_spoofed_sender() {
+        let mut bus = DbusBus::new();
+        let sender = bus.connect(creds(100)).unwrap(); // uid=1000
+        // Passing uid=0 does not match uid=1000 stored for `sender` — rejected.
+        assert_eq!(
+            bus.broadcast_signal(sender, 0, b"signal", 0, 0)
+                .unwrap_err(),
+            Error::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn test_request_privileged_name_as_root() {
+        let mut bus = DbusBus::new();
+        // uid=0 connection may claim org.freedesktop.* names.
+        let root = bus.connect(DbusCredentials::new(1, 0, 0)).unwrap();
+        let name = wk_name(b"org.freedesktop.PolicyKit");
+        assert!(bus.request_name(root, &name).is_ok());
+    }
+
+    #[test]
+    fn test_request_privileged_name_denied_non_root() {
+        let mut bus = DbusBus::new();
+        let user = bus.connect(creds(100)).unwrap(); // uid=1000
+        let name = wk_name(b"org.freedesktop.PolicyKit");
+        assert_eq!(
+            bus.request_name(user, &name).unwrap_err(),
+            Error::PermissionDenied
+        );
     }
 
     #[test]
