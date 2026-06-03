@@ -55,6 +55,7 @@
 //! `.priv-storage/.TheOpenGroup/susv5-html/functions/sigaction.html`.
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 use oncrix_process::signal::{Signal, SignalAction};
 use oncrix_syscall::dispatch::SyscallArgs;
 
@@ -271,6 +272,33 @@ unsafe fn deliver_user_handler(
         .ok_or(Error::InvalidArgument)?;
     let pretcode_va = frame_va.checked_sub(8).ok_or(Error::InvalidArgument)?;
 
+    // The frame is written as a `UserSignalFrame` whose first field is a
+    // `u64`; an unaligned base would make `write_volatile` an unaligned
+    // store. Mirror the `do_sigreturn` 8-byte alignment requirement.
+    if frame_va & 0x7 != 0 {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Full-span lower + upper bound. `saved_rsp` is attacker-controlled,
+    // so a kernel-half, below-region, or wrapped value would otherwise
+    // drive a ring-0 store at an arbitrary address. Require the lowest
+    // touched byte (`pretcode_va`) to be at or above the user floor and
+    // the highest touched byte (last byte of the frame) to stay within
+    // user space.
+    let frame_top = frame_va
+        .checked_add(FRAME_SIZE as u64)
+        .ok_or(Error::InvalidArgument)?;
+    if pretcode_va < USER_SPACE_START || frame_top > USER_SPACE_END + 1 {
+        return Err(Error::InvalidArgument);
+    }
+
+    // NOTE: these guards reject non-canonical, out-of-range, wrapped, and
+    // misaligned frame addresses. A canonical, in-range, but *unmapped*
+    // user page can still fault while we store in ring 0, which the
+    // exception path treats as a fatal kernel fault. Full protection
+    // requires routing these writes through a copy-to-user helper with
+    // page-fault fixup (follow-up).
+    //
     // Both writes target the user's mapped backing region. Single-CPU
     // SYSCALL context means the calling process's UAS is still live in
     // CR3, so user-VA stores hit the right physical frames.
@@ -335,6 +363,17 @@ pub unsafe fn do_sigreturn(frame_va: u64) -> i64 {
     }
     if frame_va & 0x7 != 0 {
         return -22; // EINVAL — frame must be 8-byte aligned
+    }
+    // Full-span bound: the frame is read as a whole `UserSignalFrame`, so
+    // the entire `[frame_va, frame_va + FRAME_SIZE)` span must lie within
+    // user space. Reject a frame whose tail would spill into the kernel
+    // half (or wrap), which would otherwise be a ring-0 read fault.
+    let frame_top = match frame_va.checked_add(FRAME_SIZE as u64) {
+        Some(top) => top,
+        None => return -22, // EINVAL — address-space wrap
+    };
+    if frame_va < USER_SPACE_START || frame_top > USER_SPACE_END + 1 {
+        return -22; // EINVAL
     }
 
     // SAFETY: frame_va is a user-VA in the calling process's mapped

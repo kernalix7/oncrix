@@ -11,18 +11,24 @@
 //! context from the frame and resumes normal execution.
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 use oncrix_process::signal::{Signal, SignalAction, SignalState};
 
-/// Maximum user-space address for signal frame placement.
+/// Exclusive upper bound for the last byte of a signal frame.
 ///
-/// Frames must reside below this boundary to remain in valid
-/// user-space memory on x86_64.
-const USER_STACK_CEILING: u64 = 0x0000_7FFF_FFFF_0000;
+/// The whole frame span must satisfy `frame_end <= USER_STACK_CEILING`,
+/// i.e. the final touched byte stays at or below the inclusive top user
+/// byte [`USER_SPACE_END`]. `+ 1` turns the inclusive bound into the
+/// exclusive `frame_end` comparison value.
+const USER_STACK_CEILING: u64 = USER_SPACE_END + 1;
 
 /// Minimum user-space address (frames must not wrap below this).
-const USER_STACK_FLOOR: u64 = 0x0000_0000_0040_0000;
+const USER_STACK_FLOOR: u64 = USER_SPACE_START;
 
 /// Alignment requirement for the signal frame (16-byte ABI).
+///
+/// 16-byte alignment already implies the 8-byte alignment the live
+/// SYSCALL frame path enforces (see `signal_dispatch::deliver_user_handler`).
 const FRAME_ALIGN: u64 = 16;
 
 /// Saved register context passed between kernel and signal
@@ -202,9 +208,19 @@ pub fn setup_signal_frame(
 
     // Build the frame in kernel memory, then write it out.
     //
-    // SAFETY: `aligned_base` has been validated to lie within the
-    // user-space range and is properly aligned. The caller must
-    // ensure the pages are mapped and writable.
+    // SAFETY: `aligned_base` has been validated so the full frame span
+    // `[aligned_base, aligned_base + frame_size)` lies within
+    // `[USER_SPACE_START, USER_SPACE_END]` and is 16-byte aligned, which
+    // rejects kernel-half, below-region, wrapped, and misaligned
+    // addresses. The caller must ensure the pages are mapped and
+    // writable.
+    //
+    // NOTE: the range check alone does not prove the page is mapped. The
+    // live SYSCALL path cannot guarantee that for an attacker-chosen RSP
+    // (a canonical, in-range, but unmapped page still faults in ring 0).
+    // When this routine is wired into the live delivery path the store
+    // below must go through a checked copy-to-user helper with page-fault
+    // fixup rather than a raw `core::ptr::write`.
     let frame = SignalFrame {
         pretcode: 0, // Caller must patch with trampoline address.
         uc_flags: 0,
