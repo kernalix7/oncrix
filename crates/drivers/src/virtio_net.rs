@@ -400,6 +400,21 @@ impl VirtioNet {
             None => return Ok(0),
         };
 
+        // `total_len` is the device-written `VirtqUsedElem.len` field
+        // (DMA, attacker-controlled). Validate it against the actual RX
+        // DMA buffer capacity before computing any lengths. A device
+        // reporting total_len > MAX_RX_BUF_SIZE is misbehaving; free the
+        // descriptors and return an error to avoid feeding stale or
+        // out-of-bounds data to the upper-layer protocol parsers.
+        if total_len as usize > MAX_RX_BUF_SIZE {
+            // Free the descriptor chain before returning.
+            // `desc_head` was already validated by pop_used (< MAX_QUEUE_SIZE).
+            let d_next = self.rx.desc[desc_head as usize].next;
+            self.rx.free_desc(d_next);
+            self.rx.free_desc(desc_head);
+            return Err(Error::IoError);
+        }
+
         // The device wrote: virtio-net header + frame data.
         // Strip the header to give the caller only the frame.
         let frame_len = (total_len as usize).saturating_sub(NET_HDR_SIZE);
@@ -414,6 +429,8 @@ impl VirtioNet {
         // For now, report the length so upper layers can process it.
 
         // Free the descriptor chain.
+        // `desc_head` was validated by pop_used; free_desc guards its
+        // own `idx` and the `.next` value it receives.
         let d_next = self.rx.desc[desc_head as usize].next;
         self.rx.free_desc(d_next);
         self.rx.free_desc(desc_head);
