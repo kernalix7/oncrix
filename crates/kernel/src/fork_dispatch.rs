@@ -294,11 +294,11 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
     // must fail with -EFAULT without consuming the child (otherwise the
     // status is lost irrecoverably). `0` means "no status wanted".
     //
-    // Reserve the full 4-byte `i32` width: a pointer in [boundary-3,
-    // boundary-1] would straddle the kernel half on the write below, so the
-    // base-only check is widened by `- 4` (mirrors sys_waitid's
-    // `- SIGINFO_SIZE`).
-    if wstatus_ptr != 0 && wstatus_ptr >= 0xFFFF_8000_0000_0000 - 4 {
+    // Span-verify the full 4-byte `i32` write against the live user address
+    // space (exact backed-window check) so a NULL, non-canonical, sub-
+    // USER_SPACE_START, unmapped, or near-boundary pointer faults here with
+    // -EFAULT rather than in ring 0.
+    if wstatus_ptr != 0 && crate::uaccess::verify_user_access(wstatus_ptr, 4, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -342,13 +342,13 @@ pub unsafe fn sys_wait4(pid_arg: u64, wstatus_ptr: u64, options: u64, _rusage: u
 
         if let Some((zombie_pid, exit_code)) = found {
             // Write wstatus to user space if pointer is non-null and valid.
-            // The `- 4` reserves the full i32 width so the write cannot
-            // straddle the kernel half (mirrors the pre-check above).
-            if wstatus_ptr != 0 && wstatus_ptr < 0xFFFF_8000_0000_0000 - 4 {
-                // SAFETY: Phase 10c assumes cooperative userspace. The pointer
-                // is non-null and the full 4-byte write stays below the kernel
-                // canonical half. Full validation (page presence, alignment)
-                // is deferred.
+            // Re-span-verify the full 4-byte i32 write here (the address space
+            // could not have changed since the pre-check, but this keeps the
+            // deref self-guarding).
+            if wstatus_ptr != 0 && crate::uaccess::verify_user_access(wstatus_ptr, 4, true).is_ok()
+            {
+                // SAFETY: wstatus_ptr is non-null and the full 4-byte write was
+                // just span-verified against the live user address space.
                 unsafe {
                     (wstatus_ptr as *mut i32).write_volatile(exit_code << 8);
                 }
@@ -487,10 +487,11 @@ pub unsafe fn sys_waitid(idtype: u64, id: u64, infop: u64, options: u64) -> i64 
     if options & WEXITED == 0 {
         return -22; // EINVAL
     }
-    // Validate the FULL 128-byte span, not just the start: a pointer just
-    // below the kernel boundary would let the tail of the siginfo write
-    // spill across it.
-    if infop != 0 && infop >= 0xFFFF_8000_0000_0000 - SIGINFO_SIZE as u64 {
+    // Span-verify the FULL 128-byte siginfo_t write against the live user
+    // address space before any zombie is reaped: a NULL, non-canonical,
+    // sub-USER_SPACE_START, unmapped, or near-boundary pointer must fault
+    // here with -EFAULT rather than in ring 0 during the write below.
+    if infop != 0 && crate::uaccess::verify_user_access(infop, SIGINFO_SIZE as u64, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -994,8 +995,10 @@ pub unsafe fn sys_rt_sigpending(set_ptr: u64, sigsetsize: u64) -> i64 {
     if sigsetsize != 8 {
         return -22; // EINVAL
     }
-    // Validate the full 8-byte span (tail must not cross the kernel split).
-    if set_ptr == 0 || set_ptr >= 0xFFFF_8000_0000_0000 - 8 {
+    // Span-verify the full 8-byte sigset write against the live user address
+    // space: a NULL, non-canonical, sub-USER_SPACE_START, unmapped, or near-
+    // boundary pointer must fault here, not in ring 0 during the write below.
+    if crate::uaccess::verify_user_access(set_ptr, 8, true).is_err() {
         return -14; // EFAULT
     }
     let pid = match crate::current::current_pid() {
@@ -1032,8 +1035,11 @@ pub unsafe fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> i64 {
         return -14; // EFAULT
     }
     if old_ss_ptr != 0 {
-        // Validate the full 24-byte stack_t span (tail must not cross split).
-        if old_ss_ptr >= 0xFFFF_8000_0000_0000 - 24 {
+        // Span-verify the full 24-byte stack_t write against the live user
+        // address space: a non-canonical, sub-USER_SPACE_START, unmapped, or
+        // near-boundary pointer must fault here, not in ring 0 below. NULL is
+        // valid (the old stack is simply not reported).
+        if crate::uaccess::verify_user_access(old_ss_ptr, 24, true).is_err() {
             return -14; // EFAULT
         }
         // stack_t { ss_sp: u64 @0, ss_flags: i32 @8, _pad: u32 @12, ss_size: u64 @16 }
@@ -1345,7 +1351,7 @@ pub unsafe fn sys_chdir(path_ptr: u64) -> i64 {
 ///
 /// Must be called from the SYSCALL dispatch path (single-CPU context).
 pub unsafe fn sys_getcwd(buf_ptr: u64, size: u64) -> i64 {
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    if buf_ptr == 0 {
         return -14; // EFAULT
     }
     let size = size as usize;
@@ -1365,8 +1371,16 @@ pub unsafe fn sys_getcwd(buf_ptr: u64, size: u64) -> i64 {
         return -34; // ERANGE
     }
 
+    // Span-verify the exact (cwd_len + 1)-byte write against the live user
+    // address space before the deref: a non-canonical, sub-USER_SPACE_START,
+    // unmapped, or near-boundary buffer must fault here, not in ring 0 below.
+    if crate::uaccess::verify_user_access(buf_ptr, (cwd_len + 1) as u64, true).is_err() {
+        return -14; // EFAULT
+    }
+
     // Copy cwd + null terminator to user buffer.
-    // SAFETY: buf_ptr validated above; cwd_len is within 255.
+    // SAFETY: buf_ptr non-null and the exact (cwd_len + 1)-byte write was
+    // just span-verified against the live user address space.
     unsafe {
         let dst = buf_ptr as *mut u8;
         core::ptr::copy_nonoverlapping(cwd_ptr, dst, cwd_len);

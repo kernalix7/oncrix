@@ -114,7 +114,8 @@ fn write_field(dst: &mut [u8], offset: usize, src: &[u8]) {
 ///
 /// # Errors (returned as negative errno)
 ///
-/// - `-14` `EFAULT` — `buf_ptr` is null or falls in kernel canonical space.
+/// - `-14` `EFAULT` — the 390-byte struct at `buf_ptr` is not a writable
+///   user-space region.
 ///
 /// # Safety
 ///
@@ -122,7 +123,8 @@ fn write_field(dst: &mut [u8], offset: usize, src: &[u8]) {
 /// muts accessed here are exclusively owned for the duration of this call
 /// (single CPU, interrupts masked by SYSCALL entry).
 pub unsafe fn sys_uname(buf_ptr: u64) -> i64 {
-    if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
+    // Span-check the exact 390-byte struct the kernel is about to write.
+    if crate::uaccess::verify_user_access(buf_ptr, UTSNAME_SIZE as u64, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -189,7 +191,8 @@ pub unsafe fn sys_uname(buf_ptr: u64) -> i64 {
 /// # Errors (returned as negative errno)
 ///
 /// - `-22` `EINVAL` — `len` exceeds 64.
-/// - `-14` `EFAULT` — `name_ptr` is null or in kernel canonical space.
+/// - `-14` `EFAULT` — the `len`-byte span at `name_ptr` is not a readable
+///   user-space region.
 ///
 /// # Safety
 ///
@@ -198,7 +201,8 @@ pub unsafe fn sys_sethostname(name_ptr: u64, len: u64) -> i64 {
     if len > 64 {
         return -22; // EINVAL
     }
-    if name_ptr == 0 || name_ptr >= 0xFFFF_8000_0000_0000 {
+    // Span-check the exact `len` bytes the kernel is about to read.
+    if crate::uaccess::verify_user_access(name_ptr, len, false).is_err() {
         return -14; // EFAULT
     }
 
@@ -234,7 +238,8 @@ pub unsafe fn sys_sethostname(name_ptr: u64, len: u64) -> i64 {
 /// # Errors (returned as negative errno)
 ///
 /// - `-22` `EINVAL` — `len` exceeds 64.
-/// - `-14` `EFAULT` — `name_ptr` is null or in kernel canonical space.
+/// - `-14` `EFAULT` — the `len`-byte span at `name_ptr` is not a readable
+///   user-space region.
 ///
 /// # Safety
 ///
@@ -243,7 +248,8 @@ pub unsafe fn sys_setdomainname(name_ptr: u64, len: u64) -> i64 {
     if len > 64 {
         return -22; // EINVAL
     }
-    if name_ptr == 0 || name_ptr >= 0xFFFF_8000_0000_0000 {
+    // Span-check the exact `len` bytes the kernel is about to read.
+    if crate::uaccess::verify_user_access(name_ptr, len, false).is_err() {
         return -14; // EFAULT
     }
 

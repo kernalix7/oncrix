@@ -53,8 +53,11 @@ pub unsafe fn sys_time(tloc: u64) -> i64 {
     // SAFETY: see fn-level note.
     let secs = unsafe { current_ticks() / TIMER_HZ } as i64;
     if tloc != 0 {
-        // Reject obviously bogus pointers.
-        if tloc >= 0xFFFF_8000_0000_0000 {
+        // Span-verify the exact 8-byte i64 write against the user's
+        // backed window — a base-only guard would accept the
+        // non-canonical hole, sub-USER_SPACE_START addresses, and a
+        // near-boundary write straddling into the kernel half.
+        if crate::uaccess::verify_user_access(tloc, 8, true).is_err() {
             return -14; // EFAULT
         }
         // SAFETY: pointer validated user-canonical above; user page
@@ -83,7 +86,9 @@ pub unsafe fn sys_clock_gettime(clk_id: u32, ts_ptr: u64) -> i64 {
     if clk_id > 1 {
         return -22; // EINVAL
     }
-    if ts_ptr == 0 || ts_ptr >= 0xFFFF_8000_0000_0000 {
+    // Span-verify the full 16-byte timespec write (two i64 fields)
+    // against the user's backed window.
+    if crate::uaccess::verify_user_access(ts_ptr, 16, true).is_err() {
         return -14; // EFAULT
     }
     // SAFETY: see module-level note.
@@ -117,10 +122,12 @@ pub unsafe fn sys_clock_gettime(clk_id: u32, ts_ptr: u64) -> i64 {
 /// scheduler hand-off that requires interrupts off and exclusive
 /// access to the scheduler — both held by the caller of this fn.
 pub unsafe fn sys_nanosleep(req_ptr: u64, rem_ptr: u64) -> i64 {
-    if req_ptr == 0 || req_ptr >= 0xFFFF_8000_0000_0000 {
+    // Span-verify the 16-byte timespec read (two i64 fields).
+    if crate::uaccess::verify_user_access(req_ptr, 16, false).is_err() {
         return -14; // EFAULT
     }
-    if rem_ptr != 0 && rem_ptr >= 0xFFFF_8000_0000_0000 {
+    // `rem` is NULL-optional; when present it is a 16-byte write target.
+    if rem_ptr != 0 && crate::uaccess::verify_user_access(rem_ptr, 16, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -255,12 +262,14 @@ pub unsafe fn sys_clock_nanosleep(clockid: u32, flags: i32, request: u64, remain
     }
     let absolute = flags & TIMER_ABSTIME != 0;
 
-    if request == 0 || request >= 0xFFFF_8000_0000_0000 {
+    // Span-verify the 16-byte timespec read (two i64 fields).
+    if crate::uaccess::verify_user_access(request, 16, false).is_err() {
         return -14; // EFAULT
     }
     // `remain` is only consulted in relative mode, but validate it
     // unconditionally when non-null so a bogus pointer is caught early.
-    if remain != 0 && remain >= 0xFFFF_8000_0000_0000 {
+    // It is a 16-byte write target.
+    if remain != 0 && crate::uaccess::verify_user_access(remain, 16, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -339,12 +348,14 @@ pub unsafe fn sys_clock_nanosleep(clockid: u32, flags: i32, request: u64, remain
 /// Must be called from the single-CPU SYSCALL dispatch path (interrupts
 /// off via FMASK); no concurrent mutation of `PIT_TIMER` is possible.
 pub unsafe fn sys_gettimeofday(tv_ptr: u64, tz_ptr: u64) -> i64 {
-    // Validate tv_ptr when non-null.
-    if tv_ptr != 0 && tv_ptr >= 0xFFFF_8000_0000_0000 {
+    // tv_ptr is NULL-optional; when present it is a 16-byte timeval
+    // write target (two i64 fields). Span-verify the exact write.
+    if tv_ptr != 0 && crate::uaccess::verify_user_access(tv_ptr, 16, true).is_err() {
         return -14; // EFAULT
     }
-    // Validate tz_ptr when non-null.
-    if tz_ptr != 0 && tz_ptr >= 0xFFFF_8000_0000_0000 {
+    // tz_ptr is NULL-optional; when present it is an 8-byte timezone
+    // write target (two i32 fields). Span-verify the exact write.
+    if tz_ptr != 0 && crate::uaccess::verify_user_access(tz_ptr, 8, true).is_err() {
         return -14; // EFAULT
     }
 
@@ -420,7 +431,8 @@ pub unsafe fn sys_clock_getres(clk_id: u32, res_ptr: u64) -> i64 {
         return -22; // EINVAL
     }
     if res_ptr != 0 {
-        if res_ptr >= 0xFFFF_8000_0000_0000 {
+        // Span-verify the full 16-byte timespec write (two i64 fields).
+        if crate::uaccess::verify_user_access(res_ptr, 16, true).is_err() {
             return -14; // EFAULT
         }
         // PIT resolution: 1/100 s = 10 ms = 10_000_000 ns.

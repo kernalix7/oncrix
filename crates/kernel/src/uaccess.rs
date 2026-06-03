@@ -147,6 +147,72 @@ pub unsafe fn validate_user_string(ptr: u64, max_len: usize) -> Result<usize> {
     Err(Error::InvalidArgument)
 }
 
+/// Copy a NUL-terminated string from user space, verifying each page is
+/// backed *before* it is read so the scan can never fault in ring 0.
+///
+/// Copies up to `max` bytes from the user virtual address `src` into
+/// `dst`, stopping at (and not copying) the first NUL byte, and returns
+/// the string length (NUL excluded). Unlike a fixed-`max` span check,
+/// this walks the string one 4 KiB page at a time: each time the scan is
+/// about to enter a new page it first calls [`verify_user_access`] on
+/// `[page_base, page_end)`, so a short string that ends near a backed
+/// window's edge is accepted while a genuinely unbacked page is rejected.
+///
+/// Returns `Err(InvalidArgument)` (→ `EFAULT` at the syscall boundary)
+/// when `src` is NULL, when no NUL is found within `max` bytes, when
+/// `dst` is too small to hold the string, or when any page the scan would
+/// touch is not backed for reading by the current process.
+///
+/// # Safety
+///
+/// `src` is a raw user virtual address. This function only dereferences a
+/// page after [`verify_user_access`] has confirmed that page is backed,
+/// so the read cannot fault while mappings stay eager. The caller must
+/// not pass a `src` that aliases kernel memory it expects to remain
+/// immutable (this only reads, never writes, user memory).
+pub unsafe fn copy_user_cstr(dst: &mut [u8], src: u64, max: usize) -> Result<usize> {
+    if src == 0 {
+        return Err(Error::InvalidArgument);
+    }
+
+    // 4 KiB page granularity for lazy, one-page-at-a-time verification.
+    const PAGE_SIZE: u64 = 4096;
+
+    let mut verified_until: u64 = src; // first VA not yet proven backed
+    let mut i: usize = 0;
+
+    while i < max {
+        let addr = src.checked_add(i as u64).ok_or(Error::InvalidArgument)?;
+
+        // Verify the page containing `addr` before reading it, but only
+        // when the scan has crossed into a page we have not proven yet.
+        if addr >= verified_until {
+            let page_base = addr & !(PAGE_SIZE - 1);
+            let page_end = page_base
+                .checked_add(PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+            let span = page_end - addr;
+            verify_user_access(addr, span, false)?;
+            verified_until = page_end;
+        }
+
+        // SAFETY: the page containing `addr` was just proven backed for
+        // reading by `verify_user_access`, so this read cannot fault.
+        let byte = unsafe { (addr as *const u8).read_volatile() };
+        if byte == 0 {
+            return Ok(i);
+        }
+        if i >= dst.len() {
+            return Err(Error::InvalidArgument);
+        }
+        dst[i] = byte;
+        i += 1;
+    }
+
+    // No NUL terminator found within `max` bytes.
+    Err(Error::InvalidArgument)
+}
+
 /// Copy data from user space to kernel space.
 ///
 /// Validates the source range, then copies `len` bytes from the
