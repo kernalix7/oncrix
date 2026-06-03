@@ -163,6 +163,12 @@ pub fn parse_header(data: &[u8]) -> Result<ElfInfo> {
     let ph_size = header.e_phentsize as usize;
     let ph_count = header.e_phnum as usize;
 
+    // Reject a malformed entry size: a sub-56 e_phentsize would otherwise let
+    // the 56-byte read_unaligned below run past the bounds-checked window.
+    if ph_size != core::mem::size_of::<Elf64Phdr>() {
+        return Err(Error::InvalidArgument);
+    }
+
     let ph_end = ph_size
         .checked_mul(ph_count)
         .and_then(|n| n.checked_add(ph_offset))
@@ -202,6 +208,22 @@ pub fn load_segments(data: &[u8]) -> Result<([LoadSegment; MAX_LOAD_SEGMENTS], u
     let ph_offset = header.e_phoff as usize;
     let ph_size = header.e_phentsize as usize;
     let ph_count = header.e_phnum as usize;
+
+    // Reject a malformed entry size so the 56-byte read_unaligned below
+    // cannot run out of bounds with a sub-56 e_phentsize.
+    if ph_size != core::mem::size_of::<Elf64Phdr>() {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Bounds-check the whole program header table up front, mirroring
+    // parse_header. The per-iteration guard below stays as defense in depth.
+    let ph_end = ph_size
+        .checked_mul(ph_count)
+        .and_then(|n| n.checked_add(ph_offset))
+        .ok_or(Error::InvalidArgument)?;
+    if ph_end > data.len() {
+        return Err(Error::InvalidArgument);
+    }
 
     let mut segments = [LoadSegment {
         vaddr: 0,

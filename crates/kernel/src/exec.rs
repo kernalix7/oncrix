@@ -59,6 +59,11 @@ pub fn prepare_exec(elf_data: &[u8]) -> Result<(ExecInfo, AddressSpace)> {
     // Parse ELF header.
     let info = elf::parse_header(elf_data)?;
 
+    // Reject an entry point outside the canonical user address range.
+    if info.entry < USER_SPACE_START || info.entry > USER_SPACE_END {
+        return Err(Error::InvalidArgument);
+    }
+
     // Extract loadable segments.
     let (segments, seg_count) = elf::load_segments(elf_data)?;
 
@@ -69,12 +74,33 @@ pub fn prepare_exec(elf_data: &[u8]) -> Result<(ExecInfo, AddressSpace)> {
     // Map each PT_LOAD segment as a VmRegion.
     let mut region_count = 0;
     for seg in &segments[..seg_count] {
+        // Validate the segment before trusting any of its fields. These guard
+        // the attacker path; valid binaries pass unchanged.
+        if seg.file_size > seg.mem_size {
+            return Err(Error::InvalidArgument);
+        }
+        let foff_end = seg
+            .file_offset
+            .checked_add(seg.file_size)
+            .ok_or(Error::InvalidArgument)?;
+        if foff_end > elf_data.len() as u64 {
+            return Err(Error::InvalidArgument);
+        }
+        let aligned = page_align_up(seg.mem_size);
+        let seg_end = seg
+            .vaddr
+            .checked_add(aligned)
+            .ok_or(Error::InvalidArgument)?;
+        if seg.vaddr < USER_SPACE_START || seg_end > USER_SPACE_END {
+            return Err(Error::InvalidArgument);
+        }
+
         let prot = segment_protection(seg);
         let kind = segment_kind(seg);
 
         let region = VmRegion {
             start: VirtAddr::new(seg.vaddr),
-            size: page_align_up(seg.mem_size),
+            size: aligned,
             prot,
             kind,
         };
@@ -159,9 +185,13 @@ fn compute_initial_brk(segments: &[LoadSegment]) -> u64 {
 }
 
 /// Align a value up to the nearest page boundary.
+///
+/// Uses saturating arithmetic so a near-`u64::MAX` input saturates rather than
+/// wrapping to a tiny value; callers reject the saturated result via their
+/// segment-end bound checks.
 fn page_align_up(val: u64) -> u64 {
     const PAGE_SIZE: u64 = 4096;
-    val.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    val.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
 // ── execve: process image replacement ──────────────────────────
@@ -216,6 +246,12 @@ pub fn do_execve(
 
     // Parse and validate the ELF binary.
     let elf_info = elf::parse_header(elf_data)?;
+
+    // Reject an entry point outside the canonical user address range.
+    if elf_info.entry < USER_SPACE_START || elf_info.entry > USER_SPACE_END {
+        return Err(Error::InvalidArgument);
+    }
+
     let (segments, seg_count) = elf::load_segments(elf_data)?;
 
     // Build a new address space (old one will be torn down by caller).
@@ -223,11 +259,32 @@ pub fn do_execve(
 
     // Map PT_LOAD segments.
     for seg in &segments[..seg_count] {
+        // Validate the segment before trusting any of its fields. These guard
+        // the attacker path; valid binaries pass unchanged.
+        if seg.file_size > seg.mem_size {
+            return Err(Error::InvalidArgument);
+        }
+        let foff_end = seg
+            .file_offset
+            .checked_add(seg.file_size)
+            .ok_or(Error::InvalidArgument)?;
+        if foff_end > elf_data.len() as u64 {
+            return Err(Error::InvalidArgument);
+        }
+        let aligned = page_align_up(seg.mem_size);
+        let seg_end = seg
+            .vaddr
+            .checked_add(aligned)
+            .ok_or(Error::InvalidArgument)?;
+        if seg.vaddr < USER_SPACE_START || seg_end > USER_SPACE_END {
+            return Err(Error::InvalidArgument);
+        }
+
         let prot = segment_protection(seg);
         let kind = segment_kind(seg);
         let region = VmRegion {
             start: VirtAddr::new(seg.vaddr),
-            size: page_align_up(seg.mem_size),
+            size: aligned,
             prot,
             kind,
         };
