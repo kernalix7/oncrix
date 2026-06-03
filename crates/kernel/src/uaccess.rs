@@ -41,6 +41,58 @@ pub fn validate_user_range(ptr: u64, len: u64) -> Result<()> {
     Ok(())
 }
 
+/// Verify that a user-pointer access lies entirely inside a currently
+/// **backed** page of the calling process.
+///
+/// [`validate_user_range`] only proves the span sits in the canonical
+/// user range; it does **not** prove the pages are actually mapped. A
+/// canonical-but-unmapped user VA (e.g. a stack pointer the caller set
+/// just past the 2 MiB region, or an mmap address beyond the committed
+/// window) would still fault when the kernel dereferences it in ring 0,
+/// and that ring-0 fault halts the whole machine. This function closes
+/// that class for the *eagerly-mapped* address space by consulting the
+/// current process's [`UserAddressSpace::backed_windows`] and requiring
+/// `[addr, addr + len)` to fall wholly within one window — and, when
+/// `write` is set, that the window is writable.
+///
+/// Returns `Err(InvalidArgument)` (→ `EFAULT` at the syscall boundary)
+/// on NULL, wrap, no-current-process, or an out-of-window span. Once it
+/// returns `Ok`, a subsequent raw read/write of the same span cannot
+/// fault, because the eager mapping makes "backed" exact.
+///
+/// NOTE: this is sound only while mappings are eager. If demand paging
+/// or CoW is added, "backed" stops being statically knowable and the
+/// kernel will instead need a page-fault fixup table for user copies.
+pub fn verify_user_span(addr: u64, len: u64, write: bool) -> Result<()> {
+    if len == 0 {
+        if addr == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        return Ok(());
+    }
+
+    // Reject wrap before consulting any window.
+    let end = addr.checked_add(len).ok_or(Error::InvalidArgument)?;
+
+    // The access must belong to the *current* process's address space.
+    let thread = crate::current::current_thread().ok_or(Error::InvalidArgument)?;
+    let uas = thread
+        .user_address_space
+        .as_ref()
+        .ok_or(Error::InvalidArgument)?;
+
+    for (start, win_end, writable) in uas.backed_windows() {
+        if addr >= start && end <= win_end {
+            if write && !writable {
+                return Err(Error::InvalidArgument);
+            }
+            return Ok(());
+        }
+    }
+
+    Err(Error::InvalidArgument)
+}
+
 /// Validate a user-space string pointer (null-terminated).
 ///
 /// Walks the string up to `max_len` bytes looking for a null

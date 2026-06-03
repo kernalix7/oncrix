@@ -76,6 +76,9 @@ const ENTRIES_PER_PT: usize = 512;
 /// install the per-process PT at the right PD slot when switching.
 pub const USER_PT_PD_INDEX: usize = 2;
 
+/// Base virtual address of the per-process 2 MiB backing region
+/// (`0x400000..0x600000`) that holds code, data and the initial stack.
+pub const USER_REGION_BASE: u64 = 0x0040_0000;
 /// Base virtual address of the per-process anonymous mmap window.
 pub const USER_MMAP_BASE: u64 = 0x0060_0000;
 /// End (exclusive) of the per-process anonymous mmap window.
@@ -244,6 +247,34 @@ impl UserAddressSpace {
     /// Size of the backing region in bytes.
     pub const fn region_size(&self) -> usize {
         USER_REGION_SIZE
+    }
+
+    /// Return the set of currently-**backed** user windows of this
+    /// process as `(start, end_exclusive, writable)` triples.
+    ///
+    /// Because every mapping is installed eagerly (there is no demand
+    /// paging), the backed extent is statically known from this struct:
+    ///
+    /// 1. the 2 MiB code/data/stack region `[USER_REGION_BASE,
+    ///    USER_REGION_BASE + USER_REGION_SIZE)`, always present `RW`; and
+    /// 2. the anonymous mmap window `[USER_MMAP_BASE, USER_MMAP_BASE +
+    ///    mmap_used_pages * PAGE_SIZE)`, also `RW`.
+    ///
+    /// A user-pointer access that does not lie entirely inside one of
+    /// these windows targets an unmapped page; dereferencing it in the
+    /// kernel would fault in ring 0 (which halts the machine), so the
+    /// caller must reject it. The mmap window is empty (`start == end`)
+    /// until the first `mmap` call.
+    pub fn backed_windows(&self) -> [(u64, u64, bool); 2] {
+        let mmap_end = USER_MMAP_BASE + self.mmap_used_pages as u64 * PAGE_SIZE as u64;
+        [
+            (
+                USER_REGION_BASE,
+                USER_REGION_BASE + USER_REGION_SIZE as u64,
+                true,
+            ),
+            (USER_MMAP_BASE, mmap_end, true),
+        ]
     }
 
     /// Return a kernel-side byte slice over the full backing region.

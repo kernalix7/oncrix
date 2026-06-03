@@ -292,13 +292,13 @@ unsafe fn deliver_user_handler(
         return Err(Error::InvalidArgument);
     }
 
-    // NOTE: these guards reject non-canonical, out-of-range, wrapped, and
-    // misaligned frame addresses. A canonical, in-range, but *unmapped*
-    // user page can still fault while we store in ring 0, which the
-    // exception path treats as a fatal kernel fault. Full protection
-    // requires routing these writes through a copy-to-user helper with
-    // page-fault fixup (follow-up).
-    //
+    // Beyond the canonical-range pre-filter above, require the entire
+    // `[pretcode_va, frame_top)` span to lie inside an actually-backed,
+    // writable window of the current process. This is what rejects a
+    // canonical, in-range, but *unmapped* RSP (e.g. just past the 2 MiB
+    // region) before the ring-0 store can fault and halt the machine.
+    crate::uaccess::verify_user_span(pretcode_va, frame_top - pretcode_va, true)?;
+
     // Both writes target the user's mapped backing region. Single-CPU
     // SYSCALL context means the calling process's UAS is still live in
     // CR3, so user-VA stores hit the right physical frames.
@@ -375,10 +375,17 @@ pub unsafe fn do_sigreturn(frame_va: u64) -> i64 {
     if frame_va < USER_SPACE_START || frame_top > USER_SPACE_END + 1 {
         return -22; // EINVAL
     }
+    // Require the whole frame span to be backed in the current process
+    // (rt_sigreturn takes frame_va straight from user RSP / arg0, so a
+    // canonical-but-unmapped value would otherwise fault the ring-0 read
+    // and halt the machine).
+    if crate::uaccess::verify_user_span(frame_va, FRAME_SIZE as u64, false).is_err() {
+        return -22; // EINVAL
+    }
 
     // SAFETY: frame_va is a user-VA in the calling process's mapped
-    // backing region; volatile read avoids any compiler reordering with
-    // the subsequent store-to-atomics.
+    // backing region; the span was just verified backed; volatile read
+    // avoids any compiler reordering with the subsequent store-to-atomics.
     let frame: UserSignalFrame = unsafe { (frame_va as *const UserSignalFrame).read_volatile() };
 
     if frame.magic != SIGFRAME_MAGIC {
