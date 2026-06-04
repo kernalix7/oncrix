@@ -6,6 +6,7 @@
 //! Implements the core `namei` algorithm: decompose a path into components,
 //! resolve symlinks, and return the final dentry/inode pair.
 
+use crate::chroot_ops::ChrootContext;
 use oncrix_lib::{Error, Result};
 
 /// Maximum path length (POSIX PATH_MAX = 4096).
@@ -130,26 +131,55 @@ pub struct WalkContext {
     pub flags: WalkFlags,
     /// Lookup intent.
     pub intent: LookupIntent,
+    /// Mount crossing depth relative to the jail root mount.
+    ///
+    /// Incremented on every forward `cross_mount`; the `..` handler
+    /// refuses to decrement below zero so a `..` immediately after
+    /// crossing a mount cannot escape the jail even when the inode
+    /// equality check would pass (cross-filesystem bind-mount case).
+    pub mount_depth: i32,
+    /// Chroot jail context for this walk.
+    ///
+    /// When `chroot_ctx.depth > 0` the walk is confined to the jail: `..`
+    /// at the jail root is clamped, and the root_ino/root_sb_id are
+    /// initialised from the jail context rather than the namespace root.
+    pub chroot_ctx: ChrootContext,
 }
 
 impl WalkContext {
     /// Create a new walk context starting at the given directory.
-    pub const fn new(
+    ///
+    /// `chroot_ctx` should be obtained from the calling process's
+    /// [`ChrootRegistry`](crate::chroot_ops::ChrootRegistry) entry.
+    /// Pass [`ChrootContext::new_root()`] for un-jailed processes.
+    pub fn new(
         cwd_sb_id: u64,
         cwd_ino: u64,
         root_sb_id: u64,
         root_ino: u64,
         flags: WalkFlags,
         intent: LookupIntent,
+        chroot_ctx: ChrootContext,
     ) -> Self {
+        // Finding 5: if a chroot jail is active, override root_sb_id/root_ino
+        // so the walk is anchored to the jail root rather than the ns root.
+        let (eff_root_sb, eff_root_ino) = if chroot_ctx.depth > 0 {
+            // The root_sb_id passed in is the one the caller resolved the jail
+            // root on; we use chroot_ctx.root_ino as the authoritative inode.
+            (root_sb_id, chroot_ctx.root_ino)
+        } else {
+            (root_sb_id, root_ino)
+        };
         Self {
             cur_sb_id: cwd_sb_id,
             cur_ino: cwd_ino,
-            root_sb_id,
-            root_ino,
+            root_sb_id: eff_root_sb,
+            root_ino: eff_root_ino,
             symlink_depth: 0,
             flags,
             intent,
+            mount_depth: 0,
+            chroot_ctx,
         }
     }
 
@@ -166,9 +196,14 @@ impl WalkContext {
     }
 
     /// Step into a mount point, updating the current sb/ino.
+    ///
+    /// Finding 6: track how deep into mounts we are relative to the jail root
+    /// mount so the `..` handler can prevent escaping by crossing back.
     pub fn cross_mount(&mut self, new_sb_id: u64, new_ino: u64) {
         self.cur_sb_id = new_sb_id;
         self.cur_ino = new_ino;
+        // Saturating add: pathological nesting (>2 billion mounts) stays i32::MAX.
+        self.mount_depth = self.mount_depth.saturating_add(1);
     }
 }
 
@@ -269,6 +304,28 @@ pub fn is_dotdot(component: &[u8]) -> bool {
 /// fn lookup_fn(sb_id: u64, dir_ino: u64, name: &[u8]) -> Result<Option<(u64, u64)>>
 /// // Returns Ok(Some((sb_id, ino))) if found, Ok(None) if not found.
 /// ```
+///
+/// # SECURITY: chroot jail wiring required at call site
+///
+/// The jail enforcement inside this function is only active when the
+/// [`WalkContext`] passed in has `chroot_ctx.depth > 0`.  All callers that
+/// dispatch `namei_lookup` on behalf of a user-space process **must** supply
+/// the calling process's [`ChrootContext`](crate::chroot_ops::ChrootContext)
+/// obtained from
+/// `crates/vfs/src/chroot_ops.rs::ChrootRegistry::get(pid)`.
+///
+/// Until that wiring is in place, callers **must** pass
+/// `ChrootContext::new_root()` (depth=0) rather than a default-initialised or
+/// all-zero context — depth=0 correctly disables jail enforcement so that
+/// unjailed processes are not accidentally confined.  Using depth=0 as the
+/// safe default means the runtime chroot jail is **not yet enforced** for any
+/// process; the chroot state stored in `ChrootRegistry` is not consulted.
+///
+/// The exact wiring point is the dispatcher in
+/// `crates/syscall/src/chroot_call.rs` (or the vfs-syscall bridge that calls
+/// `namei_lookup`): it must call `ChrootRegistry::get(pid)` and pass the
+/// resulting `ChrootContext` to `WalkContext::new(…, chroot_ctx)` before
+/// invoking `namei_lookup`.
 pub fn namei_lookup<F>(path: &[u8], ctx: &mut WalkContext, mut lookup_fn: F) -> Result<NameiResult>
 where
     F: FnMut(u64, u64, &[u8]) -> Result<Option<(u64, u64)>>,
@@ -301,11 +358,40 @@ where
         }
 
         if is_dotdot(component) {
-            // Go to parent, respecting root boundary.
-            if ctx.cur_ino != ctx.root_ino || ctx.cur_sb_id != ctx.root_sb_id {
+            // Go to parent, respecting the jail/chroot root boundary.
+            //
+            // Finding 5: The chroot jail root is enforced here.  When the
+            // current position equals the jail root (inode + sb_id), treat
+            // `..` as a no-op — the process cannot ascend further.
+            //
+            // Finding 6: Additionally guard against cross-mount escape:
+            // if mount_depth > 0 we have crossed at least one mount since
+            // the jail root mount; a `..` that would cross back up a mount
+            // must not reduce mount_depth below zero.
+            let at_root = ctx.cur_ino == ctx.root_ino && ctx.cur_sb_id == ctx.root_sb_id;
+            // Guard against cross-mount escape for *jailed* processes only.
+            //
+            // When `chroot_ctx.depth > 0` the process is confined to a jail;
+            // an unjailed process (depth == 0) may freely traverse `..` across
+            // mount boundaries — blocking it would be a regression for any
+            // process whose CWD happens to sit on a secondary mount.
+            //
+            // SECURITY: `at_mount_ceiling` must NOT fire for unjailed processes
+            // (chroot_ctx.depth == 0) — doing so wrongly blocks legitimate `..`
+            // navigation on secondary mounts.  The ceiling is only meaningful
+            // inside a chroot jail where the mount-depth counter is anchored to
+            // the jail's root mount.
+            let at_mount_ceiling =
+                ctx.chroot_ctx.depth > 0 && ctx.mount_depth <= 0 && ctx.cur_sb_id != ctx.root_sb_id;
+            if !at_root && !at_mount_ceiling {
                 if let Some((psb, pino)) = lookup_fn(ctx.cur_sb_id, ctx.cur_ino, b"..")? {
                     parent_sb_id = ctx.cur_sb_id;
                     parent_ino = ctx.cur_ino;
+                    // If the parent is on a different sb we are crossing back
+                    // through a mount — decrement the depth.
+                    if psb != ctx.cur_sb_id {
+                        ctx.mount_depth = ctx.mount_depth.saturating_sub(1);
+                    }
                     ctx.cur_sb_id = psb;
                     ctx.cur_ino = pino;
                 }

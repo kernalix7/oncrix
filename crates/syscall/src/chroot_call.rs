@@ -40,14 +40,30 @@ const EMPTY_PID: u64 = u64::MAX;
 
 /// Check whether the calling process holds `CAP_SYS_CHROOT`.
 ///
-/// In a full kernel implementation this would query the credential
-/// set of the process identified by `pid`.  This stub grants the
-/// capability to all processes whose PID is non-zero (i.e. the
-/// super-user model used during early bring-up).
-fn has_cap_sys_chroot(pid: u64) -> bool {
-    // Stub: any valid PID is considered to hold CAP_SYS_CHROOT.
-    // A real implementation queries process credentials.
-    pid != 0
+/// # Wiring status
+///
+/// The per-process credential store is not yet reachable from this crate.
+/// Until `CredentialStore::get(pid).caps.has(Capability::SysChroot)` is
+/// wired here (see `crates/process/` — owned by the syscall-api team), this
+/// function **fails closed**: it returns `false` for every caller, denying
+/// `chroot` to all processes.
+///
+/// # SECURITY
+///
+/// This must remain fail-closed (deny-by-default) until the real credential
+/// lookup is plumbed in.  **Never** grant the capability unconditionally to
+/// all non-zero PIDs — doing so is a blanket privilege escalation.  The
+/// previous stub (`pid != 0`) was incorrect and has been replaced with an
+/// explicit deny.
+///
+/// Wiring task: replace the body with
+/// `credential_store.get(pid).caps.has(Capability::SysChroot)` once the
+/// process-credential API is accessible from `crates/syscall/`.
+#[allow(unused_variables)]
+fn has_cap_sys_chroot(_pid: u64) -> bool {
+    // SECURITY: Fail-closed — deny until real credential lookup is wired.
+    // See doc comment above for the exact wiring required.
+    false
 }
 
 // ---------------------------------------------------------------------------

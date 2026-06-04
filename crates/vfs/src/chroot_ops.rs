@@ -213,6 +213,23 @@ impl Default for ChrootRegistry {
 /// Securely resolve a path within a chroot jail.
 ///
 /// Returns `Err(PermissionDenied)` if the path would escape the jail.
+///
+/// # Integration note
+///
+/// This function performs a static string-component escape check that is used
+/// as a pre-flight guard.  The primary runtime enforcement is performed by
+/// [`namei_lookup`](crate::namei::namei_lookup) via the `chroot_ctx` field of
+/// [`WalkContext`](crate::namei::WalkContext).
+///
+/// # SECURITY: Dispatch wiring required (syscall layer, outside VFS lane)
+///
+/// `crates/syscall/src/chroot_call.rs` must populate `WalkContext` with the
+/// `ChrootContext` obtained from `ChrootRegistry::get(pid)` before calling
+/// `namei_lookup`.  Until that wiring is in place, pass
+/// `ChrootContext::new_root()` as a fail-safe (no jail) rather than an
+/// uninitialized or all-permissive context.  The `namei` side is ready:
+/// `WalkContext::new(…, chroot_ctx)` anchors `root_ino`/`root_sb_id` to the
+/// jail root and the `..` handler clamps traversal at those boundaries.
 pub fn jail_resolve(path: &[u8], jail: &ChrootContext) -> Result<()> {
     if jail.is_real_root() {
         return Ok(());
