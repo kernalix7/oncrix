@@ -379,6 +379,9 @@ impl XattrStore {
 /// Maps an inode identifier to an [`XattrStore`].
 struct XattrRegistryEntry {
     inode_id: u64,
+    /// UID of the inode owner, recorded at store creation time.
+    /// Used to enforce `user.*` ownership checks in [`XattrRegistry::setxattr`].
+    owner_uid: u32,
     store: XattrStore,
     occupied: bool,
 }
@@ -387,6 +390,7 @@ impl XattrRegistryEntry {
     const fn empty() -> Self {
         Self {
             inode_id: 0,
+            owner_uid: 0,
             store: XattrStore::new(),
             occupied: false,
         }
@@ -414,7 +418,10 @@ impl XattrRegistry {
     }
 
     /// Ensures an [`XattrStore`] exists for `inode_id` and returns its index.
-    fn ensure_store(&mut self, inode_id: u64) -> Result<usize> {
+    ///
+    /// `inode_owner_uid` is recorded on first creation; subsequent calls for
+    /// the same `inode_id` leave the stored owner untouched.
+    fn ensure_store(&mut self, inode_id: u64, inode_owner_uid: u32) -> Result<usize> {
         for i in 0..MAX_STORES {
             if self.entries[i].occupied && self.entries[i].inode_id == inode_id {
                 return Ok(i);
@@ -424,6 +431,7 @@ impl XattrRegistry {
         for i in 0..MAX_STORES {
             if !self.entries[i].occupied {
                 self.entries[i].inode_id = inode_id;
+                self.entries[i].owner_uid = inode_owner_uid;
                 self.entries[i].store = XattrStore::new();
                 self.entries[i].occupied = true;
                 self.count += 1;
@@ -434,8 +442,43 @@ impl XattrRegistry {
     }
 
     /// Sets the xattr `name` to `value` on `inode_id`.
-    pub fn setxattr(&mut self, inode_id: u64, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
-        let idx = self.ensure_store(inode_id)?;
+    ///
+    /// `caller_uid` is the effective UID of the requesting process.
+    /// `inode_owner_uid` is the UID that owns the inode (from the filesystem
+    /// inode stat); it is stored in the registry on the first write and used
+    /// to enforce `user.*` ownership checks on every subsequent write.
+    /// `has_cap_admin` indicates whether the caller holds `CAP_SYS_ADMIN`.
+    ///
+    /// The following namespace restrictions are enforced before delegating to
+    /// the per-inode store:
+    ///
+    /// - `trusted.*` — requires `CAP_SYS_ADMIN`; denied for all others.
+    /// - `security.*` — requires `CAP_SYS_ADMIN`; denied for all others.
+    /// - `system.*`  — kernel-internal; always denied from this entry point.
+    /// - `user.*`    — caller must own the inode (`caller_uid == inode_owner_uid`)
+    ///                  or be root (`caller_uid == 0`).
+    /// - Unknown prefix — denied (fail-closed).
+    pub fn setxattr(
+        &mut self,
+        inode_id: u64,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+        caller_uid: u32,
+        inode_owner_uid: u32,
+        has_cap_admin: bool,
+    ) -> Result<()> {
+        // SECURITY: enforce namespace privilege before touching storage.
+        check_namespace_privilege(name, caller_uid, has_cap_admin)?;
+
+        // SECURITY: for user.* the caller must own the inode (or be root).
+        // check_namespace_privilege permits any caller for user.* at the
+        // namespace level; this is the per-inode ownership guard.
+        if name.starts_with(NS_USER) && caller_uid != 0 && caller_uid != inode_owner_uid {
+            return Err(Error::PermissionDenied);
+        }
+
+        let idx = self.ensure_store(inode_id, inode_owner_uid)?;
         self.entries[idx].store.set(name, value, flags)
     }
 
@@ -450,9 +493,27 @@ impl XattrRegistry {
     }
 
     /// Removes the xattr `name` from `inode_id`.
-    pub fn removexattr(&mut self, inode_id: u64, name: &[u8]) -> Result<()> {
+    ///
+    /// Applies the same namespace privilege check as [`Self::setxattr`].
+    /// For `user.*`, the caller must own the inode (or be root).
+    pub fn removexattr(
+        &mut self,
+        inode_id: u64,
+        name: &[u8],
+        caller_uid: u32,
+        has_cap_admin: bool,
+    ) -> Result<()> {
+        // SECURITY: enforce namespace privilege before touching storage.
+        check_namespace_privilege(name, caller_uid, has_cap_admin)?;
         for i in 0..MAX_STORES {
             if self.entries[i].occupied && self.entries[i].inode_id == inode_id {
+                // SECURITY: for user.* the caller must own the inode (or be root).
+                if name.starts_with(NS_USER)
+                    && caller_uid != 0
+                    && caller_uid != self.entries[i].owner_uid
+                {
+                    return Err(Error::PermissionDenied);
+                }
                 let result = self.entries[i].store.remove(name);
                 // Free the store entry if it's now empty.
                 if self.entries[i].store.count() == 0 {
@@ -493,6 +554,57 @@ impl XattrRegistry {
     /// Returns the number of active inode stores.
     pub fn store_count(&self) -> usize {
         self.count
+    }
+}
+
+// ── Namespace privilege helper ───────────────────────────────────
+
+/// Enforces namespace-based privilege rules for xattr set/remove.
+///
+/// This is a **fail-closed** check: any namespace not positively
+/// recognised and authorised results in `PermissionDenied`.
+///
+/// | Namespace   | Required privilege                          |
+/// |-------------|---------------------------------------------|
+/// | `user.*`    | namespace allowed; per-inode owner check    |
+/// |             | is enforced by the caller (registry layer)  |
+/// | `trusted.*` | `CAP_SYS_ADMIN` (`has_cap_admin`)           |
+/// | `security.*`| `CAP_SYS_ADMIN` (`has_cap_admin`)           |
+/// | `system.*`  | always denied (kernel-internal)             |
+/// | unknown     | always denied                               |
+///
+/// Note: for `user.*`, per-inode ownership (`caller_uid == inode_owner_uid`)
+/// is enforced in [`XattrRegistry::setxattr`] and [`XattrRegistry::removexattr`]
+/// after this function returns `Ok`.  This function only gates on namespace.
+pub fn check_namespace_privilege(name: &[u8], caller_uid: u32, has_cap_admin: bool) -> Result<()> {
+    if name.starts_with(NS_USER) {
+        // user.* — namespace-level check passes; per-inode ownership is
+        // enforced by the registry layer (XattrRegistry::setxattr /
+        // removexattr) using the stored inode owner UID.  caller_uid is
+        // used there, not discarded.
+        let _ = caller_uid;
+        Ok(())
+    } else if name.starts_with(NS_TRUSTED) || name.starts_with(NS_SECURITY) {
+        // trusted.* and security.* require CAP_SYS_ADMIN.
+        //
+        // SECURITY: crates/vfs/src/xattr_trusted.rs::validate_trusted_name
+        // uses `.min(XATTR_TRUSTED_MAX_NAME)` when copying names, silently
+        // truncating oversized inputs.  This layer already rejects names
+        // longer than XATTR_NAME_MAX via validate_trusted_xattr / the store
+        // in XattrStore::set → XattrName::from_bytes, but xattr_trusted.rs
+        // (out of this lane) must be wired to validate_trusted_xattr (which
+        // has the upper-bound check) rather than its own validate_trusted_name
+        // before the buffer copy.
+        if has_cap_admin {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
+        }
+    } else {
+        // SECURITY: system.* and any unknown prefix are denied.
+        // An attacker must not be able to write kernel-internal attributes
+        // by crafting an unrecognised or system.* prefix name.
+        Err(Error::PermissionDenied)
     }
 }
 
@@ -612,7 +724,9 @@ mod tests {
     #[test]
     fn test_registry_setxattr_getxattr() {
         let mut reg = XattrRegistry::new();
-        reg.setxattr(42, b"user.test", b"value", 0).unwrap();
+        // caller_uid=0 (root), inode_owner_uid=0, has_cap_admin=false
+        reg.setxattr(42, b"user.test", b"value", 0, 0, 0, false)
+            .unwrap();
         let mut buf = [0u8; 8];
         let n = reg.getxattr(42, b"user.test", &mut buf).unwrap();
         assert_eq!(&buf[..n], b"value");
@@ -621,7 +735,8 @@ mod tests {
     #[test]
     fn test_registry_evict() {
         let mut reg = XattrRegistry::new();
-        reg.setxattr(1, b"user.x", b"y", 0).unwrap();
+        // caller_uid=0 (root), inode_owner_uid=0, has_cap_admin=false
+        reg.setxattr(1, b"user.x", b"y", 0, 0, 0, false).unwrap();
         assert_eq!(reg.store_count(), 1);
         reg.evict(1);
         assert_eq!(reg.store_count(), 0);

@@ -10,6 +10,7 @@
 use crate::dentry::{Dentry, DentryCache, DentryName};
 use crate::file::{Fd, FdTable, OpenFile, OpenFlags};
 use crate::inode::{FileMode, FileType, Inode, InodeNumber, InodeOps};
+use crate::namei::MAX_SYMLINK_DEPTH;
 use crate::superblock::MountTable;
 use oncrix_lib::{Error, Result};
 
@@ -94,17 +95,24 @@ pub fn resolve_path(
     cur_path[..path.len()].copy_from_slice(path);
     let mut cur_len = path.len();
 
-    let mut current = walk_components(&cur_path[..cur_len], root_inode, fs)?;
+    // Shared symlink-follow depth counter; MAX_SYMLINK_DEPTH (40) is the
+    // authoritative limit (POSIX ELOOP).  Using a single counter means
+    // symlinks expanded during intermediate component resolution AND the
+    // terminal symlink expansion both count against the same budget,
+    // closing the cycle-via-intermediate-symlink window.
+    let mut depth = 0u32;
+
+    let mut current = walk_components(&cur_path[..cur_len], root_inode, fs, &mut depth)?;
 
     // Follow a terminal symbolic link to its target. Absolute targets
     // resolve from root; relative targets resolve against the link's
     // parent directory. A depth limit guards against cycles (ELOOP).
     let mut target_buf = [0u8; 256];
     let mut next_path = [0u8; SYMPATH_MAX];
-    let mut depth = 0u32;
     while current.file_type == FileType::Symlink {
-        depth += 1;
-        if depth > 8 {
+        // Guard against symlink cycles / infinite loops.
+        depth = depth.checked_add(1).ok_or(Error::InvalidArgument)?;
+        if depth as usize > MAX_SYMLINK_DEPTH {
             return Err(Error::InvalidArgument); // ELOOP
         }
         let n = fs.readlink(&current, &mut target_buf)?;
@@ -151,7 +159,7 @@ pub fn resolve_path(
 
         cur_path[..new_len].copy_from_slice(&next_path[..new_len]);
         cur_len = new_len;
-        current = walk_components(&cur_path[..cur_len], root_inode, fs)?;
+        current = walk_components(&cur_path[..cur_len], root_inode, fs, &mut depth)?;
     }
 
     Ok(current)
@@ -171,8 +179,16 @@ fn parent_slice(path: &[u8]) -> &[u8] {
 /// Walk an absolute path one component at a time WITHOUT following a
 /// terminal symlink, returning the inode the final component names.
 ///
-/// `.` is skipped; `..` is passed through to `InodeOps::lookup`.
-fn walk_components(path: &[u8], root_inode: &Inode, fs: &dyn InodeOps) -> Result<Inode> {
+/// `.` is skipped; `..` respects the root boundary — if the current inode
+/// equals `root_inode` the walk stays put (mirrors `namei_lookup` ~303-313).
+/// The `depth` counter is shared with the caller so symlinks encountered
+/// during intermediate resolution count against the same budget.
+fn walk_components(
+    path: &[u8],
+    root_inode: &Inode,
+    fs: &dyn InodeOps,
+    depth: &mut u32,
+) -> Result<Inode> {
     if path.is_empty() || path[0] != b'/' {
         return Err(Error::InvalidArgument);
     }
@@ -195,14 +211,40 @@ fn walk_components(path: &[u8], root_inode: &Inode, fs: &dyn InodeOps) -> Result
         // Convert component bytes to &str for InodeOps::lookup.
         let name = core::str::from_utf8(component).map_err(|_| Error::InvalidArgument)?;
 
-        // Handle `.` and `..` special entries.
+        // Handle `.` — stay in place.
         if name == "." {
             continue;
         }
-        // `..` would need parent tracking; for now treat it as
-        // a regular lookup (the filesystem should handle it).
 
-        current = fs.lookup(&current, name)?;
+        // Handle `..` with root-boundary enforcement.
+        //
+        // SECURITY: If the current directory is the root inode we must NOT
+        // forward ".." to the filesystem lookup — doing so allows escape from
+        // a chroot/bind-mount jail.  Mirror namei_lookup (~303-313): clamp at
+        // root by staying put.
+        //
+        // Both ino AND sb_id must match: two filesystems can share the same
+        // inode number, so checking only ino risks a false clamp mid-tree
+        // (different sb_id, same ino) or a missed clamp (same sb_id matched
+        // against a different mount's inode).
+        if name == ".." && current.ino == root_inode.ino && current.sb_id == root_inode.sb_id {
+            // Already at root — ".." is a no-op (clamped).
+            continue;
+        }
+        // If name == ".." and we are NOT at root: fall through to
+        // fs.lookup() which knows the on-disk parent pointer.
+
+        // If the inode is a symlink encountered as an intermediate component,
+        // count it against the shared symlink budget to prevent cycles built
+        // from chains of intermediate symlinks.
+        let result = fs.lookup(&current, name)?;
+        if result.file_type == FileType::Symlink {
+            *depth = depth.checked_add(1).ok_or(Error::InvalidArgument)?;
+            if *depth as usize > MAX_SYMLINK_DEPTH {
+                return Err(Error::InvalidArgument); // ELOOP
+            }
+        }
+        current = result;
     }
 
     Ok(current)

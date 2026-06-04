@@ -10,6 +10,7 @@
 //! This is used by container runtimes and init systems to switch the root
 //! filesystem after early boot or namespace creation.
 
+use crate::mount_table::MountTable;
 use oncrix_lib::{Error, Result};
 
 /// Maximum path length for pivot_root arguments.
@@ -71,8 +72,8 @@ pub struct PivotResult {
 /// Validate pivot_root preconditions.
 ///
 /// Checks that:
-/// - `new_root` is a mount point.
-/// - `put_old` is under `new_root`.
+/// - `new_root` is a mount point different from the current root.
+/// - `put_old` is genuinely under `new_root` according to the mount table.
 /// - The calling process has appropriate capabilities.
 /// - Neither path is shared in a propagated way that would be unsafe.
 pub fn validate_pivot_root(
@@ -80,33 +81,86 @@ pub fn validate_pivot_root(
     put_old_mount: MountId,
     current_root: MountId,
     caller_privileged: bool,
+    table: &MountTable,
 ) -> Result<()> {
     if !caller_privileged {
         return Err(Error::PermissionDenied);
     }
+
+    // SECURITY: Verify both new_root and put_old exist in the mount table
+    // before proceeding.  A caller-supplied id of 0 or any id not present in
+    // the table must be rejected here — id=0 would otherwise skip the ancestor
+    // walk entirely (is_under_mount_in_table short-circuits on 0).
+    let new_root_entry = table
+        .find_by_id(new_root_mount.id)
+        .ok_or(Error::InvalidArgument)?;
+    let _put_old_entry = table
+        .find_by_id(put_old_mount.id)
+        .ok_or(Error::InvalidArgument)?;
+
     // new_root must be a different mount than current root.
     if new_root_mount.id == current_root.id {
         return Err(Error::InvalidArgument);
     }
-    // put_old must be on or under new_root's tree.
-    // Simplified check: put_old's parent chain must reach new_root.
-    if !is_under_mount(put_old_mount, new_root_mount) {
+
+    // new_root must itself be a mount point: derive parent_id from the
+    // table entry rather than trusting the caller-supplied value.
+    // A mount is a proper sub-mount when its table-recorded parent_id differs
+    // from its own id (the initial root mount is self-referential).
+    let new_root_table_parent = new_root_entry.parent_id;
+    if new_root_table_parent == new_root_mount.id || new_root_table_parent == 0 {
+        // Self-referential or parentless — this IS the root, not a sub-mount.
         return Err(Error::InvalidArgument);
     }
-    // new_root must not be the filesystem root of its own namespace
-    // (it must itself be a mount point, i.e. parent_id != id).
-    if new_root_mount.parent_id == new_root_mount.id {
+
+    // put_old must be genuinely under new_root by walking the real parent
+    // chain through the mount table.  We do NOT trust the caller-supplied
+    // parent_id fields.
+    if !is_under_mount_in_table(put_old_mount.id, new_root_mount.id, table) {
         return Err(Error::InvalidArgument);
     }
     Ok(())
 }
 
-/// Check if `candidate` is under `root` in the mount tree.
+/// Walk the real parent-chain in `table` from `candidate_id` upward,
+/// checking whether `root_id` is a true ancestor.
 ///
-/// Simplified: checks that candidate's parent_id is root's id.
-fn is_under_mount(candidate: MountId, root: MountId) -> bool {
-    // A real implementation would walk the mount tree.
-    candidate.parent_id == root.id || candidate.id == root.id
+/// The walk is bounded to `MAX_MOUNTS` steps to prevent an infinite loop if
+/// the table contains a cycle (which should not happen, but we are defensive).
+///
+/// Exported so that higher-level pivot_root callers (e.g. `syscall` crate) can
+/// use the same table-verified ancestry check rather than a string-prefix heuristic.
+pub fn is_under_mount_in_table(candidate_id: u32, root_id: u32, table: &MountTable) -> bool {
+    // A mount is under root_id if it IS root_id, or if any ancestor equals
+    // root_id when following parent_id links through the verified table.
+    //
+    // SECURITY: We intentionally do NOT trust the caller-supplied MountId
+    // structs' parent_id fields.  Instead we look up each mount by ID in the
+    // table and read the parent_id stored there.
+    let max_steps = crate::mount_table::MAX_MOUNTS;
+    let mut current_id = candidate_id;
+    for _ in 0..max_steps {
+        if current_id == root_id {
+            return true;
+        }
+        // Zero means "no parent" (initial root mount).
+        if current_id == 0 {
+            return false;
+        }
+        match table.find_by_id(current_id) {
+            Some(entry) => {
+                let parent = entry.parent_id;
+                if parent == current_id {
+                    // Self-referential root mount — stop.
+                    return false;
+                }
+                current_id = parent;
+            }
+            None => return false,
+        }
+    }
+    // Exceeded maximum walk depth — fail-closed.
+    false
 }
 
 /// Execute the pivot_root operation on the given mount namespace state.
@@ -115,13 +169,17 @@ fn is_under_mount(candidate: MountId, root: MountId) -> bool {
 /// 1. Detach `new_root` from its current parent mount.
 /// 2. Attach `new_root` as the new namespace root.
 /// 3. Move old root to `put_old`.
+///
+/// `table` is required so that ancestry is verified through the real mount
+/// tree rather than trusting caller-supplied `parent_id` fields.
 pub fn do_pivot_root(
     current_root: MountId,
     new_root: MountId,
     put_old: MountId,
     privileged: bool,
+    table: &MountTable,
 ) -> Result<PivotResult> {
-    validate_pivot_root(new_root, put_old, current_root, privileged)?;
+    validate_pivot_root(new_root, put_old, current_root, privileged, table)?;
     Ok(PivotResult {
         new_root: MountId::new(new_root.id, 0),
         old_root: MountId::new(current_root.id, new_root.id),

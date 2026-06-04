@@ -168,32 +168,56 @@ pub fn inode_permission(meta: &InodeMeta, cred: &Cred, mask: AccessMask) -> Resu
     } else {
         other_rwx
     };
-    // Check each requested permission bit.
+
+    // Collect *all* denied bits before applying any capability override.
+    // An early Ok() on the first denied bit would skip evaluation of the
+    // remaining requested bits, allowing a partial-grant to stand in for a
+    // full grant.  Instead we accumulate every denied bit and then decide
+    // whether capabilities cover the entire denied set.
+    let mut denied_read = false;
+    let mut denied_write = false;
+    let mut denied_exec = false;
+
     if mask.wants_read() && effective_bits & 4 == 0 {
-        if cred.cap_dac_read_search {
-            return Ok(());
-        }
-        if cred.cap_dac_override {
-            return Ok(());
-        }
-        return Err(Error::PermissionDenied);
+        denied_read = true;
     }
     if mask.wants_write() && effective_bits & 2 == 0 {
-        if cred.cap_dac_override {
-            return Ok(());
-        }
-        return Err(Error::PermissionDenied);
+        denied_write = true;
     }
     if mask.wants_exec() && effective_bits & 1 == 0 {
-        if cred.cap_dac_override {
-            // CAP_DAC_OVERRIDE only works for execute if some execute bit is set.
-            let (o, g, oth) = (owner_rwx, group_rwx, other_rwx);
-            if (o | g | oth) & 1 != 0 {
-                return Ok(());
-            }
-        }
-        return Err(Error::PermissionDenied);
+        denied_exec = true;
     }
+
+    // Nothing denied by DAC — permit immediately.
+    if !denied_read && !denied_write && !denied_exec {
+        return Ok(());
+    }
+
+    // Capability override: CAP_DAC_OVERRIDE covers read and write
+    // unconditionally, and execute only when at least one execute bit is
+    // set anywhere on the file.  CAP_DAC_READ_SEARCH additionally covers
+    // read (and directory search) but NOT write or execute.
+    let any_exec_bit = (owner_rwx | group_rwx | other_rwx) & 1 != 0;
+
+    // Try to cover each denied bit with a capability.
+    if denied_read {
+        if !cred.cap_dac_read_search && !cred.cap_dac_override {
+            return Err(Error::PermissionDenied);
+        }
+    }
+    if denied_write {
+        if !cred.cap_dac_override {
+            return Err(Error::PermissionDenied);
+        }
+    }
+    if denied_exec {
+        // CAP_DAC_OVERRIDE only grants execute when the file has at least
+        // one execute bit set (matches Linux semantics).
+        if !cred.cap_dac_override || !any_exec_bit {
+            return Err(Error::PermissionDenied);
+        }
+    }
+
     Ok(())
 }
 
@@ -216,13 +240,24 @@ pub fn sticky_check(dir_meta: &InodeMeta, file_uid: u32, cred: &Cred) -> Result<
 
 /// Check if a new mode is valid for chmod.
 ///
-/// Non-root cannot set the SGID bit on a file whose group they don't belong to.
-pub fn may_setattr_mode(new_mode: u16, inode_gid: u32, cred: &Cred) -> Result<()> {
+/// Only the inode owner or root may change the mode.  Non-root callers
+/// additionally cannot set the SGID bit on a file whose group they do not
+/// belong to (POSIX.1-2024 §chmod).
+///
+/// `inode_uid` is the current owner UID of the inode.  The previous
+/// implementation accepted a `caller` comment saying "owner check done by
+/// caller" but no call site was performing that check, leaving chmod open
+/// to any unprivileged process.
+pub fn may_setattr_mode(new_mode: u16, inode_uid: u32, inode_gid: u32, cred: &Cred) -> Result<()> {
     if cred.euid == 0 {
         return Ok(());
     }
-    // Non-owner cannot change mode.
-    // (Owner check done by caller — just validate SGID rule here.)
+    // SECURITY: fail-closed ownership check — only the file owner may
+    // chmod.  Any other identity is denied regardless of capability.
+    if cred.euid != inode_uid {
+        return Err(Error::PermissionDenied);
+    }
+    // Owner may not set SGID on a file whose group they do not belong to.
     if new_mode & mode::S_ISGID != 0 && !cred.in_group(inode_gid) {
         return Err(Error::PermissionDenied);
     }

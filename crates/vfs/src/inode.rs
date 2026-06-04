@@ -81,8 +81,16 @@ impl fmt::Display for FileMode {
 /// Inode metadata.
 #[derive(Debug, Clone, Copy)]
 pub struct Inode {
-    /// Inode number.
+    /// Inode number (unique within a single filesystem / superblock).
     pub ino: InodeNumber,
+    /// Superblock identifier — disambiguates inodes across mounted filesystems.
+    ///
+    /// Defaults to `0` (the root/single filesystem).  Callers that manage
+    /// multiple mount points should set this to the mount's superblock ID so
+    /// that root-boundary comparisons of the form
+    /// `(ino == root.ino) && (sb_id == root.sb_id)` are unambiguous even when
+    /// two different filesystems happen to share an inode number.
+    pub sb_id: u64,
     /// File type.
     pub file_type: FileType,
     /// Permission bits.
@@ -99,9 +107,14 @@ pub struct Inode {
 
 impl Inode {
     /// Create a new inode with default metadata.
+    ///
+    /// `sb_id` is initialised to `0` (root / single-filesystem context).
+    /// Assign `inode.sb_id` explicitly when the inode belongs to a specific
+    /// mounted filesystem.
     pub const fn new(ino: InodeNumber, file_type: FileType, mode: FileMode) -> Self {
         Self {
             ino,
+            sb_id: 0,
             file_type,
             mode,
             size: 0,

@@ -191,6 +191,14 @@ impl UidGid {
     pub fn is_privileged(&self) -> bool {
         self.euid == ROOT_UID
     }
+
+    /// Return `true` if any of real/effective/saved UID is root.
+    ///
+    /// Used to decide whether a credential transition crossed the last
+    /// privilege boundary and must drop capabilities (see `setuid(2)`).
+    pub fn any_root(&self) -> bool {
+        self.ruid == ROOT_UID || self.euid == ROOT_UID || self.suid == ROOT_UID
+    }
 }
 
 // ── CapabilitySet ────────────────────────────────────────────────────────────
@@ -210,6 +218,10 @@ pub struct CapabilitySet {
     pub effective: u64,
     /// Inheritable capabilities (preserved across exec).
     pub inheritable: u64,
+    /// Bounding capabilities — upper limit on the permitted set gained at
+    /// `execve` (notably the file-permitted contribution). A capability not in
+    /// the bounding set can never be acquired via a file-capable binary.
+    pub bounding: u64,
 }
 
 impl Default for CapabilitySet {
@@ -218,6 +230,11 @@ impl Default for CapabilitySet {
             permitted: 0,
             effective: 0,
             inheritable: 0,
+            // The bounding set is an upper *limit* narrowed by privileged
+            // drops, mirroring `ThreadCapState::new_unprivileged`; it starts
+            // full so a normal process can still gain file caps, while
+            // `apply_exec` enforces it as the cap on the file-permitted set.
+            bounding: u64::MAX,
         }
     }
 }
@@ -229,15 +246,21 @@ impl CapabilitySet {
             permitted: u64::MAX,
             effective: u64::MAX,
             inheritable: u64::MAX,
+            bounding: u64::MAX,
         }
     }
 
     /// Empty capability set (no privileges).
+    ///
+    /// The bounding set is left full: it is an upper limit, not a grant, so a
+    /// fresh unprivileged task can still gain file capabilities (subject to
+    /// `apply_exec` masking) until the bounding set is explicitly narrowed.
     pub const fn empty() -> Self {
         Self {
             permitted: 0,
             effective: 0,
             inheritable: 0,
+            bounding: u64::MAX,
         }
     }
 
@@ -307,23 +330,50 @@ impl CapabilitySet {
 
     /// Compute the capability set after `execve`.
     ///
-    /// new_permitted  = (old_inheritable & file_inheritable)
-    ///                | file_permitted
-    /// new_effective  = new_permitted   (if file has set-effective bit)
+    /// ```text
+    /// new_permitted   = (old_inheritable & file_inheritable)
+    ///                 | (file_permitted & bounding)
+    /// new_effective   = new_permitted   (if file has set-effective bit)
     /// new_inheritable = old_inheritable
+    /// new_bounding    = bounding        (preserved across execve)
+    /// ```
+    ///
+    /// SECURITY: the file-permitted contribution is masked by the bounding
+    /// set. `file_permitted` comes from a binary's extended attributes and is
+    /// therefore attacker-controlled; without the mask, executing a
+    /// "file-capable" binary would let an unprivileged task acquire any
+    /// capability (privilege escalation). The bounding set is the fail-closed
+    /// upper limit that cannot be exceeded on exec.
     pub fn apply_exec(
         &self,
         file_permitted: u64,
         file_inheritable: u64,
         file_effective_bit: bool,
     ) -> Self {
-        let new_permitted = (self.inheritable & file_inheritable) | file_permitted;
+        let new_permitted =
+            (self.inheritable & file_inheritable) | (file_permitted & self.bounding);
         let new_effective = if file_effective_bit { new_permitted } else { 0 };
         Self {
             permitted: new_permitted,
             effective: new_effective,
             inheritable: self.inheritable,
+            bounding: self.bounding,
         }
+    }
+
+    /// Clear the effective set only (keep permitted, so privilege can be
+    /// re-raised). Applied when a uid transition leaves effective UID non-root
+    /// while a root uid still remains elsewhere.
+    pub fn clear_effective(&mut self) {
+        self.effective = 0;
+    }
+
+    /// Clear both permitted and effective sets. Applied when a uid transition
+    /// drops the last root uid: the task can no longer hold or re-raise any
+    /// capability.
+    pub fn clear_permitted_effective(&mut self) {
+        self.permitted = 0;
+        self.effective = 0;
     }
 }
 
@@ -572,6 +622,7 @@ impl CredentialStore {
                 permitted: 0,
                 effective: 0,
                 inheritable: 0,
+                bounding: u64::MAX,
             },
             state: CredState::Free,
             no_new_privs: false,
@@ -685,6 +736,8 @@ impl CredentialStore {
         }
 
         let privileged = cred.capable(CAP_SETUID);
+        let was_euid_root = cred.ids.euid == ROOT_UID;
+        let had_root = cred.ids.any_root();
 
         if privileged {
             cred.ids.ruid = new_uid;
@@ -699,6 +752,7 @@ impl CredentialStore {
             return Err(Error::PermissionDenied);
         }
 
+        Self::cap_fixup_after_setuid(cred, was_euid_root, had_root);
         self.stats.setuid_count += 1;
         Ok(())
     }
@@ -763,6 +817,8 @@ impl CredentialStore {
         let cur_r = cred.ids.ruid;
         let cur_e = cred.ids.euid;
         let cur_s = cred.ids.suid;
+        let was_euid_root = cred.ids.euid == ROOT_UID;
+        let had_root = cred.ids.any_root();
 
         let allowed = |val: u32| -> bool {
             val == u32::MAX || privileged || val == cur_r || val == cur_e || val == cur_s
@@ -784,6 +840,7 @@ impl CredentialStore {
             cred.ids.suid = suid;
         }
 
+        Self::cap_fixup_after_setuid(cred, was_euid_root, had_root);
         self.stats.setuid_count += 1;
         Ok(())
     }
@@ -900,6 +957,28 @@ impl CredentialStore {
     }
 
     // ── Private helpers ──────────────────────────────────────────
+
+    /// Drop capabilities after a UID transition, per `setuid(2)`.
+    ///
+    /// SECURITY: capabilities must follow the loss of root. Given the
+    /// pre-transition state (`was_euid_root`, `had_root`):
+    /// - if no UID remains root, clear permitted + effective so the task can
+    ///   neither hold nor re-raise any capability;
+    /// - otherwise, if the effective UID just left root, clear the effective
+    ///   set (permitted is retained so a later `seteuid(0)` can re-raise).
+    ///
+    /// A privileged process holding `CAP_SETUID` that voluntarily drops the
+    /// last root UID still loses its capabilities here — fail-closed.
+    fn cap_fixup_after_setuid(cred: &mut TaskCredentials, was_euid_root: bool, had_root: bool) {
+        let still_root = cred.ids.any_root();
+        if had_root && !still_root {
+            cred.caps.clear_permitted_effective();
+            return;
+        }
+        if was_euid_root && cred.ids.euid != ROOT_UID {
+            cred.caps.clear_effective();
+        }
+    }
 
     /// Find the table index for `task_id`.
     fn find_index(&self, task_id: u64) -> Option<usize> {

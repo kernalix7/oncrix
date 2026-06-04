@@ -56,6 +56,15 @@ const NS_TRUSTED: &[u8] = b"trusted.";
 /// Prefix for security namespace xattrs.
 const NS_SECURITY: &[u8] = b"security.";
 
+// ── File-type constants (upper nibble of the 16-bit mode word) ──
+
+/// File-type mask: isolates the four high bits of the mode word.
+const S_IFMT: u16 = 0xF000;
+/// Regular file.
+const S_IFREG: u16 = 0x8000;
+/// Directory.
+const S_IFDIR: u16 = 0x4000;
+
 // ── XattrHandler ────────────────────────────────────────────────
 
 /// Dispatches xattr operations to filesystem-specific handlers.
@@ -274,6 +283,16 @@ impl VfsXattrTable {
             return Err(Error::InvalidArgument);
         }
 
+        // POSIX: user.* xattrs are only permitted on regular files and
+        // directories.  Allowing them on symlinks, devices, FIFOs, or
+        // sockets creates confusing semantics and potential escapes.
+        if Self::prefix_matches(name, NS_USER, NS_USER.len()) {
+            let ftype = perm.mode & S_IFMT;
+            if ftype != S_IFREG && ftype != S_IFDIR {
+                return Err(Error::PermissionDenied);
+            }
+        }
+
         // Namespace permission check.
         Self::check_namespace_perm(name, perm, caller_uid)?;
 
@@ -451,6 +470,13 @@ impl VfsXattrTable {
     // ── Private helpers ─────────────────────────────────────────
 
     /// Checks namespace-based permissions for the attribute name.
+    ///
+    /// Only the three recognised namespaces (`user.`, `trusted.`,
+    /// `security.`) are allowed from external callers.  Any name that
+    /// does not match a positively identified, authorised namespace is
+    /// **denied** — this includes the `system.` namespace which is
+    /// reserved for kernel-internal use and must never be reachable from
+    /// an unprivileged call path.
     fn check_namespace_perm(name: &[u8], perm: &XattrPermission, caller_uid: u32) -> Result<()> {
         let allowed = if Self::prefix_matches(name, NS_TRUSTED, NS_TRUSTED.len()) {
             perm.can_set_trusted(caller_uid)
@@ -459,7 +485,11 @@ impl VfsXattrTable {
         } else if Self::prefix_matches(name, NS_USER, NS_USER.len()) {
             perm.can_set_user(caller_uid)
         } else {
-            true
+            // SECURITY: unknown / system.* namespace — deny by default.
+            // Allowing unrecognised prefixes would let an unprivileged caller
+            // write kernel-internal attributes (e.g., system.*) that are
+            // never meant to be reachable from user-space call paths.
+            false
         };
         if allowed {
             Ok(())

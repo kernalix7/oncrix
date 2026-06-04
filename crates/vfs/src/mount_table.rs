@@ -37,6 +37,7 @@
 //! Linux `fs/namespace.c`, `fs/mount.h`;
 //! POSIX.1-2024 `mount(8)` utility.
 
+use crate::cred_check::{Capability, VfsCred};
 use oncrix_lib::{Error, Result};
 
 extern crate alloc;
@@ -299,7 +300,8 @@ impl MountTable {
 
     /// Mount a filesystem.
     ///
-    /// `mountpoint` must be an absolute path. Returns the new mount ID.
+    /// Requires `CAP_SYS_ADMIN` in `caller`. `mountpoint` must be an absolute
+    /// path free of `..` components. Returns the new mount ID.
     /// Returns `Err(AlreadyExists)` if the exact same mountpoint is already
     /// in use (duplicate mounts on the same path are rejected unless the
     /// caller passes `MS_BIND`).
@@ -309,10 +311,28 @@ impl MountTable {
         device: &[u8],
         fstype: &[u8],
         flags: u32,
+        caller: &VfsCred,
     ) -> Result<u32> {
-        if mountpoint.is_empty() || mountpoint[0] != b'/' {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
+
+        // Normalize and validate the mount point path.
+        let mut norm_buf = [0u8; MAX_PATH_LEN];
+        let norm_len = normalize_path(mountpoint, &mut norm_buf);
+        if norm_len == 0 {
             return Err(Error::InvalidArgument);
         }
+        let norm_mp = &norm_buf[..norm_len];
+
+        // Reject any normalized path still containing a `..` component.
+        // Finding 4: an attacker could slip "../" through a creative path.
+        // normalize_path() collapses `.` but not `..`; we must reject them.
+        if contains_dotdot(norm_mp) {
+            return Err(Error::InvalidArgument);
+        }
+
         if self.count >= MAX_MOUNTS {
             return Err(Error::OutOfMemory);
         }
@@ -320,7 +340,7 @@ impl MountTable {
         // Check for duplicate exact mount point (non-bind).
         if flags & MS_BIND == 0 {
             for slot in self.slots.iter().flatten() {
-                if slot.mountpoint.eq_bytes(mountpoint) {
+                if slot.mountpoint.eq_bytes(norm_mp) {
                     return Err(Error::AlreadyExists);
                 }
             }
@@ -329,7 +349,7 @@ impl MountTable {
         let id = self.next_id;
         self.next_id += 1;
 
-        let entry = MountEntry::new(id, mountpoint, device, fstype, flags);
+        let entry = MountEntry::new(id, norm_mp, device, fstype, flags);
 
         // Find a free slot.
         for slot in self.slots.iter_mut() {
@@ -346,9 +366,15 @@ impl MountTable {
 
     /// Unmount by exact mount point path.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller`.
     /// Returns `Err(NotFound)` if no mount at `mountpoint`.
     /// Returns `Err(Busy)` if other mounts are nested beneath it.
-    pub fn umount(&mut self, mountpoint: &[u8]) -> Result<()> {
+    pub fn umount(&mut self, mountpoint: &[u8], caller: &VfsCred) -> Result<()> {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
+
         // Check for nested mounts.
         let mut target_id = 0u32;
         let mut found = false;
@@ -396,7 +422,13 @@ impl MountTable {
     }
 
     /// Unmount by mount ID.
-    pub fn umount_by_id(&mut self, id: u32) -> Result<()> {
+    ///
+    /// Requires `CAP_SYS_ADMIN` in `caller`.
+    pub fn umount_by_id(&mut self, id: u32, caller: &VfsCred) -> Result<()> {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
         // Capture the path before calling umount to avoid conflicting borrows.
         let mut mp_bytes = [0u8; MAX_PATH_LEN];
         let mut mp_len = 0usize;
@@ -414,15 +446,28 @@ impl MountTable {
         if !found {
             return Err(Error::NotFound);
         }
-        self.umount(&mp_bytes[..mp_len])
+        self.umount(&mp_bytes[..mp_len], caller)
     }
 
     /// Lazy unmount (MNT_DETACH): immediately hide the mount from path
     /// resolution but keep the slot until all open references are released.
     ///
-    /// Unlike `umount`, this does not fail with `Err(Busy)` — it detaches
-    /// even when child mounts or open files exist.
-    pub fn umount_lazy(&mut self, mountpoint: &[u8]) -> Result<()> {
+    /// Requires `CAP_SYS_ADMIN` in `caller`. Unlike `umount`, this does not
+    /// fail with `Err(Busy)` — it detaches even when child mounts or open
+    /// files exist.
+    ///
+    /// If `open_count` is already zero when the detach is requested, the slot
+    /// is reclaimed immediately in a second pass so that repeated lazy unmounts
+    /// cannot exhaust `MAX_MOUNTS` with permanently orphaned slots.
+    pub fn umount_lazy(&mut self, mountpoint: &[u8], caller: &VfsCred) -> Result<()> {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
+
+        // First pass: find the entry and mark it detached; capture its id so
+        // that a second pass can free the slot if no open references exist.
+        let mut target_id: Option<u32> = None;
         for slot in self.slots.iter_mut().flatten() {
             if slot.mountpoint.eq_bytes(mountpoint) {
                 if slot.detached {
@@ -430,13 +475,41 @@ impl MountTable {
                 }
                 slot.detached = true;
                 if slot.open_count == 0 {
-                    // No open references — remove immediately.
-                    // We need a second pass to clear the slot.
+                    target_id = Some(slot.id);
                 }
-                return Ok(());
+                break;
             }
         }
-        Err(Error::NotFound)
+
+        // `mountpoint` was not found in any active slot.
+        if target_id.is_none() {
+            // Check if we broke out early (found but open_count > 0) or not
+            // found at all.  Re-scan to distinguish.
+            let found = self
+                .slots
+                .iter()
+                .flatten()
+                .any(|e| e.detached && e.mountpoint.eq_bytes(mountpoint));
+            if !found {
+                return Err(Error::NotFound);
+            }
+            // Found and detached, but open_count > 0 — slot is kept until
+            // all file descriptions are closed via `release_open_ref`.
+            return Ok(());
+        }
+
+        // Second pass: reclaim the slot now that open_count == 0.
+        let id = target_id.expect("set above");
+        for slot in self.slots.iter_mut() {
+            if let Some(ref e) = *slot {
+                if e.id == id {
+                    *slot = None;
+                    self.count -= 1;
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Called when an open file description on `mount_id` is closed.
@@ -480,22 +553,38 @@ impl MountTable {
 
     /// Move a mount from its current location to `new_mountpoint`.
     ///
-    /// Equivalent to `mount --move old new` (MS_MOVE). The mount retains its
-    /// ID, device, fstype, and flags. Returns `Err(NotFound)` if no mount is
-    /// at `old_mountpoint`, `Err(Busy)` if child mounts depend on it.
-    pub fn move_mount(&mut self, old_mountpoint: &[u8], new_mountpoint: &[u8]) -> Result<()> {
-        if new_mountpoint.is_empty() || new_mountpoint[0] != b'/' {
+    /// Requires `CAP_SYS_ADMIN` in `caller`. Equivalent to `mount --move old
+    /// new` (MS_MOVE). The mount retains its ID, device, fstype, and flags.
+    /// Returns `Err(NotFound)` if no mount is at `old_mountpoint`,
+    /// `Err(Busy)` if child mounts depend on it.
+    pub fn move_mount(
+        &mut self,
+        old_mountpoint: &[u8],
+        new_mountpoint: &[u8],
+        caller: &VfsCred,
+    ) -> Result<()> {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
+
+        // Normalize and validate the new mount point path.
+        let mut norm_buf = [0u8; MAX_PATH_LEN];
+        let norm_len = normalize_path(new_mountpoint, &mut norm_buf);
+        if norm_len == 0 || contains_dotdot(&norm_buf[..norm_len]) {
             return Err(Error::InvalidArgument);
         }
+        let norm_new = &norm_buf[..norm_len];
+
         // Ensure a mount exists at the target path for the new location
         // (i.e., new_mountpoint must itself be covered by some mount).
-        if self.find_mount(new_mountpoint).is_none() {
+        if self.find_mount(norm_new).is_none() {
             return Err(Error::NotFound);
         }
         // Find and update the moved mount.
         for slot in self.slots.iter_mut().flatten() {
             if slot.mountpoint.eq_bytes(old_mountpoint) {
-                slot.mountpoint = FixedStr::from_bytes(new_mountpoint);
+                slot.mountpoint = FixedStr::from_bytes(norm_new);
                 slot.flags |= MS_MOVE;
                 return Ok(());
             }
@@ -564,7 +653,18 @@ impl MountTable {
     // ── Propagation ──────────────────────────────────────────────────────────
 
     /// Change the propagation type of the mount at `mountpoint`.
-    pub fn set_propagation(&mut self, mountpoint: &[u8], prop: PropagationType) -> Result<()> {
+    ///
+    /// Requires `CAP_SYS_ADMIN` in `caller`.
+    pub fn set_propagation(
+        &mut self,
+        mountpoint: &[u8],
+        prop: PropagationType,
+        caller: &VfsCred,
+    ) -> Result<()> {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
         for slot in self.slots.iter_mut().flatten() {
             if slot.mountpoint.eq_bytes(mountpoint) {
                 slot.propagation = prop;
@@ -578,9 +678,14 @@ impl MountTable {
 
     /// Remount an existing mount with new flags.
     ///
-    /// Only flag changes (read-only toggle, etc.) are supported; the
-    /// device and filesystem type remain unchanged.
-    pub fn remount(&mut self, mountpoint: &[u8], new_flags: u32) -> Result<()> {
+    /// Requires `CAP_SYS_ADMIN` in `caller`. Only flag changes (read-only
+    /// toggle, etc.) are supported; the device and filesystem type remain
+    /// unchanged.
+    pub fn remount(&mut self, mountpoint: &[u8], new_flags: u32, caller: &VfsCred) -> Result<()> {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
         for slot in self.slots.iter_mut().flatten() {
             if slot.mountpoint.eq_bytes(mountpoint) {
                 slot.flags = new_flags;
@@ -594,11 +699,22 @@ impl MountTable {
 
     /// Create a bind mount: make `target` appear at `new_mountpoint`.
     ///
-    /// The bind mount shares the same device and filesystem type as the
-    /// source mount covering `target`.
-    pub fn bind_mount(&mut self, target: &[u8], new_mountpoint: &[u8]) -> Result<u32> {
-        // Find the source mount.
-        let (device_buf, device_len, fstype_buf, fstype_len, flags) = {
+    /// Requires `CAP_SYS_ADMIN` in `caller`. The bind mount shares the same
+    /// device and filesystem type as the source mount covering `target`.
+    /// Returns `Err(PermissionDenied)` if the source mount is `Unbindable`.
+    pub fn bind_mount(
+        &mut self,
+        target: &[u8],
+        new_mountpoint: &[u8],
+        caller: &VfsCred,
+    ) -> Result<u32> {
+        // SECURITY: Fail-closed — deny if caller lacks CAP_SYS_ADMIN.
+        if !caller.capable(Capability::SysAdmin) {
+            return Err(Error::PermissionDenied);
+        }
+
+        // Find the source mount and capture necessary fields.
+        let (device_buf, device_len, fstype_buf, fstype_len, flags, propagation) = {
             let src = self.find_mount(target).ok_or(Error::NotFound)?;
             (
                 src.device.buf,
@@ -606,11 +722,19 @@ impl MountTable {
                 src.fstype.buf,
                 src.fstype.len,
                 src.flags,
+                src.propagation,
             )
         };
+
+        // Finding 2: Unbindable mounts must not be used as bind-mount sources.
+        if propagation == PropagationType::Unbindable {
+            return Err(Error::PermissionDenied);
+        }
+
         let device = &device_buf[..device_len];
         let fstype = &fstype_buf[..fstype_len];
-        self.mount(new_mountpoint, device, fstype, flags | MS_BIND)
+        // Delegate to mount() which itself re-checks CAP_SYS_ADMIN and path.
+        self.mount(new_mountpoint, device, fstype, flags | MS_BIND, caller)
     }
 
     // ── /proc/mounts formatting ──────────────────────────────────────────────
@@ -872,6 +996,32 @@ impl MountStats {
 }
 
 // ── Path normalization ────────────────────────────────────────────────────────
+
+/// Return `true` if the normalized absolute path contains any `..` component.
+///
+/// Used to reject mount paths that would escape the intended subtree.
+pub fn contains_dotdot(path: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < path.len() {
+        // Advance to next component start (skip slashes).
+        while i < path.len() && path[i] == b'/' {
+            i += 1;
+        }
+        if i >= path.len() {
+            break;
+        }
+        // Find end of component.
+        let start = i;
+        while i < path.len() && path[i] != b'/' {
+            i += 1;
+        }
+        let component = &path[start..i];
+        if component == b".." {
+            return true;
+        }
+    }
+    false
+}
 
 /// Normalize a path by collapsing redundant separators and `.` components.
 ///

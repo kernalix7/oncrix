@@ -346,21 +346,35 @@ impl Acl {
     ///
     /// `mode` is the full 12-bit mode value; only the lower 9
     /// bits (owner/group/other rwx) are used.
-    pub fn from_mode(mode: u16) -> Self {
+    ///
+    /// `owner_uid` is the UID of the inode owner and is stored as the
+    /// qualifier of the `UserObj` entry.  The qualifier must equal the
+    /// caller's UID for step 1 of the ACL evaluation algorithm to fire;
+    /// leaving it at 0 would make root the only identity that matches
+    /// the owner entry.
+    ///
+    /// `owner_gid` is the GID of the inode's owning group and is stored as
+    /// the qualifier of the `GroupObj` entry.  Without this, step 3 of the
+    /// ACL evaluation algorithm only matches when `gid == 0`, so all
+    /// non-root groups would silently fall through to the `Other` entry.
+    pub fn from_mode(mode: u16, owner_uid: u32, owner_gid: u32) -> Self {
         let mut entries = [AclEntry::default(); MAX_ACL_ENTRIES];
 
-        // Owner bits (bits 8–6).
+        // Owner bits (bits 8–6).  Qualifier records the owning UID so that
+        // check_access can identify the owner without a separate inode lookup.
         entries[0] = AclEntry {
             tag: AclTag::UserObj,
             perm: AclPerm::from_mode(mode >> 6),
-            qualifier: 0,
+            qualifier: owner_uid,
             active: true,
         };
-        // Group bits (bits 5–3).
+        // Group bits (bits 5–3).  Qualifier records the owning GID so that
+        // step 3 of check_access correctly matches the file's group entry;
+        // a hardcoded 0 would silently bypass group permissions for gid != 0.
         entries[1] = AclEntry {
             tag: AclTag::GroupObj,
             perm: AclPerm::from_mode(mode >> 3),
-            qualifier: 0,
+            qualifier: owner_gid,
             active: true,
         };
         // Other bits (bits 2–0).
