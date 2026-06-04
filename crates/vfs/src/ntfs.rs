@@ -158,6 +158,13 @@ pub struct NtfsBpb {
 
 impl NtfsBpb {
     /// Parse a BPB from the 512-byte boot sector buffer.
+    ///
+    /// Validates geometry fields against safe ranges before accepting the image:
+    /// - `bytes_per_sector`: power-of-two in `[512, 4096]`
+    /// - `sectors_per_cluster`: power-of-two in `[1, 128]`
+    /// - resulting cluster size must not exceed 2 MiB
+    /// - `clusters_per_mft_record` encoding: if negative, the absolute value
+    ///   must be a valid shift in `[1, 31]`
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
         if buf.len() < 512 {
             return Err(Error::InvalidArgument);
@@ -168,39 +175,99 @@ impl NtfsBpb {
         if oem & 0x00FF_FFFF_FFFF_FFFF != NTFS_OEM_ID & 0x00FF_FFFF_FFFF_FFFF {
             return Err(Error::InvalidArgument);
         }
+
+        let bytes_per_sector = read_u16_le(buf, 11);
+        // Must be a power-of-two in [512, 4096].
+        let bps = bytes_per_sector as u32;
+        if !(512..=4096).contains(&bps) || !bps.is_power_of_two() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let sectors_per_cluster = read_u8(buf, 13);
+        let spc = sectors_per_cluster as u32;
+        // Must be a non-zero power-of-two in [1, 128].
+        if !(1..=128).contains(&spc) || !spc.is_power_of_two() {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Cluster size <= 2 MiB (validated inputs make checked_mul infallible here,
+        // but we use it anyway to satisfy the safety contract).
+        let cluster_size = bps.checked_mul(spc).ok_or(Error::InvalidArgument)?;
+        if cluster_size > 2 * 1024 * 1024 {
+            return Err(Error::InvalidArgument);
+        }
+
+        let clusters_per_mft_record = buf[64] as i8;
+        // Validate the negative (shift) encoding: abs(value) must be in [1, 31].
+        if clusters_per_mft_record < 0 {
+            let shift = -(clusters_per_mft_record as i32);
+            if !(1..=31).contains(&shift) {
+                return Err(Error::InvalidArgument);
+            }
+        }
+
         Ok(Self {
-            bytes_per_sector: read_u16_le(buf, 11),
-            sectors_per_cluster: read_u8(buf, 13),
+            bytes_per_sector,
+            sectors_per_cluster,
             total_sectors: read_u64_le(buf, 40),
             mft_lcn: read_u64_le(buf, 48),
             mft_mirror_lcn: read_u64_le(buf, 56),
-            clusters_per_mft_record: buf[64] as i8,
+            clusters_per_mft_record,
             clusters_per_index_block: buf[68] as i8,
         })
     }
 
     /// Cluster size in bytes.
+    ///
+    /// Returns `Err(InvalidArgument)` if the product overflows, which cannot
+    /// happen for images accepted by `from_bytes` (max 4096 * 128 = 512 KiB).
+    /// The infallible variant is safe to call after successful `from_bytes`.
     pub fn cluster_size(&self) -> u64 {
+        // Validated by from_bytes: product fits in u32, always < 2^21.
         self.bytes_per_sector as u64 * self.sectors_per_cluster as u64
     }
 
     /// MFT record size in bytes.
-    pub fn mft_record_size(&self) -> u64 {
+    ///
+    /// Returns `Err(InvalidArgument)` on geometry overflow. After a successful
+    /// `from_bytes`, overflow cannot occur because `clusters_per_mft_record`
+    /// shift is validated to `[1, 31]`.
+    pub fn mft_record_size(&self) -> Result<u64> {
         if self.clusters_per_mft_record >= 0 {
-            self.cluster_size() * self.clusters_per_mft_record as u64
+            let clusters = self.clusters_per_mft_record as u64;
+            self.cluster_size()
+                .checked_mul(clusters)
+                .ok_or(Error::InvalidArgument)
         } else {
-            1u64 << (-(self.clusters_per_mft_record as i32)) as u64
+            // Negative value encodes the power-of-two size as a shift.
+            // from_bytes validated shift is in [1, 31].
+            let shift = (-(self.clusters_per_mft_record as i32)) as u32;
+            if shift > 31 {
+                return Err(Error::InvalidArgument);
+            }
+            Ok(1u64 << shift)
         }
     }
 
     /// Byte offset of LCN `lcn` on the volume.
-    pub fn lcn_to_byte(&self, lcn: u64) -> u64 {
-        lcn * self.cluster_size()
+    ///
+    /// Returns `Err(InvalidArgument)` on overflow.
+    pub fn lcn_to_byte(&self, lcn: u64) -> Result<u64> {
+        lcn.checked_mul(self.cluster_size())
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Byte offset of MFT record `record_no`.
-    pub fn mft_record_offset(&self, mft_start_byte: u64, record_no: u64) -> u64 {
-        mft_start_byte + record_no * self.mft_record_size()
+    ///
+    /// Returns `Err(InvalidArgument)` on overflow.
+    pub fn mft_record_offset(&self, mft_start_byte: u64, record_no: u64) -> Result<u64> {
+        let rec_size = self.mft_record_size()?;
+        let rec_off = record_no
+            .checked_mul(rec_size)
+            .ok_or(Error::InvalidArgument)?;
+        mft_start_byte
+            .checked_add(rec_off)
+            .ok_or(Error::InvalidArgument)
     }
 }
 
@@ -332,12 +399,28 @@ impl AttrHeader {
 /// Extracts the resident value from an attribute buffer.
 ///
 /// Returns `(offset_from_attr_start, value_length)` for resident attributes.
+///
+/// Validates that:
+/// - `attr_buf` is at least `RESIDENT_HEADER_SIZE` bytes
+/// - `value_offset >= RESIDENT_HEADER_SIZE` (no overlap with the header)
+/// - `value_offset + value_length <= attr_buf.len()` (no out-of-bounds read)
 fn resident_value_range(attr_buf: &[u8]) -> Result<(usize, usize)> {
     if attr_buf.len() < AttrHeader::RESIDENT_HEADER_SIZE {
         return Err(Error::InvalidArgument);
     }
     let value_length = read_u32_le(attr_buf, 16) as usize;
     let value_offset = read_u16_le(attr_buf, 20) as usize;
+    // Reject offsets that overlap the mandatory header fields.
+    if value_offset < AttrHeader::RESIDENT_HEADER_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+    // Guard against overflow in the end-bound calculation.
+    let end = value_offset
+        .checked_add(value_length)
+        .ok_or(Error::InvalidArgument)?;
+    if end > attr_buf.len() {
+        return Err(Error::InvalidArgument);
+    }
     Ok((value_offset, value_length))
 }
 
@@ -387,24 +470,41 @@ impl RunList {
             let len_size = (header & 0x0F) as usize;
             let off_size = ((header >> 4) & 0x0F) as usize;
 
-            if len_size == 0 || pos + len_size + off_size > buf.len() {
+            // Each nibble is 0-15, but shifts of 8*n bits into a 64-bit integer
+            // are only defined for n in [0, 7].  Reject anything wider; also
+            // require len_size >= 1 so every real run carries at least one length
+            // byte (off_size == 0 is valid and denotes a sparse run).
+            if len_size == 0 || len_size > 8 || off_size > 8 {
+                return Err(Error::InvalidArgument);
+            }
+            // Guard bounds before any indexing.
+            let total = len_size
+                .checked_add(off_size)
+                .ok_or(Error::InvalidArgument)?;
+            if pos.checked_add(total).ok_or(Error::InvalidArgument)? > buf.len() {
                 return Err(Error::InvalidArgument);
             }
 
-            // Decode run length (unsigned).
+            // Decode run length (unsigned, 1-8 bytes, LE).
             let mut run_len: u64 = 0;
             for i in 0..len_size {
+                // i < len_size <= 8, so 8*i <= 56: shift is always in-range.
                 run_len |= (buf[pos + i] as u64) << (8 * i);
             }
             pos += len_size;
 
-            // Decode LCN offset (signed, relative to previous).
+            // Decode LCN offset (signed, relative to previous, 0-8 bytes, LE).
             let mut lcn_delta: i64 = 0;
             for i in 0..off_size {
+                // i < off_size <= 8, so 8*i <= 56: shift is always in-range.
                 lcn_delta |= (buf[pos + i] as i64) << (8 * i);
             }
-            // Sign-extend.
-            if off_size > 0 && (buf[pos + off_size - 1] & 0x80) != 0 {
+            // Sign-extend: propagate the sign bit of the most-significant byte
+            // into the upper bits of lcn_delta.  When off_size == 8 all 64 bits
+            // are already occupied, so no extension is needed or possible.
+            if off_size > 0 && off_size < 8 && (buf[pos + off_size - 1] & 0x80) != 0 {
+                // off_size is in [1, 7], so 8 * off_size is in [8, 56]: the shift
+                // fits comfortably inside a 64-bit integer.
                 lcn_delta |= !((1i64 << (8 * off_size)) - 1);
             }
             pos += off_size;
@@ -447,14 +547,21 @@ impl RunList {
                 break;
             }
             let run = self.runs[i];
-            let run_bytes = run.length * cluster_size;
-            let run_end = virt_off + run_bytes;
+            // Overflow guard: an attacker-controlled run length or cluster size
+            // must not wrap around u64 and cause us to read from a wrong offset.
+            let run_bytes = run
+                .length
+                .checked_mul(cluster_size)
+                .ok_or(Error::InvalidArgument)?;
+            let run_end = virt_off
+                .checked_add(run_bytes)
+                .ok_or(Error::InvalidArgument)?;
 
             if run_end <= offset {
                 virt_off = run_end;
                 continue;
             }
-            if virt_off >= offset + remaining as u64 {
+            if virt_off >= offset.saturating_add(remaining as u64) {
                 break;
             }
 
@@ -471,7 +578,14 @@ impl RunList {
                 // Sparse run — fill with zeros.
                 buf[buf_pos..buf_pos + to_read].fill(0);
             } else {
-                let phys_off = run.lcn * cluster_size + start_in_run;
+                // Overflow guard: lcn * cluster_size + start_in_run must not wrap.
+                let phys_base = run
+                    .lcn
+                    .checked_mul(cluster_size)
+                    .ok_or(Error::InvalidArgument)?;
+                let phys_off = phys_base
+                    .checked_add(start_in_run)
+                    .ok_or(Error::InvalidArgument)?;
                 reader.read_bytes(phys_off, &mut buf[buf_pos..buf_pos + to_read])?;
             }
 
@@ -617,7 +731,7 @@ impl<R: BlockReader> NtfsFs<R> {
         let mut boot = [0u8; 512];
         reader.read_bytes(0, &mut boot)?;
         let bpb = NtfsBpb::from_bytes(&boot)?;
-        let mft_start_byte = bpb.lcn_to_byte(bpb.mft_lcn);
+        let mft_start_byte = bpb.lcn_to_byte(bpb.mft_lcn)?;
         Ok(Self {
             reader,
             bpb,
@@ -641,14 +755,14 @@ impl<R: BlockReader> NtfsFs<R> {
 
     /// Read and validate an MFT record.
     fn read_mft_record(&self, record_no: u64, buf: &mut [u8; MFT_RECORD_SIZE]) -> Result<()> {
-        let offset = self.bpb.mft_record_offset(self.mft_start_byte, record_no);
+        let offset = self.bpb.mft_record_offset(self.mft_start_byte, record_no)?;
         self.reader.read_bytes(offset, buf)?;
         // Basic fixup: verify signature after reading.
         let sig = read_u32_le(buf, 0);
         if sig != MFT_RECORD_SIG {
             // Try mirror.
-            let mirror_start = self.bpb.lcn_to_byte(self.bpb.mft_mirror_lcn);
-            let mirror_off = self.bpb.mft_record_offset(mirror_start, record_no);
+            let mirror_start = self.bpb.lcn_to_byte(self.bpb.mft_mirror_lcn)?;
+            let mirror_off = self.bpb.mft_record_offset(mirror_start, record_no)?;
             self.reader.read_bytes(mirror_off, buf)?;
             let sig2 = read_u32_le(buf, 0);
             if sig2 != MFT_RECORD_SIG {
@@ -668,7 +782,14 @@ impl<R: BlockReader> NtfsFs<R> {
     /// or `Err(NotFound)` if no such attribute exists.
     fn find_attr(&self, mft_buf: &[u8; MFT_RECORD_SIZE], attr_type: u32) -> Result<usize> {
         let hdr = MftRecordHeader::from_bytes(mft_buf)?;
-        let mut pos = hdr.attrs_offset as usize;
+        let attrs_offset = hdr.attrs_offset as usize;
+        // attrs_offset must lie inside the record and leave room for at least a
+        // 4-byte type code.  The MFT record header is 48 bytes, so the minimum
+        // valid offset is 48.  Values >= MFT_RECORD_SIZE would be OOB.
+        if attrs_offset < 48 || attrs_offset >= MFT_RECORD_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+        let mut pos = attrs_offset;
 
         while pos + 4 <= mft_buf.len() {
             let ty = read_u32_le(mft_buf, pos);
@@ -752,9 +873,17 @@ impl<R: BlockReader> NtfsFs<R> {
         let root_val = &attr_buf[val_off..val_off + val_len.min(MAX_RESIDENT_SIZE)];
         // Byte 16 of index root: index block header starts here.
         // Entries offset within the index block header is at byte 0 of the index header.
-        let entries_offset = read_u32_le(root_val, 16) as usize; // offset to first entry (from start of index header)
+        // entries_offset is relative to the start of the index block header,
+        // which itself starts at byte 16 of the $INDEX_ROOT value.
+        let entries_offset = read_u32_le(root_val, 16) as usize;
         let index_header_off = 16usize; // index root header = 16 bytes
-        let entry_start = index_header_off + entries_offset;
+        // Guard against overflow and OOB: entry_start must be within root_val.
+        let entry_start = index_header_off
+            .checked_add(entries_offset)
+            .ok_or(Error::InvalidArgument)?;
+        if entry_start >= root_val.len() {
+            return Err(Error::InvalidArgument);
+        }
 
         self.search_index_entries(root_val, entry_start, name)
     }
@@ -839,9 +968,16 @@ impl<R: BlockReader> NtfsFs<R> {
             return Err(Error::InvalidArgument);
         }
 
+        // entries_offset is relative to the start of the index block header
+        // (byte 16 of the $INDEX_ROOT value).  Guard against overflow and OOB.
         let entries_offset = read_u32_le(root_val, 16) as usize;
         let index_header_off = 16usize;
-        let entry_start = index_header_off + entries_offset;
+        let entry_start = index_header_off
+            .checked_add(entries_offset)
+            .ok_or(Error::InvalidArgument)?;
+        if entry_start >= root_val.len() {
+            return Err(Error::InvalidArgument);
+        }
 
         let mut count = 0usize;
         let mut pos = entry_start;
@@ -924,11 +1060,20 @@ impl<R: BlockReader> NtfsFs<R> {
             Ok(to_copy)
         } else {
             // Non-resident data — decode run list.
-            // Run list offset from start of attribute.
+            // The non-resident header is at least 64 bytes; the mapping-pairs
+            // (run list) offset is encoded at byte 32 of the attribute.
             if attr_buf.len() < AttrHeader::NON_RESIDENT_HEADER_SIZE {
                 return Err(Error::InvalidArgument);
             }
             let run_list_offset = read_u16_le(attr_buf, 32) as usize;
+            // run_list_offset must be at least NON_RESIDENT_HEADER_SIZE and
+            // strictly within the attribute buffer; otherwise the on-disk image
+            // is malformed and we reject it to prevent an OOB slice.
+            if run_list_offset < AttrHeader::NON_RESIDENT_HEADER_SIZE
+                || run_list_offset >= attr_buf.len()
+            {
+                return Err(Error::InvalidArgument);
+            }
             let data_size = read_u64_le(attr_buf, 48); // real (initialised) size
 
             if offset >= data_size {

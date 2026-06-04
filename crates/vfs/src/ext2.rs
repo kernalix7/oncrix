@@ -55,6 +55,13 @@ const MAX_ADDRESSABLE_BLOCKS: usize = EXT2_NDIR_BLOCKS + 1024;
 /// Maximum directory entries we return from a single readdir.
 const MAX_DIR_ENTRIES: usize = 128;
 
+/// Maximum directory data we will scan in a single readdir (8 MiB).
+///
+/// Real directories rarely exceed a few hundred KiB.  An attacker-controlled
+/// i_size (up to 2^32-1) with minimal rec_len entries would otherwise spin the
+/// walk for hundreds of millions of iterations at ring-0.
+const MAX_DIR_SCAN: u64 = 8 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // ext2 inode type bits (from i_mode)
 // ---------------------------------------------------------------------------
@@ -122,37 +129,69 @@ impl Ext2Superblock {
         if buf.len() < 1024 {
             return Err(Error::InvalidArgument);
         }
-        let sb = Self {
+
+        // Validate magic before anything else.
+        let magic = read_u16(buf, 56);
+        if magic != EXT2_MAGIC {
+            return Err(Error::InvalidArgument);
+        }
+
+        // [CRITICAL] s_log_block_size: 1024 << n must not overflow u64.
+        // Maximum useful shift is 6 (64 KiB); reject anything larger.
+        let s_log_block_size = read_u32(buf, 24);
+        if s_log_block_size > 6 {
+            return Err(Error::InvalidArgument);
+        }
+
+        let s_blocks_per_group = read_u32(buf, 32);
+        let s_inodes_per_group = read_u32(buf, 40);
+
+        // [CRITICAL] Both fields are used as divisors; 0 causes a kernel halt.
+        if s_blocks_per_group == 0 || s_inodes_per_group == 0 {
+            return Err(Error::InvalidArgument);
+        }
+
+        let s_rev_level = read_u32(buf, 76);
+        let s_inode_size = if s_rev_level >= 1 {
+            // [HIGH] rev >= 1 carries inode size at offset 88.
+            // Must be power-of-two in [128, 1024] and fit inside a block.
+            let raw = read_u16(buf, 88);
+            if !(128u16..=1024).contains(&raw) || (raw & (raw - 1)) != 0 {
+                return Err(Error::InvalidArgument);
+            }
+            raw
+        } else {
+            128u16
+        };
+
+        Ok(Self {
             s_inodes_count: read_u32(buf, 0),
             s_blocks_count: read_u32(buf, 4),
             s_free_blocks_count: read_u32(buf, 12),
             s_free_inodes_count: read_u32(buf, 16),
             s_first_data_block: read_u32(buf, 20),
-            s_log_block_size: read_u32(buf, 24),
-            s_blocks_per_group: read_u32(buf, 32),
-            s_inodes_per_group: read_u32(buf, 40),
-            s_magic: read_u16(buf, 56),
-            s_inode_size: if read_u32(buf, 76) >= 1 {
-                // rev >= 1: inode size at offset 88
-                read_u16(buf, 88)
-            } else {
-                128
-            },
-            s_rev_level: read_u32(buf, 76),
-        };
-        if sb.s_magic != EXT2_MAGIC {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(sb)
+            s_log_block_size,
+            s_blocks_per_group,
+            s_inodes_per_group,
+            s_magic: magic,
+            s_inode_size,
+            s_rev_level,
+        })
     }
 
     /// Computed block size in bytes.
+    ///
+    /// Safe: `s_log_block_size` is validated to be <= 6 in `from_bytes`.
     pub fn block_size(&self) -> u64 {
+        // SAFETY: shift amount is bounded to [0, 6] by from_bytes validation.
         BASE_BLOCK_SIZE << self.s_log_block_size
     }
 
     /// Number of block groups.
+    ///
+    /// Safe: `s_blocks_per_group` is validated to be non-zero in `from_bytes`.
     pub fn block_group_count(&self) -> u32 {
+        // s_blocks_per_group != 0 is guaranteed by from_bytes.
         self.s_blocks_count.div_ceil(self.s_blocks_per_group)
     }
 }
@@ -403,7 +442,12 @@ impl<R: BlockReader> Ext2Fs<R> {
         }
         // Inode numbers are 1-based.
         let idx = ino - 1;
-        let group = (idx / self.sb.s_inodes_per_group) as usize;
+
+        // [CRITICAL] s_inodes_per_group != 0 guaranteed by from_bytes, but
+        // use checked_div defensively to prevent any future regression.
+        let group = idx
+            .checked_div(self.sb.s_inodes_per_group)
+            .ok_or(Error::InvalidArgument)? as usize;
         let local_idx = idx % self.sb.s_inodes_per_group;
 
         if group >= self.bg_count {
@@ -412,7 +456,19 @@ impl<R: BlockReader> Ext2Fs<R> {
         let bgd = self.bgd[group].as_ref().ok_or(Error::NotFound)?;
 
         let inode_size = self.sb.s_inode_size as u64;
-        let offset = bgd.bg_inode_table as u64 * self.block_size() + local_idx as u64 * inode_size;
+        let block_size = self.block_size();
+
+        // [HIGH] Use checked arithmetic to prevent wrap-around on
+        // attacker-controlled on-disk fields.
+        let table_offset = (bgd.bg_inode_table as u64)
+            .checked_mul(block_size)
+            .ok_or(Error::InvalidArgument)?;
+        let local_offset = (local_idx as u64)
+            .checked_mul(inode_size)
+            .ok_or(Error::InvalidArgument)?;
+        let offset = table_offset
+            .checked_add(local_offset)
+            .ok_or(Error::InvalidArgument)?;
 
         let mut buf = [0u8; 256]; // max inode size we handle
         let read_len = (inode_size as usize).min(buf.len());
@@ -510,7 +566,10 @@ impl<R: BlockReader> Ext2Fs<R> {
         }
 
         let mut result = DirEntries::new();
-        let dir_size = inode.size();
+        // Cap the scan to MAX_DIR_SCAN bytes.  i_size can be up to 2^32-1 on
+        // an untrusted image; without the cap an attacker can drive the loop
+        // for hundreds of millions of iterations at ring-0.
+        let dir_size = inode.size().min(MAX_DIR_SCAN);
         let mut offset = 0u64;
 
         while offset < dir_size {
@@ -526,9 +585,18 @@ impl<R: BlockReader> Ext2Fs<R> {
             let name_len = hdr[6];
             let file_type_indicator = hdr[7];
 
-            if rec_len == 0 {
-                break; // prevent infinite loop on corrupt data
+            // [HIGH] Validate rec_len to prevent CPU-DoS from tiny or
+            // misaligned entries that advance offset by < 8 bytes per
+            // iteration over the full dir_size-sized loop.
+            // Minimum valid entry: 8-byte header + 4-byte aligned name.
+            // Also guard against offset + rec_len wrapping past dir_size.
+            if rec_len < 8 || (rec_len & 3) != 0 {
+                break; // corrupt entry — stop safely
             }
+            let next_offset = match offset.checked_add(rec_len) {
+                Some(n) if n <= dir_size => n,
+                _ => break, // would overflow or exceed directory data
+            };
 
             if entry_inode != 0 && name_len > 0 {
                 let mut entry = Ext2DirEntry {
@@ -548,7 +616,7 @@ impl<R: BlockReader> Ext2Fs<R> {
                 let _ = result.push(entry);
             }
 
-            offset += rec_len;
+            offset = next_offset;
         }
 
         Ok(result)

@@ -262,19 +262,39 @@ impl Chunk {
         match self.profile {
             RaidProfile::Single | RaidProfile::Dup => {
                 let s = &self.stripes[0];
-                Ok((s.dev_id, s.physical + offset))
+                let phys = s
+                    .physical
+                    .checked_add(offset)
+                    .ok_or(Error::InvalidArgument)?;
+                Ok((s.dev_id, phys))
             }
             RaidProfile::Raid0 => {
-                let stripe_size = self.length / self.stripe_count as u64;
+                // stripe_count == 0 is already rejected above.  The second
+                // hazard is length < stripe_count, which produces stripe_size
+                // == 0 and causes a divide-by-zero on the next two operations.
+                // Use checked_div and treat stripe_size == 0 as a corrupt image.
+                let stripe_size = self
+                    .length
+                    .checked_div(self.stripe_count as u64)
+                    .filter(|&s| s != 0)
+                    .ok_or(Error::InvalidArgument)?;
                 let idx = (offset / stripe_size) as usize % self.stripe_count;
                 let stripe_off = offset % stripe_size;
                 let s = &self.stripes[idx];
-                Ok((s.dev_id, s.physical + stripe_off))
+                let phys = s
+                    .physical
+                    .checked_add(stripe_off)
+                    .ok_or(Error::InvalidArgument)?;
+                Ok((s.dev_id, phys))
             }
             RaidProfile::Raid1 => {
                 // Both stripes hold the same data; use the first for reads.
                 let s = &self.stripes[0];
-                Ok((s.dev_id, s.physical + offset))
+                let phys = s
+                    .physical
+                    .checked_add(offset)
+                    .ok_or(Error::InvalidArgument)?;
+                Ok((s.dev_id, phys))
             }
         }
     }
@@ -380,7 +400,14 @@ impl BlockGroup {
     /// - `OutOfMemory` if the free-extent array is full.
     /// - `InvalidArgument` if the range is outside this block group.
     pub fn free_range(&mut self, start: u64, num_bytes: u64) -> Result<()> {
-        if start < self.start || start + num_bytes > self.start + self.size {
+        // Use checked_add on both sums; an overflow on attacker-controlled
+        // on-disk values would bypass the range guard entirely.
+        let range_end = start.checked_add(num_bytes).ok_or(Error::InvalidArgument)?;
+        let bg_end = self
+            .start
+            .checked_add(self.size)
+            .ok_or(Error::InvalidArgument)?;
+        if start < self.start || range_end > bg_end {
             return Err(Error::InvalidArgument);
         }
         if self.free_extent_count >= MAX_FREE_EXTENTS {
@@ -523,7 +550,10 @@ impl ChunkAllocator {
             return Err(Error::OutOfMemory);
         }
         let copies = profile.copies() as u64;
-        let per_dev_bytes = size * copies / profile.min_stripes() as u64;
+        // Guard against overflow in size * copies; min_stripes() >= 1 so no
+        // division-by-zero is possible.
+        let per_dev_bytes =
+            size.checked_mul(copies).ok_or(Error::InvalidArgument)? / profile.min_stripes() as u64;
 
         // Find enough devices with free space.
         let mut chosen = [0u32; MAX_STRIPES];
@@ -550,7 +580,16 @@ impl ChunkAllocator {
             _ => size,
         };
         for (i, &dev_id) in chosen[..chosen_count].iter().enumerate() {
-            let phys = self.device_free[dev_id as usize] - per_dev_bytes + i as u64 * stripe_len;
+            // Compute physical start: base - per_dev_bytes + i * stripe_len.
+            // All three operations are checked so a crafted geometry cannot wrap.
+            let base = self.device_free[dev_id as usize];
+            let stripe_off = (i as u64)
+                .checked_mul(stripe_len)
+                .ok_or(Error::InvalidArgument)?;
+            let phys = base
+                .checked_sub(per_dev_bytes)
+                .and_then(|v| v.checked_add(stripe_off))
+                .ok_or(Error::InvalidArgument)?;
             chunk.add_stripe(Stripe::new(dev_id, phys, stripe_len))?;
             self.device_free[dev_id as usize] =
                 self.device_free[dev_id as usize].saturating_sub(per_dev_bytes);
@@ -558,7 +597,8 @@ impl ChunkAllocator {
         // Dup: duplicate the first stripe on the same device.
         if profile == RaidProfile::Dup && chosen_count == 1 {
             let s = chunk.stripes[0];
-            chunk.add_stripe(Stripe::new(s.dev_id, s.physical + size, size))?;
+            let dup_phys = s.physical.checked_add(size).ok_or(Error::InvalidArgument)?;
+            chunk.add_stripe(Stripe::new(s.dev_id, dup_phys, size))?;
         }
 
         let chunk_idx = self.chunk_count;
@@ -599,7 +639,14 @@ impl ChunkAllocator {
     pub fn free_bytes(&mut self, start: u64, num_bytes: u64) -> Result<()> {
         let pos = self.block_groups[..self.bg_count]
             .iter()
-            .position(|bg| bg.in_use && start >= bg.start && start < bg.start + bg.size)
+            .position(|bg| {
+                bg.in_use
+                    && start >= bg.start
+                    && bg
+                        .start
+                        .checked_add(bg.size)
+                        .map_or(false, |end| start < end)
+            })
             .ok_or(Error::NotFound)?;
         self.block_groups[pos].free_range(start, num_bytes)?;
         let stype = self.block_groups[pos].space_type;
@@ -615,7 +662,13 @@ impl ChunkAllocator {
     pub fn lookup_chunk(&self, logical: u64) -> Result<&Chunk> {
         self.chunks[..self.chunk_count]
             .iter()
-            .find(|c| c.in_use && logical >= c.logical && logical < c.logical + c.length)
+            .find(|c| {
+                c.in_use
+                    && logical >= c.logical
+                    && c.logical
+                        .checked_add(c.length)
+                        .map_or(false, |end| logical < end)
+            })
             .ok_or(Error::NotFound)
     }
 

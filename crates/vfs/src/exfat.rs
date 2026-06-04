@@ -194,6 +194,15 @@ impl ExfatBootSector {
     }
 
     /// Validate the boot sector.
+    ///
+    /// Rejects any boot sector field that would cause integer overflow or an
+    /// out-of-range shift in `bytes_per_sector()`, `sectors_per_cluster()`, or
+    /// `bytes_per_cluster()`.
+    ///
+    /// `bytes_per_sector_shift` must be 9–12 (512–4096 bytes per sector per the
+    /// exFAT specification).  `sectors_per_cluster_shift` must be 0–25, and the
+    /// combined shift `bytes_per_sector_shift + sectors_per_cluster_shift` must
+    /// be at most 25 so that `bytes_per_cluster()` stays within a `u32`.
     pub fn validate(&self) -> Result<()> {
         if self.signature != EXFAT_BOOT_SIGNATURE {
             return Err(Error::InvalidArgument);
@@ -205,6 +214,19 @@ impl ExfatBootSector {
             return Err(Error::InvalidArgument);
         }
         if self.bytes_per_sector_shift < 9 || self.bytes_per_sector_shift > 12 {
+            return Err(Error::InvalidArgument);
+        }
+        // sectors_per_cluster_shift > 25 would make sectors_per_cluster()
+        // overflow a u32 (1u32 << 26 panics in debug mode / wraps in release).
+        if self.sectors_per_cluster_shift > 25 {
+            return Err(Error::InvalidArgument);
+        }
+        // The combined shift must fit in u32 without overflow.
+        // bytes_per_cluster() = (1 << bps_shift) * (1 << spc_shift)
+        //                     = 1 << (bps_shift + spc_shift)
+        // u32 can hold up to 1 << 31; we cap at 1 << 25 to leave headroom.
+        let combined = self.bytes_per_sector_shift as u32 + self.sectors_per_cluster_shift as u32;
+        if combined > 25 {
             return Err(Error::InvalidArgument);
         }
         Ok(())
@@ -266,10 +288,20 @@ impl FatTable {
     }
 
     /// Free a chain starting at `start`. Returns number of freed clusters.
+    ///
+    /// A cyclic FAT (where cluster N points back to an earlier cluster in the
+    /// chain) would loop forever without a steps bound.  We use `entries.len()`
+    /// as the upper bound: a well-formed FAT cannot have a chain longer than the
+    /// total number of clusters.
     fn free_chain(&mut self, start: u32) -> Result<u32> {
         let mut current = start;
         let mut freed = 0u32;
+        let max_steps = self.entries.len();
         loop {
+            if freed as usize >= max_steps {
+                // Chain is longer than the FAT itself — the image is corrupt.
+                return Err(Error::IoError);
+            }
             let next = self.get(current)?;
             self.set(current, FAT_FREE)?;
             freed += 1;
