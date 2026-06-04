@@ -206,10 +206,36 @@ pub fn do_shmget(
 
 /// Handler for `shmctl(IPC_RMID)` — mark segment for removal.
 ///
+/// # POSIX.1-2024 ownership rule
+///
+/// Only the segment owner (`uid`), creator (`cuid`), or a privileged
+/// caller (`is_privileged == true`) may remove a segment.  All other
+/// callers receive `PermissionDenied` (→ `EPERM`).
+///
+/// # Arguments
+///
+/// * `caller_uid`    — effective UID of the calling process.
+/// * `is_privileged` — true when the caller holds `CAP_IPC_OWNER` or
+///   equivalent superuser capability.
+///
 /// # Errors
 ///
-/// Returns `Err(NotFound)` if `shmid` is invalid.
-pub fn do_shmctl_rmid(table: &mut ShmTable, shmid: i32) -> Result<()> {
+/// - [`Error::NotFound`] if `shmid` is invalid.
+/// - [`Error::PermissionDenied`] if the caller is not the owner,
+///   creator, or privileged.
+pub fn do_shmctl_rmid(
+    table: &mut ShmTable,
+    shmid: i32,
+    caller_uid: u32,
+    is_privileged: bool,
+) -> Result<()> {
+    // Check existence and ownership before mutating.
+    {
+        let seg = table.get(shmid).ok_or(Error::NotFound)?;
+        if !is_privileged && caller_uid != seg.uid && caller_uid != seg.cuid {
+            return Err(Error::PermissionDenied);
+        }
+    }
     let seg = table.get_mut(shmid).ok_or(Error::NotFound)?;
     seg.removed = true;
     Ok(())

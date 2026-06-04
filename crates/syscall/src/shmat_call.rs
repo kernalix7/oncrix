@@ -34,6 +34,7 @@
 //! - Linux: `ipc/shm.c`, `include/uapi/linux/shm.h`
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // ---------------------------------------------------------------------------
 // Flag constants
@@ -64,6 +65,13 @@ pub struct ShmatRequest {
     pub shmaddr: u64,
     /// Attachment flags (`SHM_RDONLY`, `SHM_RND`, …).
     pub shmflg: i32,
+    /// Size of the segment in bytes (used for end-address range validation).
+    ///
+    /// The caller must supply the true segment size so that
+    /// `validate()` can reject requests where `shmaddr + segment_size`
+    /// would overflow into the kernel address range even when `shmaddr`
+    /// alone appears valid.
+    pub segment_size: u64,
 }
 
 impl ShmatRequest {
@@ -73,6 +81,17 @@ impl ShmatRequest {
             shmid,
             shmaddr,
             shmflg,
+            segment_size: 0,
+        }
+    }
+
+    /// Create a new attach request with an explicit segment size.
+    pub const fn with_size(shmid: i32, shmaddr: u64, shmflg: i32, segment_size: u64) -> Self {
+        Self {
+            shmid,
+            shmaddr,
+            shmflg,
+            segment_size,
         }
     }
 
@@ -92,13 +111,44 @@ impl ShmatRequest {
     }
 
     /// Validate the request parameters.
+    ///
+    /// A non-zero `shmaddr` must satisfy **all** of:
+    ///
+    /// 1. Start address is within the canonical user lower-half window
+    ///    (`[USER_SPACE_START, USER_SPACE_END]`).  Addresses in the
+    ///    kernel higher half or below the user start are rejected with
+    ///    `InvalidArgument` (→ `EINVAL`).
+    /// 2. End address (`shmaddr + segment_size`) must not overflow `u64`
+    ///    and must not exceed `USER_SPACE_END`.  This prevents a
+    ///    page-aligned `shmaddr` just below `USER_SPACE_END` combined
+    ///    with a large `segment_size` from mapping into kernel virtual
+    ///    address space.
+    /// 3. Page-aligned when `SHM_RND` is not set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] (→ `EINVAL`) for any violation.
     pub fn validate(&self) -> Result<()> {
         if self.shmid < 0 {
             return Err(Error::InvalidArgument);
         }
-        // If SHM_RND is not set, shmaddr must be page-aligned.
-        if self.shmaddr != 0 && self.shmflg & SHM_RND == 0 {
-            if self.shmaddr % (SHMLBA as u64) != 0 {
+        if self.shmaddr != 0 {
+            // Reject addresses outside the canonical user window before
+            // any alignment or rounding is applied.
+            if self.shmaddr < USER_SPACE_START || self.shmaddr > USER_SPACE_END {
+                return Err(Error::InvalidArgument);
+            }
+            // Verify that the entire segment fits inside user space.
+            // checked_add guards against u64 overflow (wrap-around attack).
+            let end = self
+                .shmaddr
+                .checked_add(self.segment_size)
+                .ok_or(Error::InvalidArgument)?;
+            if end > USER_SPACE_END {
+                return Err(Error::InvalidArgument);
+            }
+            // If SHM_RND is not set, shmaddr must be page-aligned.
+            if self.shmflg & SHM_RND == 0 && self.shmaddr % (SHMLBA as u64) != 0 {
                 return Err(Error::InvalidArgument);
             }
         }
@@ -199,14 +249,18 @@ mod tests {
 
     #[test]
     fn misaligned_addr_without_rnd_rejected() {
-        // Address 0x1234 is not page-aligned and SHM_RND is not set.
-        assert_eq!(sys_shmat(1, 0x1234, 0).unwrap_err(), Error::InvalidArgument);
+        // Address is in user space but not page-aligned and SHM_RND is not set.
+        assert_eq!(
+            sys_shmat(1, 0x0000_0000_0040_1234, 0).unwrap_err(),
+            Error::InvalidArgument
+        );
     }
 
     #[test]
     fn misaligned_addr_with_rnd_accepted_validation() {
-        // Validation should pass when SHM_RND is set regardless of alignment.
-        let req = ShmatRequest::new(1, 0x1234, SHM_RND);
+        // Validation should pass when SHM_RND is set and the address is within
+        // the user space window (USER_SPACE_START = 0x40_0000).
+        let req = ShmatRequest::new(1, 0x0000_0000_0040_1234, SHM_RND);
         assert!(req.validate().is_ok());
     }
 
@@ -237,7 +291,79 @@ mod tests {
 
     #[test]
     fn page_aligned_addr_passes_validation() {
-        let req = ShmatRequest::new(2, 4096, 0);
+        // 0x40_0000 == USER_SPACE_START and is page-aligned.
+        let req = ShmatRequest::new(2, 0x0000_0000_0040_0000, 0);
         assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn kernel_addr_rejected() {
+        // Addresses in the kernel higher half must be rejected.
+        let req = ShmatRequest::new(1, 0xFFFF_8000_0000_0000, 0);
+        assert_eq!(req.validate().unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn below_user_start_rejected() {
+        // Addresses below USER_SPACE_START (0x40_0000) must be rejected.
+        let req = ShmatRequest::new(1, 4096, 0);
+        assert_eq!(req.validate().unwrap_err(), Error::InvalidArgument);
+    }
+
+    // --- segment_size end-address checks ---
+
+    /// A segment whose end exactly equals USER_SPACE_END is accepted.
+    #[test]
+    fn segment_end_at_user_space_end_accepted() {
+        // Place the start one page before USER_SPACE_END; segment_size = one page.
+        let start = USER_SPACE_END - SHMLBA as u64 + 1;
+        // Align down to page boundary.
+        let start = start & !(SHMLBA as u64 - 1);
+        let size = USER_SPACE_END - start;
+        let req = ShmatRequest::with_size(1, start, 0, size);
+        assert!(
+            req.validate().is_ok(),
+            "end == USER_SPACE_END must be valid"
+        );
+    }
+
+    /// A segment whose end exceeds USER_SPACE_END is rejected.
+    #[test]
+    fn segment_end_past_user_space_end_rejected() {
+        // shmaddr is page-aligned and within the user window ...
+        let start = USER_SPACE_END & !(SHMLBA as u64 - 1);
+        // ... but the segment extends one byte past the end.
+        let size = 1u64;
+        let req = ShmatRequest::with_size(1, start, 0, size);
+        assert_eq!(
+            req.validate().unwrap_err(),
+            Error::InvalidArgument,
+            "end > USER_SPACE_END must be rejected",
+        );
+    }
+
+    /// A very large segment_size that would overflow u64 must be rejected.
+    #[test]
+    fn segment_size_overflow_rejected() {
+        // shmaddr is valid; segment_size chosen so shmaddr + size wraps.
+        let start = 0x0000_0000_0040_0000u64; // USER_SPACE_START
+        let size = u64::MAX - start + 2; // would wrap on addition
+        let req = ShmatRequest::with_size(1, start, 0, size);
+        assert_eq!(
+            req.validate().unwrap_err(),
+            Error::InvalidArgument,
+            "u64 overflow in end address must be rejected",
+        );
+    }
+
+    /// Zero shmaddr (kernel-chosen) bypasses the end-address check entirely.
+    #[test]
+    fn zero_shmaddr_large_segment_size_ignored() {
+        // segment_size is arbitrarily large; with shmaddr==0 the check is skipped.
+        let req = ShmatRequest::with_size(1, 0, 0, u64::MAX);
+        assert!(
+            req.validate().is_ok(),
+            "kernel-chosen attach (addr=0) must not be rejected by end-range check",
+        );
     }
 }
