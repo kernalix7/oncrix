@@ -530,6 +530,12 @@ pub fn scan_capabilities(config: &[u8]) -> Result<CapabilityList> {
 /// least 0x100 bytes; for full PCIe extended config space it should be
 /// 4096 bytes.
 ///
+/// Cycle detection uses a DWORD-offset visited bitmap covering the entire
+/// extended config region (offsets 0x100–0xFFF, DWORD-aligned → 960 slots).
+/// The bitmap is stored as `[u64; 15]` (960 bits), with bit `i` set when
+/// DWORD slot `i` (absolute offset `0x100 + i*4`) has been visited.
+/// This detects every possible cycle without truncating legitimate chains.
+///
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] if `ecfg.len() < 0x100`.
@@ -539,10 +545,43 @@ pub fn scan_extended_capabilities(ecfg: &[u8]) -> Result<CapabilityList> {
     }
     let mut list = CapabilityList::default();
     let mut offset: usize = 0x100;
-    for _ in 0..48 {
-        if offset + 4 > ecfg.len() || offset < 0x100 {
+
+    // Visited-offset bitmap for the extended config region (0x100–0xFFF).
+    // Each bit represents one DWORD-aligned slot: bit i → absolute offset
+    // 0x100 + i*4.  960 slots → [u64; 15] (15 * 64 = 960 bits).
+    //
+    // Helper: slot index for a given byte offset.
+    //   slot = (offset - 0x100) / 4   (offset is already DWORD-aligned)
+    // Maximum valid offset before a 4-byte read: ecfg.len() - 4, capped
+    // at 0xFFC (last DWORD in the 4 KiB config space).
+    // Visited-offset bitmap: 960 bits for DWORD slots 0x100..=0xFFC.
+    // slot index = (byte_offset - 0x100) / 4  (offset is always DWORD-aligned).
+    let mut visited = [0u64; 15];
+
+    // Upper bound: at most 960 entries (every DWORD slot in 0x100–0xFFC).
+    // The bitmap guarantees we stop at the first repeated slot, so the loop
+    // bound is only a defence-in-depth ceiling that can never be reached on
+    // a well-formed chain.
+    for _ in 0..960_usize {
+        // offset must be in [0x100, 0xFFC] and at least 4 bytes before the
+        // end of the supplied buffer.
+        if offset < 0x100 || offset > 0xFFC {
             break;
         }
+        if offset.checked_add(4).map_or(true, |e| e > ecfg.len()) {
+            break;
+        }
+
+        // Cycle detection: compute slot index and test-and-set the bitmap.
+        let slot = (offset - 0x100) / 4; // 0..=959
+        let word = slot / 64;
+        let bit = slot % 64;
+        if visited[word] & (1u64 << bit) != 0 {
+            break;
+        }
+        visited[word] |= 1u64 << bit;
+
+        // Read the 4-byte extended-capability header.
         let dword = u32::from_le_bytes([
             ecfg[offset],
             ecfg[offset + 1],
@@ -551,12 +590,20 @@ pub fn scan_extended_capabilities(ecfg: &[u8]) -> Result<CapabilityList> {
         ]);
         let cap_id = (dword & 0xFFFF) as u16;
         let version = ((dword >> 16) & 0x0F) as u8;
-        let next = ((dword >> 20) & 0xFFF) as u16;
-        // cap_id == 0 with next == 0 means end of list (or absent).
-        if cap_id == 0 && next == 0 {
+        // Bits [31:20]: next-capability pointer (12 bits), must be DWORD-aligned.
+        let next_raw = (dword >> 20) & 0xFFF;
+        let next = (next_raw & !0x3) as usize;
+
+        // cap_id == 0 means end-of-list regardless of the next pointer (PCIe spec).
+        if cap_id == 0 {
             break;
         }
+
+        // Record this capability if space remains in the output array.
+        // If the array is full keep walking so the visited bitmap stays
+        // accurate and cycle detection continues to work correctly.
         if list.ecap_count < MAX_ECAPS {
+            // offset is at most 0xFFC which fits in u16 without truncation.
             list.ecaps[list.ecap_count] = Some(ExtCapLocation {
                 offset: offset as u16,
                 cap_id,
@@ -564,10 +611,13 @@ pub fn scan_extended_capabilities(ecfg: &[u8]) -> Result<CapabilityList> {
             });
             list.ecap_count += 1;
         }
+
+        // A next-pointer of 0 or below the extended region means end-of-list.
         if next < 0x100 {
             break;
         }
-        offset = next as usize;
+
+        offset = next;
     }
     Ok(list)
 }
