@@ -229,11 +229,69 @@ impl PtraceManager {
         }
     }
 
-    /// Attaches a tracer to a tracee.
-    pub fn attach(&mut self, tracer_pid: u64, tracee_pid: u64) -> Result<usize> {
+    /// Decide whether a tracer may attach to a tracee (PTRACE_MODE_ATTACH).
+    ///
+    /// Mirrors the Linux `ptrace_may_access` policy. The caller resolves the
+    /// live credential structs into scalars: the tracer's real uid and whether
+    /// it holds `CAP_SYS_PTRACE`, plus the tracee's real uid and whether the
+    /// tracee is dumpable. `CAP_SYS_PTRACE` bypasses the uid / dumpable checks;
+    /// otherwise the tracer must share the tracee's real uid AND the tracee
+    /// must be dumpable. Fail-closed: any mismatch denies.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if the access policy is not satisfied.
+    pub fn may_access(
+        tracer_uid: u32,
+        tracer_cap_sys_ptrace: bool,
+        tracee_uid: u32,
+        tracee_dumpable: bool,
+    ) -> Result<()> {
+        if tracer_cap_sys_ptrace {
+            return Ok(());
+        }
+        if tracer_uid != tracee_uid || !tracee_dumpable {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    /// Attaches a tracer to a tracee after a PTRACE_MODE_ATTACH access check.
+    ///
+    /// The access policy is evaluated via [`PtraceManager::may_access`] using
+    /// the resolved credential scalars supplied by the caller (which owns the
+    /// live credential structs). An unprivileged tracer may only attach to a
+    /// same-uid, dumpable tracee; `CAP_SYS_PTRACE` bypasses. Without this gate
+    /// any process could attach to — and then peek/poke — a more-privileged
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if the tracer may not attach to the tracee.
+    /// - [`Error::InvalidArgument`] if `tracer_pid == tracee_pid`.
+    /// - [`Error::AlreadyExists`] if the tracee is already traced.
+    /// - [`Error::OutOfMemory`] if no session slot is free.
+    pub fn attach(
+        &mut self,
+        tracer_pid: u64,
+        tracee_pid: u64,
+        tracer_uid: u32,
+        tracer_cap_sys_ptrace: bool,
+        tracee_uid: u32,
+        tracee_dumpable: bool,
+    ) -> Result<usize> {
         if tracer_pid == tracee_pid {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: gate attach on PTRACE_MODE_ATTACH before creating a
+        // session. The pid/uid/dumpable inputs are attacker-controlled, so the
+        // policy must be fail-closed.
+        Self::may_access(
+            tracer_uid,
+            tracer_cap_sys_ptrace,
+            tracee_uid,
+            tracee_dumpable,
+        )?;
         // Check for existing session on this tracee.
         if self.find_by_tracee(tracee_pid).is_some() {
             return Err(Error::AlreadyExists);

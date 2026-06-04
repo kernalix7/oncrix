@@ -99,6 +99,13 @@ impl CapSet {
     pub fn is_subset_of(&self, other: &CapSet) -> bool {
         (self.bits & !other.bits) == 0
     }
+
+    /// Union (OR) of two sets.
+    pub fn union(&self, other: &CapSet) -> CapSet {
+        CapSet {
+            bits: self.bits | other.bits,
+        }
+    }
 }
 
 /// Per-thread capability state.
@@ -215,13 +222,23 @@ pub fn do_capget(hdr: &CapUserHeader, caps: &ThreadCaps) -> Result<CapUserData> 
 /// Updates the capability sets.  Enforces that:
 /// - new effective ⊆ new permitted.
 /// - new permitted ⊆ old permitted (cannot regain dropped caps).
+/// - new inheritable ⊆ (old permitted ∪ old inheritable).
+/// - without `CAP_SETPCAP`: new inheritable ⊆ (old inheritable ∪ bounding),
+///   so an unprivileged caller may not add inheritable caps outside the
+///   bounding set.
+///
+/// SECURITY: the inheritable set is attacker-controlled input. Without the
+/// last two rules a caller could place a capability it does not hold (any
+/// cap, or one only in its permitted set) into the inheritable set and have it
+/// survive `execve` of a file-inheritable binary — a privilege-escalation
+/// path. All checks are fail-closed.
 ///
 /// # Errors
 ///
 /// | `Error`           | Condition                                    |
 /// |-------------------|----------------------------------------------|
 /// | `InvalidArgument` | Unsupported version or effective > permitted |
-/// | `PermissionDenied`| Trying to raise permitted beyond old permitted|
+/// | `PermissionDenied`| Permitted or inheritable rule violated       |
 pub fn do_capset(hdr: &CapUserHeader, caps: &mut ThreadCaps, data: &CapUserData) -> Result<()> {
     if hdr.version != _LINUX_CAPABILITY_VERSION_3 && hdr.version != 0 {
         return Err(Error::InvalidArgument);
@@ -244,6 +261,19 @@ pub fn do_capset(hdr: &CapUserHeader, caps: &mut ThreadCaps, data: &CapUserData)
     // New permitted must not exceed old permitted.
     if !new_perm.is_subset_of(&caps.permitted) {
         return Err(Error::PermissionDenied);
+    }
+    // New inheritable must be drawn from old permitted ∪ old inheritable.
+    let perm_or_inh = caps.permitted.union(&caps.inheritable);
+    if !new_inh.is_subset_of(&perm_or_inh) {
+        return Err(Error::PermissionDenied);
+    }
+    // Without CAP_SETPCAP, inheritable additions are further capped by the
+    // bounding set: new_inheritable ⊆ (old inheritable ∪ bounding).
+    if !caps.effective.has(CAP_SETPCAP) {
+        let inh_or_bound = caps.inheritable.union(&caps.bounding);
+        if !new_inh.is_subset_of(&inh_or_bound) {
+            return Err(Error::PermissionDenied);
+        }
     }
 
     caps.effective = new_eff;
