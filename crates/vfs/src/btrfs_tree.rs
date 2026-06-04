@@ -512,7 +512,12 @@ impl BtrfsTree {
         }
         let leaf_idx = path.nodes[path.depth.saturating_sub(1)];
         let leaf = self.pool.nodes[leaf_idx].as_mut().ok_or(Error::IoError)?;
-        let nritems = leaf.header.nritems as usize;
+        // Cap disk-derived nritems to the fixed array bound to prevent
+        // out-of-bounds access, and guard against underflow when nritems == 0.
+        let nritems = (leaf.header.nritems as usize).min(MAX_LEAF_ITEMS);
+        if nritems == 0 {
+            return Err(Error::IoError);
+        }
         let slot = path.leaf_slot;
 
         // Shift items left.
@@ -522,15 +527,43 @@ impl BtrfsTree {
             lo[i].swap_with_slice(&mut hi[0]);
         }
         leaf.leaf_items[nritems - 1] = None;
-        leaf.header.nritems -= 1;
+        leaf.header.nritems = leaf.header.nritems.saturating_sub(1);
         self.generation += 1;
         Ok(())
     }
 }
 
 impl Default for BtrfsTree {
+    /// Returns a new empty tree identical to [`BtrfsTree::new`].
+    ///
+    /// The internal node pool starts completely empty (`MAX_NODES` free slots),
+    /// so allocating the initial root leaf cannot fail. The `Result` from
+    /// `new()` is therefore always `Ok`; we handle the `Err` arm by returning
+    /// a bare-bones sentinel (pool empty, `root_idx = 0`) which is safe
+    /// because every tree operation checks `node_idx < pool.count` before
+    /// indexing and returns `Err(IoError)` when the pool is empty.
     fn default() -> Self {
-        Self::new().expect("BtrfsTree::default")
+        // BtrfsNodePool::new() creates MAX_NODES=256 empty slots. alloc_leaf
+        // only returns Err when count >= MAX_NODES, which is impossible on a
+        // fresh pool. We avoid expect/unwrap by handling the Err arm
+        // explicitly with a sentinel that degrades gracefully.
+        let mut pool = BtrfsNodePool::new();
+        match pool.alloc_leaf(1) {
+            Ok(root_idx) => Self {
+                pool,
+                root_idx,
+                generation: 1,
+            },
+            Err(_) => {
+                // Unreachable on a freshly-created pool; produce a
+                // zero-slot sentinel that returns Err on every operation.
+                Self {
+                    pool,
+                    root_idx: 0,
+                    generation: 1,
+                }
+            }
+        }
     }
 }
 

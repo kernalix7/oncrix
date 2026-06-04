@@ -249,8 +249,11 @@ impl BtrfsLeaf {
     /// Find an item by key.
     ///
     /// Returns the index if found.
+    ///
+    /// `header.nritems` is disk-derived; cap it to `MAX_ITEMS_PER_LEAF` before
+    /// indexing to prevent out-of-bounds access on a crafted image.
     pub fn find(&self, key: &BtrfsKey) -> Option<usize> {
-        let count = self.header.nritems as usize;
+        let count = (self.header.nritems as usize).min(MAX_ITEMS_PER_LEAF);
         (0..count).find(|&i| self.items[i].in_use && self.items[i].key == *key)
     }
 
@@ -261,6 +264,13 @@ impl BtrfsLeaf {
     /// - `OutOfMemory` if the leaf is full.
     /// - `AlreadyExists` if an item with the same key exists.
     pub fn insert(&mut self, item: BtrfsItem) -> Result<()> {
+        // Reject a corrupt on-disk node whose nritems exceeds the fixed array
+        // bound.  This check must come BEFORE is_full() so that an over-MAX
+        // value is treated as a hard error rather than silently as "just full".
+        if self.header.nritems as usize > MAX_ITEMS_PER_LEAF {
+            return Err(Error::InvalidArgument);
+        }
+
         if self.is_full() {
             return Err(Error::OutOfMemory);
         }
@@ -299,7 +309,8 @@ impl BtrfsLeaf {
     ///
     /// - `NotFound` if no item with the given key exists.
     pub fn delete(&mut self, key: &BtrfsKey) -> Result<()> {
-        let count = self.header.nritems as usize;
+        // Cap disk-derived nritems to the fixed array bound before indexing.
+        let count = (self.header.nritems as usize).min(MAX_ITEMS_PER_LEAF);
         let idx = self.find(key).ok_or(Error::NotFound)?;
 
         // Shift items to fill the gap.
@@ -767,9 +778,23 @@ impl BtrfsChunkMap {
     /// - `NotFound` if the logical address is not in any chunk.
     pub fn translate(&self, logical: u64) -> Result<u64> {
         for chunk in &self.chunks {
-            if chunk.in_use && logical >= chunk.logical && logical < chunk.logical + chunk.length {
+            if !chunk.in_use {
+                continue;
+            }
+            // Both sums use checked_add so attacker-controlled on-disk
+            // `logical`/`length`/`physical` fields cannot bypass the range
+            // guard or produce a wrapped physical address.
+            let chunk_end = chunk
+                .logical
+                .checked_add(chunk.length)
+                .ok_or(Error::InvalidArgument)?;
+            if logical >= chunk.logical && logical < chunk_end {
                 let offset = logical - chunk.logical;
-                return Ok(chunk.physical + offset);
+                let physical = chunk
+                    .physical
+                    .checked_add(offset)
+                    .ok_or(Error::InvalidArgument)?;
+                return Ok(physical);
             }
         }
         Err(Error::NotFound)

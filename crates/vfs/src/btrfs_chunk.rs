@@ -130,8 +130,13 @@ impl ChunkItem {
     }
 
     /// Return `true` if `logical` falls within this chunk.
+    ///
+    /// Uses a checked addition to avoid wrapping on attacker-controlled
+    /// on-disk `logical_start`/`length` values.
     pub fn contains(&self, logical: u64) -> bool {
-        logical >= self.logical_start && logical < self.logical_start + self.length
+        self.logical_start
+            .checked_add(self.length)
+            .map_or(false, |end| logical >= self.logical_start && logical < end)
     }
 
     /// Return the stripe index for a given logical offset within this chunk
@@ -218,7 +223,18 @@ impl ChunkTree {
             chunk.stripe_len
         };
         let stripe_offset = offset_in_chunk % stripe_len;
-        let phys = stripe.dev_offset + (offset_in_chunk / stripe_len) * stripe_len + stripe_offset;
+        // All arithmetic on attacker-controlled on-disk fields: use checked ops
+        // so a malformed chunk cannot produce an arbitrary device offset that
+        // would be used to read/write outside the device.
+        let stripe_units = offset_in_chunk / stripe_len;
+        let stripe_base = stripe_units
+            .checked_mul(stripe_len)
+            .ok_or(Error::InvalidArgument)?;
+        let phys = stripe
+            .dev_offset
+            .checked_add(stripe_base)
+            .and_then(|v| v.checked_add(stripe_offset))
+            .ok_or(Error::InvalidArgument)?;
 
         Ok((stripe_idx, phys))
     }
@@ -261,6 +277,10 @@ impl ChunkTree {
             return Err(Error::InvalidArgument);
         }
         let logical = self.next_logical;
+        // Reject a length that would wrap next_logical around u64::MAX.
+        // This also protects the sorted-insert invariant: the new chunk's
+        // logical_start + length must not overflow so contains() stays safe.
+        let next = logical.checked_add(length).ok_or(Error::InvalidArgument)?;
         let mut chunk = ChunkItem::new_single(logical, length, chunk_type);
         // Set up a placeholder stripe at device offset = logical start.
         chunk.stripes[0] = Stripe {
@@ -279,7 +299,7 @@ impl ChunkTree {
         }
         self.chunks[pos] = chunk;
         self.count += 1;
-        self.next_logical = logical + length;
+        self.next_logical = next;
         Ok(logical)
     }
 
