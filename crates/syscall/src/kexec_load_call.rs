@@ -87,9 +87,21 @@ impl KexecSegment {
         }
     }
 
-    /// Validate that the segment is non-empty.
+    /// Validate that the segment descriptor is well-formed.
+    ///
+    /// Checks:
+    /// - `bufsz > 0` — segment must have data.
+    /// - `memsz >= bufsz` — memory region must be at least as large as the
+    ///   source buffer.
+    /// - `buf + bufsz` does not wrap around — prevents attacker-crafted
+    ///   pointer arithmetic from bypassing copy-from-user bounds checks.
+    /// - `mem + memsz` does not wrap around — prevents target physical address
+    ///   arithmetic from overflowing when the kexec subsystem is fully wired.
     pub fn is_valid(&self) -> bool {
-        self.bufsz > 0 && self.memsz >= self.bufsz
+        self.bufsz > 0
+            && self.memsz >= self.bufsz
+            && self.buf.checked_add(self.bufsz).is_some()
+            && self.mem.checked_add(self.memsz).is_some()
     }
 }
 

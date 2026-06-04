@@ -371,6 +371,13 @@ const MAX_PHDRS: usize = 32;
 /// Maximum interpreter path length.
 const MAX_INTERP_LEN: usize = 256;
 
+/// Upper bound on a single PT_LOAD segment's virtual memory size.
+///
+/// Mirrors the conventional user-space limit (128 TiB on x86-64).  A segment
+/// whose `p_memsz` exceeds this value is almost certainly a decompression-bomb
+/// or a crafted attack image; reject it before touching the MM subsystem.
+const TASK_SIZE_MAX: u64 = 0x0000_7FFF_FFFF_F000;
+
 /// Fully parsed ELF binary descriptor.
 ///
 /// Produced by `parse_elf()` and consumed by the exec path to set up
@@ -452,13 +459,56 @@ impl ElfInfo {
             match ph.seg_type() {
                 PhdrType::Interp => {
                     // Copy the interpreter path from the file data.
+                    // Use checked_add to prevent wrap-around: a p_offset near
+                    // usize::MAX would otherwise pass "off + sz <= data.len()"
+                    // and then panic when indexing data[off..off+copy_len].
                     let off = ph.p_offset as usize;
                     let sz = ph.p_filesz as usize;
-                    if off + sz <= data.len() && sz > 0 {
+                    if sz > 0 {
+                        let end = off.checked_add(sz).ok_or(Error::InvalidArgument)?;
+                        if end > data.len() {
+                            return Err(Error::InvalidArgument);
+                        }
                         let copy_len = sz.min(MAX_INTERP_LEN - 1);
                         interp_path[..copy_len].copy_from_slice(&data[off..off + copy_len]);
                         interp_len = copy_len;
                         needs_interp = true;
+                    }
+                }
+                PhdrType::Load => {
+                    // Validate the PT_LOAD segment against the file buffer and
+                    // address-space limits before recording it.
+                    //
+                    // 1. p_offset + p_filesz must fit in usize and be within
+                    //    data (prevents out-of-file reads).
+                    // 2. p_filesz <= p_memsz (invariant; a crafted image could
+                    //    set filesz > memsz to defeat BSS zeroing logic).
+                    // 3. p_vaddr + p_memsz must not overflow u64 AND the
+                    //    resulting end address must not exceed TASK_SIZE_MAX.
+                    //    Checking only p_memsz is insufficient: a segment with
+                    //    p_vaddr = TASK_SIZE_MAX and p_memsz = 1 passes a
+                    //    bare p_memsz check yet maps one byte into kernel space.
+                    let file_off = ph.p_offset as usize;
+                    let file_sz = ph.p_filesz as usize;
+                    let file_end = file_off
+                        .checked_add(file_sz)
+                        .ok_or(Error::InvalidArgument)?;
+                    if file_end > data.len() {
+                        return Err(Error::InvalidArgument);
+                    }
+                    if ph.p_filesz > ph.p_memsz {
+                        return Err(Error::InvalidArgument);
+                    }
+                    // Capture the segment end address: reject both u64 wrap-around
+                    // (overflow attack) and any end address that exceeds the user
+                    // virtual address space limit.  Using strict > means a segment
+                    // whose end equals TASK_SIZE_MAX exactly is still accepted.
+                    let seg_end = ph
+                        .p_vaddr
+                        .checked_add(ph.p_memsz)
+                        .ok_or(Error::InvalidArgument)?;
+                    if seg_end > TASK_SIZE_MAX {
+                        return Err(Error::InvalidArgument);
                     }
                 }
                 PhdrType::GnuStack => {

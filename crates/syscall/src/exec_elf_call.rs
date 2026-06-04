@@ -52,6 +52,11 @@ pub const MAX_PHDRS: usize = 64;
 pub const PAGE_SIZE: u64 = 4096;
 /// Page mask.
 pub const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
+/// Upper bound on a PT_LOAD segment's virtual memory size (128 TiB on x86-64).
+///
+/// Segments larger than this are almost certainly decompression-bomb attacks.
+/// The value is identical to Linux's `TASK_SIZE_MAX` for x86-64.
+pub const TASK_SIZE_MAX: u64 = 0x0000_7FFF_FFFF_F000;
 
 // ---------------------------------------------------------------------------
 // Elf64Phdr — ELF64 program header
@@ -105,8 +110,17 @@ impl Elf64Phdr {
         self.p_vaddr & PAGE_MASK
     }
 
-    /// Validate basic constraints.
-    pub fn validate(&self) -> Result<()> {
+    /// Validate basic constraints for a PT_LOAD segment.
+    ///
+    /// `file_len` is the total byte length of the ELF image on disk; it is
+    /// used to ensure `p_offset + p_filesz` does not exceed the file, which
+    /// would otherwise allow an out-of-bounds read when the loader copies file
+    /// data into the mapped segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if any constraint is violated.
+    pub fn validate(&self, file_len: usize) -> Result<()> {
         if self.p_type != PT_LOAD {
             return Ok(()); // Non-LOAD segments have relaxed constraints.
         }
@@ -114,6 +128,27 @@ impl Elf64Phdr {
             return Err(Error::InvalidArgument); // Not a power of two.
         }
         if self.p_filesz > self.p_memsz {
+            return Err(Error::InvalidArgument);
+        }
+        // Reject both u64 wrap-around and any end address that exceeds the
+        // user virtual address space limit.  Checking only p_memsz is
+        // insufficient: p_vaddr = TASK_SIZE_MAX with p_memsz = 1 passes a
+        // bare size check yet places the segment end in kernel virtual space.
+        // Using strict > allows a segment whose end equals TASK_SIZE_MAX.
+        let seg_end = self
+            .p_vaddr
+            .checked_add(self.p_memsz)
+            .ok_or(Error::InvalidArgument)?;
+        if seg_end > TASK_SIZE_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        // Ensure p_offset + p_filesz is within the file image.
+        let file_off = self.p_offset as usize;
+        let file_sz = self.p_filesz as usize;
+        let file_end = file_off
+            .checked_add(file_sz)
+            .ok_or(Error::InvalidArgument)?;
+        if file_end > file_len {
             return Err(Error::InvalidArgument);
         }
         Ok(())
@@ -231,6 +266,8 @@ impl ElfParseResult {
 /// * `phdrs`       — Slice of program headers.
 /// * `entry_point` — ELF entry point from the ELF header.
 /// * `interp_data` — Optional data from the PT_INTERP segment.
+/// * `file_len`    — Total byte length of the ELF image; used to bounds-check
+///                   `PT_LOAD` segment file offsets.
 ///
 /// # Errors
 ///
@@ -239,6 +276,7 @@ pub fn parse_program_headers(
     phdrs: &[Elf64Phdr],
     entry_point: u64,
     interp_data: Option<&[u8]>,
+    file_len: usize,
 ) -> Result<ElfParseResult> {
     if phdrs.len() > MAX_PHDRS {
         return Err(Error::InvalidArgument);
@@ -247,7 +285,7 @@ pub fn parse_program_headers(
     let mut result = ElfParseResult::new(entry_point);
 
     for phdr in phdrs {
-        phdr.validate()?;
+        phdr.validate(file_len)?;
 
         match phdr.p_type {
             PT_LOAD => {
@@ -311,7 +349,9 @@ mod tests {
     #[test]
     fn parse_basic_binary() {
         let phdrs = [text_phdr(), data_phdr()];
-        let r = parse_program_headers(&phdrs, 0x40_1000, None).unwrap();
+        // file_len must cover the highest offset + filesz used in the test
+        // phdrs: text at offset 0 size 4096, data at offset 4096 size 512 → 4608
+        let r = parse_program_headers(&phdrs, 0x40_1000, None, 8192).unwrap();
         assert_eq!(r.segment_count, 2);
         assert!(!r.is_dynamic());
     }
@@ -338,7 +378,8 @@ mod tests {
             p_align: 1,
         };
         let phdrs = [text_phdr(), interp_phdr];
-        let r = parse_program_headers(&phdrs, 0, Some(b"/lib/ld-linux.so.2")).unwrap();
+        // file_len must cover text segment (offset 0, size 4096) = 4096
+        let r = parse_program_headers(&phdrs, 0, Some(b"/lib/ld-linux.so.2"), 4096).unwrap();
         assert!(r.is_dynamic());
         assert_eq!(&r.interp_path_str(), b"/lib/ld-linux.so.2");
     }
@@ -350,7 +391,8 @@ mod tests {
             p_flags: PF_R | PF_W, // no X
             ..Default::default()
         };
-        let r = parse_program_headers(&[stack], 0, None).unwrap();
+        // GNU_STACK is not PT_LOAD so file_len is irrelevant; use 0.
+        let r = parse_program_headers(&[stack], 0, None, 0).unwrap();
         assert!(r.noexec_stack);
     }
 
@@ -359,15 +401,100 @@ mod tests {
         let mut bad = text_phdr();
         bad.p_filesz = 8192;
         bad.p_memsz = 4096;
-        assert_eq!(bad.validate(), Err(Error::InvalidArgument));
+        // file_len is irrelevant here because filesz > memsz is caught first.
+        assert_eq!(bad.validate(65536), Err(Error::InvalidArgument));
     }
 
     #[test]
     fn too_many_phdrs() {
         let phdrs = [const { Elf64Phdr::default() }; 65];
         assert_eq!(
-            parse_program_headers(&phdrs, 0, None),
+            parse_program_headers(&phdrs, 0, None, 0),
             Err(Error::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn vaddr_memsz_overflow_rejected() {
+        // p_vaddr near usize::MAX: p_vaddr + p_memsz wraps.
+        let bad = Elf64Phdr {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: u64::MAX - 1,
+            p_paddr: u64::MAX - 1,
+            p_filesz: 1,
+            p_memsz: 4096,
+            p_align: PAGE_SIZE,
+        };
+        assert_eq!(bad.validate(65536), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn memsz_exceeds_task_size_rejected() {
+        let bad = Elf64Phdr {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: 0x40_0000,
+            p_paddr: 0x40_0000,
+            p_filesz: 0,
+            p_memsz: TASK_SIZE_MAX + 1,
+            p_align: PAGE_SIZE,
+        };
+        assert_eq!(bad.validate(65536), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn high_vaddr_small_memsz_end_exceeds_task_size_rejected() {
+        // p_vaddr = TASK_SIZE_MAX, p_memsz = 1: end address overflows into
+        // kernel virtual space even though p_memsz alone is tiny.  This was
+        // the specific attack vector fixed by checking seg_end > TASK_SIZE_MAX
+        // instead of p_memsz > TASK_SIZE_MAX.
+        let bad = Elf64Phdr {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: TASK_SIZE_MAX,
+            p_paddr: TASK_SIZE_MAX,
+            p_filesz: 0,
+            p_memsz: 1,
+            p_align: PAGE_SIZE,
+        };
+        assert_eq!(bad.validate(65536), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn seg_end_exactly_task_size_accepted() {
+        // A segment whose end address equals TASK_SIZE_MAX exactly is valid
+        // (strict > comparison).
+        let ok = Elf64Phdr {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: TASK_SIZE_MAX - 4096,
+            p_paddr: TASK_SIZE_MAX - 4096,
+            p_filesz: 0,
+            p_memsz: 4096,
+            p_align: PAGE_SIZE,
+        };
+        assert!(ok.validate(65536).is_ok());
+    }
+
+    #[test]
+    fn segment_beyond_file_rejected() {
+        // p_offset + p_filesz > file_len
+        let bad = Elf64Phdr {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: 0x40_0000,
+            p_paddr: 0x40_0000,
+            p_filesz: 8192,
+            p_memsz: 8192,
+            p_align: PAGE_SIZE,
+        };
+        // file_len is only 4096 — segment extends beyond file.
+        assert_eq!(bad.validate(4096), Err(Error::InvalidArgument));
     }
 }

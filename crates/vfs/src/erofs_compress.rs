@@ -42,6 +42,10 @@
 //! - Linux `fs/erofs/compress.c`, `fs/erofs/zdata.c`
 //! - EROFS on-disk format documentation
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use core::mem::MaybeUninit;
 use oncrix_lib::{Error, Result};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -232,13 +236,19 @@ impl DecompressCtx {
             // Literal length from upper nibble.
             let mut lit_len = token >> 4;
             if lit_len == 15 {
+                // Length-extension loop: accumulate extra bytes until < 255.
+                // Use checked_add and cap to MAX_DECOMPRESSED_SIZE to prevent
+                // integer overflow and decompression-bomb from crafted input.
                 loop {
                     if src >= input.len() {
                         return Err(Error::IoError);
                     }
                     let extra = input[src] as usize;
                     src += 1;
-                    lit_len += extra;
+                    lit_len = lit_len.checked_add(extra).ok_or(Error::InvalidArgument)?;
+                    if lit_len > MAX_DECOMPRESSED_SIZE {
+                        return Err(Error::InvalidArgument);
+                    }
                     if extra != 255 {
                         break;
                     }
@@ -267,34 +277,45 @@ impl DecompressCtx {
             }
             let offset = (input[src] as usize) | ((input[src + 1] as usize) << 8);
             src += 2;
-            if offset == 0 {
-                return Err(Error::IoError);
-            }
 
             // Match length from lower nibble + 4 minimum.
             let mut match_len = (token & 0x0F) + 4;
             if match_len - 4 == 15 {
+                // Length-extension loop: use checked_add + cap to prevent
+                // overflow and decompression-bomb from crafted input.
                 loop {
                     if src >= input.len() {
                         return Err(Error::IoError);
                     }
                     let extra = input[src] as usize;
                     src += 1;
-                    match_len += extra;
+                    match_len = match_len.checked_add(extra).ok_or(Error::InvalidArgument)?;
+                    if match_len > MAX_DECOMPRESSED_SIZE {
+                        return Err(Error::InvalidArgument);
+                    }
                     if extra != 255 {
                         break;
                     }
                 }
             }
 
-            if dst < offset {
+            // Validate match back-reference: offset must be in [1, dst].
+            if offset == 0 || dst < offset {
                 return Err(Error::IoError);
             }
             let match_src = dst - offset;
+            // Bound copy by remaining output space.
+            let remaining_out = MAX_DECOMPRESSED_SIZE - dst;
+            if match_len > remaining_out {
+                return Err(Error::InvalidArgument);
+            }
             for i in 0..match_len {
-                if dst >= MAX_DECOMPRESSED_SIZE {
-                    return Err(Error::InvalidArgument);
-                }
+                // match_src + i is bounded: match_src < dst <= MAX_DECOMPRESSED_SIZE,
+                // and LZ4 allows overlapping (match_src + i may reach dst).
+                // Since match_len <= remaining_out and remaining_out = MAX - dst,
+                // dst + match_len <= MAX_DECOMPRESSED_SIZE, so dst is always valid.
+                // match_src + i grows by 1 each iteration; it can equal dst when
+                // offset == 1 (run-length expansion), which is valid.
                 self.output[dst] = self.output[match_src + i];
                 dst += 1;
             }
@@ -441,20 +462,49 @@ impl ErofsCompressedFile {
 
         if cluster.cluster_type == ClusterType::Plain || cluster.algo == CompressionAlgo::None {
             // Plain (uncompressed) cluster — read directly.
-            let mut buf = [0u8; MAX_DECOMPRESSED_SIZE];
-            let n = block_reader(cluster.blkaddr, cluster.block_offset, &mut buf)?;
+            // Heap-allocate the 64 KiB read buffer to avoid a kernel-stack overflow.
+            // SAFETY: the buffer is immediately passed to block_reader which fills it;
+            // we only read bytes [0..n] which block_reader guarantees are initialised.
+            let mut buf_uninit: Box<MaybeUninit<[u8; MAX_DECOMPRESSED_SIZE]>> =
+                Box::try_new_uninit().map_err(|_| Error::OutOfMemory)?;
+            // SAFETY: zeroing the buffer makes all bytes a valid u8 (0).
+            unsafe { buf_uninit.as_mut_ptr().write_bytes(0, 1) };
+            // SAFETY: all bytes were just zeroed; the all-zero pattern is valid for [u8; N].
+            let mut buf_box: Box<[u8; MAX_DECOMPRESSED_SIZE]> = unsafe { buf_uninit.assume_init() };
+            let n = block_reader(cluster.blkaddr, cluster.block_offset, buf_box.as_mut())?;
+            // Guard: block_reader must not claim more bytes than the fixed buffer
+            // holds.  A crafted or buggy block device returning n > buf_box.len()
+            // would otherwise produce an out-of-bounds slice below.
+            if n > buf_box.len() {
+                return Err(Error::IoError);
+            }
             let available = n.saturating_sub(cluster_offset as usize);
             let to_copy = available.min(dst.len());
-            dst[..to_copy]
-                .copy_from_slice(&buf[cluster_offset as usize..cluster_offset as usize + to_copy]);
+            dst[..to_copy].copy_from_slice(
+                &buf_box[cluster_offset as usize..cluster_offset as usize + to_copy],
+            );
             return Ok(to_copy);
         }
 
         // Compressed cluster: decompress then slice.
-        let mut ctx = DecompressCtx::default();
+        // Heap-allocate the DecompressCtx (128 KiB of fixed buffers) and the
+        // compressed staging buffer (64 KiB) to avoid a kernel-stack overflow.
+        let mut ctx_uninit: Box<MaybeUninit<DecompressCtx>> =
+            Box::try_new_uninit().map_err(|_| Error::OutOfMemory)?;
+        // SAFETY: zeroing the struct makes all fields 0; CompressionAlgo::None == 0
+        // and all integer/array fields are valid at zero.
+        unsafe { ctx_uninit.as_mut_ptr().write_bytes(0, 1) };
+        // SAFETY: all bytes were initialised by write_bytes above.
+        let mut ctx: Box<DecompressCtx> = unsafe { ctx_uninit.assume_init() };
         ctx.algo = cluster.algo;
-        let mut compressed = [0u8; MAX_COMPRESSED_SIZE];
-        let n = block_reader(cluster.blkaddr, cluster.block_offset, &mut compressed)?;
+
+        let mut comp_uninit: Box<MaybeUninit<[u8; MAX_COMPRESSED_SIZE]>> =
+            Box::try_new_uninit().map_err(|_| Error::OutOfMemory)?;
+        // SAFETY: zeroing makes all bytes a valid u8 (0).
+        unsafe { comp_uninit.as_mut_ptr().write_bytes(0, 1) };
+        // SAFETY: all bytes were just zeroed.
+        let mut compressed: Box<[u8; MAX_COMPRESSED_SIZE]> = unsafe { comp_uninit.assume_init() };
+        let n = block_reader(cluster.blkaddr, cluster.block_offset, compressed.as_mut())?;
         ctx.load_input(&compressed[..n.min(cluster.compressed_size as usize)])?;
         ctx.decompress()?;
 
