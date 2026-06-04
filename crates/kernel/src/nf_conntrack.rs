@@ -327,18 +327,62 @@ impl ConnTrackEntry {
 }
 
 // =========================================================================
+// Slot — open-addressing slot state with tombstones
+// =========================================================================
+
+/// A single hash-table slot.
+///
+/// Open addressing with linear probing requires distinguishing a slot
+/// that was *never* used ([`Slot::Empty`]) from one whose entry was
+/// *deleted* ([`Slot::Tombstone`]).  A probe must stop only at
+/// `Empty`; stopping at a deleted hole would make any entry inserted
+/// later in the same probe chain unreachable — a conntrack miss that
+/// an attacker can weaponise into state confusion or policy bypass.
+#[derive(Debug, Clone)]
+enum Slot {
+    /// Slot has never held an entry; terminates a probe chain.
+    Empty,
+    /// Slot previously held an entry that was removed; a probe must
+    /// continue past it, but an insert may reclaim it.
+    Tombstone,
+    /// Slot holds a live connection entry.
+    Occupied(ConnTrackEntry),
+}
+
+impl Slot {
+    /// Borrow the contained entry, if occupied.
+    const fn entry(&self) -> Option<&ConnTrackEntry> {
+        match self {
+            Slot::Occupied(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Mutably borrow the contained entry, if occupied.
+    fn entry_mut(&mut self) -> Option<&mut ConnTrackEntry> {
+        match self {
+            Slot::Occupied(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+// =========================================================================
 // ConnTrackTable
 // =========================================================================
 
 /// Fixed-size connection tracking table.
 ///
 /// Stores up to [`CONNTRACK_TABLE_SIZE`] entries indexed by hash of
-/// the 5-tuple.  Collisions are resolved by linear probing.
+/// the 5-tuple.  Collisions are resolved by linear probing, with
+/// tombstones so that deletions never sever a probe chain.
 pub struct ConnTrackTable {
     /// Storage for connection entries.
-    entries: [Option<ConnTrackEntry>; CONNTRACK_TABLE_SIZE],
-    /// Number of active entries.
+    entries: [Slot; CONNTRACK_TABLE_SIZE],
+    /// Number of live (occupied) entries.
     count: usize,
+    /// Number of tombstone slots awaiting reclamation.
+    tombstones: usize,
     /// Current monotonic tick counter for timeout management.
     current_tick: u64,
     /// Total packets processed.
@@ -347,10 +391,12 @@ pub struct ConnTrackTable {
     total_new: u64,
     /// Total entries that timed out.
     total_expired: u64,
+    /// Total entries evicted to make room under table pressure.
+    total_evicted: u64,
 }
 
-/// Helper to create the `None`-initialised array at compile time.
-const EMPTY_ENTRY: Option<ConnTrackEntry> = None;
+/// Helper to create the empty-initialised array at compile time.
+const EMPTY_SLOT: Slot = Slot::Empty;
 
 impl Default for ConnTrackTable {
     fn default() -> Self {
@@ -362,12 +408,14 @@ impl ConnTrackTable {
     /// Create a new empty connection tracking table.
     pub const fn new() -> Self {
         Self {
-            entries: [EMPTY_ENTRY; CONNTRACK_TABLE_SIZE],
+            entries: [EMPTY_SLOT; CONNTRACK_TABLE_SIZE],
             count: 0,
+            tombstones: 0,
             current_tick: 0,
             total_packets: 0,
             total_new: 0,
             total_expired: 0,
+            total_evicted: 0,
         }
     }
 
@@ -396,21 +444,27 @@ impl ConnTrackTable {
         self.total_expired
     }
 
+    /// Return total entries evicted under table pressure.
+    pub const fn total_evicted(&self) -> u64 {
+        self.total_evicted
+    }
+
     /// Advance the tick counter and expire stale entries.
     ///
     /// Call this periodically (e.g. once per timer interrupt) to
-    /// age out connections that have exceeded their timeout.
+    /// age out connections that have exceeded their timeout.  Expired
+    /// slots become tombstones so that probe chains stay intact.
     pub fn tick(&mut self, ticks: u64) {
         self.current_tick = self.current_tick.saturating_add(ticks);
         for slot in self.entries.iter_mut() {
-            if let Some(entry) = slot {
+            if let Slot::Occupied(entry) = slot {
                 if entry.timeout <= ticks {
-                    entry.active = false;
-                    *slot = None;
+                    *slot = Slot::Tombstone;
                     self.count = self.count.saturating_sub(1);
+                    self.tombstones = self.tombstones.saturating_add(1);
                     self.total_expired = self.total_expired.saturating_add(1);
                 } else {
-                    entry.timeout -= ticks;
+                    entry.timeout = entry.timeout.saturating_sub(ticks);
                 }
             }
         }
@@ -421,12 +475,16 @@ impl ConnTrackTable {
     /// Searches for a match on either the original or reply tuple.
     /// Returns a reference to the entry and a boolean indicating
     /// whether the match was on the reply direction (`true` = reply).
+    ///
+    /// Probing continues past [`Slot::Tombstone`] holes and stops
+    /// only at [`Slot::Empty`], so an entry inserted behind a deleted
+    /// predecessor in the same chain remains reachable.
     pub fn lookup(&self, tuple: &ConnTrackTuple) -> Option<(&ConnTrackEntry, bool)> {
         let start = tuple.hash();
         for i in 0..CONNTRACK_TABLE_SIZE {
             let idx = (start + i) % CONNTRACK_TABLE_SIZE;
             match &self.entries[idx] {
-                Some(entry) if entry.active => {
+                Slot::Occupied(entry) if entry.active => {
                     if entry.original == *tuple {
                         return Some((entry, false));
                     }
@@ -434,7 +492,7 @@ impl ConnTrackTable {
                         return Some((entry, true));
                     }
                 }
-                None => return None,
+                Slot::Empty => return None,
                 _ => {}
             }
         }
@@ -442,22 +500,26 @@ impl ConnTrackTable {
     }
 
     /// Look up a connection by 5-tuple (mutable).
+    ///
+    /// Like [`Self::lookup`], probing skips tombstones and terminates
+    /// only on an empty slot.
     fn lookup_mut(&mut self, tuple: &ConnTrackTuple) -> Option<(&mut ConnTrackEntry, bool)> {
         let start = tuple.hash();
         for i in 0..CONNTRACK_TABLE_SIZE {
             let idx = (start + i) % CONNTRACK_TABLE_SIZE;
             match &self.entries[idx] {
-                Some(entry) if entry.active => {
-                    if entry.original == *tuple {
-                        let e = self.entries[idx].as_mut()?;
-                        return Some((e, false));
-                    }
-                    if entry.reply == *tuple {
-                        let e = self.entries[idx].as_mut()?;
-                        return Some((e, true));
-                    }
+                Slot::Occupied(entry) if entry.active => {
+                    let is_reply = if entry.original == *tuple {
+                        false
+                    } else if entry.reply == *tuple {
+                        true
+                    } else {
+                        continue;
+                    };
+                    let e = self.entries[idx].entry_mut()?;
+                    return Some((e, is_reply));
                 }
-                None => return None,
+                Slot::Empty => return None,
                 _ => {}
             }
         }
@@ -523,23 +585,126 @@ impl ConnTrackTable {
     }
 
     /// Insert a new connection entry.
+    ///
+    /// Probes the chain for the first reclaimable slot (empty or
+    /// tombstone).  If the entire table is occupied, attempts a
+    /// single bounded eviction (see [`Self::evict_one`]) before
+    /// retrying; only if nothing is reclaimable does it fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the table is full and no
+    /// entry can be evicted.
+    ///
+    /// # Precondition
+    ///
+    /// The caller MUST have performed a full-chain `lookup_mut` for `tuple`
+    /// and found no match first (as `process_packet` does). `find_insert_slot`
+    /// reuses the earliest `Empty`/`Tombstone` slot without re-scanning the
+    /// remainder of the probe chain for a duplicate, so calling this without a
+    /// preceding miss could insert a duplicate tuple and split the chain.
     fn insert_new(&mut self, tuple: &ConnTrackTuple, packet_len: u64) -> Result<ConnTrackState> {
-        let start = tuple.hash();
-        for i in 0..CONNTRACK_TABLE_SIZE {
-            let idx = (start + i) % CONNTRACK_TABLE_SIZE;
-            if self.entries[idx].is_none() {
-                let mut entry = ConnTrackEntry::new(*tuple, self.current_tick);
-                entry.orig_bytes = packet_len;
-                self.entries[idx] = Some(entry);
-                self.count += 1;
-                self.total_new = self.total_new.saturating_add(1);
+        if let Some(idx) = self.find_insert_slot(tuple) {
+            self.place_entry(idx, tuple, packet_len);
+            return Ok(ConnTrackState::New);
+        }
+
+        // Table saturated on this chain with no empty/tombstone slot:
+        // try to reclaim one entry, then retry the probe once.
+        if self.evict_one() {
+            if let Some(idx) = self.find_insert_slot(tuple) {
+                self.place_entry(idx, tuple, packet_len);
                 return Ok(ConnTrackState::New);
             }
         }
+
         Err(Error::OutOfMemory)
     }
 
+    /// Find the index of the first reclaimable slot along `tuple`'s
+    /// probe chain, preferring the earliest tombstone or empty slot.
+    fn find_insert_slot(&self, tuple: &ConnTrackTuple) -> Option<usize> {
+        let start = tuple.hash();
+        for i in 0..CONNTRACK_TABLE_SIZE {
+            let idx = (start + i) % CONNTRACK_TABLE_SIZE;
+            match &self.entries[idx] {
+                Slot::Empty | Slot::Tombstone => return Some(idx),
+                Slot::Occupied(_) => {}
+            }
+        }
+        None
+    }
+
+    /// Write a fresh entry into a known-reclaimable slot, updating
+    /// the live/tombstone counters.
+    fn place_entry(&mut self, idx: usize, tuple: &ConnTrackTuple, packet_len: u64) {
+        if matches!(self.entries[idx], Slot::Tombstone) {
+            self.tombstones = self.tombstones.saturating_sub(1);
+        }
+        let mut entry = ConnTrackEntry::new(*tuple, self.current_tick);
+        entry.orig_bytes = packet_len;
+        self.entries[idx] = Slot::Occupied(entry);
+        self.count = self.count.saturating_add(1);
+        self.total_new = self.total_new.saturating_add(1);
+    }
+
+    /// Reclaim one slot under table pressure.
+    ///
+    /// Scans the whole table once (O(table)) and evicts, in priority
+    /// order:
+    ///
+    /// 1. an already-expired entry (`timeout == 0`), if any;
+    /// 2. otherwise the oldest entry still in the unconfirmed `New`
+    ///    state (a half-open / flood candidate), by `created_tick`.
+    ///
+    /// Confirmed (`Established` / `Related`) flows are never evicted
+    /// here, so an attacker flooding new tuples cannot displace a
+    /// legitimate established connection.  Returns `true` if an entry
+    /// was evicted (leaving a tombstone).
+    fn evict_one(&mut self) -> bool {
+        let mut expired_idx: Option<usize> = None;
+        let mut oldest_new_idx: Option<usize> = None;
+        let mut oldest_new_tick: u64 = u64::MAX;
+
+        for (idx, slot) in self.entries.iter().enumerate() {
+            if let Slot::Occupied(entry) = slot {
+                if entry.is_expired() {
+                    expired_idx = Some(idx);
+                    break;
+                }
+                if entry.state == ConnTrackState::New && entry.created_tick <= oldest_new_tick {
+                    oldest_new_tick = entry.created_tick;
+                    oldest_new_idx = Some(idx);
+                }
+            }
+        }
+
+        let victim = expired_idx.or(oldest_new_idx);
+        if let Some(idx) = victim {
+            self.entries[idx] = Slot::Tombstone;
+            self.count = self.count.saturating_sub(1);
+            self.tombstones = self.tombstones.saturating_add(1);
+            self.total_evicted = self.total_evicted.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
     /// Update TCP-specific connection state based on flags.
+    ///
+    /// # Security
+    ///
+    /// TCP flags here are attacker-controlled.  This tracker does not
+    /// carry per-direction send/receive windows, so a full RFC 5961
+    /// sequence-validated RST/SYN check is out of scope (it would
+    /// require window state not present in [`ConnTrackEntry`]).  As a
+    /// lightweight mitigation we apply a *contextual* RST filter
+    /// instead of honouring every RST: a RST is only allowed to tear
+    /// down a flow when it is plausible for the current sub-state.
+    /// This rejects the classic blind off-path RST shapes while
+    /// preserving legitimate teardown (RST-ACK refusals, RST on a
+    /// live flow).  The `New -> Established` promotion likewise
+    /// already requires the ACK flag (see the `SynRecv` arm below).
     fn apply_tcp_state(entry: &mut ConnTrackEntry, is_reply: bool, tcp_flags: u16) {
         // TCP flag constants (mirroring tcp.rs)
         const FIN: u16 = 0x01;
@@ -548,9 +713,13 @@ impl ConnTrackTable {
         const ACK: u16 = 0x10;
 
         if tcp_flags & RST != 0 {
-            entry.tcp_state = TcpConnState::Closed;
-            entry.state = ConnTrackState::Invalid;
-            entry.timeout = 10; // Quick expiry
+            if Self::rst_in_context(entry.tcp_state, is_reply, tcp_flags & ACK != 0) {
+                entry.tcp_state = TcpConnState::Closed;
+                entry.state = ConnTrackState::Invalid;
+                entry.timeout = 10; // Quick expiry
+            }
+            // Out-of-context RST: ignore it and keep the existing
+            // state/timeout so a forged segment cannot drop the flow.
             return;
         }
 
@@ -588,7 +757,34 @@ impl ConnTrackTable {
         }
     }
 
+    /// Decide whether a RST is plausible enough to act on, given the
+    /// current TCP sub-state, the packet direction, and whether the
+    /// segment also carries ACK.
+    ///
+    /// This is a coarse contextual filter (not a sequence check): it
+    /// drops the off-path shapes that have no legitimate counterpart
+    /// while letting real teardown through.
+    ///
+    /// * `SynSent` — only a *reply* RST-ACK (a peer refusing the
+    ///   connection) is honoured.  A RST from the initiator side, or
+    ///   any bare RST without ACK, before a handshake exists is
+    ///   treated as forged and ignored.
+    /// * `Closed` — the flow is already torn down; a further RST is
+    ///   redundant and ignored (prevents timeout churn).
+    /// * any other established/closing sub-state — a RST is accepted,
+    ///   matching normal abortive-close behaviour.
+    const fn rst_in_context(state: TcpConnState, is_reply: bool, has_ack: bool) -> bool {
+        match state {
+            TcpConnState::SynSent => is_reply && has_ack,
+            TcpConnState::Closed => false,
+            _ => true,
+        }
+    }
+
     /// Remove a connection entry by 5-tuple.
+    ///
+    /// The freed slot becomes a [`Slot::Tombstone`] so that any entry
+    /// inserted later in the same probe chain stays reachable.
     ///
     /// # Errors
     ///
@@ -598,14 +794,15 @@ impl ConnTrackTable {
         for i in 0..CONNTRACK_TABLE_SIZE {
             let idx = (start + i) % CONNTRACK_TABLE_SIZE;
             match &self.entries[idx] {
-                Some(entry)
+                Slot::Occupied(entry)
                     if entry.active && (entry.original == *tuple || entry.reply == *tuple) =>
                 {
-                    self.entries[idx] = None;
+                    self.entries[idx] = Slot::Tombstone;
                     self.count = self.count.saturating_sub(1);
+                    self.tombstones = self.tombstones.saturating_add(1);
                     return Ok(());
                 }
-                None => return Err(Error::NotFound),
+                Slot::Empty => return Err(Error::NotFound),
                 _ => {}
             }
         }
@@ -613,11 +810,15 @@ impl ConnTrackTable {
     }
 
     /// Remove all entries, resetting the table to empty.
+    ///
+    /// A full reset clears every slot — including tombstones — so the
+    /// chain-preservation invariant is trivially restored.
     pub fn flush(&mut self) {
         for slot in self.entries.iter_mut() {
-            *slot = None;
+            *slot = Slot::Empty;
         }
         self.count = 0;
+        self.tombstones = 0;
     }
 
     /// Set a mark value on a tracked connection.
@@ -673,7 +874,7 @@ impl ConnTrackTable {
     where
         F: FnMut(&ConnTrackEntry),
     {
-        for entry in self.entries.iter().flatten() {
+        for entry in self.entries.iter().filter_map(Slot::entry) {
             if entry.active {
                 f(entry);
             }
@@ -683,7 +884,7 @@ impl ConnTrackTable {
     /// Return the number of entries in a given state.
     pub fn count_by_state(&self, state: ConnTrackState) -> usize {
         let mut n = 0;
-        for entry in self.entries.iter().flatten() {
+        for entry in self.entries.iter().filter_map(Slot::entry) {
             if entry.active && entry.state == state {
                 n += 1;
             }
@@ -700,13 +901,16 @@ impl ConnTrackTable {
     /// housekeeping independent of the tick rate.
     ///
     /// Returns the number of entries reclaimed.
+    ///
+    /// Reclaimed slots become tombstones, preserving probe chains.
     pub fn gc_sweep(&mut self) -> usize {
         let mut reclaimed = 0;
         for slot in self.entries.iter_mut() {
-            if let Some(entry) = slot {
+            if let Slot::Occupied(entry) = slot {
                 if !entry.active || entry.is_expired() {
-                    *slot = None;
+                    *slot = Slot::Tombstone;
                     self.count = self.count.saturating_sub(1);
+                    self.tombstones = self.tombstones.saturating_add(1);
                     self.total_expired = self.total_expired.saturating_add(1);
                     reclaimed += 1;
                 }
@@ -718,15 +922,17 @@ impl ConnTrackTable {
     /// Perform a targeted GC sweep, removing entries in a specific
     /// state that have exceeded a given age threshold.
     ///
-    /// Returns the number of entries removed.
+    /// Returns the number of entries removed.  Removed slots become
+    /// tombstones, preserving probe chains.
     pub fn gc_sweep_by_state(&mut self, state: ConnTrackState, max_age: u64) -> usize {
         let threshold = self.current_tick.saturating_sub(max_age);
         let mut removed = 0;
         for slot in self.entries.iter_mut() {
-            if let Some(entry) = slot {
+            if let Slot::Occupied(entry) = slot {
                 if entry.active && entry.state == state && entry.created_tick < threshold {
-                    *slot = None;
+                    *slot = Slot::Tombstone;
                     self.count = self.count.saturating_sub(1);
+                    self.tombstones = self.tombstones.saturating_add(1);
                     self.total_expired = self.total_expired.saturating_add(1);
                     removed += 1;
                 }
