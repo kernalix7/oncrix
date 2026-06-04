@@ -263,7 +263,13 @@ impl DirectoryRecord {
         let volume_seq = read_u16_lsb(&data[28..30]);
         let name_len = data[32];
 
-        let actual_name_len = (name_len as usize).min(MAX_NAME_LEN);
+        // Cross-check name_len against record_len: the on-disk name_len field
+        // is attacker-controlled and must not exceed what the record boundary
+        // actually allows.  record_len is already validated >= 33 above, so
+        // this subtraction is safe.  The three-way min prevents reading past
+        // the record boundary, past our fixed buffer, or past the data slice.
+        let max_by_record = (record_len as usize).saturating_sub(33);
+        let actual_name_len = (name_len as usize).min(MAX_NAME_LEN).min(max_by_record);
         let mut name = [0u8; MAX_NAME_LEN];
         if actual_name_len > 0 && data.len() >= 33 + actual_name_len {
             name[..actual_name_len].copy_from_slice(&data[33..33 + actual_name_len]);
@@ -312,11 +318,27 @@ impl DirectoryRecord {
 
     /// Returns the system use area offset within this record.
     ///
-    /// The system use area begins after the file identifier and
-    /// optional padding byte (identifiers are padded to even length).
+    /// The system use area begins after the file identifier and the optional
+    /// padding byte that follows it (ISO 9660 §9.1.12: the file identifier is
+    /// padded to an even total length with one extra 0x00 byte when name_len
+    /// is even).
+    ///
+    /// The on-disk record layout is defined by the raw `name_len` field (the
+    /// actual byte written in the image), NOT by the clamped `name_actual_len`
+    /// stored in this struct.  Using the clamped value would produce wrong
+    /// Rock Ridge offsets whenever clamped != raw (e.g. when `name_len` exceeds
+    /// `record_len - 33`).  We still clamp the resulting offset to
+    /// `record_len` so we never escape the record boundary.
     pub fn system_use_offset(&self) -> usize {
-        let id_len = self.name_actual_len;
-        33 + id_len + (1 - (id_len & 1))
+        // Use the raw on-disk name_len for the layout calculation.
+        let raw_name_len = self.name_len as usize;
+        // ISO 9660 §9.1.12: padding byte is present when name_len is even.
+        // The expression (1 - (raw_name_len & 1)) yields 1 for even, 0 for odd.
+        let computed = 33usize
+            .saturating_add(raw_name_len)
+            .saturating_add(1 - (raw_name_len & 1));
+        // Clamp to record_len so we never escape the record boundary.
+        computed.min(self.record_len as usize)
     }
 
     /// Returns the length of the system use area in bytes.
@@ -720,7 +742,11 @@ impl<'a> Iso9660Fs<'a> {
     fn load_path_table(&mut self) -> Result<()> {
         let pt_lba = self.pvd.path_table_l_location as usize;
         let pt_size = self.pvd.path_table_size as usize;
-        let pt_offset = pt_lba * SECTOR_SIZE;
+        // Checked multiply: pt_lba is attacker-controlled and can overflow on
+        // 32-bit targets without this guard.
+        let pt_offset = pt_lba
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::InvalidArgument)?;
 
         if pt_offset + pt_size > self.data.len() {
             return Ok(());
@@ -754,7 +780,11 @@ impl<'a> Iso9660Fs<'a> {
         extent_lba: u32,
         extent_size: u32,
     ) -> Result<([DirectoryRecord; MAX_DIR_ENTRIES], usize)> {
-        let offset = extent_lba as usize * SECTOR_SIZE;
+        // Checked multiply: extent_lba is attacker-controlled and can overflow on
+        // 32-bit targets without this guard.
+        let offset = (extent_lba as usize)
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::InvalidArgument)?;
         let size = extent_size as usize;
         if offset + size > self.data.len() {
             return Err(Error::IoError);
@@ -814,7 +844,11 @@ impl<'a> Iso9660Fs<'a> {
             return Err(Error::InvalidArgument);
         }
 
-        let extent_start = record.extent_location as usize * SECTOR_SIZE;
+        // Checked multiply: extent_location is attacker-controlled and can overflow
+        // on 32-bit targets without this guard.
+        let extent_start = (record.extent_location as usize)
+            .checked_mul(SECTOR_SIZE)
+            .ok_or(Error::InvalidArgument)?;
         let file_size = record.data_length as usize;
 
         if extent_start + file_size > self.data.len() {
@@ -850,11 +884,18 @@ impl<'a> Iso9660Fs<'a> {
         if su_len == 0 {
             return RockRidgeAttrs::empty();
         }
-        let abs_off = record_offset + su_off;
-        if abs_off + su_len > dir_extent_data.len() {
+        let abs_off = match record_offset.checked_add(su_off) {
+            Some(v) => v,
+            None => return RockRidgeAttrs::empty(),
+        };
+        let abs_end = match abs_off.checked_add(su_len) {
+            Some(v) => v,
+            None => return RockRidgeAttrs::empty(),
+        };
+        if abs_end > dir_extent_data.len() {
             return RockRidgeAttrs::empty();
         }
-        RockRidgeAttrs::parse(&dir_extent_data[abs_off..abs_off + su_len])
+        RockRidgeAttrs::parse(&dir_extent_data[abs_off..abs_end])
     }
 
     /// Decode a Joliet filename from a directory record.

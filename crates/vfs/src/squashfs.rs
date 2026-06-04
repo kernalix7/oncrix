@@ -196,6 +196,16 @@ impl SquashfsSuperblock {
         // Validate compression id.
         CompressionType::from_u16(compression_id).ok_or(Error::InvalidArgument)?;
 
+        // Reject block_size == 0 (div-by-zero in read_data) and values that
+        // are not a power of two or fall outside the valid SquashFS range
+        // [4096, 1 048 576].  An on-disk image that violates this is malformed.
+        if block_size == 0
+            || !block_size.is_power_of_two()
+            || !(4096..=1_048_576).contains(&block_size)
+        {
+            return Err(Error::InvalidArgument);
+        }
+
         Ok(Self {
             magic,
             inode_count,
@@ -523,7 +533,17 @@ impl<'a> SquashfsFs<'a> {
 
     /// Pre-load fragment table entries from the image.
     fn load_fragment_table(&mut self) -> Result<()> {
-        let frag_start = self.fragment_table_offset as usize;
+        // Guard: convert the on-disk u64 offset to usize; an image larger than
+        // usize::MAX is impossible on any supported target, but an attacker-
+        // controlled value could silently truncate on a 32-bit build.
+        let frag_start =
+            usize::try_from(self.fragment_table_offset).map_err(|_| Error::InvalidArgument)?;
+
+        // The table start must lie within the image.
+        if frag_start >= self.data.len() {
+            return Err(Error::InvalidArgument);
+        }
+
         let frag_count = self.superblock.fragment_count as usize;
         let count = frag_count.min(MAX_FRAGMENT_ENTRIES);
 
@@ -531,8 +551,14 @@ impl<'a> SquashfsFs<'a> {
         const ENTRY_SIZE: usize = 16;
 
         for i in 0..count {
-            let off = frag_start + i * ENTRY_SIZE;
-            if off + ENTRY_SIZE > self.data.len() {
+            // Checked arithmetic: i * ENTRY_SIZE and the subsequent addition
+            // both use checked_* to prevent wrap-around on 32-bit targets.
+            let entry_rel = i.checked_mul(ENTRY_SIZE).ok_or(Error::InvalidArgument)?;
+            let off = frag_start
+                .checked_add(entry_rel)
+                .ok_or(Error::InvalidArgument)?;
+            let end = off.checked_add(ENTRY_SIZE).ok_or(Error::InvalidArgument)?;
+            if end > self.data.len() {
                 break;
             }
             let start_block = u64::from_le_bytes([
@@ -580,7 +606,11 @@ impl<'a> SquashfsFs<'a> {
         // The inode table is a sequence of compressed metadata blocks.
         // In this stub implementation we use the root_inode offset as a
         // base and offset from there. Real decompression is deferred.
-        let base = self.inode_table_offset as usize;
+        //
+        // Guard: convert the on-disk u64 inode table start to usize with a
+        // checked conversion to avoid silent truncation on 32-bit targets.
+        let base = usize::try_from(self.inode_table_offset).map_err(|_| Error::InvalidArgument)?;
+
         // Inode reference encodes block + offset in the 64-bit root_inode field:
         // upper 32 bits = block index, lower 16 bits = offset within block.
         let block_idx = (self.superblock.root_inode >> 16) as usize;
@@ -590,10 +620,19 @@ impl<'a> SquashfsFs<'a> {
         const META_BLOCK_HDR: usize = 2;
         const META_BLOCK_BODY: usize = 8192; // max uncompressed metadata block size
 
-        let block_start = base + block_idx * (META_BLOCK_HDR + META_BLOCK_BODY);
+        // Guard: all arithmetic is checked to prevent overflow when the on-disk
+        // block_idx is attacker-controlled.
+        let block_stride = META_BLOCK_HDR
+            .checked_add(META_BLOCK_BODY)
+            .ok_or(Error::InvalidArgument)?;
+        let block_rel = block_idx
+            .checked_mul(block_stride)
+            .ok_or(Error::InvalidArgument)?;
+        let block_start = base.checked_add(block_rel).ok_or(Error::InvalidArgument)?;
 
         // Minimum inode common header is 16 bytes.
-        if block_start + 16 > self.data.len() {
+        let hdr_end = block_start.checked_add(16).ok_or(Error::InvalidArgument)?;
+        if hdr_end > self.data.len() {
             return Err(Error::IoError);
         }
 
@@ -643,21 +682,35 @@ impl<'a> SquashfsFs<'a> {
 
         let mut entries = [DirectoryEntry::empty(); MAX_DIR_ENTRIES];
 
-        let dir_table_start = self.dir_table_offset as usize;
-        let dir_block = dir_table_start + inode.dir_block_start as usize;
+        // Guard: convert the on-disk u64 directory table start to usize with a
+        // checked conversion; then add each on-disk offset with checked_add so
+        // that an attacker-controlled dir_block_start or dir_offset cannot
+        // produce a wrap-around that bypasses the data.len() bound check.
+        let dir_table_start =
+            usize::try_from(self.dir_table_offset).map_err(|_| Error::InvalidArgument)?;
+        let dir_block = dir_table_start
+            .checked_add(inode.dir_block_start as usize)
+            .ok_or(Error::InvalidArgument)?;
         let dir_off = inode.dir_offset as usize;
 
         // Directory table block header: 2 bytes (compressed size).
         const DIR_HDR: usize = 2;
-        let entry_base = dir_block + DIR_HDR + dir_off;
+        let entry_base = dir_block
+            .checked_add(DIR_HDR)
+            .and_then(|v| v.checked_add(dir_off))
+            .ok_or(Error::InvalidArgument)?;
 
         // Directory block header (12 bytes): count, inode_number, start.
-        if entry_base + 12 > self.data.len() {
+        let hdr_end = entry_base.checked_add(12).ok_or(Error::InvalidArgument)?;
+        if hdr_end > self.data.len() {
             return Ok(entries);
         }
 
         let d = &self.data[entry_base..];
-        let entry_count = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize + 1;
+        // The on-disk count is stored as (actual_count - 1), so add 1.  Use
+        // saturating_add to avoid wrap on a hypothetical 32-bit build where
+        // u32::MAX as usize == usize::MAX.
+        let entry_count = (u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize).saturating_add(1);
         let _header_inode = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
         let _start = u32::from_le_bytes([d[8], d[9], d[10], d[11]]);
 
@@ -715,7 +768,11 @@ impl<'a> SquashfsFs<'a> {
         }
 
         let block_size = self.superblock.block_size as usize;
-        let start_block_byte = inode.start_block as usize;
+        // Guard: inode_table_offset is an on-disk u64; convert to usize with an
+        // explicit checked conversion so a malformed image cannot silently truncate
+        // the offset on a 32-bit target.
+        let start_block_byte =
+            usize::try_from(inode.start_block).map_err(|_| Error::InvalidArgument)?;
 
         // Determine which block contains `offset`.
         let block_idx = offset / block_size;
@@ -724,8 +781,20 @@ impl<'a> SquashfsFs<'a> {
         // Compute on-disk position of the block.
         // Data block headers (4 bytes each) are stored just after the inode.
         // Offset of the first data block header within the inode table:
-        let inode_data_hdr = inode.inode_table_offset as usize + 32; // after common + basic hdr
-        let hdr_off = inode_data_hdr + block_idx * 4;
+        //
+        // All three arithmetic steps below are checked to prevent attacker-
+        // controlled inode_table_offset or block_idx from causing wrap-around
+        // that could bypass the subsequent data.len() bound check.
+        let inode_tbl_off =
+            usize::try_from(inode.inode_table_offset).map_err(|_| Error::InvalidArgument)?;
+        // +32: skip past the common inode header (16 B) and basic-file header (16 B).
+        let inode_data_hdr = inode_tbl_off
+            .checked_add(32)
+            .ok_or(Error::InvalidArgument)?;
+        let hdr_off = block_idx
+            .checked_mul(4)
+            .and_then(|v| inode_data_hdr.checked_add(v))
+            .ok_or(Error::InvalidArgument)?;
 
         if hdr_off + 4 > self.data.len() {
             return Err(Error::IoError);
@@ -739,11 +808,20 @@ impl<'a> SquashfsFs<'a> {
         ]);
 
         // Accumulate byte offset to the start of this data block.
-        let block_abs = start_block_byte + block_idx * block_size;
+        // block_size is validated as power-of-two in [4096, 1 048 576] by
+        // SquashfsSuperblock::parse, so block_idx * block_size cannot overflow
+        // in practice, but we check anyway for defence-in-depth.
+        let block_abs = block_idx
+            .checked_mul(block_size)
+            .and_then(|v| start_block_byte.checked_add(v))
+            .ok_or(Error::InvalidArgument)?;
         let blk = DataBlock::from_raw(raw, block_abs as u64);
 
-        let blk_start = blk.offset as usize;
-        let blk_end = blk_start + blk.size as usize;
+        let blk_start = usize::try_from(blk.offset).map_err(|_| Error::InvalidArgument)?;
+        let blk_size = usize::try_from(blk.size).map_err(|_| Error::InvalidArgument)?;
+        let blk_end = blk_start
+            .checked_add(blk_size)
+            .ok_or(Error::InvalidArgument)?;
 
         if blk_end > self.data.len() {
             return Err(Error::IoError);
