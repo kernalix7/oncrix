@@ -165,13 +165,21 @@ impl Fat32Bpb {
         let backup_boot_sector = read_u16(buf, 50);
 
         // Sanity checks.
-        if bytes_per_sector == 0
-            || !bytes_per_sector.is_power_of_two()
+        // bytes_per_sector must be exactly 512: every sector buffer in this
+        // driver is [0u8; 512], and cluster_size() would saturate to ~4 GiB
+        // for larger sector sizes, making read_cluster request an enormous
+        // slice (ring-0 halt).  Reject any other value outright.
+        //
+        // reserved_sectors must be >= 1.  A value of 0 places the FAT at
+        // sector 0, aliasing it onto the boot sector; fat_start_sector()
+        // would return 0 and every FAT read would corrupt / misparse the BPB.
+        if bytes_per_sector != 512
             || sectors_per_cluster == 0
             || !sectors_per_cluster.is_power_of_two()
             || num_fats == 0
             || fat_size_32 == 0
             || root_cluster < FIRST_DATA_CLUSTER
+            || reserved_sectors == 0
         {
             return Err(Error::InvalidArgument);
         }
@@ -190,8 +198,13 @@ impl Fat32Bpb {
     }
 
     /// Bytes per cluster.
+    ///
+    /// Returns `Err(InvalidArgument)` if the product overflows `u32`.
     pub fn cluster_size(&self) -> u32 {
-        self.bytes_per_sector as u32 * self.sectors_per_cluster as u32
+        // Both fields are validated to be powers-of-two and non-zero; the
+        // product cannot realistically overflow for any spec-legal combination,
+        // but we saturate rather than panic to be safe in kernel context.
+        (self.bytes_per_sector as u32).saturating_mul(self.sectors_per_cluster as u32)
     }
 
     /// First sector of the FAT region.
@@ -200,8 +213,18 @@ impl Fat32Bpb {
     }
 
     /// First sector of the data region.
-    pub fn data_start_sector(&self) -> u32 {
-        self.reserved_sectors as u32 + self.num_fats as u32 * self.fat_size_32
+    ///
+    /// Returns `Err(InvalidArgument)` if the geometry overflows `u32`.  An
+    /// attacker-controlled boot sector can set `num_fats`, `fat_size_32`, or
+    /// `reserved_sectors` to values that would overflow a plain addition; this
+    /// method uses checked arithmetic to prevent that.
+    pub fn data_start_sector(&self) -> Result<u32> {
+        let fats_sectors = (self.num_fats as u32)
+            .checked_mul(self.fat_size_32)
+            .ok_or(Error::InvalidArgument)?;
+        (self.reserved_sectors as u32)
+            .checked_add(fats_sectors)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Convert a cluster number to its first sector number.
@@ -215,7 +238,7 @@ impl Fat32Bpb {
         let sector_offset = offset
             .checked_mul(self.sectors_per_cluster as u32)
             .ok_or(Error::InvalidArgument)?;
-        self.data_start_sector()
+        self.data_start_sector()?
             .checked_add(sector_offset)
             .ok_or(Error::InvalidArgument)
     }
@@ -971,11 +994,36 @@ impl<R: BlockReader> Fat32Fs<R> {
     }
 
     /// Read a FAT entry for the given cluster.
+    ///
+    /// Validates that the entry falls within the declared FAT region before
+    /// performing any I/O.  Without this check a cluster value of 0x3FFFFFFF
+    /// would produce a ~17 GiB byte offset that reads from arbitrary sectors
+    /// (ring-0 fault on unmapped memory or silent wrong-data read).
     pub fn read_fat_entry(&self, cluster: u32) -> Result<FatEntry> {
-        let fat_offset = cluster as u64 * 4;
-        let fat_sector_offset =
+        // Each FAT32 entry is 4 bytes wide.
+        let fat_entry_byte: u64 = (cluster as u64)
+            .checked_mul(4)
+            .ok_or(Error::InvalidArgument)?;
+
+        // FAT region in bytes: [fat_start_byte, fat_start_byte + fat_region_bytes).
+        // bytes_per_sector is validated == 512, so the multiplication is safe
+        // as long as fat_size_32 fits in u32 (which it always does).
+        let fat_start_byte: u64 =
             self.bpb.fat_start_sector() as u64 * self.bpb.bytes_per_sector as u64;
-        let byte_offset = fat_sector_offset + fat_offset;
+        let fat_region_bytes: u64 = self.bpb.fat_size_32 as u64 * self.bpb.bytes_per_sector as u64;
+
+        // Ensure the 4-byte read [fat_entry_byte, fat_entry_byte+4) lies
+        // entirely inside [0, fat_region_bytes).
+        let end_byte = fat_entry_byte
+            .checked_add(4)
+            .ok_or(Error::InvalidArgument)?;
+        if end_byte > fat_region_bytes {
+            return Err(Error::InvalidArgument);
+        }
+
+        let byte_offset = fat_start_byte
+            .checked_add(fat_entry_byte)
+            .ok_or(Error::InvalidArgument)?;
 
         let mut buf = [0u8; 4];
         self.reader.read_bytes(byte_offset, &mut buf)?;

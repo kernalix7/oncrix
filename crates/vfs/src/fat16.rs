@@ -27,7 +27,10 @@
 //! Microsoft FAT File System Specification (2004);
 //! Linux `fs/fat/` source tree.
 
+extern crate alloc;
+
 use crate::ext2::BlockReader;
+use alloc::vec::Vec;
 use oncrix_lib::{Error, Result};
 
 // ── Sector I/O helpers (BlockReader only exposes read_bytes) ─────────────────
@@ -139,7 +142,10 @@ fn parse_bpb(sector: &[u8; 512]) -> Result<Bpb> {
         return Err(Error::InvalidArgument);
     }
     let bytes_per_sector = u16::from_le_bytes([sector[11], sector[12]]);
-    if bytes_per_sector < 512 || bytes_per_sector % 512 != 0 {
+    // All I/O buffers in this driver are exactly 512 bytes.  Accepting any
+    // other sector size would allow a crafted image to index those buffers
+    // out-of-bounds (ring-0 panic).  Reject anything other than 512.
+    if bytes_per_sector != 512 {
         return Err(Error::InvalidArgument);
     }
     let sectors_per_cluster = sector[13];
@@ -192,13 +198,35 @@ pub struct FatGeometry {
 
 impl FatGeometry {
     /// Compute geometry from a parsed BPB.
+    ///
+    /// All intermediate additions and multiplications use checked arithmetic so
+    /// that a malformed on-disk image cannot cause integer overflow, which would
+    /// produce incorrect geometry and lead to out-of-bounds sector accesses.
     pub fn from_bpb(bpb: &Bpb) -> Result<Self> {
         let bps = bpb.bytes_per_sector as u32;
         let fat_start = bpb.reserved_sectors as u32;
-        let root_dir_start = fat_start + bpb.num_fats as u32 * bpb.fat_size as u32;
-        let root_dir_bytes = bpb.root_entry_count as u32 * DIR_ENTRY_SIZE as u32;
-        let root_dir_sectors = (root_dir_bytes + bps - 1) / bps;
-        let data_start = root_dir_start + root_dir_sectors;
+
+        // fat_start + num_fats * fat_size: both operands are at most u16, so the
+        // product fits in u32 without overflow, but the sum might not.
+        let fats_sectors = (bpb.num_fats as u32)
+            .checked_mul(bpb.fat_size as u32)
+            .ok_or(Error::InvalidArgument)?;
+        let root_dir_start = fat_start
+            .checked_add(fats_sectors)
+            .ok_or(Error::InvalidArgument)?;
+
+        let root_dir_bytes = (bpb.root_entry_count as u32)
+            .checked_mul(DIR_ENTRY_SIZE as u32)
+            .ok_or(Error::InvalidArgument)?;
+        // bps is validated >= 512, so it is never zero; the division is safe.
+        let root_dir_sectors = root_dir_bytes
+            .checked_add(bps - 1)
+            .ok_or(Error::InvalidArgument)?
+            / bps;
+        let data_start = root_dir_start
+            .checked_add(root_dir_sectors)
+            .ok_or(Error::InvalidArgument)?;
+
         let total = if bpb.total_sectors_16 != 0 {
             bpb.total_sectors_16 as u32
         } else {
@@ -208,7 +236,9 @@ impl FatGeometry {
             return Err(Error::InvalidArgument);
         }
         let cluster_count = (total - data_start) / bpb.sectors_per_cluster as u32;
-        let cluster_size = bps * bpb.sectors_per_cluster as u32;
+        let cluster_size = bps
+            .checked_mul(bpb.sectors_per_cluster as u32)
+            .ok_or(Error::InvalidArgument)?;
         Ok(Self {
             fat_start,
             root_dir_start,
@@ -220,14 +250,30 @@ impl FatGeometry {
     }
 
     /// Return the first sector of a data cluster.
-    pub fn cluster_to_sector(&self, cluster: u16, spc: u8) -> u32 {
-        self.data_start + (cluster as u32 - FIRST_DATA_CLUSTER as u32) * spc as u32
+    ///
+    /// Returns `Err(InvalidArgument)` if `cluster` is below [`FIRST_DATA_CLUSTER`]
+    /// (which would underflow the subtraction) or if the resulting sector number
+    /// overflows `u32`.
+    pub fn cluster_to_sector(&self, cluster: u16, spc: u8) -> Result<u32> {
+        if cluster < FIRST_DATA_CLUSTER {
+            return Err(Error::InvalidArgument);
+        }
+        let offset = (cluster as u32 - FIRST_DATA_CLUSTER as u32)
+            .checked_mul(spc as u32)
+            .ok_or(Error::InvalidArgument)?;
+        self.data_start
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)
     }
 }
 
 // ── FAT table access ─────────────────────────────────────────────────────────
 
 /// Read the FAT16 entry for `cluster` from disk.
+///
+/// Validates that the computed sector lies within the declared FAT region
+/// before performing any I/O, preventing out-of-bounds sector reads on
+/// attacker-supplied cluster values.
 fn fat_read_entry(
     reader: &dyn BlockReader,
     geo: &FatGeometry,
@@ -235,7 +281,20 @@ fn fat_read_entry(
     cluster: u16,
 ) -> Result<u16> {
     let fat_offset = cluster as u32 * 2;
-    let sector = geo.fat_start + fat_offset / bpb.bytes_per_sector as u32;
+    // bytes_per_sector is validated >= 512 in parse_bpb, never zero.
+    let sector_offset = fat_offset / bpb.bytes_per_sector as u32;
+    let sector = geo
+        .fat_start
+        .checked_add(sector_offset)
+        .ok_or(Error::InvalidArgument)?;
+    // Ensure the sector falls inside the declared FAT region.
+    let fat_end = geo
+        .fat_start
+        .checked_add(bpb.fat_size as u32)
+        .ok_or(Error::InvalidArgument)?;
+    if sector >= fat_end {
+        return Err(Error::InvalidArgument);
+    }
     let offset_in_sector = (fat_offset % bpb.bytes_per_sector as u32) as usize;
 
     let mut buf = [0u8; 512];
@@ -247,6 +306,9 @@ fn fat_read_entry(
 }
 
 /// Write a FAT16 entry for `cluster` to all FAT copies on disk.
+///
+/// Validates that each computed sector lies within its respective FAT copy
+/// before performing any I/O.
 fn fat_write_entry(
     reader: &dyn BlockReader,
     geo: &FatGeometry,
@@ -255,11 +317,30 @@ fn fat_write_entry(
     value: u16,
 ) -> Result<()> {
     let fat_offset = cluster as u32 * 2;
+    // bytes_per_sector is validated >= 512 in parse_bpb, never zero.
     let sector_offset = fat_offset / bpb.bytes_per_sector as u32;
     let offset_in_sector = (fat_offset % bpb.bytes_per_sector as u32) as usize;
 
     for fat_idx in 0..bpb.num_fats as u32 {
-        let sector = geo.fat_start + fat_idx * bpb.fat_size as u32 + sector_offset;
+        // fat_start + fat_idx * fat_size: bound-checked to stay in FAT region.
+        let fat_copy_start = geo
+            .fat_start
+            .checked_add(
+                fat_idx
+                    .checked_mul(bpb.fat_size as u32)
+                    .ok_or(Error::InvalidArgument)?,
+            )
+            .ok_or(Error::InvalidArgument)?;
+        let sector = fat_copy_start
+            .checked_add(sector_offset)
+            .ok_or(Error::InvalidArgument)?;
+        // Ensure sector falls inside this FAT copy.
+        let fat_copy_end = fat_copy_start
+            .checked_add(bpb.fat_size as u32)
+            .ok_or(Error::InvalidArgument)?;
+        if sector >= fat_copy_end {
+            return Err(Error::InvalidArgument);
+        }
         let mut buf = [0u8; 512];
         read_sector(reader, sector as u64, &mut buf)?;
         let bytes = value.to_le_bytes();
@@ -296,59 +377,59 @@ fn cluster_chain(
 
 // ── Cluster chain container ───────────────────────────────────────────────────
 
-/// Fixed-capacity cluster chain (avoids heap allocation).
+/// Heap-backed cluster chain.
+///
+/// Storing the chain on the stack as `[u16; MAX_CHAIN_LEN]` (65 536 × 2 =
+/// 128 KiB) would overflow the small kernel stack (~8–16 KiB).  Instead the
+/// chain is backed by a heap `Vec<u16>` allocated up-front with a fallible
+/// `try_reserve` so that OOM is reported via [`Error::OutOfMemory`] rather
+/// than a kernel abort.
 pub struct ClusterChain {
-    /// Cluster numbers in order.
-    clusters: [u16; MAX_CHAIN_LEN],
-    /// Number of valid entries.
-    len: usize,
+    /// Cluster numbers in chain order.
+    clusters: Vec<u16>,
 }
 
 impl ClusterChain {
-    /// Create an empty chain.
-    pub const fn new() -> Self {
+    /// Create an empty chain with no heap allocation.
+    pub fn new() -> Self {
         Self {
-            clusters: [0u16; MAX_CHAIN_LEN],
-            len: 0,
+            clusters: Vec::new(),
         }
     }
 
-    /// Append a cluster, returning `Err(OutOfMemory)` if full.
+    /// Append a cluster.
+    ///
+    /// Fails with `Err(OutOfMemory)` if the heap cannot grow or if the chain
+    /// would exceed [`MAX_CHAIN_LEN`] (cycle / corrupt image guard).
     pub fn push(&mut self, cluster: u16) -> Result<()> {
-        if self.len >= MAX_CHAIN_LEN {
+        if self.clusters.len() >= MAX_CHAIN_LEN {
             return Err(Error::OutOfMemory);
         }
-        self.clusters[self.len] = cluster;
-        self.len += 1;
+        self.clusters
+            .try_reserve(1)
+            .map_err(|_| Error::OutOfMemory)?;
+        self.clusters.push(cluster);
         Ok(())
     }
 
     /// Number of clusters in this chain.
     pub fn len(&self) -> usize {
-        self.len
+        self.clusters.len()
     }
 
     /// Whether this chain is empty.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.clusters.is_empty()
     }
 
     /// Return the cluster at position `idx`.
     pub fn get(&self, idx: usize) -> Option<u16> {
-        if idx < self.len {
-            Some(self.clusters[idx])
-        } else {
-            None
-        }
+        self.clusters.get(idx).copied()
     }
 
     /// Return the last cluster, if any.
     pub fn last(&self) -> Option<u16> {
-        if self.len > 0 {
-            Some(self.clusters[self.len - 1])
-        } else {
-            None
-        }
+        self.clusters.last().copied()
     }
 }
 
@@ -496,7 +577,16 @@ impl<'a> Fat16Fs<'a> {
     /// Count free clusters by scanning the FAT.
     pub fn free_clusters(&self) -> Result<u32> {
         let mut free = 0u32;
-        for cluster in FIRST_DATA_CLUSTER..=(self.geo.cluster_count as u16 + 1) {
+        // Iterate as u32 to avoid truncating cluster_count when it exceeds
+        // u16::MAX.  FAT16 cluster count is validated <= 65524, so the cast to
+        // u16 inside fat_read_entry (which takes u16) is safe here.
+        let last_cluster = (FIRST_DATA_CLUSTER as u32)
+            .checked_add(self.geo.cluster_count)
+            .ok_or(Error::InvalidArgument)?
+            .saturating_sub(1);
+        for cluster_u32 in FIRST_DATA_CLUSTER as u32..=last_cluster {
+            // FAT16 cluster numbers fit in u16 (validated <= 65524 at mount).
+            let cluster = cluster_u32 as u16;
             let entry = fat_read_entry(self.reader, &self.geo, &self.bpb, cluster)?;
             if entry == 0 {
                 free += 1;
@@ -510,14 +600,16 @@ impl<'a> Fat16Fs<'a> {
     /// Read the root directory entries (fixed-size region in FAT16).
     pub fn read_root_dir(&self) -> Result<DirEntries> {
         let mut entries = DirEntries::new();
-        let bytes_per_sector = self.bpb.bytes_per_sector as usize;
+        // bytes_per_sector is validated == 512 by parse_bpb, so scan_bytes
+        // always equals buf.len() and no out-of-bounds access is possible.
+        let scan_bytes = self.bpb.bytes_per_sector as usize;
         let mut buf = [0u8; 512];
         let mut raw_entry = [0u8; DIR_ENTRY_SIZE];
 
         'outer: for sector_idx in 0..self.geo.root_dir_sectors {
             let sector = self.geo.root_dir_start + sector_idx;
             read_sector(self.reader, sector as u64, &mut buf)?;
-            for entry_off in (0..bytes_per_sector).step_by(DIR_ENTRY_SIZE) {
+            for entry_off in (0..scan_bytes).step_by(DIR_ENTRY_SIZE) {
                 if entry_off + DIR_ENTRY_SIZE > buf.len() {
                     break;
                 }
@@ -549,7 +641,7 @@ impl<'a> Fat16Fs<'a> {
 
         'chain: for ci in 0..chain.len() {
             let cluster = chain.get(ci).ok_or(Error::IoError)?;
-            let start = self.geo.cluster_to_sector(cluster, spc);
+            let start = self.geo.cluster_to_sector(cluster, spc)?;
             for s in 0..spc as u32 {
                 read_sector(self.reader, (start + s) as u64, &mut buf)?;
                 for entry_off in (0..bps).step_by(DIR_ENTRY_SIZE) {
@@ -621,10 +713,14 @@ impl<'a> Fat16Fs<'a> {
             let cluster_offset = (file_pos % cluster_size) as usize;
             let cluster = chain.get(cluster_idx).ok_or(Error::IoError)?;
 
-            let start_sector = self.geo.cluster_to_sector(cluster, spc);
+            let start_sector = self.geo.cluster_to_sector(cluster, spc)?;
             let sector_idx = cluster_offset / bps;
             let sector_offset = cluster_offset % bps;
-            let sector = start_sector + sector_idx as u32;
+            // Checked addition: a crafted geometry could make start_sector +
+            // sector_idx overflow u32, which would wrap to a wrong sector.
+            let sector = start_sector
+                .checked_add(sector_idx as u32)
+                .ok_or(Error::InvalidArgument)?;
 
             let mut sector_buf = [0u8; 512];
             read_sector(self.reader, sector as u64, &mut sector_buf)?;
@@ -694,7 +790,14 @@ impl<'a> Fat16Fs<'a> {
 
     /// Allocate a free cluster, mark it as end-of-chain, and return its number.
     pub fn alloc_cluster(&self) -> Result<u16> {
-        for cluster in FIRST_DATA_CLUSTER..=(self.geo.cluster_count as u16 + 1) {
+        // Iterate as u32 to avoid truncating cluster_count; cast to u16 only
+        // after confirming the value fits (FAT16 is validated <= 65524 at mount).
+        let last_cluster = (FIRST_DATA_CLUSTER as u32)
+            .checked_add(self.geo.cluster_count)
+            .ok_or(Error::InvalidArgument)?
+            .saturating_sub(1);
+        for cluster_u32 in FIRST_DATA_CLUSTER as u32..=last_cluster {
+            let cluster = cluster_u32 as u16;
             let entry = fat_read_entry(self.reader, &self.geo, &self.bpb, cluster)?;
             if entry == 0 {
                 fat_write_entry(self.reader, &self.geo, &self.bpb, cluster, EOC_MIN)?;
