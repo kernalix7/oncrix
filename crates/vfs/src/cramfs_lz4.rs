@@ -75,16 +75,21 @@ impl CramfsLz4Context {
             let token = src[src_pos];
             src_pos += 1;
 
-            // Literal length from high nibble
+            // Literal length from high nibble.
             let mut lit_len = ((token >> 4) & 0x0f) as usize;
             if lit_len == 15 {
+                // Length-extension loop: use checked_add and cap to CRAMFS_BLOCK_SIZE
+                // to prevent integer overflow and decompression-bomb from crafted input.
                 loop {
                     if src_pos >= src.len() {
                         return Err(Error::IoError);
                     }
                     let extra = src[src_pos] as usize;
                     src_pos += 1;
-                    lit_len += extra;
+                    lit_len = lit_len.checked_add(extra).ok_or(Error::InvalidArgument)?;
+                    if lit_len > CRAMFS_BLOCK_SIZE {
+                        return Err(Error::InvalidArgument);
+                    }
                     if extra != 255 {
                         break;
                     }
@@ -108,38 +113,49 @@ impl CramfsLz4Context {
                 break;
             }
 
-            // Match offset (little-endian 16-bit)
+            // Match offset (little-endian 16-bit).
             if src_pos + 2 > src.len() {
                 return Err(Error::IoError);
             }
-            let _offset = u16::from_le_bytes([src[src_pos], src[src_pos + 1]]) as usize;
+            let offset = u16::from_le_bytes([src[src_pos], src[src_pos + 1]]) as usize;
             src_pos += 2;
 
-            // Match length from low nibble + 4 minimum
+            // Match length from low nibble + 4 minimum.
             let mut match_len = ((token & 0x0f) as usize) + 4;
             if match_len - 4 == 15 {
+                // Length-extension loop: use checked_add and cap to CRAMFS_BLOCK_SIZE
+                // to prevent integer overflow and decompression-bomb from crafted input.
                 loop {
                     if src_pos >= src.len() {
                         return Err(Error::IoError);
                     }
                     let extra = src[src_pos] as usize;
                     src_pos += 1;
-                    match_len += extra;
+                    match_len = match_len.checked_add(extra).ok_or(Error::InvalidArgument)?;
+                    if match_len > CRAMFS_BLOCK_SIZE {
+                        return Err(Error::InvalidArgument);
+                    }
                     if extra != 255 {
                         break;
                     }
                 }
             }
 
-            // Stub: full match-copy from history not implemented
-            if dst_pos + match_len > CRAMFS_BLOCK_SIZE {
+            // Validate match back-reference: offset must be in [1, dst_pos].
+            if offset == 0 || dst_pos < offset {
                 return Err(Error::IoError);
             }
-            // Zero-fill for the stub path
-            for b in &mut self.output[dst_pos..dst_pos + match_len] {
-                *b = 0;
+            // Bound copy by remaining output space.
+            let remaining_out = CRAMFS_BLOCK_SIZE - dst_pos;
+            if match_len > remaining_out {
+                return Err(Error::InvalidArgument);
             }
-            dst_pos += match_len;
+            // Copy from match history (LZ4 allows overlapping — copy byte-by-byte).
+            let match_start = dst_pos - offset;
+            for i in 0..match_len {
+                self.output[dst_pos] = self.output[match_start + i];
+                dst_pos += 1;
+            }
         }
 
         self.output_len = dst_pos;

@@ -13,7 +13,7 @@
 //! # Design
 //!
 //! - [`CompressionAlgo`] — algorithm selector with on-disk encoding
-//! - [`CompressWorkspace`] — fixed-size scratch buffers (no heap allocation)
+//! - [`CompressWorkspace`] — fixed-size scratch buffers (heap-allocated via [`CompressWorkspace::try_new_boxed`] in kernel contexts)
 //! - [`CompressedExtent`] — metadata for one compressed on-disk extent
 //! - `compress_heuristic` — entropy sample to decide whether to attempt compression
 //! - `compress_extent` / `decompress_extent` — stub compress/decompress paths
@@ -24,6 +24,10 @@
 //! - Linux `fs/btrfs/compression.c`, `fs/btrfs/compression.h`
 //! - `include/uapi/linux/btrfs.h` (BTRFS_COMPRESS_* constants)
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use core::mem::MaybeUninit;
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -111,8 +115,13 @@ impl CompressionAlgo {
 
 /// Scratch workspace for one compression or decompression pass.
 ///
-/// The buffers are stack/static rather than heap-allocated; `WORKSPACE_BYTES`
-/// must fit in the kernel stack budget for the calling context.
+/// Each workspace contains two `[u8; WORKSPACE_BYTES]` buffers (~128 KiB
+/// total).  Constructing a `CompressWorkspace` by value (via [`Self::new`] or
+/// [`Default::default`]) places the struct on the caller's stack, which is
+/// only safe in contexts with a large enough stack budget (e.g. user-space
+/// threads or explicitly over-sized kernel stacks).  **Kernel code must use
+/// [`Self::try_new_boxed`] instead**, which allocates the workspace directly
+/// on the heap and avoids any large stack temporary.
 pub struct CompressWorkspace {
     /// Input data buffer.
     pub input: [u8; WORKSPACE_BYTES],
@@ -143,11 +152,49 @@ impl Default for CompressWorkspace {
 
 impl CompressWorkspace {
     /// Create a new workspace for `algo`.
+    ///
+    /// The workspace is placed on the **caller's stack**.  Kernel contexts must
+    /// call [`Self::try_new_boxed`] to avoid a stack overflow.
     pub fn new(algo: CompressionAlgo) -> Self {
         Self {
             algo,
             ..Self::default()
         }
+    }
+
+    /// Allocate a workspace directly on the heap for `algo`.
+    ///
+    /// This is the **required constructor for kernel code**, where the default
+    /// 8–16 KiB kernel stack cannot accommodate the ~128 KiB buffers held by
+    /// `CompressWorkspace`.  The allocation is performed without any large stack
+    /// temporary: the memory is zeroed in place and then the algorithm fields are
+    /// written.
+    ///
+    /// Returns `Err(Error::OutOfMemory)` if the heap allocation fails.
+    ///
+    /// # Safety invariants
+    ///
+    /// The all-zero byte pattern is valid for every field of `CompressWorkspace`:
+    /// - `input` and `output` are `[u8; WORKSPACE_BYTES]` — zero is a valid `u8`.
+    /// - `input_len` and `output_len` are `usize` — zero is valid.
+    /// - `zstd_level` is `i32` — zero is valid (will be overwritten to `3`).
+    /// - `algo` is `CompressionAlgo` — `CompressionAlgo::None` is the first
+    ///   (default) variant with discriminant 0; it will be overwritten to the
+    ///   requested value.
+    pub fn try_new_boxed(algo: CompressionAlgo) -> Result<Box<Self>> {
+        // Allocate uninitialised memory for the full struct without touching the stack.
+        let mut uninit: Box<MaybeUninit<Self>> =
+            Box::try_new_uninit().map_err(|_| Error::OutOfMemory)?;
+        // SAFETY: zeroing every byte of `CompressWorkspace` produces a valid value for
+        // all fields (see the safety invariants in the doc comment above).  The `algo`
+        // and `zstd_level` fields are overwritten immediately below, so their transient
+        // all-zero state is never observed by safe code.
+        unsafe { uninit.as_mut_ptr().write_bytes(0, 1) };
+        // SAFETY: all bytes were initialised by `write_bytes` above.
+        let mut ws: Box<Self> = unsafe { uninit.assume_init() };
+        ws.algo = algo;
+        ws.zstd_level = 3;
+        Ok(ws)
     }
 
     /// Load input data from `src`.  Returns [`Error::InvalidArgument`] if `src`

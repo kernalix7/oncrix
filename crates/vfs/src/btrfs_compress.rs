@@ -24,6 +24,10 @@
 //! - Linux `fs/btrfs/compression.c`
 //! - `include/uapi/linux/btrfs.h` (BTRFS_COMPRESS_*)
 
+extern crate alloc;
+
+use alloc::boxed::Box;
+use core::mem::MaybeUninit;
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -231,29 +235,40 @@ pub struct CompressWorkspace {
     lzo_hash: [u16; LZO_HASH_SIZE],
 }
 
+// Compile-time size guard: CompressWorkspace must not exceed 512 KiB so that
+// callers are reminded to heap-allocate it rather than placing it on the stack.
+const _: () = assert!(
+    core::mem::size_of::<CompressWorkspace>() <= 512 * 1024,
+    "CompressWorkspace exceeds 512 KiB — review field sizes"
+);
+
 impl CompressWorkspace {
-    /// Create a new empty workspace for `algorithm`.
-    pub fn new(algorithm: CompressType) -> Self {
-        Self {
-            input: [0u8; WORKSPACE_SIZE],
-            output: [0u8; WORKSPACE_SIZE],
-            input_len: 0,
-            output_len: 0,
-            algorithm,
-            lzo_hash: [0u16; LZO_HASH_SIZE],
-        }
+    /// Heap-allocate a new workspace for `algorithm`.
+    ///
+    /// The workspace is ~278 KiB; it **must** live on the heap to avoid
+    /// overflowing the kernel stack (~8–16 KiB).  Returns
+    /// [`Error::OutOfMemory`] when the kernel heap is exhausted.
+    pub fn try_new_boxed(algorithm: CompressType) -> Result<Box<Self>> {
+        // Allocate uninitialised heap memory first, then zero in place.
+        // This avoids materialising the large struct on the caller's stack
+        // before copying it into the Box (which would overflow the stack).
+        let mut uninit: Box<MaybeUninit<Self>> =
+            Box::try_new_uninit().map_err(|_| Error::OutOfMemory)?;
+        // SAFETY: `uninit` points to heap memory sized/aligned for `Self`.
+        // `write_bytes` zeroes the entire allocation; all-zero bytes produce
+        // a valid `CompressWorkspace` (u8 arrays, usize, CompressType, u16 array,
+        // all of which are valid at 0 / zero-discriminant).
+        unsafe { uninit.as_mut_ptr().write_bytes(0, 1) };
+        // SAFETY: every byte of the allocation was zeroed above.
+        let mut ws: Box<Self> = unsafe { uninit.assume_init() };
+        ws.algorithm = algorithm;
+        Ok(ws)
     }
 
     /// Reset the workspace buffers.
     pub fn reset(&mut self) {
         self.input_len = 0;
         self.output_len = 0;
-    }
-}
-
-impl Default for CompressWorkspace {
-    fn default() -> Self {
-        Self::new(CompressType::None)
     }
 }
 
@@ -281,22 +296,31 @@ pub struct WorkspacePool {
     in_use: [bool; POOL_SIZE],
 }
 
+// Compile-time size guard: WorkspacePool is POOL_SIZE × CompressWorkspace, which is
+// over 1 MiB.  It must never be stack-allocated.
+const _: () = assert!(
+    core::mem::size_of::<WorkspacePool>() <= 8 * 1024 * 1024,
+    "WorkspacePool exceeds 8 MiB — review POOL_SIZE / WORKSPACE_SIZE"
+);
+
 impl WorkspacePool {
-    /// Create a new pool with all slots initialised to `CompressType::None`.
-    pub fn new() -> Self {
-        Self {
-            slots: [const {
-                CompressWorkspace {
-                    input: [0u8; WORKSPACE_SIZE],
-                    output: [0u8; WORKSPACE_SIZE],
-                    input_len: 0,
-                    output_len: 0,
-                    algorithm: CompressType::None,
-                    lzo_hash: [0u16; LZO_HASH_SIZE],
-                }
-            }; POOL_SIZE],
-            in_use: [false; POOL_SIZE],
-        }
+    /// Heap-allocate a new pool with all slots initialised to `CompressType::None`.
+    ///
+    /// `WorkspacePool` is ~1.1 MiB; it **must** live on the heap to avoid
+    /// overflowing the kernel stack.  Returns [`Error::OutOfMemory`] when
+    /// the kernel heap is exhausted.
+    pub fn try_new_boxed() -> Result<Box<Self>> {
+        // Allocate uninitialised heap memory, then zero in place to avoid
+        // materialising the >1 MiB struct on the caller's stack first.
+        let mut uninit: Box<MaybeUninit<Self>> =
+            Box::try_new_uninit().map_err(|_| Error::OutOfMemory)?;
+        // SAFETY: `uninit` points to heap memory sized/aligned for `Self`.
+        // Zeroing produces valid values for every field: u8 arrays, bool=false,
+        // CompressType::None (discriminant 0), usize=0, u16 arrays.
+        unsafe { uninit.as_mut_ptr().write_bytes(0, 1) };
+        // SAFETY: all bytes of the allocation were zeroed above.
+        let pool: Box<Self> = unsafe { uninit.assume_init() };
+        Ok(pool)
     }
 
     /// Acquire a free workspace slot, setting its algorithm.
@@ -339,12 +363,6 @@ impl WorkspacePool {
     /// Number of currently free slots.
     pub fn free_count(&self) -> usize {
         self.in_use.iter().filter(|&&u| !u).count()
-    }
-}
-
-impl Default for WorkspacePool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -522,10 +540,11 @@ fn lzo_decompress(input: &[u8], out: &mut [u8]) -> Result<usize> {
             // Literal run.
             let mut lit_len = ((tok >> 4) & 0x0F) as usize;
             if lit_len == 15 {
-                // Extended literal length.
-                // Cap accumulation against out.len() to prevent usize overflow
-                // from a crafted stream that supplies arbitrarily many 0xFF bytes.
-                lit_len += 15;
+                // Extended literal length: the base is 15; each 0xFF extension byte
+                // adds 255 and the first non-0xFF byte terminates the sequence,
+                // adding its value.  Do NOT pre-increment before the loop — that
+                // would produce a base of 30 and corrupt the decoded length.
+                // (Matches the match-length extension pattern above.)
                 loop {
                     if ip >= input.len() {
                         return Err(Error::InvalidArgument);

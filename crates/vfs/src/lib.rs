@@ -23,6 +23,7 @@
 //! - [`xattr_vfs`] — VFS-level extended attribute integration
 
 #![no_std]
+#![feature(allocator_api)]
 
 pub mod acl;
 pub mod btrfs;
