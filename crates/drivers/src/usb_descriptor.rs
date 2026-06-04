@@ -99,6 +99,12 @@ pub const MAX_ENDPOINTS: usize = 8;
 pub const MAX_STRINGS: usize = 16;
 /// Maximum string length in UTF-16LE code units.
 pub const MAX_STRING_LEN: usize = 64;
+/// Maximum number of descriptors (of any type) the outer config walk will
+/// process before returning `InvalidArgument`. A legitimate full-speed
+/// configuration descriptor with wTotalLength = 65535 and 2-byte minimum
+/// descriptors can hold at most 32767 entries; 256 is a safe practical cap
+/// that keeps the ring-0 parse time bounded.
+pub const MAX_DESCRIPTORS: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Descriptor structures
@@ -346,9 +352,18 @@ impl<'a> DescriptorParser<'a> {
 
     /// Peek at the type of the next descriptor without advancing.
     ///
-    /// Returns `None` if fewer than 2 bytes remain.
+    /// Returns `None` if fewer than 2 bytes remain **or** if `bLength` is
+    /// zero. A zero-length descriptor would stall the parser (no forward
+    /// progress), so it is treated as irrecoverably malformed here rather
+    /// than being deferred to the first [`skip`](Self::skip) call.
     pub fn peek_type(&self) -> Option<u8> {
-        if self.offset + 1 < self.buf.len() {
+        if self.offset.checked_add(1)? < self.buf.len() {
+            // Treat bLength == 0 as fatal: a zero-length descriptor cannot
+            // be skipped and would stall any loop that relies on peek_type
+            // to gate forward progress.
+            if self.buf[self.offset] == 0 {
+                return None;
+            }
             Some(self.buf[self.offset + 1])
         } else {
             None
@@ -501,14 +516,65 @@ impl<'a> DescriptorParser<'a> {
     /// endpoints) starting at the current offset.
     ///
     /// Returns the configuration and a list of parsed interfaces.
+    ///
+    /// # Security
+    ///
+    /// The walk is bounded by two independent guards:
+    ///
+    /// 1. **Byte bound** — the walk end is the minimum of
+    ///    `cfg_start + wTotalLength` and the real buffer length, preventing an
+    ///    attacker from using crafted `bLength` values to walk past received data.
+    ///
+    /// 2. **Iteration bound** — the outer loop maintains a descriptor counter
+    ///    capped at [`MAX_DESCRIPTORS`] (256). This prevents a device from
+    ///    issuing up to 32767 two-byte descriptors within a 65535-byte
+    ///    `wTotalLength` and stalling ring-0 parse time.
+    ///
+    /// 3. **Per-interface skip counter** — limits non-endpoint class-specific
+    ///    descriptors consumed between endpoint descriptors, preventing an
+    ///    infinite-loop attack via a stream of valid-length unknown descriptors.
+    ///
+    /// 4. **Zero-length guard** — [`peek_type`](Self::peek_type) returns `None`
+    ///    for a descriptor with `bLength == 0`, immediately terminating the walk
+    ///    rather than stalling progress.
     pub fn parse_full_config(
         &mut self,
     ) -> Result<(ConfigDescriptor, [ParsedInterface; MAX_INTERFACES], usize)> {
+        // Record where the config header started so wTotalLength is relative
+        // to that position, not the current offset after parse_config().
+        let cfg_start = self.offset;
         let cfg = self.parse_config()?;
+
+        // Clamp the walk end: trust wTotalLength only up to the real buffer
+        // length.  cfg_start.saturating_add avoids wrapping if cfg_start is
+        // already near usize::MAX (cannot happen in practice but keeps the
+        // invariant explicit).
+        let walk_end = cfg_start
+            .saturating_add(cfg.total_length as usize)
+            .min(self.buf.len());
+
         let mut interfaces = [ParsedInterface::EMPTY; MAX_INTERFACES];
         let mut iface_count = 0usize;
 
-        while !self.is_done() {
+        // Maximum number of non-endpoint class-specific descriptors we will
+        // skip between endpoints inside one interface.  Prevents a device from
+        // stalling the parser with an unbounded stream of unknown descriptors.
+        const MAX_SKIP_PER_INTERFACE: usize = 64;
+
+        // Outer iteration counter — caps the total number of descriptors
+        // (of any type, including unknown) the outer loop processes.  Without
+        // this a device can craft wTotalLength=65535 full of 2-byte unknown
+        // descriptors and force up to 32767 outer iterations in ring-0 context.
+        let mut outer_iter = 0usize;
+
+        while self.offset < walk_end {
+            // Reject zero-length and truncated descriptors immediately; also
+            // enforces the outer iteration bound before any per-type dispatch.
+            outer_iter += 1;
+            if outer_iter > MAX_DESCRIPTORS {
+                return Err(Error::InvalidArgument);
+            }
+
             let dt = match self.peek_type() {
                 Some(t) => t,
                 None => break,
@@ -531,9 +597,17 @@ impl<'a> DescriptorParser<'a> {
                     parsed.descriptor = iface;
 
                     let mut ep_idx = 0usize;
-                    while ep_idx < ep_count && !self.is_done() {
+                    // skip_count bounds how many consecutive non-endpoint
+                    // descriptors we tolerate.  Once exceeded we treat the
+                    // interface as complete rather than looping forever.
+                    let mut skip_count = 0usize;
+                    while ep_idx < ep_count && self.offset < walk_end {
+                        // peek_type returns None for bLength==0, breaking
+                        // the inner loop safely.
                         let ept = self.peek_type().unwrap_or(0);
                         if ept == DT_ENDPOINT {
+                            // Reset skip counter each time we advance.
+                            skip_count = 0;
                             if ep_idx < MAX_ENDPOINTS {
                                 parsed.endpoints[ep_idx] = self.parse_endpoint()?;
                                 ep_idx += 1;
@@ -543,6 +617,13 @@ impl<'a> DescriptorParser<'a> {
                         } else if ept == DT_INTERFACE || ept == DT_CONFIG {
                             break;
                         } else {
+                            // Class-specific or unknown descriptor between
+                            // endpoints.  Count skips to prevent an infinite
+                            // loop if the device fills the space with them.
+                            skip_count += 1;
+                            if skip_count > MAX_SKIP_PER_INTERFACE {
+                                return Err(Error::InvalidArgument);
+                            }
                             self.skip()?;
                         }
                     }
@@ -552,6 +633,9 @@ impl<'a> DescriptorParser<'a> {
                 }
                 DT_CONFIG => break,
                 _ => {
+                    // Unknown or class-specific descriptor at the outer level
+                    // (e.g. HID, IAD, vendor-specific). Count these under the
+                    // outer iteration bound (already incremented above) and skip.
                     self.skip()?;
                 }
             }

@@ -480,6 +480,20 @@ impl UsbStorageDevice {
     }
 
     /// Issue a READ CAPACITY(10) command and store geometry.
+    ///
+    /// # Security
+    ///
+    /// The device-supplied block size is validated before being stored:
+    ///
+    /// - `bs == 0` is rejected: `checked_mul(0)` would silently produce
+    ///   `Some(0)`, making every buffer-size guard pass and issuing a
+    ///   zero-length transfer; divisions by `block_size` elsewhere would
+    ///   also trap with divide-by-zero in ring-0.
+    /// - `bs > 65536` is rejected: no standard storage block size exceeds
+    ///   65536 bytes; a larger value is either a firmware bug or an attack.
+    /// - `!bs.is_power_of_two()` is rejected: USB storage block sizes are
+    ///   always powers of two (512, 1024, 2048, 4096 …); an odd value
+    ///   signals a malformed or adversarial response.
     fn do_read_capacity(&mut self) -> Result<()> {
         let tag = self.alloc_tag();
         let cdb = scsi_read_capacity10();
@@ -495,6 +509,13 @@ impl UsbStorageDevice {
         // Block size (big-endian u32) in bytes 4..8.
         let bs = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
+        // Validate the device-supplied block size before storing it.
+        // An attacker can return arbitrary values; reject degenerate ones
+        // before they propagate into buffer-size arithmetic or divisions.
+        if bs == 0 || bs > 65536 || !bs.is_power_of_two() {
+            return Err(Error::InvalidArgument);
+        }
+
         self.block_count = u64::from(last_lba) + 1;
         self.block_size = bs;
         Ok(())
@@ -509,8 +530,13 @@ impl UsbStorageDevice {
         if !self.ready {
             return Err(Error::Busy);
         }
-        let total = count as u32 * self.block_size;
-        if (buf.len() as u32) < total {
+        // SAFETY-NOTE: count and block_size are device-supplied; use
+        // checked_mul to prevent wrap-around producing a bogus total
+        // that would underrun the actual transfer.
+        let total = (count as u32)
+            .checked_mul(self.block_size)
+            .ok_or(Error::InvalidArgument)?;
+        if buf.len() < total as usize {
             return Err(Error::InvalidArgument);
         }
         if lba > u64::from(u32::MAX) {
@@ -536,8 +562,13 @@ impl UsbStorageDevice {
         if !self.ready {
             return Err(Error::Busy);
         }
-        let total = count as u32 * self.block_size;
-        if (buf.len() as u32) < total {
+        // SAFETY-NOTE: count and block_size are device-supplied; use
+        // checked_mul to prevent wrap-around producing a bogus total
+        // that would underrun the actual transfer.
+        let total = (count as u32)
+            .checked_mul(self.block_size)
+            .ok_or(Error::InvalidArgument)?;
+        if buf.len() < total as usize {
             return Err(Error::InvalidArgument);
         }
         if lba > u64::from(u32::MAX) {
