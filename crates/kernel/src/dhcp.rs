@@ -66,6 +66,34 @@ pub const OPT_MSG_TYPE: u8 = 53;
 /// DHCP option: server identifier.
 pub const OPT_SERVER_ID: u8 = 54;
 
+/// DHCP option: option overload (RFC 2132 section 9.3).
+///
+/// Length 1; value indicates which fixed BOOTP fields are reused to
+/// carry options: 1 = the `file` field, 2 = the `sname` field,
+/// 3 = both.
+pub const OPT_OVERLOAD: u8 = 52;
+
+/// Option overload value: the `file` field holds options.
+const OVERLOAD_FILE: u8 = 1;
+
+/// Option overload value: the `sname` field holds options.
+const OVERLOAD_SNAME: u8 = 2;
+
+/// Option overload value: both `file` and `sname` hold options.
+const OVERLOAD_BOTH: u8 = 3;
+
+/// Offset of the `sname` field within the fixed DHCP header.
+const SNAME_OFFSET: usize = 44;
+
+/// Length of the `sname` field in bytes.
+const SNAME_LEN: usize = 64;
+
+/// Offset of the `file` field within the fixed DHCP header.
+const FILE_OFFSET: usize = 108;
+
+/// Length of the `file` field in bytes.
+const FILE_LEN: usize = 128;
+
 /// DHCP option: end of options.
 pub const OPT_END: u8 = 255;
 
@@ -226,6 +254,9 @@ pub struct DhcpOptions {
     pub lease_time: u32,
     /// Requested IP address (option 50).
     pub requested_ip: [u8; 4],
+    /// Option overload value (option 52): 0 = none, 1 = file,
+    /// 2 = sname, 3 = both (RFC 2132 section 9.3).
+    pub overload: u8,
 }
 
 // =========================================================================
@@ -276,6 +307,25 @@ pub enum DhcpEvent {
 /// data.
 pub fn parse_dhcp_options(data: &[u8]) -> Result<DhcpOptions> {
     let mut opts = DhcpOptions::default();
+    parse_dhcp_options_into(data, &mut opts)?;
+    Ok(opts)
+}
+
+/// Parse DHCP options from `data`, merging results into `opts`.
+///
+/// Accumulates recognised options into the supplied [`DhcpOptions`]
+/// rather than returning a fresh value, so callers can layer the
+/// primary options field with the `sname` / `file` overflow fields
+/// per RFC 2132 section 9.3.  Options encountered later override the
+/// same field parsed earlier; absent options leave prior values
+/// untouched.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if the options data is
+/// truncated or an option's declared length exceeds the remaining
+/// data.
+fn parse_dhcp_options_into(data: &[u8], opts: &mut DhcpOptions) -> Result<()> {
     let mut pos: usize = 0;
 
     while pos < data.len() {
@@ -333,10 +383,67 @@ pub fn parse_dhcp_options(data: &[u8]) -> Result<DhcpOptions> {
                 opts.server_id
                     .copy_from_slice(&data[pos..pos.saturating_add(4)]);
             }
+            OPT_OVERLOAD if opt_len >= 1 => {
+                opts.overload = data[pos];
+            }
             _ => { /* skip unknown or too-short options */ }
         }
 
         pos = pos.saturating_add(opt_len);
+    }
+
+    Ok(())
+}
+
+/// Parse DHCP options with RFC 2132 section 9.3 option-overload support.
+///
+/// `data` is the full received DHCP message (header + magic cookie +
+/// options).  The primary options field (after the magic cookie at
+/// [`DHCP_HEADER_LEN`] + 4) is parsed first.  If it carries option 52
+/// (Option Overload) with value 1, 2, or 3, the `file` and/or `sname`
+/// fixed fields are additionally parsed as options and merged.  Each
+/// overflow region is bounded to its fixed length, so a malformed or
+/// hostile server cannot read beyond the header.
+///
+/// Per RFC 2131, when both fields are overloaded the `file` field is
+/// processed before `sname`; options parsed later override earlier
+/// ones for the same field.  Overload markers inside the overflow
+/// regions are ignored (only the primary field may signal overload),
+/// preventing recursion.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `data` is shorter than the
+/// fixed header plus magic cookie, or if any parsed region is
+/// malformed.
+fn parse_options_with_overload(data: &[u8]) -> Result<DhcpOptions> {
+    let cookie_end = DHCP_HEADER_LEN.saturating_add(4);
+    if data.len() < cookie_end {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Primary options field follows the magic cookie.
+    let mut opts = DhcpOptions::default();
+    parse_dhcp_options_into(&data[cookie_end..], &mut opts)?;
+
+    let overload = opts.overload;
+    if overload != OVERLOAD_FILE && overload != OVERLOAD_SNAME && overload != OVERLOAD_BOTH {
+        return Ok(opts);
+    }
+
+    // RFC 2131: process `file` before `sname`. Each region is sliced
+    // to its fixed length; the full header is guaranteed present
+    // because `data.len() >= cookie_end > DHCP_HEADER_LEN`, so these
+    // reads stay in bounds regardless of attacker-supplied content.
+    if overload == OVERLOAD_FILE || overload == OVERLOAD_BOTH {
+        let start = FILE_OFFSET;
+        let end = start.saturating_add(FILE_LEN);
+        parse_dhcp_options_into(&data[start..end], &mut opts)?;
+    }
+    if overload == OVERLOAD_SNAME || overload == OVERLOAD_BOTH {
+        let start = SNAME_OFFSET;
+        let end = start.saturating_add(SNAME_LEN);
+        parse_dhcp_options_into(&data[start..end], &mut opts)?;
     }
 
     Ok(opts)
@@ -490,6 +597,14 @@ impl DhcpClient {
         }
 
         // Verify transaction ID.
+        //
+        // TODO(security): the xid match is the only off-path defence
+        // here. A blind off-path attacker who guesses (or brute-forces)
+        // a 32-bit xid can forge an OFFER/ACK. Full hardening requires
+        // the caller to (a) seed `xid` from a CSPRNG per exchange and
+        // (b) validate the server identity (UDP source address and
+        // option 54) against the selected server before binding the
+        // lease. Those live outside this parser.
         let xid = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         if xid != self.xid {
             return Err(Error::InvalidArgument);
@@ -506,8 +621,10 @@ impl DhcpClient {
         let mut siaddr = [0u8; 4];
         siaddr.copy_from_slice(&data[20..24]);
 
-        // Parse options.
-        let opts = parse_dhcp_options(&data[cookie_end..])?;
+        // Parse options, honouring Option Overload (RFC 2132 9.3):
+        // option 52 may direct the parser to additionally read the
+        // `file` and/or `sname` fixed fields as options.
+        let opts = parse_options_with_overload(data)?;
 
         // Prefer server_id from options; fall back to siaddr.
         let server_ip = if opts.server_id != [0; 4] {
@@ -955,5 +1072,166 @@ mod tests {
         // Verify the options can be parsed back.
         let opts = parse_dhcp_options(&buf[DHCP_HEADER_LEN + 4..len]).unwrap();
         assert_eq!(opts.msg_type, DHCPDISCOVER);
+    }
+
+    /// Build a minimal valid reply (header + cookie) into a 300-byte
+    /// packet and return it; primary option field starts at
+    /// `DHCP_HEADER_LEN + 4`.
+    fn base_reply(xid: u32) -> [u8; 300] {
+        let mut pkt = [0u8; 300];
+        pkt[0] = BOOTREPLY;
+        pkt[1] = HTYPE_ETHERNET;
+        pkt[2] = HLEN_ETHERNET;
+        pkt[4..8].copy_from_slice(&xid.to_be_bytes());
+        pkt[DHCP_HEADER_LEN..DHCP_HEADER_LEN + 4].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        pkt
+    }
+
+    #[test]
+    fn test_parse_dhcp_options_overload_recognised() {
+        // Option 52 with value 3 must populate `overload`.
+        #[rustfmt::skip]
+        let data: [u8; 6] = [
+            OPT_OVERLOAD, 1, OVERLOAD_BOTH,
+            OPT_MSG_TYPE, 1, DHCPACK,
+        ];
+        let opts = parse_dhcp_options(&data).unwrap();
+        assert_eq!(opts.overload, OVERLOAD_BOTH);
+        assert_eq!(opts.msg_type, DHCPACK);
+    }
+
+    #[test]
+    fn test_overload_file_field_parsed() {
+        let xid = 0xA1B2C3D4;
+        let mut pkt = base_reply(xid);
+        // Primary field: msg type + overload(file). Subnet lives in file.
+        let opt = DHCP_HEADER_LEN + 4;
+        pkt[opt] = OPT_MSG_TYPE;
+        pkt[opt + 1] = 1;
+        pkt[opt + 2] = DHCPACK;
+        pkt[opt + 3] = OPT_OVERLOAD;
+        pkt[opt + 4] = 1;
+        pkt[opt + 5] = OVERLOAD_FILE;
+        pkt[opt + 6] = OPT_END;
+        // file field (offset 108): a subnet-mask option.
+        pkt[FILE_OFFSET] = OPT_SUBNET_MASK;
+        pkt[FILE_OFFSET + 1] = 4;
+        pkt[FILE_OFFSET + 2..FILE_OFFSET + 6].copy_from_slice(&[255, 255, 255, 0]);
+        pkt[FILE_OFFSET + 6] = OPT_END;
+
+        let opts = parse_options_with_overload(&pkt).unwrap();
+        assert_eq!(opts.msg_type, DHCPACK);
+        assert_eq!(opts.subnet_mask, [255, 255, 255, 0]);
+    }
+
+    #[test]
+    fn test_overload_sname_field_parsed() {
+        let xid = 0x0F0F0F0F;
+        let mut pkt = base_reply(xid);
+        let opt = DHCP_HEADER_LEN + 4;
+        pkt[opt] = OPT_OVERLOAD;
+        pkt[opt + 1] = 1;
+        pkt[opt + 2] = OVERLOAD_SNAME;
+        pkt[opt + 3] = OPT_END;
+        // sname field (offset 44): a router option.
+        pkt[SNAME_OFFSET] = OPT_ROUTER;
+        pkt[SNAME_OFFSET + 1] = 4;
+        pkt[SNAME_OFFSET + 2..SNAME_OFFSET + 6].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[SNAME_OFFSET + 6] = OPT_END;
+
+        let opts = parse_options_with_overload(&pkt).unwrap();
+        assert_eq!(opts.router, [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_overload_both_precedence_sname_after_file() {
+        // RFC 2131: file parsed before sname; sname wins on conflict.
+        let xid = 0x99887766;
+        let mut pkt = base_reply(xid);
+        let opt = DHCP_HEADER_LEN + 4;
+        pkt[opt] = OPT_OVERLOAD;
+        pkt[opt + 1] = 1;
+        pkt[opt + 2] = OVERLOAD_BOTH;
+        pkt[opt + 3] = OPT_END;
+        // file sets router 1.1.1.1; sname overrides with 2.2.2.2.
+        pkt[FILE_OFFSET] = OPT_ROUTER;
+        pkt[FILE_OFFSET + 1] = 4;
+        pkt[FILE_OFFSET + 2..FILE_OFFSET + 6].copy_from_slice(&[1, 1, 1, 1]);
+        pkt[FILE_OFFSET + 6] = OPT_END;
+        pkt[SNAME_OFFSET] = OPT_ROUTER;
+        pkt[SNAME_OFFSET + 1] = 4;
+        pkt[SNAME_OFFSET + 2..SNAME_OFFSET + 6].copy_from_slice(&[2, 2, 2, 2]);
+        pkt[SNAME_OFFSET + 6] = OPT_END;
+
+        let opts = parse_options_with_overload(&pkt).unwrap();
+        assert_eq!(opts.router, [2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn test_process_response_offer_with_overload() {
+        // End-to-end: msg type in primary, lease/server-id in sname.
+        let mac = [0x02, 0, 0, 0, 0, 1];
+        let xid = 0xCAFEBABE;
+        let client = DhcpClient::new(mac, xid);
+        let mut pkt = base_reply(xid);
+        pkt[16..20].copy_from_slice(&[192, 168, 5, 20]);
+        let opt = DHCP_HEADER_LEN + 4;
+        pkt[opt] = OPT_MSG_TYPE;
+        pkt[opt + 1] = 1;
+        pkt[opt + 2] = DHCPOFFER;
+        pkt[opt + 3] = OPT_OVERLOAD;
+        pkt[opt + 4] = 1;
+        pkt[opt + 5] = OVERLOAD_SNAME;
+        pkt[opt + 6] = OPT_END;
+        // sname carries server-id + lease time.
+        pkt[SNAME_OFFSET] = OPT_SERVER_ID;
+        pkt[SNAME_OFFSET + 1] = 4;
+        pkt[SNAME_OFFSET + 2..SNAME_OFFSET + 6].copy_from_slice(&[192, 168, 5, 1]);
+        pkt[SNAME_OFFSET + 6] = OPT_LEASE_TIME;
+        pkt[SNAME_OFFSET + 7] = 4;
+        pkt[SNAME_OFFSET + 8..SNAME_OFFSET + 12].copy_from_slice(&86400u32.to_be_bytes());
+        pkt[SNAME_OFFSET + 12] = OPT_END;
+
+        match client.process_response(&pkt).unwrap() {
+            DhcpEvent::Offer {
+                server_ip,
+                offered_ip,
+                lease_time,
+                ..
+            } => {
+                assert_eq!(server_ip, [192, 168, 5, 1]);
+                assert_eq!(offered_ip, [192, 168, 5, 20]);
+                assert_eq!(lease_time, 86400);
+            }
+            _ => panic!("expected Offer"),
+        }
+    }
+
+    #[test]
+    fn test_overload_does_not_recurse() {
+        // An overload marker inside the sname region must be ignored
+        // (no second-level expansion), so a malformed nested marker
+        // cannot trigger extra parsing passes.
+        let xid = 0x13371337;
+        let mut pkt = base_reply(xid);
+        let opt = DHCP_HEADER_LEN + 4;
+        pkt[opt] = OPT_OVERLOAD;
+        pkt[opt + 1] = 1;
+        pkt[opt + 2] = OVERLOAD_SNAME;
+        pkt[opt + 3] = OPT_END;
+        // sname re-declares overload=file plus a router; only router
+        // should be picked up, file region stays unparsed (zeroed).
+        pkt[SNAME_OFFSET] = OPT_OVERLOAD;
+        pkt[SNAME_OFFSET + 1] = 1;
+        pkt[SNAME_OFFSET + 2] = OVERLOAD_FILE;
+        pkt[SNAME_OFFSET + 3] = OPT_ROUTER;
+        pkt[SNAME_OFFSET + 4] = 4;
+        pkt[SNAME_OFFSET + 5..SNAME_OFFSET + 9].copy_from_slice(&[7, 7, 7, 7]);
+        pkt[SNAME_OFFSET + 9] = OPT_END;
+
+        let opts = parse_options_with_overload(&pkt).unwrap();
+        assert_eq!(opts.router, [7, 7, 7, 7]);
+        // file region was never parsed -> subnet stays default.
+        assert_eq!(opts.subnet_mask, [0, 0, 0, 0]);
     }
 }

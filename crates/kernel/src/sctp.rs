@@ -275,15 +275,17 @@ impl SctpChunk {
         }
         chunk.data_len = payload_len;
 
-        // Chunks are padded to 4-byte boundaries.
+        // Chunks are padded to 4-byte boundaries.  A trailing chunk whose
+        // padded length exceeds the buffer is malformed (under-padded by a
+        // remote sender): reject it rather than clamping `consumed`, which
+        // would otherwise desync a multi-chunk walk by reporting a length
+        // shorter than the chunk claims.
         let padded = (len + 3) & !3;
-        let consumed = if padded > data.len() {
-            data.len()
-        } else {
-            padded
-        };
+        if padded > data.len() {
+            return Err(Error::InvalidArgument);
+        }
 
-        Ok((chunk, consumed))
+        Ok((chunk, padded))
     }
 
     /// Serialise this chunk into `buf`.
@@ -707,8 +709,16 @@ impl SctpAssociation {
             self.recv_len += copy_len;
         }
 
-        // Advance cumulative TSN ack.
-        self.cumulative_tsn_ack = tsn;
+        // Advance the cumulative TSN ack only for the next in-sequence TSN.
+        // A remote peer must not be able to set the ack state to an arbitrary
+        // value: trusting `tsn` unconditionally lets an attacker-chosen TSN
+        // corrupt reliability accounting.  Per RFC 4960 section 6.2 the
+        // cumulative ack point advances by exactly one TSN at a time; out-of-
+        // order or replayed TSNs leave it unchanged (the payload is still
+        // buffered above, matching the simple in-order receive model here).
+        if tsn == self.cumulative_tsn_ack.wrapping_add(1) {
+            self.cumulative_tsn_ack = tsn;
+        }
 
         // Build SACK.
         let mut sack = SctpChunk::new(SctpChunkType::Sack);

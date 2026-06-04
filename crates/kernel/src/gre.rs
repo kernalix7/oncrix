@@ -74,6 +74,14 @@ const GRE_SEQUENCE_FIELD_LEN: usize = 4;
 /// EtherType for IPv4 (used as default protocol type).
 const ETHERTYPE_IPV4: u16 = 0x0800;
 
+/// EtherType for IPv6 (accepted as an inner protocol type).
+const ETHERTYPE_IPV6: u16 = 0x86DD;
+
+/// Protocol type indicating GRE-in-GRE (RFC 2784 transparent
+/// encapsulation of another GRE packet).  Used to detect nesting on
+/// the receive path.
+const ETHERTYPE_GRE: u16 = 0x6558;
+
 /// Default TTL for the outer IP header.
 const DEFAULT_TTL: u8 = 64;
 
@@ -478,25 +486,87 @@ impl GreTunnel {
     /// referencing the encapsulated inner packet.  If this tunnel has
     /// a key configured, the key in the header must match.
     ///
+    /// This is the single-level entry point used by the receive path.
+    /// It starts the anti-nesting depth budget at [`MAX_ENCAP_LIMIT`]
+    /// and delegates to [`decapsulate_depth`](Self::decapsulate_depth).
+    /// A re-dispatcher peeling further GRE layers must thread the
+    /// returned remaining budget back in so GRE-in-GRE nesting is
+    /// bounded across the whole chain.
+    ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] if the GRE header is malformed
-    ///   or the key does not match.
+    /// - [`Error::InvalidArgument`] if the GRE header is malformed,
+    ///   the key does not match, or the inner protocol type is not a
+    ///   supported payload type.
     pub fn decapsulate<'a>(&self, outer_packet: &'a [u8]) -> Result<&'a [u8]> {
+        let (inner, _remaining) = self.decapsulate_depth(outer_packet, MAX_ENCAP_LIMIT)?;
+        Ok(inner)
+    }
+
+    /// Decapsulate a GRE packet while enforcing a nesting-depth budget.
+    ///
+    /// `depth_budget` is the number of GRE layers still permitted to be
+    /// peeled on this receive chain (including this one).  It mirrors
+    /// the encapsulate-side [`MAX_ENCAP_LIMIT`] cap, but on the receive
+    /// path: a GRE-in-GRE packet is rejected once the budget is
+    /// exhausted, bounding attacker-controlled recursion and the
+    /// associated CPU/stack DoS once an inner GRE layer is re-dispatched.
+    ///
+    /// Returns the inner payload slice together with the remaining
+    /// budget (decremented by one).  A caller that re-dispatches an
+    /// inner GRE packet must pass the returned remaining budget back in
+    /// rather than restarting from [`MAX_ENCAP_LIMIT`].
+    ///
+    /// The inner `protocol_type` is validated: only IPv4, IPv6, and a
+    /// further (still-budgeted) GRE layer are accepted; any other type
+    /// is rejected so it is never blindly re-injected into the stack.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if `depth_budget` is zero, the GRE
+    ///   header is malformed, the key does not match, the payload is
+    ///   empty, or the inner protocol type is unsupported.
+    pub fn decapsulate_depth<'a>(
+        &self,
+        outer_packet: &'a [u8],
+        depth_budget: u8,
+    ) -> Result<(&'a [u8], u8)> {
+        // Refuse to peel another layer once the receive-side encap cap
+        // is reached — the anti-nesting guard that bounds attacker-chosen
+        // GRE-in-GRE recursion depth.
+        if depth_budget == 0 {
+            return Err(Error::InvalidArgument);
+        }
+
         let (header, payload_offset) = parse_gre(outer_packet)?;
 
         // Validate key if configured.
-        if let Some(expected_key) = self.key {
-            if !header.flags().key_present() || header.key != expected_key {
-                return Err(Error::InvalidArgument);
-            }
+        if let Some(expected_key) = self.key
+            && (!header.flags().key_present() || header.key != expected_key)
+        {
+            return Err(Error::InvalidArgument);
         }
 
         if payload_offset >= outer_packet.len() {
             return Err(Error::InvalidArgument);
         }
 
-        Ok(&outer_packet[payload_offset..])
+        let remaining = depth_budget - 1;
+
+        // Validate the inner protocol type.  A nested GRE layer is only
+        // acceptable while depth budget remains for the re-dispatcher to
+        // consume; an unknown protocol type is rejected outright.
+        match header.protocol_type {
+            ETHERTYPE_IPV4 | ETHERTYPE_IPV6 => {}
+            ETHERTYPE_GRE => {
+                if remaining == 0 {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+            _ => return Err(Error::InvalidArgument),
+        }
+
+        Ok((&outer_packet[payload_offset..], remaining))
     }
 }
 

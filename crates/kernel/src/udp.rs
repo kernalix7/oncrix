@@ -61,9 +61,17 @@ pub struct UdpHeader {
 
 /// Parse a UDP header and payload from raw bytes.
 ///
+/// The on-wire `length` field is treated as authoritative: it is
+/// validated to be at least [`UDP_HEADER_LEN`] (8 bytes) and no
+/// larger than the received `data`, then used to bound the payload.
 /// Returns the parsed [`UdpHeader`] and a slice referencing the
 /// payload (everything after the 8-byte header, bounded by the
 /// `length` field).
+///
+/// A datagram is rejected — never truncated silently — when its
+/// header length is below the header size or exceeds the received
+/// bytes, so an attacker cannot desynchronise the length field from
+/// the bytes actually present.
 ///
 /// # Errors
 ///
@@ -72,6 +80,25 @@ pub struct UdpHeader {
 /// - The `length` field is less than 8 (minimum valid UDP length).
 /// - The `length` field exceeds the available data.
 pub fn parse_udp(data: &[u8]) -> Result<(UdpHeader, &[u8])> {
+    let (header, datagram) = parse_udp_datagram(data)?;
+    Ok((header, &datagram[UDP_HEADER_LEN..]))
+}
+
+/// Parse a UDP header and return the length-bounded *full datagram*.
+///
+/// Like [`parse_udp`], but the second return value is the complete
+/// UDP datagram (header plus payload) trimmed to exactly the on-wire
+/// `length` field, i.e. `&data[..length]`.  This is the precise span
+/// the receive-side checksum must cover; passing the raw receive
+/// buffer (which may carry trailing padding or coalesced bytes) would
+/// fold in bytes that are not part of the datagram and corrupt the
+/// computed checksum.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] under the same conditions as
+/// [`parse_udp`].
+pub fn parse_udp_datagram(data: &[u8]) -> Result<(UdpHeader, &[u8])> {
     if data.len() < UDP_HEADER_LEN {
         return Err(Error::InvalidArgument);
     }
@@ -81,6 +108,8 @@ pub fn parse_udp(data: &[u8]) -> Result<(UdpHeader, &[u8])> {
     let length = u16::from_be_bytes([data[4], data[5]]);
     let checksum = u16::from_be_bytes([data[6], data[7]]);
 
+    // The length field is authoritative: it must cover at least the
+    // 8-byte header and must not claim more bytes than were received.
     let len = length as usize;
     if len < UDP_HEADER_LEN || len > data.len() {
         return Err(Error::InvalidArgument);
@@ -93,7 +122,45 @@ pub fn parse_udp(data: &[u8]) -> Result<(UdpHeader, &[u8])> {
         checksum,
     };
 
-    Ok((header, &data[UDP_HEADER_LEN..len]))
+    Ok((header, &data[..len]))
+}
+
+/// Verify the checksum of a received UDP datagram (RFC 768).
+///
+/// `datagram` must be the length-bounded UDP datagram (header plus
+/// payload) exactly as produced by [`parse_udp_datagram`]; `src_ip`
+/// and `dst_ip` are the real addresses taken from the enclosing IPv4
+/// header.
+///
+/// A zero checksum field means "checksum not computed" and is
+/// accepted for IPv4 (RFC 768).  Otherwise the checksum is folded
+/// over the pseudo-header and the length-bounded datagram; a valid
+/// datagram folds to zero, so any non-zero fold is treated as
+/// corruption and rejected.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `datagram` is shorter than
+/// [`UDP_HEADER_LEN`], or if a non-zero on-wire checksum fails to
+/// verify.
+pub fn verify_udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], datagram: &[u8]) -> Result<()> {
+    if datagram.len() < UDP_HEADER_LEN {
+        return Err(Error::InvalidArgument);
+    }
+
+    // A zero checksum field signals "not computed" for IPv4 UDP.
+    let on_wire = u16::from_be_bytes([datagram[6], datagram[7]]);
+    if on_wire == 0 {
+        return Ok(());
+    }
+
+    // Recompute over the pseudo-header and the exact datagram span.
+    // The on-wire checksum is part of the sum, so a correct datagram
+    // folds to zero; anything else is corruption.
+    if fold_udp_checksum(src_ip, dst_ip, datagram) != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
 }
 
 // =========================================================================
@@ -150,17 +217,21 @@ pub fn write_udp(
 // udp_checksum
 // =========================================================================
 
-/// Compute the UDP checksum over a pseudo-header and UDP data
-/// (RFC 768).
+/// Fold the UDP pseudo-header and datagram into a 16-bit one's
+/// complement sum (RFC 768), *before* the final bitwise inversion.
 ///
 /// The pseudo-header consists of the source IP, destination IP, a
-/// zero byte, the protocol number (17), and the UDP length.  The
-/// `udp_data` slice must contain the complete UDP datagram (header
-/// plus payload) as it appears on the wire.
+/// zero byte, the protocol number (17), and the UDP length — which is
+/// derived from `udp_data.len()`.  The `udp_data` slice must
+/// therefore be the complete UDP datagram trimmed to exactly the
+/// on-wire `length` field (see [`parse_udp_datagram`]); any trailing
+/// bytes beyond that length would be folded in and corrupt the
+/// result.
 ///
-/// Returns the one's-complement checksum.  A return value of
-/// `0xFFFF` is substituted for a computed zero per RFC 768.
-pub fn udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_data: &[u8]) -> u16 {
+/// For a datagram that already carries a correct checksum this folded
+/// value is `0xFFFF`, so its bitwise inverse (used by verification)
+/// is `0`.
+fn fold_udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Pseudo-header: src IP (2 x u16).
@@ -174,7 +245,7 @@ pub fn udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_data: &[u8]) -> u16 
     // Pseudo-header: zero + protocol.
     sum = sum.wrapping_add(PROTO_UDP as u32);
 
-    // Pseudo-header: UDP length.
+    // Pseudo-header: UDP length (derived from the bounded slice).
     sum = sum.wrapping_add(udp_data.len() as u32);
 
     // Sum 16-bit words of the UDP datagram.
@@ -195,7 +266,22 @@ pub fn udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_data: &[u8]) -> u16 
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
-    let result = !(sum as u16);
+    !(sum as u16)
+}
+
+/// Compute the UDP checksum over a pseudo-header and UDP data
+/// (RFC 768).
+///
+/// The pseudo-header consists of the source IP, destination IP, a
+/// zero byte, the protocol number (17), and the UDP length.  The
+/// `udp_data` slice must contain the complete UDP datagram (header
+/// plus payload) trimmed to exactly the on-wire `length` field, as
+/// returned by [`parse_udp_datagram`].
+///
+/// Returns the one's-complement checksum.  A return value of
+/// `0xFFFF` is substituted for a computed zero per RFC 768.
+pub fn udp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_data: &[u8]) -> u16 {
+    let result = fold_udp_checksum(src_ip, dst_ip, udp_data);
 
     // RFC 768: if the computed checksum is zero, transmit 0xFFFF.
     if result == 0 { 0xFFFF } else { result }
@@ -656,6 +742,92 @@ mod tests {
         let data = [0u8; 8]; // all zeros
         let cksum = udp_checksum(&src_ip, &dst_ip, &data);
         assert_ne!(cksum, 0);
+    }
+
+    #[test]
+    fn test_parse_udp_datagram_is_length_bounded() {
+        // 12-byte buffer but on-wire length = 10: the datagram slice
+        // must stop at 10, ignoring the trailing 2 bytes of padding.
+        #[rustfmt::skip]
+        let data: [u8; 12] = [
+            0x04, 0xD2, // src
+            0x00, 0x50, // dst
+            0x00, 0x0A, // length = 10 (8 header + 2 payload)
+            0x00, 0x00, // checksum
+            0xDE, 0xAD, // payload
+            0xBE, 0xEF, // trailing padding (NOT part of datagram)
+        ];
+        let (hdr, datagram) = parse_udp_datagram(&data).ok().unwrap();
+        assert_eq!(hdr.length, 10);
+        assert_eq!(datagram.len(), 10);
+        assert_eq!(&datagram[UDP_HEADER_LEN..], &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_zero_field_accepted() {
+        // A zero checksum field means "not computed"; accept it.
+        #[rustfmt::skip]
+        let data: [u8; 10] = [
+            0x04, 0xD2, 0x00, 0x50,
+            0x00, 0x0A, 0x00, 0x00, // length=10, checksum=0
+            0xDE, 0xAD,
+        ];
+        let (_, datagram) = parse_udp_datagram(&data).ok().unwrap();
+        assert!(verify_udp_checksum(&[10, 0, 0, 1], &[10, 0, 0, 2], datagram).is_ok());
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_valid_roundtrip() {
+        // Build a datagram, fill in a correct checksum, and verify it.
+        let src_ip = [192, 168, 0, 1];
+        let dst_ip = [192, 168, 0, 2];
+        let mut buf = [0u8; 13];
+        let n = write_udp(1234, 5678, &[1, 2, 3, 4, 5], &mut buf)
+            .ok()
+            .unwrap();
+        let cksum = udp_checksum(&src_ip, &dst_ip, &buf[..n]);
+        let ck = cksum.to_be_bytes();
+        buf[6] = ck[0];
+        buf[7] = ck[1];
+
+        let (_, datagram) = parse_udp_datagram(&buf[..n]).ok().unwrap();
+        assert!(verify_udp_checksum(&src_ip, &dst_ip, datagram).is_ok());
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_corrupt_rejected() {
+        // A non-zero but wrong checksum must be rejected.
+        let src_ip = [192, 168, 0, 1];
+        let dst_ip = [192, 168, 0, 2];
+        let mut buf = [0u8; 13];
+        let n = write_udp(1234, 5678, &[1, 2, 3, 4, 5], &mut buf)
+            .ok()
+            .unwrap();
+        let cksum = udp_checksum(&src_ip, &dst_ip, &buf[..n]);
+        let ck = cksum.to_be_bytes();
+        // Corrupt the checksum (flip a bit, keep it non-zero).
+        buf[6] = ck[0] ^ 0x01;
+        buf[7] = ck[1];
+
+        let (_, datagram) = parse_udp_datagram(&buf[..n]).ok().unwrap();
+        assert!(verify_udp_checksum(&src_ip, &dst_ip, datagram).is_err());
+    }
+
+    #[test]
+    fn test_verify_udp_checksum_wrong_src_ip_rejected() {
+        // Checksum computed for one src IP must fail against another,
+        // proving the pseudo-header IPs are actually covered.
+        let src_ip = [192, 168, 0, 1];
+        let dst_ip = [192, 168, 0, 2];
+        let mut buf = [0u8; 11];
+        let n = write_udp(1, 2, &[0xAA, 0xBB, 0xCC], &mut buf).ok().unwrap();
+        let cksum = udp_checksum(&src_ip, &dst_ip, &buf[..n]);
+        let ck = cksum.to_be_bytes();
+        buf[6] = ck[0];
+        buf[7] = ck[1];
+
+        let (_, datagram) = parse_udp_datagram(&buf[..n]).ok().unwrap();
+        assert!(verify_udp_checksum(&[10, 0, 0, 9], &dst_ip, datagram).is_err());
     }
 
     // -- UdpSocketTable --
