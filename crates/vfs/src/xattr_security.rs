@@ -132,9 +132,11 @@ impl SecurityXattrStore {
             return Err(Error::OutOfMemory);
         }
         let slot = &mut self.attrs[self.count];
-        let nl = name.len().min(XATTR_SECURITY_MAX_NAME);
-        slot.name[..nl].copy_from_slice(&name[..nl]);
-        slot.name_len = nl;
+        // validate_security_name (called above) guarantees name.len() <=
+        // XATTR_SECURITY_MAX_NAME, so a plain copy is safe — no truncation.
+        debug_assert!(name.len() <= XATTR_SECURITY_MAX_NAME);
+        slot.name[..name.len()].copy_from_slice(name);
+        slot.name_len = name.len();
         let vl = value.len();
         slot.value[..vl].copy_from_slice(value);
         slot.value_len = vl;
@@ -165,6 +167,10 @@ impl SecurityXattrStore {
         for i in 0..self.count {
             if self.attrs[i].active && self.attrs[i].name() == name {
                 self.attrs[i].active = false;
+                // BUGFIX: decrement count so the slot is reusable; without
+                // this, after MAX insertions the store permanently returns
+                // OutOfMemory even if all attributes have been removed.
+                self.count -= 1;
                 return Ok(());
             }
         }
@@ -203,8 +209,17 @@ impl Default for SecurityXattrStore {
 }
 
 /// Validate that `name` starts with the `security.` prefix.
+///
+/// Name length is upper-bounded by [`XATTR_SECURITY_MAX_NAME`] **before** any
+/// copy.  Without this check an oversized name would be silently truncated by
+/// the `.min()` in [`SecurityXattrStore::set`], producing a different key than
+/// the caller supplied — a subtle security confusion bug.
 pub fn validate_security_name(name: &[u8]) -> Result<()> {
     if name.len() <= XATTR_SECURITY_PREFIX.len() {
+        return Err(Error::InvalidArgument);
+    }
+    // SECURITY: reject before any buffer copy; truncation changes identity.
+    if name.len() > XATTR_SECURITY_MAX_NAME {
         return Err(Error::InvalidArgument);
     }
     if !name.starts_with(XATTR_SECURITY_PREFIX) {
