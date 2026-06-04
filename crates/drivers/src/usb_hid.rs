@@ -47,6 +47,14 @@ const MAX_DESCRIPTOR_FIELDS: usize = 32;
 /// Maximum number of concurrently tracked HID devices.
 pub const MAX_HID_DEVICES: usize = 16;
 
+/// Hard upper bound on a HID report descriptor length we will accept.
+///
+/// USB HID 1.11 §7.1 imposes no explicit maximum, but descriptors larger than
+/// this are considered malformed/hostile in our threat model. The USB 2.0 spec
+/// limits control transfers to 64 KiB; we choose 4 KiB as a conservative
+/// kernel-safe limit — real HID descriptors are rarely larger than ~512 bytes.
+pub const MAX_HID_DESCRIPTOR_SIZE: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // HID Descriptor (repr(C), per USB HID 1.11 section 6.2.1)
 // ---------------------------------------------------------------------------
@@ -387,6 +395,125 @@ impl HidDevice {
         }
         self.report_descriptor[self.descriptor_field_count] = field;
         self.descriptor_field_count += 1;
+        Ok(())
+    }
+
+    /// Parse a raw HID report descriptor byte buffer.
+    ///
+    /// `raw` must be exactly the bytes of the HID report descriptor, as
+    /// fetched from the device.  `declared_length` is the value of
+    /// `wReportDescriptorLength` from the HID class descriptor; it must
+    /// not exceed [`MAX_HID_DESCRIPTOR_SIZE`].
+    ///
+    /// The function walks the descriptor's TLV-style items, each consisting
+    /// of a tag/size prefix byte optionally followed by 1, 2, or 4 data bytes.
+    /// It stops when `declared_length` bytes have been consumed, when the
+    /// buffer is exhausted, or when [`MAX_DESCRIPTOR_FIELDS`] fields have been
+    /// recorded.
+    ///
+    /// # Security
+    ///
+    /// - `declared_length` is capped at [`MAX_HID_DESCRIPTOR_SIZE`] before use.
+    /// - Every item read is checked to be fully contained within both `raw`
+    ///   and the declared boundary — no byte is read past the smaller of
+    ///   `raw.len()` and `declared_length`.
+    /// - An item size byte of 3 is treated as 4 data bytes per HID spec.
+    /// - A prefix byte of `0xFE` (long item) is rejected as unsupported.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if `declared_length` exceeds
+    ///   [`MAX_HID_DESCRIPTOR_SIZE`], if an item overruns the buffer/boundary,
+    ///   or if a long item (prefix 0xFE) is encountered.
+    pub fn parse_report_descriptor(&mut self, raw: &[u8], declared_length: u16) -> Result<()> {
+        // Reject device-declared lengths that exceed our kernel-safe cap.
+        let declared = declared_length as usize;
+        if declared > MAX_HID_DESCRIPTOR_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+        // Walk only up to the smaller of the real buffer and the declared size.
+        let limit = declared.min(raw.len());
+
+        // State carried across items (minimal subset for field extraction).
+        let mut usage_page = HidUsagePage::GenericDesktop;
+        let mut usage_raw: u16 = 0;
+        let mut logical_min: i32 = 0;
+        let mut logical_max: i32 = 0;
+        let mut report_size: u8 = 0; // bits per field
+        let mut bit_offset: u16 = 0;
+
+        let mut pos = 0usize;
+        while pos < limit {
+            // Each short item starts with a prefix byte.
+            let prefix = raw[pos];
+            pos += 1;
+
+            // Long item (prefix == 0xFE) is not used by any real boot-class
+            // keyboard or mouse; reject it to keep the parser simple.
+            if prefix == 0xFE {
+                return Err(Error::InvalidArgument);
+            }
+
+            // Low 2 bits of prefix encode data size: 0=0, 1=1, 2=2, 3=4 bytes.
+            let size_code = prefix & 0x03;
+            let data_bytes: usize = match size_code {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3 => 4,
+                _ => unreachable!(),
+            };
+
+            // Verify the data bytes are within the safe limit.
+            let item_end = pos.checked_add(data_bytes).ok_or(Error::InvalidArgument)?;
+            if item_end > limit {
+                return Err(Error::InvalidArgument);
+            }
+
+            // Read the (up to 4) data bytes as a little-endian u32.
+            let data_u32: u32 = match data_bytes {
+                0 => 0,
+                1 => raw[pos] as u32,
+                2 => u16::from_le_bytes([raw[pos], raw[pos + 1]]) as u32,
+                4 => u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]),
+                _ => unreachable!(),
+            };
+            pos = item_end;
+
+            // Tag (bits 7:4) and type (bits 3:2).
+            let tag = (prefix >> 4) & 0x0F;
+            let item_type = (prefix >> 2) & 0x03;
+
+            match (item_type, tag) {
+                // Global items.
+                (1, 0) => usage_page = HidUsagePage::from_u16(data_u32 as u16),
+                (1, 1) => logical_min = data_u32 as i8 as i32,
+                (1, 2) => logical_max = data_u32 as i8 as i32,
+                (1, 7) => report_size = (data_u32 & 0xFF) as u8,
+                // Local items.
+                (2, 0) => usage_raw = data_u32 as u16,
+                // Main items — Input (tag=8).
+                (0, 8) => {
+                    // Bit 1: 0 = array, 1 = variable.
+                    let is_array = (data_u32 & 0x02) == 0;
+                    let field = HidReportField {
+                        usage_page,
+                        usage: HidUsage::from_u16(usage_raw),
+                        bit_offset,
+                        bit_size: report_size,
+                        logical_min,
+                        logical_max,
+                        is_array,
+                    };
+                    // add_report_field stops at MAX_DESCRIPTOR_FIELDS;
+                    // ignore OutOfMemory to continue consuming the descriptor.
+                    let _ = self.add_report_field(field);
+                    bit_offset = bit_offset.saturating_add(report_size as u16);
+                }
+                _ => { /* other tags not needed for boot-class parsing */ }
+            }
+        }
+
         Ok(())
     }
 

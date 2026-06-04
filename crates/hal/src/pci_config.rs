@@ -494,6 +494,11 @@ impl PciConfigSpace {
     /// capabilities pointer at offset `0x34`. Returns the first
     /// capability matching `cap_id`.
     ///
+    /// Cycle detection uses a 256-bit visited bitmap (`[u64; 4]`) that
+    /// covers every byte offset in the standard config space (0x00–0xFF).
+    /// Each bit corresponds to one byte offset; only offsets ≥ 0x40 are
+    /// ever set, so offsets 0x00–0x3F are implicitly refused.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the capability is not present.
@@ -515,8 +520,27 @@ impl PciConfigSpace {
         let mut ptr = self.read_config_u8(bus, device, function, CFG_CAP_PTR);
         ptr &= 0xFC; // Align to dword.
 
-        let mut iterations = 0u32;
-        while ptr != 0 && iterations < 48 {
+        // 256-bit visited bitmap: one bit per byte offset in config space.
+        // Prevents A→B→A loops from firmware-supplied malicious next pointers.
+        let mut visited = [0u64; 4];
+
+        while ptr != 0 {
+            // A valid capability must reside above the standard header region
+            // (offsets 0x00–0x3F). A next-pointer into that region is a sign
+            // of malicious or corrupt firmware and must never be followed.
+            if ptr < 0x40 {
+                break;
+            }
+
+            // Cycle detection: test and set the visited bit for this offset.
+            let bit_idx = usize::from(ptr);
+            let word = bit_idx / 64;
+            let bit = bit_idx % 64;
+            if visited[word] & (1u64 << bit) != 0 {
+                break;
+            }
+            visited[word] |= 1u64 << bit;
+
             let header = self.read_config(bus, device, function, ptr);
             let id = (header & 0xFF) as u8;
             let next = ((header >> 8) & 0xFF) as u8;
@@ -530,7 +554,6 @@ impl PciConfigSpace {
             }
 
             ptr = next & 0xFC;
-            iterations += 1;
         }
 
         Err(Error::NotFound)
@@ -539,7 +562,10 @@ impl PciConfigSpace {
     /// Enumerate all capabilities for a device.
     ///
     /// Returns the number of capabilities found and fills the
-    /// output slice.
+    /// output slice. Cycle detection uses the same 256-bit visited
+    /// bitmap as [`find_capability`]; the walk stops as soon as a
+    /// previously-seen offset is encountered rather than relying on
+    /// a fixed iteration ceiling.
     ///
     /// # Errors
     ///
@@ -560,9 +586,26 @@ impl PciConfigSpace {
         let mut ptr = self.read_config_u8(bus, device, function, CFG_CAP_PTR);
         ptr &= 0xFC;
 
+        // 256-bit visited bitmap: one bit per byte offset in config space.
+        let mut visited = [0u64; 4];
         let mut count = 0usize;
-        let mut iterations = 0u32;
-        while ptr != 0 && iterations < 48 && count < out.len() {
+
+        while ptr != 0 && count < out.len() {
+            // Reject any pointer into the standard header region (0x00–0x3F);
+            // firmware may supply a malicious next-pointer that loops back there.
+            if ptr < 0x40 {
+                break;
+            }
+
+            // Cycle detection: test and set the visited bit for this offset.
+            let bit_idx = usize::from(ptr);
+            let word = bit_idx / 64;
+            let bit = bit_idx % 64;
+            if visited[word] & (1u64 << bit) != 0 {
+                break;
+            }
+            visited[word] |= 1u64 << bit;
+
             let header = self.read_config(bus, device, function, ptr);
             let id = (header & 0xFF) as u8;
             let next = ((header >> 8) & 0xFF) as u8;
@@ -575,7 +618,6 @@ impl PciConfigSpace {
             count += 1;
 
             ptr = next & 0xFC;
-            iterations += 1;
         }
 
         Ok(count)

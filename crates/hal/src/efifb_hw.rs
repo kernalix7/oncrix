@@ -131,14 +131,34 @@ impl EfiFb {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the coordinate is out of bounds.
+    /// Returns [`Error::InvalidArgument`] if the coordinate is out of bounds,
+    /// if any offset arithmetic overflows, or if the computed write range
+    /// exceeds the declared framebuffer size (possible when `stride > width`).
     pub fn put_pixel(&self, x: u32, y: u32, pixel: Pixel) -> Result<()> {
         if x >= self.info.width || y >= self.info.height {
             return Err(Error::InvalidArgument);
         }
-        let offset = (y * self.info.stride + x) as usize * 4;
-        let ptr = (self.info.fb_base as usize + offset) as *mut u32;
-        // SAFETY: fb_base is a valid mapped framebuffer; offset is in-bounds.
+        // Widen to usize before multiplying to prevent u32 overflow.
+        let row_start = (y as usize)
+            .checked_mul(self.info.stride as usize)
+            .ok_or(Error::InvalidArgument)?;
+        let pixel_off = row_start
+            .checked_add(x as usize)
+            .ok_or(Error::InvalidArgument)?;
+        let byte_off = pixel_off.checked_mul(4).ok_or(Error::InvalidArgument)?;
+        // Guard the write against the real framebuffer byte length.
+        // stride > width is a valid GOP configuration and means x < width does
+        // NOT guarantee byte_off + 4 <= fb_size.
+        let write_end = byte_off.checked_add(4).ok_or(Error::InvalidArgument)?;
+        if write_end > self.info.fb_size {
+            return Err(Error::InvalidArgument);
+        }
+        let addr = (self.info.fb_base as usize)
+            .checked_add(byte_off)
+            .ok_or(Error::InvalidArgument)?;
+        let ptr = addr as *mut u32;
+        // SAFETY: fb_base is a valid mapped framebuffer. byte_off + 4 <= fb_size
+        // (checked above) guarantees the write stays within the mapped region.
         unsafe { core::ptr::write_volatile(ptr, pixel.encode(self.info.format)) };
         Ok(())
     }
@@ -147,17 +167,40 @@ impl EfiFb {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the rectangle is out of bounds.
+    /// Returns [`Error::InvalidArgument`] if the rectangle is out of bounds,
+    /// if any offset arithmetic overflows, or if any computed write range
+    /// exceeds the declared framebuffer size (possible when `stride > width`).
     pub fn fill_rect(&self, x: u32, y: u32, w: u32, h: u32, pixel: Pixel) -> Result<()> {
-        if x + w > self.info.width || y + h > self.info.height {
+        // Use saturating_add in the guard so that x + w or y + h cannot wrap around
+        // and silently pass a rectangle that extends beyond the framebuffer edge.
+        if x.saturating_add(w) > self.info.width || y.saturating_add(h) > self.info.height {
             return Err(Error::InvalidArgument);
         }
         let encoded = pixel.encode(self.info.format);
         for row in y..y + h {
             for col in x..x + w {
-                let offset = (row * self.info.stride + col) as usize * 4;
-                let ptr = (self.info.fb_base as usize + offset) as *mut u32;
-                // SAFETY: fb_base mapped; offset in bounds.
+                // Widen to usize before multiplying to prevent u32 overflow.
+                let row_start = (row as usize)
+                    .checked_mul(self.info.stride as usize)
+                    .ok_or(Error::InvalidArgument)?;
+                let pixel_off = row_start
+                    .checked_add(col as usize)
+                    .ok_or(Error::InvalidArgument)?;
+                let byte_off = pixel_off.checked_mul(4).ok_or(Error::InvalidArgument)?;
+                // Guard the write against the real framebuffer byte length.
+                // stride > width is a valid GOP config; dimension checks alone
+                // do not prevent writes past fb_size.
+                let write_end = byte_off.checked_add(4).ok_or(Error::InvalidArgument)?;
+                if write_end > self.info.fb_size {
+                    return Err(Error::InvalidArgument);
+                }
+                let addr = (self.info.fb_base as usize)
+                    .checked_add(byte_off)
+                    .ok_or(Error::InvalidArgument)?;
+                let ptr = addr as *mut u32;
+                // SAFETY: fb_base is a valid mapped framebuffer. byte_off + 4 <=
+                // fb_size (checked above) guarantees the write stays within the
+                // mapped region.
                 unsafe { core::ptr::write_volatile(ptr, encoded) };
             }
         }
@@ -172,6 +215,12 @@ impl EfiFb {
     /// Copies a row of pixels from `src` (BGRX format) into the framebuffer.
     ///
     /// `src` must have exactly `width` elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `y` is out of bounds, `src` length
+    /// does not match the framebuffer width, any offset arithmetic overflows, or
+    /// any write range exceeds the declared framebuffer size.
     pub fn blit_row(&self, y: u32, src: &[Pixel]) -> Result<()> {
         if y >= self.info.height {
             return Err(Error::InvalidArgument);
@@ -180,9 +229,26 @@ impl EfiFb {
             return Err(Error::InvalidArgument);
         }
         for (x, &px) in src.iter().enumerate() {
-            let offset = (y * self.info.stride + x as u32) as usize * 4;
-            let ptr = (self.info.fb_base as usize + offset) as *mut u32;
-            // SAFETY: fb_base mapped; offset in bounds.
+            // Widen to usize before multiplying to prevent u32 overflow.
+            let row_start = (y as usize)
+                .checked_mul(self.info.stride as usize)
+                .ok_or(Error::InvalidArgument)?;
+            let pixel_off = row_start.checked_add(x).ok_or(Error::InvalidArgument)?;
+            let byte_off = pixel_off.checked_mul(4).ok_or(Error::InvalidArgument)?;
+            // Guard the write against the real framebuffer byte length.
+            // stride > width is a valid GOP config; src.len() == width alone
+            // does not prevent writes past fb_size.
+            let write_end = byte_off.checked_add(4).ok_or(Error::InvalidArgument)?;
+            if write_end > self.info.fb_size {
+                return Err(Error::InvalidArgument);
+            }
+            let addr = (self.info.fb_base as usize)
+                .checked_add(byte_off)
+                .ok_or(Error::InvalidArgument)?;
+            let ptr = addr as *mut u32;
+            // SAFETY: fb_base is a valid mapped framebuffer. byte_off + 4 <=
+            // fb_size (checked above) guarantees the write stays within the
+            // mapped region.
             unsafe { core::ptr::write_volatile(ptr, px.encode(self.info.format)) };
         }
         Ok(())

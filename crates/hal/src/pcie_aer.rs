@@ -788,7 +788,15 @@ impl AerRegistry {
     }
 
     /// Returns a mutable reference to the AER capability at `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `index >= AER_MAX_DEVICES`.
+    /// Returns [`Error::NotFound`] if the slot at `index` is unoccupied.
     pub fn get_mut(&mut self, index: usize) -> Result<&mut AerCapability> {
+        if index >= AER_MAX_DEVICES {
+            return Err(Error::InvalidArgument);
+        }
         self.devices[index].as_mut().ok_or(Error::NotFound)
     }
 
