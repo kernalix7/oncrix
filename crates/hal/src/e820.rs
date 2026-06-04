@@ -185,14 +185,23 @@ impl E820Map {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `data` is too short for `count` entries.
+    /// Returns [`Error::InvalidArgument`] if `data` is too short for `count` entries or
+    /// if the byte-length arithmetic overflows.
     pub fn parse_raw(data: &[u8], count: usize) -> Result<Self> {
         const ENTRY_SIZE: usize = 20;
-        if data.len() < count * ENTRY_SIZE {
+        // Cap the declared count to the structural maximum before any arithmetic so that
+        // a malicious firmware value cannot cause the total_bytes multiply to overflow.
+        let count = count.min(MAX_E820_ENTRIES);
+        let total_bytes = count
+            .checked_mul(ENTRY_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        if data.len() < total_bytes {
             return Err(Error::InvalidArgument);
         }
         let mut map = Self::new();
-        for i in 0..count.min(MAX_E820_ENTRIES) {
+        for i in 0..count {
+            // i < MAX_E820_ENTRIES and ENTRY_SIZE == 20, so i * ENTRY_SIZE <= 127 * 20 = 2540
+            // which is well within usize; no overflow possible here.
             let off = i * ENTRY_SIZE;
             let base = u64::from_le_bytes([
                 data[off],

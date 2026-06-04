@@ -297,10 +297,16 @@ pub struct EarlyAllocator {
 
 impl EarlyAllocator {
     /// Creates a new early allocator at the given address.
+    ///
+    /// If `arena_start + arena_size` overflows `u64` the arena is clamped to
+    /// `u64::MAX`, which effectively means zero usable space — `early_alloc`
+    /// will return [`Error::OutOfMemory`] on the first call.
     pub fn new(arena_start: u64, arena_size: u64) -> Self {
+        // Clamp on overflow so the OOM path in early_alloc fires correctly.
+        let arena_end = arena_start.saturating_add(arena_size);
         Self {
             arena_start,
-            arena_end: arena_start + arena_size,
+            arena_end,
             cursor: arena_start,
             nr_allocs: 0,
             bytes_allocated: 0,
@@ -309,6 +315,12 @@ impl EarlyAllocator {
     }
 
     /// Allocates memory from the bump arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the allocator is inactive or `size` is zero.
+    /// Returns [`Error::OutOfMemory`] if there is insufficient space or if the alignment
+    /// or end-address arithmetic overflows.
     pub fn early_alloc(&mut self, size: u64, align: u64) -> Result<u64> {
         if !self.active {
             return Err(Error::InvalidArgument);
@@ -318,9 +330,14 @@ impl EarlyAllocator {
         }
 
         let align = align.max(EARLY_ALLOC_ALIGN);
-        // Align the cursor up.
-        let aligned = (self.cursor + align - 1) & !(align - 1);
-        let end = aligned + size;
+        // Align must be a power of two for the mask trick; if it overflows we OOM.
+        // cursor + align - 1: use checked arithmetic to avoid wrapping.
+        let aligned = self
+            .cursor
+            .checked_add(align - 1)
+            .map(|v| v & !(align - 1))
+            .ok_or(Error::OutOfMemory)?;
+        let end = aligned.checked_add(size).ok_or(Error::OutOfMemory)?;
 
         if end > self.arena_end {
             return Err(Error::OutOfMemory);
@@ -333,8 +350,15 @@ impl EarlyAllocator {
     }
 
     /// Allocates a page-aligned region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `nr_pages * PAGE_SIZE` overflows `u64`.
     pub fn alloc_pages(&mut self, nr_pages: u64) -> Result<u64> {
-        self.early_alloc(nr_pages * PAGE_SIZE, PAGE_SIZE)
+        let byte_count = nr_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        self.early_alloc(byte_count, PAGE_SIZE)
     }
 
     /// Returns the remaining space.
@@ -354,11 +378,11 @@ impl EarlyAllocator {
 
     /// Returns the usage percentage (0-100).
     pub fn usage_pct(&self) -> u64 {
-        let total = self.arena_end - self.arena_start;
+        let total = self.arena_end.saturating_sub(self.arena_start);
         if total == 0 {
             return 0;
         }
-        self.bytes_allocated * 100 / total
+        self.bytes_allocated.saturating_mul(100) / total
     }
 
     /// Deactivates the allocator (buddy is ready).
