@@ -55,6 +55,14 @@ const DEFAULT_ROBUSTNESS: u32 = 2;
 /// Default query interval in ticks (RFC 2236 section 8.2).
 const DEFAULT_QUERY_INTERVAL: u32 = 125;
 
+/// Timer ticks per second.  The report timer counts down in these
+/// units; one tick is 1/[`TICKS_PER_SEC`] of a second.
+const TICKS_PER_SEC: u32 = 10;
+
+/// Wire-encoded Max Response Time units per second.  RFC 2236 §2.2
+/// expresses the field in 1/10-second (deci-second) units.
+const MAX_RESP_UNITS_PER_SEC: u32 = 10;
+
 // =========================================================================
 // IgmpType
 // =========================================================================
@@ -309,25 +317,65 @@ impl IgmpState {
         }
     }
 
+    /// Derive a bounded report-timer value (in ticks) from a query's
+    /// wire-encoded Max Response Time field.
+    ///
+    /// `max_resp_time` is the attacker-controlled byte from the query
+    /// header, expressed in deci-seconds (RFC 2236 §2.2).  Per RFC 2236
+    /// §8.3 a host receiving a query sets its report delay to a value
+    /// chosen from `(0, Max Response Time]`.  This routine hardens that
+    /// against malicious inputs:
+    ///
+    /// 1. Convert deci-seconds to timer ticks.
+    /// 2. Treat a wire value of 0 as the configured query interval
+    ///    (RFC 2236 §8.2) rather than a zero or unbounded delay.
+    /// 3. Cap the result at [`query_interval`](Self::query_interval) so
+    ///    a large attacker value cannot pin the report timer far into
+    ///    the future.
+    /// 4. Return a deterministic mid-point in `(0, max_resp_ticks]`
+    ///    (no RNG is wired here), guaranteeing a strictly positive,
+    ///    bounded delay instead of echoing the raw attacker value.
+    fn report_timer_ticks(&self, max_resp_time: u8) -> u32 {
+        // Convert the deci-second wire value into timer ticks.
+        let raw_ticks = (max_resp_time as u32)
+            .saturating_mul(TICKS_PER_SEC)
+            .div_ceil(MAX_RESP_UNITS_PER_SEC);
+
+        // A zero wire value means "use the query interval" rather than a
+        // zero (immediate) or unbounded delay.
+        let max_resp_ticks = if raw_ticks == 0 {
+            self.query_interval
+        } else {
+            raw_ticks
+        };
+
+        // Cap so an attacker cannot push the report arbitrarily far out,
+        // and floor at 1 tick so the window is never empty.
+        let max_resp_ticks = max_resp_ticks.min(self.query_interval).max(1);
+
+        // Deterministic mid-point of (0, max_resp_ticks]; always >= 1.
+        (max_resp_ticks / 2).max(1)
+    }
+
     /// Process an incoming IGMP Membership Query.
     ///
     /// A General Query (`group_address == 0`) resets the report
     /// timer for all active groups.  A Group-Specific Query resets
     /// only the timer for the targeted group.
     ///
-    /// `max_resp_time` is in 1/10-second units; the report timer is
-    /// set to a simplified value derived from it.
+    /// `max_resp_time` is the wire-encoded Max Response Time (in
+    /// deci-seconds).  The report timer is derived via
+    /// [`report_timer_ticks`](Self::report_timer_ticks), which
+    /// converts, caps, and clamps it into `(0, Max Response Time]` per
+    /// RFC 2236 §8.3 so an attacker-controlled value is never used
+    /// verbatim.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if a group-specific query targets
     /// a group that this interface has not joined.
     pub fn process_query(&mut self, group_address: u32, max_resp_time: u8) -> Result<()> {
-        let timer_value = if max_resp_time == 0 {
-            self.query_interval
-        } else {
-            max_resp_time as u32
-        };
+        let timer_value = self.report_timer_ticks(max_resp_time);
 
         if group_address == 0 {
             // General Query — reset timers for all active groups.
