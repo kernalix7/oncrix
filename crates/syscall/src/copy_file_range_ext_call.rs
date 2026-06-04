@@ -15,6 +15,18 @@ use oncrix_lib::{Error, Result};
 /// Maximum bytes per single copy_file_range_ext call (1 GiB).
 pub const COPY_FILE_RANGE_EXT_MAX: u64 = 1 << 30;
 
+/// Inclusive upper bound of the canonical user-space lower half (x86_64).
+///
+/// Mirrors `oncrix_mm::address_space::USER_SPACE_END`.  Any pointer supplied
+/// by the caller for `off_in_ptr` / `off_out_ptr` must satisfy
+/// `ptr <= USER_PTR_MAX`.
+const USER_PTR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
+
+/// Minimum alignment (in bytes) required for `off_in_ptr` / `off_out_ptr`.
+///
+/// Both pointers reference a `u64` offset, so they must be 8-byte aligned.
+const OFFSET_PTR_ALIGN: usize = core::mem::align_of::<u64>();
+
 /// Flags for the extended copy_file_range interface.
 pub struct CopyFileRangeExtFlags;
 
@@ -97,9 +109,43 @@ pub struct CopyFileRangeExtRequest {
     pub sync: bool,
 }
 
+/// Validate that a user-supplied offset pointer is safe to dereference.
+///
+/// A value of `0` means "use current file position" and is explicitly
+/// permitted.  Any non-zero value must be:
+///
+/// - Within the canonical user-space lower half (`<= USER_PTR_MAX`).
+/// - Aligned to `OFFSET_PTR_ALIGN` bytes (the pointer targets a `u64`).
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` if the pointer is a non-zero kernel-half or
+/// non-canonical address, or if it is insufficiently aligned.
+fn validate_offset_ptr(ptr: usize) -> Result<()> {
+    if ptr == 0 {
+        // Zero is the sentinel meaning "use current file position".
+        return Ok(());
+    }
+    if ptr as u64 > USER_PTR_MAX {
+        return Err(Error::InvalidArgument);
+    }
+    if ptr % OFFSET_PTR_ALIGN != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
 /// Validate extended copy_file_range arguments.
 ///
 /// Returns a structured request or an appropriate errno.
+///
+/// # Security
+///
+/// `off_in_ptr` and `off_out_ptr` are user-supplied virtual addresses that
+/// the kernel will dereference (via `copy_from_user` / `copy_to_user`).
+/// Each non-zero pointer is validated to be within the canonical user-space
+/// lower half and properly aligned before the call proceeds.  A kernel-half
+/// address would cause a ring-0 fault and halt the kernel.
 pub fn validate_copy_file_range_ext_args(
     args: &CopyFileRangeExtArgs,
 ) -> Result<CopyFileRangeExtRequest> {
@@ -116,6 +162,10 @@ pub fn validate_copy_file_range_ext_args(
     if args.len > COPY_FILE_RANGE_EXT_MAX {
         return Err(Error::InvalidArgument);
     }
+
+    // Validate offset pointers before any kernel dereference.
+    validate_offset_ptr(args.off_in_ptr)?;
+    validate_offset_ptr(args.off_out_ptr)?;
 
     // Validate flag combinations.
     let known = CopyFileRangeExtFlags::COPY_FR_REFLINK
@@ -181,4 +231,142 @@ pub fn align_copy_len(len: u64, block_size: u64) -> u64 {
         return len;
     }
     (len / block_size) * block_size
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_args() -> CopyFileRangeExtArgs {
+        CopyFileRangeExtArgs {
+            fd_in: 3,
+            off_in_ptr: 0,
+            fd_out: 4,
+            off_out_ptr: 0,
+            len: 4096,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn valid_args_accepted() {
+        assert!(validate_copy_file_range_ext_args(&valid_args()).is_ok());
+    }
+
+    #[test]
+    fn negative_fd_rejected() {
+        let mut args = valid_args();
+        args.fd_in = -1;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn same_fd_rejected() {
+        let mut args = valid_args();
+        args.fd_out = args.fd_in;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn zero_len_rejected() {
+        let mut args = valid_args();
+        args.len = 0;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn kernel_half_off_in_ptr_rejected() {
+        // off_in_ptr pointing into kernel-half is a ring-0 dereference hazard.
+        let mut args = valid_args();
+        args.off_in_ptr = 0xFFFF_8000_0000_0000_usize;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn kernel_half_off_out_ptr_rejected() {
+        let mut args = valid_args();
+        args.off_out_ptr = 0xFFFF_8000_0000_0008_usize;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn unaligned_off_in_ptr_rejected() {
+        let mut args = valid_args();
+        // Must be 8-byte aligned (points to u64).
+        args.off_in_ptr = 0x1001;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn unaligned_off_out_ptr_rejected() {
+        let mut args = valid_args();
+        args.off_out_ptr = 0x1003;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn aligned_user_ptr_accepted() {
+        // A properly aligned, user-space pointer is valid.
+        let mut args = valid_args();
+        args.off_in_ptr = 0x1000; // page-aligned, well within user space
+        args.off_out_ptr = 0x2000;
+        assert!(validate_copy_file_range_ext_args(&args).is_ok());
+    }
+
+    #[test]
+    fn zero_ptrs_accepted() {
+        // Zero == "use file position", always permitted.
+        let args = valid_args();
+        assert_eq!(args.off_in_ptr, 0);
+        assert_eq!(args.off_out_ptr, 0);
+        assert!(validate_copy_file_range_ext_args(&args).is_ok());
+    }
+
+    #[test]
+    fn fallback_and_no_xdev_mutually_exclusive() {
+        let mut args = valid_args();
+        args.flags =
+            CopyFileRangeExtFlags::COPY_FR_FALLBACK | CopyFileRangeExtFlags::COPY_FR_NO_XDEV;
+        assert_eq!(
+            validate_copy_file_range_ext_args(&args).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn align_copy_len_rounds_down() {
+        assert_eq!(align_copy_len(4100, 4096), 4096);
+        assert_eq!(align_copy_len(8192, 4096), 8192);
+        assert_eq!(align_copy_len(1, 512), 0);
+    }
+
+    #[test]
+    fn align_copy_len_zero_block_size() {
+        assert_eq!(align_copy_len(1234, 0), 1234);
+    }
 }

@@ -73,6 +73,16 @@ pub const PIPE_MAX_BUF: usize = 1 << 20; // 1 MiB
 /// Maximum number of `iovec` elements in a single `vmsplice` call.
 pub const VMSPLICE_MAX_IOV: usize = 16;
 
+/// Inclusive upper bound of the canonical user-space lower half (x86_64).
+///
+/// Mirrors `oncrix_mm::address_space::USER_SPACE_END`.  Every `iov_base`
+/// supplied by the caller must satisfy `iov_base <= USER_ADDR_MAX` and
+/// `iov_base + iov_len <= USER_ADDR_LIMIT`.
+const USER_ADDR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
+
+/// Exclusive upper bound for user-space range arithmetic (`USER_ADDR_MAX + 1`).
+const USER_ADDR_LIMIT: u64 = USER_ADDR_MAX.wrapping_add(1);
+
 // ---------------------------------------------------------------------------
 // Fd type classification
 // ---------------------------------------------------------------------------
@@ -410,10 +420,26 @@ pub fn do_vmsplice(
         return Err(Error::InvalidArgument);
     }
 
-    // Compute total length and validate each iovec.
+    // Compute total length and validate each iovec entry.
+    //
+    // Security: every iov_base must lie within the canonical user-space
+    // lower half, and iov_base + iov_len must not overflow or escape that
+    // window.  A kernel-half address or wrap-around would allow reading or
+    // writing kernel memory from a ring-0 context.
     let mut total_len: usize = 0;
     for v in &iov[..iov_count] {
         if v.iov_len == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Reject any base address above the user-space upper bound.
+        if v.iov_base > USER_ADDR_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        // Checked overflow: end of buffer must stay within user space.
+        let iov_end = (v.iov_base as u64)
+            .checked_add(v.iov_len as u64)
+            .ok_or(Error::InvalidArgument)?;
+        if iov_end > USER_ADDR_LIMIT {
             return Err(Error::InvalidArgument);
         }
         total_len = total_len.saturating_add(v.iov_len);
@@ -809,6 +835,34 @@ mod tests {
         }];
         let n = do_vmsplice(&mut pipe, &iov, 1, SPLICE_F_GIFT, true).unwrap();
         assert_eq!(n, 4096);
+    }
+
+    #[test]
+    fn vmsplice_kernel_half_iov_base_rejected() {
+        // iov_base pointing into kernel-half must be rejected.
+        let mut pipe = make_pipe(5, 0);
+        let iov = [IoVec {
+            iov_base: 0xFFFF_8000_0000_0000,
+            iov_len: 4096,
+        }];
+        assert_eq!(
+            do_vmsplice(&mut pipe, &iov, 1, 0, true),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn vmsplice_iov_base_overflow_rejected() {
+        // iov_base + iov_len wraps around.
+        let mut pipe = make_pipe(5, 0);
+        let iov = [IoVec {
+            iov_base: u64::MAX - 4095,
+            iov_len: 4096,
+        }];
+        assert_eq!(
+            do_vmsplice(&mut pipe, &iov, 1, 0, true),
+            Err(Error::InvalidArgument)
+        );
     }
 
     // --- PipeBuf helpers ---
