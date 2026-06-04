@@ -643,7 +643,10 @@ fn parse_string_table(data: &[u8]) -> StringTable {
     let mut table = StringTable::empty();
     let mut offset = 0;
 
-    // Handle empty string section (starts with double NUL).
+    // Fast path: empty string section begins with double-NUL (SMBIOS §6.1.3).
+    // We require len >= 2 here because a single-NUL tail (len == 1, data[0]==0)
+    // falls through safely to the main loop below, which detects the empty
+    // string via the `offset == start` branch and sets consumed = 1.
     if data.len() >= 2 && data[0] == 0 && data[1] == 0 {
         table.consumed = 2;
         return table;

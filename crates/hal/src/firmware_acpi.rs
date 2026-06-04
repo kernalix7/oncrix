@@ -349,16 +349,27 @@ pub fn parse_mcfg(data: &[u8]) -> Result<Mcfg> {
     if data[..4] != MCFG_SIGNATURE {
         return Err(Error::InvalidArgument);
     }
-    verify_table_checksum(data)?;
+    // Clip both checksum and entry walk to the declared table Length.  Using
+    // the raw buffer length would let malicious firmware append fake ECAM
+    // allocation entries (arbitrary PCIe config-space base = MMIO redirect)
+    // beyond what the header declares.
+    let table_end = {
+        let declared = read_u32(data, 4) as usize;
+        if declared < AcpiTableHeader::SIZE + 8 {
+            return Err(Error::InvalidArgument);
+        }
+        declared.min(data.len())
+    };
+    verify_table_checksum(&data[..table_end])?;
     // Each MCFG allocation record starts at offset 44 (after header + 8 reserved).
     const ENTRY_SIZE: usize = 16;
     let entries_start = AcpiTableHeader::SIZE + 8;
-    let available = data.len().saturating_sub(entries_start);
+    let available = table_end.saturating_sub(entries_start);
     let num_entries = (available / ENTRY_SIZE).min(MAX_MCFG_ENTRIES);
     let mut mcfg = Mcfg::default();
     for i in 0..num_entries {
         let off = entries_start + i * ENTRY_SIZE;
-        if off + ENTRY_SIZE > data.len() {
+        if off + ENTRY_SIZE > table_end {
             break;
         }
         mcfg.entries[i] = McfgEntry {
@@ -543,14 +554,24 @@ pub fn parse_srat(data: &[u8]) -> Result<Srat> {
     if data[..4] != SRAT_SIGNATURE {
         return Err(Error::InvalidArgument);
     }
-    verify_table_checksum(data)?;
+    // Clip walk and checksum to the declared table Length — mirrors parse_madt.
+    // Walking to data.len() would allow attacker bytes beyond the header's
+    // declared Length to be parsed as memory-affinity subtables.
+    let table_end = {
+        let declared = read_u32(data, 4) as usize;
+        if declared < AcpiTableHeader::SIZE + 12 {
+            return Err(Error::InvalidArgument);
+        }
+        declared.min(data.len())
+    };
+    verify_table_checksum(&data[..table_end])?;
     let mut srat = Srat::default();
     // Sub-structures start after header (36) + 12 reserved bytes.
     let mut offset = AcpiTableHeader::SIZE + 12;
-    while offset + 2 <= data.len() {
+    while offset + 2 <= table_end {
         let stype = data[offset];
         let slen = data[offset + 1] as usize;
-        if slen < 2 || offset + slen > data.len() {
+        if slen < 2 || offset + slen > table_end {
             break;
         }
         if stype == SratType::MemoryAffinity as u8 && slen >= 40 {
@@ -617,14 +638,22 @@ pub fn parse_xsdt(data: &[u8]) -> Result<Xsdt> {
     if data[..4] != XSDT_SIGNATURE {
         return Err(Error::InvalidArgument);
     }
-    verify_table_checksum(data)?;
+    // Clip the checksum region to the declared table Length, not the raw buffer
+    // size — a caller-supplied buffer may be larger than the real table, which
+    // would allow an attacker to append bytes that compensate a corrupted body
+    // and still pass the checksum.
     let table_len = read_u32(data, 4) as usize;
-    let entries_len = table_len.saturating_sub(AcpiTableHeader::SIZE);
+    if table_len < AcpiTableHeader::SIZE {
+        return Err(Error::InvalidArgument);
+    }
+    let table_end = table_len.min(data.len());
+    verify_table_checksum(&data[..table_end])?;
+    let entries_len = table_end.saturating_sub(AcpiTableHeader::SIZE);
     let num = (entries_len / 8).min(MAX_XSDT_ENTRIES);
     let mut xsdt = Xsdt::default();
     for i in 0..num {
         let off = AcpiTableHeader::SIZE + i * 8;
-        if off + 8 > data.len() {
+        if off + 8 > table_end {
             break;
         }
         xsdt.entries[i] = read_u64(data, off);
@@ -998,14 +1027,20 @@ pub fn parse_rsdt(data: &[u8]) -> Result<Rsdt> {
     if data[..4] != RSDT_SIGNATURE {
         return Err(Error::InvalidArgument);
     }
-    verify_table_checksum(data)?;
+    // Verify checksum only over the declared table Length (same rationale as
+    // parse_xsdt — buffer may be larger than the real table).
     let table_len = read_u32(data, 4) as usize;
-    let entries_len = table_len.saturating_sub(AcpiTableHeader::SIZE);
+    if table_len < AcpiTableHeader::SIZE {
+        return Err(Error::InvalidArgument);
+    }
+    let table_end = table_len.min(data.len());
+    verify_table_checksum(&data[..table_end])?;
+    let entries_len = table_end.saturating_sub(AcpiTableHeader::SIZE);
     let num = (entries_len / 4).min(MAX_RSDT_ENTRIES);
     let mut rsdt = Rsdt::default();
     for i in 0..num {
         let off = AcpiTableHeader::SIZE + i * 4;
-        if off + 4 > data.len() {
+        if off + 4 > table_end {
             break;
         }
         rsdt.entries[i] = read_u32(data, off);
