@@ -591,7 +591,9 @@ impl ShmRegistry {
                 }
                 self.segments[idx].perm.uid = buf.perm.uid;
                 self.segments[idx].perm.gid = buf.perm.gid;
-                self.segments[idx].perm.mode = buf.perm.mode;
+                // Mask to the low 9 permission bits only — never propagate
+                // reserved/attacker-controlled bits from user space.
+                self.segments[idx].perm.mode = buf.perm.mode & 0o777;
                 self.segments[idx].ctime = 0; // Placeholder.
             }
             ShmCtlCmd::IpcRmid => {

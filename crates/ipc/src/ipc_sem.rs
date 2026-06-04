@@ -656,8 +656,18 @@ pub fn semop(registry: &mut SemRegistry, sem_id: usize, sops: &[Sembuf], pid: u3
 
 /// Control operations on a semaphore array.
 ///
+/// `caller_uid` is the effective UID of the calling process.
+/// `is_privileged` is `true` when the caller holds `CAP_IPC_OWNER` or
+/// equivalent superuser capability.
+///
 /// `arg_val` carries the value for `SETVAL`; `arg_array` is the buffer
 /// for `GETALL` / `SETALL` (must be at least `nsems` elements).
+///
+/// # POSIX.1-2024 ownership rule
+///
+/// `IPC_RMID` and `IPC_SET` require the caller to be the owner
+/// (`perm.uid`), the creator (`perm.cuid`), or a privileged process.
+/// Any other caller receives `PermissionDenied` (→ `EPERM`).
 pub fn semctl(
     registry: &mut SemRegistry,
     sem_id: usize,
@@ -666,17 +676,25 @@ pub fn semctl(
     arg_val: i32,
     arg_array: &mut [i32],
     arg_ds: Option<&SemDs>,
+    caller_uid: u32,
+    is_privileged: bool,
 ) -> Result<i32> {
     match cmd {
         IPC_RMID => {
             if sem_id >= SEM_REGISTRY_MAX {
                 return Err(Error::InvalidArgument);
             }
+            // POSIX: only owner, creator, or privileged caller may remove.
             match registry.arrays[sem_id] {
-                Some(ref mut a) => {
-                    a.removed = true;
+                Some(ref a) => {
+                    if !is_privileged && caller_uid != a.perm.uid && caller_uid != a.perm.cuid {
+                        return Err(Error::PermissionDenied);
+                    }
                 }
                 None => return Err(Error::NotFound),
+            }
+            if let Some(ref mut a) = registry.arrays[sem_id] {
+                a.removed = true;
             }
             registry.arrays[sem_id] = None;
             Ok(0)
@@ -694,10 +712,19 @@ pub fn semctl(
 
         IPC_SET => {
             registry.check_sem_id(sem_id)?;
+            // POSIX: only owner, creator, or privileged caller may set.
+            {
+                let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+                if !is_privileged && caller_uid != array.perm.uid && caller_uid != array.perm.cuid {
+                    return Err(Error::PermissionDenied);
+                }
+            }
             if let Some(ds) = arg_ds {
                 let array = registry.arrays[sem_id].as_mut().ok_or(Error::NotFound)?;
                 array.perm.uid = ds.sem_perm.uid;
                 array.perm.gid = ds.sem_perm.gid;
+                // Mask mode to permission bits only — never accept reserved bits
+                // from attacker-controlled user-space input.
                 array.perm.mode = ds.sem_perm.mode & 0o777;
                 array.sem_ctime = array.sem_ctime.wrapping_add(1);
             }

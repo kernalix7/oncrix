@@ -14,6 +14,7 @@
 //! - Linux mm/mremap.c
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // ---------------------------------------------------------------------------
 // Page size
@@ -70,6 +71,11 @@ impl MremapArgs {
     /// - `MREMAP_FIXED` is set and `new_addr` is not page-aligned.
     /// - `MREMAP_DONTUNMAP` is set without `MREMAP_MAYMOVE`.
     /// - The old mapping would overflow (old_addr + old_size overflow).
+    /// - The old or page-aligned new size overflows on round-up.
+    /// - The old range falls outside the canonical user-address window.
+    /// - With `MREMAP_FIXED`: the destination `[new_addr, new_addr +
+    ///   aligned_new_size)` overflows or leaves the user window, or (unless
+    ///   `MREMAP_DONTUNMAP` is set) it overlaps the old range.
     pub fn validate(&self) -> Result<()> {
         if self.old_addr & PAGE_MASK != 0 {
             return Err(Error::InvalidArgument);
@@ -89,10 +95,38 @@ impl MremapArgs {
         if self.flags & MREMAP_DONTUNMAP != 0 && self.flags & MREMAP_MAYMOVE == 0 {
             return Err(Error::InvalidArgument);
         }
-        // Overflow check for old range.
+        // Round-ups of the attacker-supplied sizes must not overflow/wrap.
+        let aligned_old = align_up(self.old_size).ok_or(Error::InvalidArgument)?;
+        let aligned_new = align_up(self.new_size).ok_or(Error::InvalidArgument)?;
+        // Overflow check for the old range, then bound it to the user window.
         self.old_addr
             .checked_add(self.old_size)
             .ok_or(Error::InvalidArgument)?;
+        if !is_user_span(self.old_addr, aligned_old) {
+            return Err(Error::InvalidArgument);
+        }
+        // MREMAP_FIXED: the caller fully controls the destination address.
+        if self.flags & MREMAP_FIXED != 0 {
+            // Destination must not overflow and must stay in the user window.
+            if !is_user_span(self.new_addr, aligned_new) {
+                return Err(Error::InvalidArgument);
+            }
+            // Unless DONTUNMAP is set, the fixed destination may not overlap
+            // the source range (Linux returns EINVAL for a self-overlap).
+            if self.flags & MREMAP_DONTUNMAP == 0 {
+                let old_end = self
+                    .old_addr
+                    .checked_add(aligned_old)
+                    .ok_or(Error::InvalidArgument)?;
+                let new_end = self
+                    .new_addr
+                    .checked_add(aligned_new)
+                    .ok_or(Error::InvalidArgument)?;
+                if self.old_addr < new_end && self.new_addr < old_end {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -111,14 +145,20 @@ impl MremapArgs {
         self.flags & MREMAP_DONTUNMAP != 0
     }
 
-    /// Return the page-aligned old size.
+    /// Return the page-aligned old size, or `0` if it would overflow.
+    ///
+    /// Callers must run [`validate`](Self::validate) first, which rejects an
+    /// overflowing size; the `0` fallback is a fail-closed default only.
     pub fn aligned_old_size(&self) -> u64 {
-        align_up(self.old_size)
+        align_up(self.old_size).unwrap_or(0)
     }
 
-    /// Return the page-aligned new size.
+    /// Return the page-aligned new size, or `0` if it would overflow.
+    ///
+    /// Callers must run [`validate`](Self::validate) first, which rejects an
+    /// overflowing size; the `0` fallback is a fail-closed default only.
     pub fn aligned_new_size(&self) -> u64 {
-        align_up(self.new_size)
+        align_up(self.new_size).unwrap_or(0)
     }
 }
 
@@ -159,14 +199,33 @@ pub struct MremapResult {
 // ---------------------------------------------------------------------------
 
 /// Align `n` up to the next page boundary.
-fn align_up(n: u64) -> u64 {
-    n.wrapping_add(PAGE_SIZE - 1) & !PAGE_MASK
+///
+/// Returns [`None`] on overflow. `checked_add` (not `wrapping_add`) prevents
+/// a near-`u64::MAX` size from wrapping to `0` and producing a zero-page
+/// mapping that slipped past the `new_size == 0` guard.
+fn align_up(n: u64) -> Option<u64> {
+    n.checked_add(PAGE_SIZE - 1).map(|v| v & !PAGE_MASK)
+}
+
+/// Return `true` if `[start, start + size)` lies wholly inside the canonical
+/// lower-half user window, with no overflow.
+///
+/// Mirrors `kernel/src/uaccess.rs::validate_user_range`: `start` at or above
+/// [`USER_SPACE_START`] and the exclusive end at or below [`USER_SPACE_END`]
+/// + 1. Rejects kernel-half and non-canonical destinations.
+fn is_user_span(start: u64, size: u64) -> bool {
+    match start.checked_add(size) {
+        Some(end) => start >= USER_SPACE_START && end <= USER_SPACE_END + 1,
+        None => false,
+    }
 }
 
 /// Determine the remap action from the validated args.
 fn determine_action(args: &MremapArgs) -> RemapAction {
-    let old_pages = align_up(args.old_size) / PAGE_SIZE;
-    let new_pages = align_up(args.new_size) / PAGE_SIZE;
+    // Validated upstream, so the aligned sizes are non-overflowing; the `0`
+    // fallback keeps this total without an unwrap on attacker data.
+    let old_pages = align_up(args.old_size).unwrap_or(0) / PAGE_SIZE;
+    let new_pages = align_up(args.new_size).unwrap_or(0) / PAGE_SIZE;
 
     if new_pages == old_pages {
         return RemapAction::NoChange;
@@ -229,14 +288,18 @@ pub fn do_mremap(args: &MremapArgs) -> Result<MremapResult> {
 
     let action = determine_action(args);
 
+    // `validate()` succeeded above, so these round-ups cannot overflow; use
+    // `ok_or` rather than an unwrap to stay panic-free on the attacker path.
+    let aligned_old = align_up(args.old_size).ok_or(Error::InvalidArgument)?;
+    let aligned_new = align_up(args.new_size).ok_or(Error::InvalidArgument)?;
     let (new_addr, new_size) = match action {
-        RemapAction::NoChange => (args.old_addr, align_up(args.old_size)),
-        RemapAction::ShrinkInPlace { .. } => (args.old_addr, align_up(args.new_size)),
+        RemapAction::NoChange => (args.old_addr, aligned_old),
+        RemapAction::ShrinkInPlace { .. } => (args.old_addr, aligned_new),
         RemapAction::GrowInPlace { .. } => {
             // Stub: real implementation tries to extend the VMA in place.
             return Err(Error::NotImplemented);
         }
-        RemapAction::MoveMapping { new_addr, .. } => (new_addr, align_up(args.new_size)),
+        RemapAction::MoveMapping { new_addr, .. } => (new_addr, aligned_new),
     };
 
     Ok(MremapResult {

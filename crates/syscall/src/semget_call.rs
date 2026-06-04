@@ -83,8 +83,10 @@ pub struct SemSet {
     pub values: [i16; SEMMSL],
     /// Permission mode.
     pub mode: u16,
-    /// Owner UID.
+    /// Owner UID (may be changed by `IPC_SET`).
     pub uid: u32,
+    /// Creator UID (immutable after creation).
+    pub cuid: u32,
 }
 
 /// Table of System V semaphore sets.
@@ -176,6 +178,7 @@ pub fn do_semget(
             values: [0i16; SEMMSL],
             mode,
             uid,
+            cuid: uid,
         });
         return Ok(id);
     }
@@ -204,6 +207,7 @@ pub fn do_semget(
         values: [0i16; SEMMSL],
         mode,
         uid,
+        cuid: uid,
     });
     Ok(id)
 }
@@ -275,8 +279,42 @@ pub fn do_semctl_setval(table: &mut SemTable, semid: i32, semnum: usize, val: i1
 }
 
 /// Handler for `semctl(IPC_RMID)`.
-pub fn do_semctl_rmid(table: &mut SemTable, semid: i32) -> Result<()> {
+///
+/// Removes the semaphore set identified by `semid`.
+///
+/// # Access control
+///
+/// POSIX.1-2024 requires that the caller is the owner (`set.uid`),
+/// the creator (`set.cuid`), or a privileged process.  Any other caller
+/// receives [`Error::PermissionDenied`] (→ `EPERM`).  The check is
+/// **fail-closed**: if the set is not found the call returns
+/// [`Error::NotFound`] before the permission check.
+///
+/// # Parameters
+///
+/// - `caller_uid`   — effective UID of the calling process.
+/// - `is_privileged` — `true` when the caller holds `CAP_IPC_OWNER` or
+///   equivalent superuser privilege.
+///
+/// # Errors
+///
+/// | `Error`            | Condition                                    |
+/// |--------------------|----------------------------------------------|
+/// | `NotFound`         | `semid` does not identify a live set         |
+/// | `PermissionDenied` | Caller is not the owner, creator, or root    |
+pub fn do_semctl_rmid(
+    table: &mut SemTable,
+    semid: i32,
+    caller_uid: u32,
+    is_privileged: bool,
+) -> Result<()> {
     let idx = table.find_by_id(semid).ok_or(Error::NotFound)?;
+    // SAFETY-NOTE: idx came from find_by_id so the slot is Some.
+    let set = table.sets[idx].as_ref().unwrap();
+    // POSIX: owner, creator, or privileged caller only.
+    if !is_privileged && caller_uid != set.uid && caller_uid != set.cuid {
+        return Err(Error::PermissionDenied);
+    }
     table.sets[idx] = None;
     Ok(())
 }
@@ -328,5 +366,57 @@ mod tests {
             sem_flg: IPC_NOWAIT,
         }];
         assert_eq!(do_semop(&mut t, id, &ops), Err(Error::WouldBlock));
+    }
+
+    // --- do_semctl_rmid ownership gate ---
+
+    /// Owner (uid == set.uid) may remove.
+    #[test]
+    fn rmid_owner_succeeds() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 1, 0o600, 1000).unwrap();
+        assert!(do_semctl_rmid(&mut t, id, 1000, false).is_ok());
+        // Set must be gone afterwards.
+        assert_eq!(t.get(id), None);
+    }
+
+    /// Creator (uid == set.cuid) may remove even if uid was subsequently changed.
+    #[test]
+    fn rmid_creator_succeeds() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 1, 0o600, 2000).unwrap();
+        // Simulate ownership transfer: change uid but cuid stays 2000.
+        if let Some(set) = t.get_mut(id) {
+            set.uid = 9999;
+        }
+        assert!(do_semctl_rmid(&mut t, id, 2000, false).is_ok());
+    }
+
+    /// Privileged caller (is_privileged=true) may remove regardless of uid.
+    #[test]
+    fn rmid_privileged_succeeds() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 1, 0o600, 1000).unwrap();
+        assert!(do_semctl_rmid(&mut t, id, 0, true).is_ok());
+    }
+
+    /// Unprivileged stranger must be denied — privilege escalation path.
+    #[test]
+    fn rmid_stranger_denied() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 1, 0o600, 1000).unwrap();
+        assert_eq!(
+            do_semctl_rmid(&mut t, id, 1001, false),
+            Err(Error::PermissionDenied),
+        );
+        // Set must still exist after the failed removal.
+        assert!(t.get(id).is_some());
+    }
+
+    /// Non-existent semid returns NotFound, not PermissionDenied.
+    #[test]
+    fn rmid_not_found() {
+        let mut t = SemTable::new();
+        assert_eq!(do_semctl_rmid(&mut t, 999, 0, true), Err(Error::NotFound),);
     }
 }

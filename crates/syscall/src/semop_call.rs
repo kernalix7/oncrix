@@ -9,7 +9,10 @@
 //! POSIX Reference: susv5 functions/semop.html
 //! POSIX.1-2024 — semop is required; semtimedop is Linux-specific.
 
+use core::mem::size_of;
+
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 /// Maximum operations per semop call.
 pub const SEMOPM: u32 = 500;
@@ -118,18 +121,43 @@ pub struct SemtimedopArgs {
 
 /// Validate `semop` arguments.
 ///
-/// Checks that semid is non-negative, sops_ptr is non-null, and nsops
-/// is within the SEMOPM limit.
+/// Checks that `semid` is non-negative, `nsops` is within the
+/// [`SEMOPM`] limit, and that the `sops_ptr` user buffer for
+/// `nsops` × `sizeof(SemBuf)` bytes lies entirely within the
+/// canonical user-space address window.
+///
+/// # Errors
+///
+/// - [`Error::InvalidArgument`] — `semid < 0`, `nsops == 0` or
+///   `nsops > SEMOPM`, overflow when computing total byte length,
+///   null or out-of-range `sops_ptr`.
 pub fn validate_semop_args(semid: i32, sops_ptr: usize, nsops: u32) -> Result<()> {
     if semid < 0 {
-        return Err(Error::InvalidArgument);
-    }
-    if sops_ptr == 0 {
         return Err(Error::InvalidArgument);
     }
     if nsops == 0 || nsops > SEMOPM {
         return Err(Error::InvalidArgument);
     }
+
+    // Compute total byte length with checked arithmetic — an attacker
+    // could supply nsops just below SEMOPM and overflow the multiply.
+    let total = (nsops as usize)
+        .checked_mul(size_of::<SemBuf>())
+        .ok_or(Error::InvalidArgument)?;
+
+    // Validate the user pointer: non-null, in canonical user window,
+    // no wrap-around.
+    let ptr = sops_ptr as u64;
+    if ptr == 0 || ptr < USER_SPACE_START {
+        return Err(Error::InvalidArgument);
+    }
+    let end = ptr
+        .checked_add(total as u64)
+        .ok_or(Error::InvalidArgument)?;
+    if end > USER_SPACE_END.saturating_add(1) {
+        return Err(Error::InvalidArgument);
+    }
+
     Ok(())
 }
 

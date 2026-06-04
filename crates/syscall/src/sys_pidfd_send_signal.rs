@@ -98,9 +98,16 @@ pub struct SignalCred {
 /// Check if `sender` may send a signal to a process owned by `target_uid` /
 /// `target_saved_uid`.
 ///
-/// Implements the POSIX permission model for `kill(2)`:
+/// Implements the complete POSIX permission model for `kill(2)` (POSIX.1-2024):
 /// > The real or effective user ID of the sending process shall match the
 /// > real or saved set-user-ID of the receiving process.
+///
+/// Specifically, permission is granted when any of the following hold:
+/// - The caller holds `CAP_KILL` (privileged override).
+/// - `cred.ruid == target_uid`        (sender real UID = target real UID)
+/// - `cred.ruid == target_saved_uid`  (sender real UID = target saved-set-UID)
+/// - `cred.euid == target_uid`        (sender effective UID = target real UID)
+/// - `cred.euid == target_saved_uid`  (sender effective UID = target saved-set-UID)
 ///
 /// Privileged callers (`cap_kill == true`) may signal any process.
 ///
@@ -108,12 +115,16 @@ pub struct SignalCred {
 pub fn check_signal_permission(
     cred: &SignalCred,
     target_uid: u32,
-    _target_saved_uid: u32,
+    target_saved_uid: u32,
 ) -> Result<()> {
     if cred.cap_kill {
         return Ok(());
     }
-    if cred.ruid == target_uid || cred.euid == target_uid {
+    if cred.ruid == target_uid
+        || cred.ruid == target_saved_uid
+        || cred.euid == target_uid
+        || cred.euid == target_saved_uid
+    {
         return Ok(());
     }
     Err(Error::PermissionDenied)
@@ -261,6 +272,8 @@ pub fn do_pidfd_send_signal_ext(
     mode: SignalDeliveryMode,
 ) -> Result<()> {
     // Delegate core validation + permission check to the base module.
+    // Pass the full caller credential triple so the live path enforces the
+    // complete POSIX kill(2) DAC rule (ruid, euid, CAP_KILL).
     crate::pidfd_calls::do_pidfd_send_signal(
         table,
         pidfd,
@@ -269,6 +282,8 @@ pub fn do_pidfd_send_signal_ext(
         flags,
         sender_pid,
         sender_cred.ruid,
+        sender_cred.euid,
+        sender_cred.cap_kill,
     )?;
 
     // Signal 0 is a probe — nothing to enqueue.
@@ -474,6 +489,29 @@ mod tests {
             check_signal_permission(&cred, 500, 500),
             Err(Error::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn check_signal_permission_ruid_matches_saved_uid() {
+        // ruid matches target saved-set-UID — POSIX permits this.
+        let cred = SignalCred {
+            ruid: 777,
+            euid: 888,
+            cap_kill: false,
+        };
+        // target real UID differs, but saved-set-UID matches ruid.
+        assert_eq!(check_signal_permission(&cred, 999, 777), Ok(()));
+    }
+
+    #[test]
+    fn check_signal_permission_euid_matches_saved_uid() {
+        // euid matches target saved-set-UID — POSIX permits this.
+        let cred = SignalCred {
+            ruid: 888,
+            euid: 777,
+            cap_kill: false,
+        };
+        assert_eq!(check_signal_permission(&cred, 999, 777), Ok(()));
     }
 
     #[test]

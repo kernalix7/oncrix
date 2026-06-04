@@ -46,8 +46,16 @@ const PAGE_SIZE: u64 = 4096;
 /// Page-offset mask (low 12 bits).
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
 
-/// User-space address space limit (canonical lower-half on x86_64).
-const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+/// Inclusive upper bound of the user-space canonical lower-half (x86_64).
+///
+/// Mirrors `oncrix_mm::address_space::USER_SPACE_END`.
+const USER_SPACE_END: u64 = 0x0000_7FFF_FFFF_FFFF;
+
+/// Exclusive upper bound used for range arithmetic (`USER_SPACE_END + 1`).
+///
+/// An address range is valid when its exclusive end does not exceed this value,
+/// i.e. `start.checked_add(len) <= USER_SPACE_LIMIT`.
+const USER_SPACE_LIMIT: u64 = USER_SPACE_END.wrapping_add(1); // 0x0000_8000_0000_0000
 
 /// Maximum number of registered regions per userfaultfd.
 const UFFD_MAX_REGIONS: usize = 256;
@@ -348,6 +356,12 @@ impl UffdRange {
     }
 
     /// Validate the range.
+    ///
+    /// Checks that:
+    /// - `start` and `len` are page-aligned.
+    /// - `len` is non-zero.
+    /// - `start.checked_add(len)` does not overflow.
+    /// - The exclusive end does not exceed the canonical user-space limit.
     pub fn validate(&self) -> Result<()> {
         if self.start & PAGE_MASK != 0 {
             return Err(Error::InvalidArgument);
@@ -361,16 +375,24 @@ impl UffdRange {
             .checked_add(self.len)
             .ok_or(Error::InvalidArgument)?;
 
-        if end > USER_SPACE_END {
+        // `end` is the exclusive byte past the last byte of the range.
+        // It must not exceed USER_SPACE_LIMIT (== USER_SPACE_END + 1).
+        if end > USER_SPACE_LIMIT {
             return Err(Error::InvalidArgument);
         }
 
         Ok(())
     }
 
-    /// Return the end address (exclusive).
-    pub const fn end(&self) -> u64 {
-        self.start + self.len
+    /// Return the end address (exclusive), or `None` on overflow.
+    ///
+    /// # Security
+    ///
+    /// Callers that use this for containment or overlap checks MUST handle
+    /// the `None` case as an invalid range.  Use `validate()` before calling
+    /// `overlaps()` or `contains()` to guarantee no overflow occurs.
+    pub fn checked_end(&self) -> Option<u64> {
+        self.start.checked_add(self.len)
     }
 
     /// Return the number of pages in the range.
@@ -379,13 +401,34 @@ impl UffdRange {
     }
 
     /// Check whether this range overlaps with another.
-    pub const fn overlaps(&self, other: &Self) -> bool {
-        self.start < other.end() && other.start < self.end()
+    ///
+    /// Returns `false` (non-overlapping) if either range has a `len` that
+    /// would overflow `u64`, treating overflow as an invalid range.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let self_end = match self.checked_end() {
+            Some(e) => e,
+            None => return false,
+        };
+        let other_end = match other.checked_end() {
+            Some(e) => e,
+            None => return false,
+        };
+        self.start < other_end && other.start < self_end
     }
 
     /// Check whether this range fully contains another.
-    pub const fn contains(&self, other: &Self) -> bool {
-        self.start <= other.start && other.end() <= self.end()
+    ///
+    /// Returns `false` if either range has a `len` that would overflow `u64`.
+    pub fn contains(&self, other: &Self) -> bool {
+        let self_end = match self.checked_end() {
+            Some(e) => e,
+            None => return false,
+        };
+        let other_end = match other.checked_end() {
+            Some(e) => e,
+            None => return false,
+        };
+        self.start <= other.start && other_end <= self_end
     }
 }
 
@@ -574,11 +617,19 @@ impl UffdConfig {
     }
 
     /// Find the registration covering a given address.
+    ///
+    /// Skips any registration whose stored range would overflow on
+    /// `checked_end()`.  Such registrations are treated as non-matching
+    /// rather than causing an early return.
     pub fn find_registration(&self, addr: u64) -> Option<&UffdRegistration> {
         for entry in &self.regions {
             if let Some(reg) = entry {
-                if addr >= reg.range.start && addr < reg.range.end() {
-                    return Some(reg);
+                // Skip corrupt registrations (overflow in range) rather than
+                // short-circuiting the entire search.
+                if let Some(end) = reg.range.checked_end() {
+                    if addr >= reg.range.start && addr < end {
+                        return Some(reg);
+                    }
                 }
             }
         }
@@ -649,6 +700,14 @@ const UFFDIO_COPY_MODE_VALID: u64 = UFFDIO_COPY_MODE_DONTWAKE | UFFDIO_COPY_MODE
 
 impl UffdCopyArgs {
     /// Validate the copy arguments.
+    ///
+    /// # Security
+    ///
+    /// Both `src` and `dst` must lie within the canonical user-space lower
+    /// half (`[0, USER_SPACE_END]`) and their respective end addresses must
+    /// not overflow or exceed `USER_SPACE_LIMIT`.  This prevents a
+    /// UFFDIO_COPY from reading kernel memory into a user fault range
+    /// (information disclosure / privilege escalation).
     pub fn validate(&self) -> Result<()> {
         if self.dst & PAGE_MASK != 0 {
             return Err(Error::InvalidArgument);
@@ -663,13 +722,30 @@ impl UffdCopyArgs {
             return Err(Error::InvalidArgument);
         }
 
-        // Overflow checks.
-        self.dst
+        // Reject any address above the canonical user-space upper bound.
+        if self.dst > USER_SPACE_END {
+            return Err(Error::InvalidArgument);
+        }
+        if self.src > USER_SPACE_END {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Checked overflow: exclusive end must not exceed USER_SPACE_LIMIT.
+        let dst_end = self
+            .dst
             .checked_add(self.len)
             .ok_or(Error::InvalidArgument)?;
-        self.src
+        if dst_end > USER_SPACE_LIMIT {
+            return Err(Error::InvalidArgument);
+        }
+
+        let src_end = self
+            .src
             .checked_add(self.len)
             .ok_or(Error::InvalidArgument)?;
+        if src_end > USER_SPACE_LIMIT {
+            return Err(Error::InvalidArgument);
+        }
 
         Ok(())
     }
@@ -1453,5 +1529,69 @@ mod tests {
             ..args
         };
         assert_eq!(bad.validate().unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn test_copy_args_kernel_src_rejected() {
+        // src in kernel-half must be rejected (information disclosure).
+        let args = UffdCopyArgs {
+            dst: 0x1000,
+            src: 0xFFFF_8000_0000_0000, // kernel half
+            len: 0x1000,
+            mode: 0,
+            copy_bytes: 0,
+        };
+        assert_eq!(args.validate().unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn test_copy_args_kernel_dst_rejected() {
+        // dst in kernel-half must be rejected.
+        let args = UffdCopyArgs {
+            dst: 0xFFFF_8000_0000_0000, // kernel half
+            src: 0x1000,
+            len: 0x1000,
+            mode: 0,
+            copy_bytes: 0,
+        };
+        assert_eq!(args.validate().unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn test_copy_args_src_overflow_rejected() {
+        // src + len wraps around u64.
+        let args = UffdCopyArgs {
+            dst: 0x1000,
+            src: u64::MAX & !PAGE_MASK, // near max, page-aligned
+            len: 0x1000,
+            mode: 0,
+            copy_bytes: 0,
+        };
+        assert_eq!(args.validate().unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn test_range_overlaps_overflow_safe() {
+        // A range with len that would overflow u64 must never report overlaps.
+        let overflow_range = UffdRange::new(u64::MAX - PAGE_MASK, u64::MAX & !PAGE_MASK);
+        let normal_range = UffdRange::new(0x1000, 0x1000);
+        // overlaps() must return false, not wrap around.
+        assert!(!overflow_range.overlaps(&normal_range));
+        assert!(!normal_range.overlaps(&overflow_range));
+    }
+
+    #[test]
+    fn test_range_contains_overflow_safe() {
+        let overflow_range = UffdRange::new(u64::MAX - PAGE_MASK, u64::MAX & !PAGE_MASK);
+        let normal_range = UffdRange::new(0x1000, 0x1000);
+        assert!(!overflow_range.contains(&normal_range));
+        assert!(!normal_range.contains(&overflow_range));
+    }
+
+    #[test]
+    fn test_range_validate_above_user_space_end() {
+        // A range that ends above USER_SPACE_LIMIT must fail.
+        let r = UffdRange::new(USER_SPACE_END & !PAGE_MASK, 0x2000);
+        assert_eq!(r.validate().unwrap_err(), Error::InvalidArgument);
     }
 }

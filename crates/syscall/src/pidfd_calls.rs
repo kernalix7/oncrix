@@ -572,13 +572,15 @@ pub fn do_pidfd_getfd(
 ///
 /// # Arguments
 ///
-/// * `table`      — Pidfd table.
-/// * `pidfd`      — File descriptor referring to the target process.
-/// * `sig`        — Signal number (0–64); 0 performs permission check only.
-/// * `info`       — Optional `siginfo_t`.  If `None`, the kernel fills it in.
-/// * `flags`      — Must be 0 (reserved for future use).
-/// * `caller_pid` — PID of the caller (filled into `si_pid`).
-/// * `caller_uid` — UID of the caller (for permission checks).
+/// * `table`        — Pidfd table.
+/// * `pidfd`        — File descriptor referring to the target process.
+/// * `sig`          — Signal number (0–64); 0 performs permission check only.
+/// * `info`         — Optional `siginfo_t`.  If `None`, the kernel fills it in.
+/// * `flags`        — Must be 0 (reserved for future use).
+/// * `caller_pid`   — PID of the caller (filled into `si_pid`).
+/// * `caller_ruid`  — Real UID of the caller.
+/// * `caller_euid`  — Effective UID of the caller.
+/// * `caller_cap_kill` — Whether the caller holds `CAP_KILL`.
 ///
 /// # Returns
 ///
@@ -595,6 +597,20 @@ pub fn do_pidfd_getfd(
 /// Signal 0 (`sig == 0`) performs only the existence/permission check without
 /// actually delivering a signal — identical to `kill(pid, 0)`.
 /// SIGKILL and SIGSTOP cannot be caught but can be sent via pidfd.
+///
+/// Permission model mirrors POSIX `kill(2)` (POSIX.1-2024 §kill):
+/// > The real or effective user ID of the sending process shall match the
+/// > real or saved set-user-ID of the receiving process, or the sender holds
+/// > an appropriate privilege (CAP_KILL).
+///
+/// `PidfdEntry` currently carries only the target's `uid` (real UID at open
+/// time); a saved-set-user-ID field is not yet tracked.  Until that field is
+/// added the check permits: `caller_ruid == target_uid`, `caller_euid ==
+/// target_uid`, or `CAP_KILL`.
+///
+/// TODO: extend `PidfdEntry` with `saved_set_uid` and add the
+/// `caller_ruid == saved_set_uid` / `caller_euid == saved_set_uid` arms to
+/// complete the full POSIX saved-set-UID rule.
 pub fn do_pidfd_send_signal(
     table: &PidfdTable,
     pidfd: u32,
@@ -602,7 +618,9 @@ pub fn do_pidfd_send_signal(
     info: Option<&SigInfo>,
     flags: u32,
     caller_pid: u32,
-    caller_uid: u32,
+    caller_ruid: u32,
+    caller_euid: u32,
+    caller_cap_kill: bool,
 ) -> Result<()> {
     // flags must be zero.
     if flags != 0 {
@@ -636,10 +654,23 @@ pub fn do_pidfd_send_signal(
         return Err(Error::NotFound);
     }
 
-    // Permission check (simplified DAC):
-    // - Root (uid 0) can signal any process.
-    // - Otherwise caller must own the target.
-    if caller_uid != 0 && entry.uid != caller_uid {
+    // -----------------------------------------------------------------------
+    // Permission check — POSIX kill(2) DAC rules (fail-closed).
+    //
+    // Permitted when ANY of the following hold:
+    //   1. Caller holds CAP_KILL (privileged override).
+    //   2. caller_ruid == target real UID.
+    //   3. caller_euid == target real UID.
+    //
+    // The full POSIX rule also includes matching against the target's
+    // saved-set-user-ID, but `PidfdEntry` does not yet carry that field.
+    // TODO: add `saved_set_uid` to `PidfdEntry` and extend arms 2 & 3 with
+    //       `|| caller_ruid == entry.saved_set_uid`
+    //       `|| caller_euid == entry.saved_set_uid`.
+    // -----------------------------------------------------------------------
+    let target_uid = entry.uid;
+    let permitted = caller_cap_kill || caller_ruid == target_uid || caller_euid == target_uid;
+    if !permitted {
         return Err(Error::PermissionDenied);
     }
 
@@ -870,8 +901,9 @@ mod tests {
         let mut t = PidfdTable::new();
         let r = make_registry();
         let pidfd = do_pidfd_open(&mut t, &r, 1000, 0, 500).unwrap();
+        // ruid == target uid (500 == 500) — permitted.
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 500, 500),
+            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 500, 500, 500, false),
             Ok(())
         );
     }
@@ -882,7 +914,7 @@ mod tests {
         let r = make_registry();
         let pidfd = do_pidfd_open(&mut t, &r, 1000, 0, 500).unwrap();
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, 0, None, 0, 500, 500),
+            do_pidfd_send_signal(&t, pidfd, 0, None, 0, 500, 500, 500, false),
             Ok(())
         );
     }
@@ -893,7 +925,7 @@ mod tests {
         let r = make_registry();
         let pidfd = do_pidfd_open(&mut t, &r, 1000, 0, 500).unwrap();
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, 100, None, 0, 500, 500),
+            do_pidfd_send_signal(&t, pidfd, 100, None, 0, 500, 500, 500, false),
             Err(Error::InvalidArgument)
         );
     }
@@ -904,7 +936,7 @@ mod tests {
         let r = make_registry();
         let pidfd = do_pidfd_open(&mut t, &r, 1000, 0, 500).unwrap();
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, SIGKILL, None, 1, 500, 500),
+            do_pidfd_send_signal(&t, pidfd, SIGKILL, None, 1, 500, 500, 500, false),
             Err(Error::InvalidArgument)
         );
     }
@@ -917,7 +949,7 @@ mod tests {
         t.notify_exit(1000, 0);
         t.get_mut(pidfd).unwrap().mark_dead();
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 500, 500),
+            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 500, 500, 500, false),
             Err(Error::NotFound)
         );
     }
@@ -927,9 +959,34 @@ mod tests {
         let mut t = PidfdTable::new();
         let r = make_registry();
         let pidfd = do_pidfd_open(&mut t, &r, 1000, 0, 500).unwrap();
+        // ruid=999, euid=999, no cap_kill — neither matches target uid 500.
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 999, 999),
+            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 999, 999, 999, false),
             Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn send_signal_cap_kill_bypasses_uid_check() {
+        let mut t = PidfdTable::new();
+        let r = make_registry();
+        let pidfd = do_pidfd_open(&mut t, &r, 1000, 0, 500).unwrap();
+        // uid 999 != target 500, but CAP_KILL permits it.
+        assert_eq!(
+            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 999, 999, 999, true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn send_signal_euid_matches_target_uid_permitted() {
+        let mut t = PidfdTable::new();
+        let r = make_registry();
+        let pidfd = do_pidfd_open(&mut t, &r, 1000, 0, 500).unwrap();
+        // ruid=999 differs, but euid=500 matches target uid 500 — permitted.
+        assert_eq!(
+            do_pidfd_send_signal(&t, pidfd, SIGTERM, None, 0, 999, 999, 500, false),
+            Ok(())
         );
     }
 
@@ -946,7 +1003,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, SIGTERM, Some(&si), 0, 500, 500),
+            do_pidfd_send_signal(&t, pidfd, SIGTERM, Some(&si), 0, 500, 500, 500, false),
             Ok(())
         );
     }
@@ -962,7 +1019,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            do_pidfd_send_signal(&t, pidfd, SIGTERM, Some(&si), 0, 500, 500),
+            do_pidfd_send_signal(&t, pidfd, SIGTERM, Some(&si), 0, 500, 500, 500, false),
             Err(Error::InvalidArgument)
         );
     }
