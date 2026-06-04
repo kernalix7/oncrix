@@ -409,8 +409,13 @@ impl DsnMapping {
     }
 
     /// Check if a DSN falls within this mapping.
+    ///
+    /// `dsn` is attacker-supplied, so containment is tested without the
+    /// overflowing `self.dsn + self.length` (which can wrap or panic in
+    /// debug builds near `u64::MAX`). The offset from the mapping base is
+    /// computed first and compared against the length.
     pub fn contains_dsn(&self, dsn: u64) -> bool {
-        self.active && dsn >= self.dsn && dsn < self.dsn + self.length as u64
+        self.active && dsn >= self.dsn && dsn.wrapping_sub(self.dsn) < self.length as u64
     }
 
     /// Translate a DSN to the corresponding SSN.
@@ -439,8 +444,6 @@ impl Default for DsnMapping {
 pub struct DataSequenceMap {
     /// Mapping entries.
     mappings: [DsnMapping; MAX_DSN_MAPPINGS],
-    /// Number of active mappings.
-    count: usize,
     /// Next expected DSN for in-order delivery.
     next_dsn: u64,
     /// Highest DSN acknowledged by the remote.
@@ -452,7 +455,6 @@ impl DataSequenceMap {
     pub const fn new() -> Self {
         Self {
             mappings: [const { DsnMapping::new() }; MAX_DSN_MAPPINGS],
-            count: 0,
             next_dsn: 0,
             ack_dsn: 0,
         }
@@ -474,7 +476,6 @@ impl DataSequenceMap {
             acked: false,
             active: true,
         };
-        self.count += 1;
         Ok(())
     }
 
@@ -484,9 +485,15 @@ impl DataSequenceMap {
     }
 
     /// Acknowledge all mappings up to (exclusive) the given DSN.
+    ///
+    /// `dsn` is attacker-supplied, so the end-of-mapping comparison avoids
+    /// the overflowing `mapping.dsn + mapping.length`. A mapping is fully
+    /// acknowledged when its length does not exceed the gap between its
+    /// base and `dsn`; for any `dsn` at or below the base the saturating
+    /// subtraction yields `0`, leaving non-empty mappings unacknowledged.
     pub fn acknowledge(&mut self, dsn: u64) {
         for mapping in &mut self.mappings {
-            if mapping.active && mapping.dsn + mapping.length as u64 <= dsn {
+            if mapping.active && mapping.length as u64 <= dsn.saturating_sub(mapping.dsn) {
                 mapping.acked = true;
             }
         }
@@ -500,7 +507,6 @@ impl DataSequenceMap {
         for mapping in &mut self.mappings {
             if mapping.active && mapping.acked {
                 mapping.active = false;
-                self.count = self.count.saturating_sub(1);
             }
         }
     }
@@ -521,8 +527,11 @@ impl DataSequenceMap {
     }
 
     /// Return the number of active mappings.
+    ///
+    /// Derived on demand from the active flags so the count can never drift
+    /// out of sync with the underlying slots regardless of insert/GC order.
     pub fn count(&self) -> usize {
-        self.count
+        self.mappings.iter().filter(|m| m.active).count()
     }
 }
 

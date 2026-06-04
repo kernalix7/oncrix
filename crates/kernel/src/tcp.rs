@@ -754,8 +754,31 @@ impl TcpConnection {
     /// invalid in the current state (e.g., RST received, or
     /// unexpected flags).
     pub fn process_segment(&mut self, header: &TcpHeader, payload: &[u8]) -> Result<TcpAction> {
-        // RST handling — abort in any state.
+        // RST handling. A bare RST flag is attacker-forgeable off-path, so
+        // it cannot be honoured unconditionally (RFC 5961 §3, blind reset
+        // protection).
+        //
+        // In synchronised states (ESTABLISHED and later) the RST is
+        // accepted only when its sequence number is exactly RCV.NXT;
+        // anything else is silently dropped rather than aborting the
+        // connection. In non-synchronised states (SYN-SENT, SYN-RECEIVED)
+        // there is no established receive sequence to validate against, so
+        // the legacy abort behaviour is retained.
         if header.rst() {
+            let synchronised = matches!(
+                self.state,
+                TcpState::Established
+                    | TcpState::FinWait1
+                    | TcpState::FinWait2
+                    | TcpState::CloseWait
+                    | TcpState::Closing
+                    | TcpState::LastAck
+                    | TcpState::TimeWait
+            );
+            if synchronised && header.seq_num != self.recv_next {
+                // Out-of-window RST: drop it, keep the connection open.
+                return Ok(TcpAction::Nothing);
+            }
             self.state = TcpState::Closed;
             return Ok(TcpAction::ConnectionClosed);
         }
@@ -908,31 +931,61 @@ impl TcpConnection {
     }
 
     /// Handle segment in Established state.
+    ///
+    /// Performs RFC 793 §3.9 acceptance checks against attacker-controlled
+    /// sequence and acknowledgement numbers before mutating any connection
+    /// state:
+    ///
+    /// * The ACK field updates `SND.UNA`/`SND.WND` only when it is in the
+    ///   half-open range `SND.UNA <= ACK <= SND.NXT` (wrap-aware), so a
+    ///   forged ACK cannot rewind the unacknowledged pointer or inflate the
+    ///   send window.
+    /// * Payload is buffered, and `RCV.NXT` advanced, only for the strictly
+    ///   in-order segment (`SEG.SEQ == RCV.NXT`).  This stack carries no
+    ///   reassembly queue, so a segment left of the window, beyond the
+    ///   window, or merely out of order is dropped — defeating off-path
+    ///   data injection and stream desynchronisation.
+    /// * A FIN consumes its sequence number only when the segment that
+    ///   carries it is itself in order, so a forged out-of-window FIN
+    ///   cannot tear the connection down.
     fn process_established(&mut self, header: &TcpHeader, payload: &[u8]) -> Result<TcpAction> {
-        // Update send window from ACK.
+        // Gate the ACK: accept only SND.UNA <= ACK <= SND.NXT in wrap
+        // arithmetic. `ack_in_window` is the distance from SND.UNA to the
+        // acked byte; it must not exceed the in-flight window
+        // (SND.NXT - SND.UNA). A forged ACK outside this range is ignored.
         if header.ack() {
-            self.send_unack = header.ack_num;
-            self.send_window = header.window_size;
-        }
-
-        // Buffer incoming data.
-        if !payload.is_empty() {
-            let available = RECV_BUF_SIZE.saturating_sub(self.recv_len);
-            let count = if payload.len() < available {
-                payload.len()
-            } else {
-                available
-            };
-            if count > 0 {
-                self.recv_buf[self.recv_len..self.recv_len + count]
-                    .copy_from_slice(&payload[..count]);
-                self.recv_len += count;
-                self.recv_next = self.recv_next.wrapping_add(count as u32);
+            let ack_in_window = header.ack_num.wrapping_sub(self.send_unack);
+            let send_window = self.send_next.wrapping_sub(self.send_unack);
+            if ack_in_window <= send_window {
+                self.send_unack = header.ack_num;
+                self.send_window = header.window_size;
             }
         }
 
-        // Handle FIN — remote is closing.
-        if header.fin() {
+        // Accept payload only when it begins exactly at RCV.NXT (in order).
+        // The wrap-aware distance from RCV.NXT to the segment's first byte
+        // is zero only for the in-order segment; a non-zero offset means the
+        // segment is old (left of the window) or ahead of it, and it is
+        // dropped (this stack keeps no reassembly queue).
+        let in_order = header.seq_num.wrapping_sub(self.recv_next) == 0;
+
+        // Buffer incoming data only for the in-order segment.
+        let mut accepted = 0usize;
+        if in_order && !payload.is_empty() {
+            let available = RECV_BUF_SIZE.saturating_sub(self.recv_len);
+            accepted = payload.len().min(available);
+            if accepted > 0 {
+                self.recv_buf[self.recv_len..self.recv_len + accepted]
+                    .copy_from_slice(&payload[..accepted]);
+                self.recv_len += accepted;
+                self.recv_next = self.recv_next.wrapping_add(accepted as u32);
+            }
+        }
+
+        // Handle FIN — remote is closing. Only an in-order FIN whose data
+        // (if any) was fully accepted occupies the next sequence number;
+        // otherwise the FIN sits beyond a gap and must not be consumed.
+        if header.fin() && in_order && accepted == payload.len() {
             self.recv_next = self.recv_next.wrapping_add(1);
             self.state = TcpState::CloseWait;
             return Ok(TcpAction::SendSegment {
@@ -943,7 +996,8 @@ impl TcpConnection {
             });
         }
 
-        // ACK received data if any.
+        // ACK any in-order data we accepted, or send a duplicate ACK for a
+        // non-empty out-of-window segment so the peer can recover.
         if !payload.is_empty() {
             return Ok(TcpAction::SendSegment {
                 flags: TCP_ACK,
