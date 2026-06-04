@@ -19,8 +19,9 @@
 //! | L2.5      | ARP (IPv4/Ether)  | Request + reply   |
 //! | L3        | IPv4              | Parse + checksum  |
 //! | L3        | ICMP              | Echo reply (ping) |
+//! | L4        | UDP               | Rx checksum check |
 //!
-//! TCP and UDP are planned for future implementation.
+//! TCP is planned for future implementation.
 
 use oncrix_lib::{Error, Result};
 
@@ -765,8 +766,43 @@ impl NetworkStack {
 
         match ip_hdr.protocol {
             PROTO_ICMP => self.handle_icmp_packet(eth, &ip_hdr, ip_payload, reply_buf),
+            PROTO_UDP => self.handle_udp_packet(&ip_hdr, ip_payload),
             _ => Err(Error::NotImplemented),
         }
+    }
+
+    /// Validate an incoming UDP datagram before delivery.
+    ///
+    /// Re-parses the datagram so the on-wire UDP `length` field — not
+    /// the IP-layer payload length — bounds the bytes considered, then
+    /// verifies the UDP checksum over that exact span using the real
+    /// source/destination addresses from the enclosing IPv4 header.
+    /// A zero checksum field is accepted ("not computed") per RFC 768;
+    /// a non-zero field that fails to fold to zero causes the datagram
+    /// to be dropped before it can reach a socket.
+    ///
+    /// Returns `Ok(0)`: the datagram is consumed at this layer and no
+    /// Ethernet-level reply is produced.  Demultiplexing the validated
+    /// payload to a bound [`crate::udp::UdpSocketTable`] is performed
+    /// by the socket layer above.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Error::InvalidArgument`] from
+    /// [`crate::udp::parse_udp_datagram`] for a malformed length field,
+    /// and from [`crate::udp::verify_udp_checksum`] for a datagram whose
+    /// non-zero checksum does not verify.
+    fn handle_udp_packet(&self, ip_hdr: &Ipv4Header, udp_payload: &[u8]) -> Result<usize> {
+        // The UDP length field is authoritative; `datagram` is trimmed
+        // to exactly that length so the checksum covers no trailing
+        // bytes from the IP payload.
+        let (_hdr, datagram) = crate::udp::parse_udp_datagram(udp_payload)?;
+
+        // Verify against the real IPs from the IP header; drop on a
+        // checksum mismatch.
+        crate::udp::verify_udp_checksum(&ip_hdr.src_addr, &ip_hdr.dst_addr, datagram)?;
+
+        Ok(0)
     }
 
     /// Build a full Ethernet+IPv4+ICMP echo reply frame.
@@ -1036,5 +1072,133 @@ mod tests {
         let stack = NetworkStack::default();
         assert_eq!(stack.local_mac, [0; 6]);
         assert_eq!(stack.local_ip, [0; 4]);
+    }
+
+    /// Build an Ethernet+IPv4+UDP frame addressed to `dst_ip`.
+    ///
+    /// When `good_checksum` is true a valid UDP checksum is written;
+    /// otherwise the checksum is corrupted to a non-zero wrong value.
+    fn build_udp_frame(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        payload: &[u8],
+        good_checksum: bool,
+        frame: &mut [u8],
+    ) -> usize {
+        // UDP datagram into a scratch buffer.
+        let mut udp = [0u8; 64];
+        let udp_len = crate::udp::write_udp(1111, 2222, payload, &mut udp)
+            .ok()
+            .unwrap();
+        let cksum = crate::udp::udp_checksum(&src_ip, &dst_ip, &udp[..udp_len]);
+        let ck = if good_checksum {
+            cksum.to_be_bytes()
+        } else {
+            (cksum ^ 0x0100).to_be_bytes() // wrong, still non-zero
+        };
+        udp[6] = ck[0];
+        udp[7] = ck[1];
+
+        // Ethernet header.
+        frame[..6].copy_from_slice(&[0xAA; 6]);
+        frame[6..12].copy_from_slice(&[0xBB; 6]);
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4
+
+        // IPv4 header via the crate serialiser (fills checksum).
+        let ip = Ipv4Header {
+            version_ihl: 0x45,
+            tos: 0,
+            total_len: (IPV4_HEADER_MIN_LEN + udp_len) as u16,
+            id: 0,
+            flags_frag: 0,
+            ttl: 64,
+            protocol: PROTO_UDP,
+            checksum: 0,
+            src_addr: src_ip,
+            dst_addr: dst_ip,
+        };
+        let ip_off = ETHER_HEADER_LEN;
+        write_ipv4(&mut frame[ip_off..], &ip).ok().unwrap();
+
+        let udp_off = ip_off + IPV4_HEADER_MIN_LEN;
+        frame[udp_off..udp_off + udp_len].copy_from_slice(&udp[..udp_len]);
+        udp_off + udp_len
+    }
+
+    #[test]
+    fn test_udp_good_checksum_consumed() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        let mut frame = [0u8; 128];
+        let n = build_udp_frame(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            &[1, 2, 3, 4],
+            true,
+            &mut frame,
+        );
+
+        let mut reply = [0u8; 128];
+        // Valid datagram for us: consumed, no L2 reply.
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_udp_bad_checksum_dropped() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        let mut frame = [0u8; 128];
+        let n = build_udp_frame(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            &[1, 2, 3, 4],
+            false,
+            &mut frame,
+        );
+
+        let mut reply = [0u8; 128];
+        // Corrupt checksum: the datagram must be dropped (Err), not
+        // silently delivered.
+        assert!(stack.process_packet(&frame[..n], &mut reply).is_err());
+    }
+
+    #[test]
+    fn test_udp_zero_checksum_accepted() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        // write_udp leaves the checksum field zero ("not computed").
+        let mut frame = [0u8; 128];
+        let mut udp = [0u8; 64];
+        let udp_len = crate::udp::write_udp(1, 2, &[0xAB, 0xCD], &mut udp)
+            .ok()
+            .unwrap();
+        frame[..6].copy_from_slice(&[0xAA; 6]);
+        frame[6..12].copy_from_slice(&[0xBB; 6]);
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        let ip = Ipv4Header {
+            version_ihl: 0x45,
+            tos: 0,
+            total_len: (IPV4_HEADER_MIN_LEN + udp_len) as u16,
+            id: 0,
+            flags_frag: 0,
+            ttl: 64,
+            protocol: PROTO_UDP,
+            checksum: 0,
+            src_addr: [10, 0, 0, 1],
+            dst_addr: [10, 0, 0, 2],
+        };
+        write_ipv4(&mut frame[ETHER_HEADER_LEN..], &ip)
+            .ok()
+            .unwrap();
+        let udp_off = ETHER_HEADER_LEN + IPV4_HEADER_MIN_LEN;
+        frame[udp_off..udp_off + udp_len].copy_from_slice(&udp[..udp_len]);
+        let n = udp_off + udp_len;
+
+        let mut reply = [0u8; 128];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0);
     }
 }
