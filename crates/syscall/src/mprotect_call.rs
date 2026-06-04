@@ -14,6 +14,7 @@
 //! - Linux man pages: `mprotect(2)`
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // ---------------------------------------------------------------------------
 // Page size
@@ -112,8 +113,18 @@ impl ProtRange {
         if prot != PROT_NONE && prot & !PROT_VALID != 0 {
             return Err(Error::InvalidArgument);
         }
-        let aligned_len = align_up(length);
-        if addr.checked_add(aligned_len).is_none() {
+        // `length` is attacker-controlled: a huge value must not round up to
+        // `0` (which would make an empty range validate) or overflow `u64`.
+        let aligned_len = align_up(length).ok_or(Error::InvalidArgument)?;
+        if aligned_len == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let end = addr
+            .checked_add(aligned_len)
+            .ok_or(Error::InvalidArgument)?;
+        // Confine the whole range to the canonical lower-half user window;
+        // a kernel-half or non-canonical `addr` is rejected before any walk.
+        if addr < USER_SPACE_START || end > USER_SPACE_END + 1 {
             return Err(Error::InvalidArgument);
         }
         Ok(Self {
@@ -124,8 +135,15 @@ impl ProtRange {
     }
 
     /// Return the exclusive end address of this range.
+    ///
+    /// Uses `saturating_add` so the method is locally sound even though
+    /// [`ProtRange::new`] already bounds `addr + length` to the user
+    /// window: a bare `+` could panic under debug overflow-checks (a
+    /// ring-0 fault halts the machine). For every range `new` accepts the
+    /// sum is `<= USER_SPACE_END + 1`, so saturation never changes the
+    /// returned value.
     pub const fn end(&self) -> u64 {
-        self.addr + self.length
+        self.addr.saturating_add(self.length)
     }
 }
 
@@ -187,8 +205,12 @@ impl VmaEntry {
 // ---------------------------------------------------------------------------
 
 /// Align `n` up to the next page boundary.
-fn align_up(n: u64) -> u64 {
-    n.wrapping_add(PAGE_SIZE - 1) & !PAGE_MASK
+///
+/// Returns [`None`] on overflow. Using `checked_add` (not `wrapping_add`)
+/// stops a near-`u64::MAX` length from wrapping to `0` and making an empty
+/// range pass validation.
+fn align_up(n: u64) -> Option<u64> {
+    n.checked_add(PAGE_SIZE - 1).map(|v| v & !PAGE_MASK)
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +241,12 @@ fn align_up(n: u64) -> u64 {
 pub fn do_mprotect(addr: u64, length: u64, prot: u32, vmas: &[VmaEntry]) -> Result<MprotResult> {
     let range = ProtRange::new(addr, length, prot)?;
 
+    // No mappings at all means the range is unmapped: POSIX requires ENOMEM
+    // here. An empty slice must not silently succeed.
+    if vmas.is_empty() {
+        return Err(Error::NotFound);
+    }
+
     let mut result = MprotResult::default();
     let mut covered = false;
 
@@ -238,7 +266,7 @@ pub fn do_mprotect(addr: u64, length: u64, prot: u32, vmas: &[VmaEntry]) -> Resu
         }
     }
 
-    if !covered && !vmas.is_empty() {
+    if !covered {
         return Err(Error::NotFound);
     }
 
@@ -258,6 +286,6 @@ pub fn page_count_for_range(addr: u64, length: u64) -> Result<u64> {
     if addr & PAGE_MASK != 0 || length == 0 {
         return Err(Error::InvalidArgument);
     }
-    let aligned = align_up(length);
+    let aligned = align_up(length).ok_or(Error::InvalidArgument)?;
     Ok(aligned / PAGE_SIZE)
 }

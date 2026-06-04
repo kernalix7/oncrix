@@ -407,7 +407,10 @@ impl SignalfdExtRegistry {
         let fd = self.find_mut(id)?;
 
         let signo = info.ssi_signo;
-        if signo == 0 {
+        // Validate signal number BEFORE any shift: signo must be 1..=SIGRTMAX (64).
+        // signo == 0 is not a real signal; signo > 64 would shift a u64 by ≥ 64
+        // bits which is undefined behaviour / a debug panic.
+        if signo == 0 || signo > SIGRTMAX {
             return Err(Error::InvalidArgument);
         }
 

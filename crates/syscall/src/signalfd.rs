@@ -420,11 +420,16 @@ impl SignalTimerFdRegistry {
     pub fn signalfd_deliver(&mut self, id: u64, siginfo: &SignalfdSiginfo) -> Result<()> {
         let fd = self.find_sfd_mut(id)?;
 
-        // Check that the signal is in the mask (bit position = signo - 1).
-        if siginfo.ssi_signo == 0 {
+        // Validate signal number BEFORE any shift: signo must be 1..=64.
+        // A signo of 0 is not a real signal; signo > 64 would shift a u64
+        // by ≥ 64 bits which is undefined behaviour / debug panic.
+        let signo = siginfo.ssi_signo;
+        if signo == 0 || signo > 64 {
             return Err(Error::InvalidArgument);
         }
-        let bit = 1u64 << (siginfo.ssi_signo - 1);
+
+        // Check that the signal is in the mask (bit position = signo - 1).
+        let bit = 1u64 << (signo - 1);
         if fd.mask & bit == 0 {
             return Err(Error::InvalidArgument);
         }

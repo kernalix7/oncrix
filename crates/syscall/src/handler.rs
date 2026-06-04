@@ -497,9 +497,10 @@ pub fn sys_ipc_create_endpoint() -> SyscallResult {
 /// `SYS_KILL` — Send a signal to a process.
 ///
 /// Arguments: pid (target process), sig (signal number).
+/// Valid range: 0 (existence probe) or 1..=[`SIGMAX`] (64).
 pub fn sys_kill(_pid: u64, _sig: u64) -> SyscallResult {
-    // Validate signal number range (1-32).
-    if _sig == 0 || _sig > 32 {
+    // Signal 0 is a valid probe; 1..=SIGMAX covers standard + RT signals.
+    if _sig > SIGMAX {
         return error_to_errno(Error::InvalidArgument);
     }
     // Stub: would look up the target process and call signal.send().
@@ -537,15 +538,22 @@ pub fn sys_wait4(pid: u64, _wstatus: u64, _options: u64, _rusage: u64) -> Syscal
     error_to_errno(Error::NotImplemented)
 }
 
+/// Maximum signal number (standard + real-time); mirrors `kill_call::SIGMAX`.
+const SIGMAX: u64 = 64;
+
 /// `SYS_SIGACTION` — Examine and change a signal action.
 ///
 /// Arguments: sig, act_ptr (new action), oldact_ptr (old action).
 /// ONCRIX extension syscall number.
+///
+/// Valid signal numbers are 1..=[`SIGMAX`] (64), covering both standard
+/// signals (1..31) and real-time signals (32..64).  The previous guard
+/// of `> 32` incorrectly rejected all RT signals.
 pub fn sys_sigaction(_sig: u64, _act: u64, _oldact: u64) -> SyscallResult {
-    if _sig == 0 || _sig > 32 {
+    if _sig == 0 || _sig > SIGMAX {
         return error_to_errno(Error::InvalidArgument);
     }
-    // SIGKILL and SIGSTOP cannot be caught.
+    // SIGKILL (9) and SIGSTOP (19) cannot be caught or ignored.
     if _sig == 9 || _sig == 19 {
         return error_to_errno(Error::InvalidArgument);
     }
@@ -562,11 +570,48 @@ pub fn sys_sigaction(_sig: u64, _act: u64, _oldact: u64) -> SyscallResult {
 /// This syscall does not return in the normal sense; on success
 /// the kernel resumes execution at the saved RIP with the saved
 /// register state.
+///
+/// # Security
+///
+/// **This is intentionally a stub.** Do NOT implement `do_sigreturn` here
+/// without first satisfying ALL of the following invariants; missing any
+/// one is a privilege-escalation or kernel-crash vector:
+///
+/// 1. **RSP canonical + user-range check** — The frame pointer passed in
+///    (or read from the current thread's saved RSP) must be validated with
+///    `validate_user_range(rsp, sizeof(SignalFrame))` before any dereference.
+///    A kernel-half or non-canonical RSP must return `EFAULT`; dereferencing
+///    it causes a ring-0 page fault that halts the kernel.
+///
+/// 2. **RFLAGS sanitisation** — The `rflags` field read from the frame must
+///    have all privileged bits (IOPL, IF, VM86, NT, …) stripped or
+///    confirmed to be unchanged from the values saved at signal-entry time.
+///    Restoring attacker-controlled RFLAGS can disable interrupts (DoS) or
+///    enter Virtual-8086 mode.
+///
+/// 3. **CS / SS privilege check** — The saved `cs` and `ss` registers must
+///    carry ring-3 RPL (bits 1:0 == 3) and point to the user-mode code and
+///    data segment selectors.  Restoring a kernel-mode `cs` would cause the
+///    CPU to resume in ring 0 under user-controlled RIP — full privilege
+///    escalation.
+///
+/// 4. **RIP in user range** — The saved instruction pointer must fall within
+///    the canonical lower-half user window (`< USER_SPACE_END`) to prevent
+///    jumping into kernel text.
+///
+/// 5. **Signal mask restore** — The saved `sigmask` must be validated
+///    against `SIGKILL` / `SIGSTOP` (which cannot be blocked) before being
+///    written back to the thread's `blocked` mask.
+///
+/// Until all five points are implemented and reviewed, this entry point
+/// correctly returns `ENOSYS`, which is fail-closed: user-space signal
+/// handlers will not be able to return, but no security invariant is broken.
 pub fn sys_rt_sigreturn(_rsp: u64) -> SyscallResult {
     // Stub: a full implementation reads the SignalFrame from the
     // user stack (at _rsp), restores registers and signal mask
     // via oncrix_kernel::signal_deliver::do_sigreturn(), then
     // resumes the interrupted context instead of returning here.
+    // See the # Security section above for mandatory pre-conditions.
     error_to_errno(Error::NotImplemented)
 }
 

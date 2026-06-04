@@ -43,6 +43,7 @@
 //! - Linux: `mm/mmap.c`, `do_mmap()`
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // ---------------------------------------------------------------------------
 // Protection flags
@@ -246,11 +247,21 @@ impl VmaTable {
     }
 
     /// Allocate a non-overlapping address region of `len` bytes.
+    ///
+    /// The candidate span is confined to the canonical lower-half user
+    /// window: once `next_addr` is bumped past [`USER_SPACE_END`] (e.g.
+    /// after a large allocation) a bare candidate would land in the
+    /// kernel half (`0x0000_8000_0000_0000`+). Returning [`None`] turns
+    /// window exhaustion into [`Error::OutOfMemory`] at the call site
+    /// instead of inserting an out-of-window VMA.
     fn alloc_addr(&mut self, len: u64) -> Option<u64> {
         let mut candidate = self.next_addr;
         // Simple linear scan to find a free slot.
         for _ in 0..MAX_VMA_COUNT {
             let end = candidate.checked_add(len)?;
+            if !is_user_range(candidate, end) {
+                return None;
+            }
             if !self.overlaps(candidate, end) {
                 self.next_addr = end;
                 return Some(candidate);
@@ -273,12 +284,37 @@ impl Default for VmaTable {
 }
 
 // ---------------------------------------------------------------------------
+// User-space window check
+// ---------------------------------------------------------------------------
+
+/// Return `true` if `[start, end)` lies wholly inside the canonical
+/// lower-half user window.
+///
+/// Mirrors `kernel/src/uaccess.rs::validate_user_range`: the start must be
+/// at or above [`USER_SPACE_START`] and the exclusive `end` must not exceed
+/// [`USER_SPACE_END`] + 1. Kernel-half or non-canonical addresses are
+/// rejected so a `MAP_FIXED`/hint address can never place a VMA outside the
+/// user range.
+const fn is_user_range(start: u64, end: u64) -> bool {
+    start >= USER_SPACE_START && end <= USER_SPACE_END + 1 && start < end
+}
+
+// ---------------------------------------------------------------------------
 // Round up to page size
 // ---------------------------------------------------------------------------
 
 /// Round `len` up to the nearest page boundary.
-pub const fn round_up_page(len: u64) -> u64 {
-    (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+///
+/// Returns [`None`] when the round-up would overflow `u64` (i.e.
+/// `len > u64::MAX - (PAGE_SIZE - 1)`). A bare `+` here would panic under
+/// debug overflow-checks (a ring-0 fault halts the machine) or wrap to `0`
+/// in release, bypassing the `len == 0` guard and inserting a zero-length
+/// VMA into the table — so the attacker-controlled `len` must be checked.
+pub const fn round_up_page(len: u64) -> Option<u64> {
+    match len.checked_add(PAGE_SIZE - 1) {
+        Some(v) => Some(v & !(PAGE_SIZE - 1)),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +358,11 @@ pub fn do_mmap_anonymous(
     }
 
     let flags = MmapFlags::from_raw(raw_flags)?;
-    let map_len = round_up_page(len);
+    // `len` is attacker-controlled: reject a round-up that overflows or that
+    // wraps a huge `len` back to a zero-length mapping.
+    let map_len = round_up_page(len)
+        .filter(|&l| l != 0)
+        .ok_or(Error::InvalidArgument)?;
 
     let start = if flags.is_fixed() {
         if addr % PAGE_SIZE != 0 {
@@ -330,6 +370,11 @@ pub fn do_mmap_anonymous(
         }
         // MAP_FIXED: remove any existing VMAs that overlap.
         let end = addr.checked_add(map_len).ok_or(Error::InvalidArgument)?;
+        // The caller fully controls `addr`; confine the whole span to the
+        // canonical lower-half user window before touching the table.
+        if !is_user_range(addr, end) {
+            return Err(Error::InvalidArgument);
+        }
         // Collect starts to remove.
         let mut to_remove = [0u64; MAX_VMA_COUNT];
         let mut n_remove = 0usize;
@@ -346,9 +391,11 @@ pub fn do_mmap_anonymous(
         }
         addr
     } else if addr != 0 {
-        // Hint: try `addr` first, fall back to allocation.
+        // Hint: try `addr` first, fall back to allocation. A hint outside the
+        // user window is never honoured verbatim — it falls back to the
+        // kernel-chosen allocator instead.
         let end = addr.checked_add(map_len).ok_or(Error::InvalidArgument)?;
-        if addr % PAGE_SIZE == 0 && !table.overlaps(addr, end) {
+        if addr % PAGE_SIZE == 0 && is_user_range(addr, end) && !table.overlaps(addr, end) {
             addr
         } else {
             table.alloc_addr(map_len).ok_or(Error::OutOfMemory)?
@@ -357,11 +404,13 @@ pub fn do_mmap_anonymous(
         table.alloc_addr(map_len).ok_or(Error::OutOfMemory)?
     };
 
+    let end = start.checked_add(map_len).ok_or(Error::InvalidArgument)?;
+
     let populated = flags.is_populate() && prot != PROT_NONE;
 
     let vma = VmaEntry {
         start,
-        end: start + map_len,
+        end,
         prot,
         flags,
         populated,
@@ -524,9 +573,74 @@ mod tests {
 
     #[test]
     fn round_up_page_size() {
-        assert_eq!(round_up_page(1), 4096);
-        assert_eq!(round_up_page(4096), 4096);
-        assert_eq!(round_up_page(4097), 8192);
+        assert_eq!(round_up_page(1), Some(4096));
+        assert_eq!(round_up_page(4096), Some(4096));
+        assert_eq!(round_up_page(4097), Some(8192));
+    }
+
+    #[test]
+    fn round_up_page_overflow_is_none() {
+        // A `len` near u64::MAX must not wrap to 0 (would bypass the len==0
+        // guard) or panic — it returns None and the caller rejects it.
+        assert_eq!(round_up_page(u64::MAX), None);
+        assert_eq!(round_up_page(u64::MAX - 10), None);
+    }
+
+    #[test]
+    fn mmap_anon_huge_len_rejected() {
+        let mut t = VmaTable::new();
+        assert_eq!(
+            do_mmap_anonymous(&mut t, 0, u64::MAX, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn mmap_anon_fixed_kernel_half_rejected() {
+        let mut t = VmaTable::new();
+        // A kernel-half MAP_FIXED address must be rejected, not mapped.
+        assert_eq!(
+            do_mmap_anonymous(
+                &mut t,
+                0xFFFF_8000_0000_0000,
+                PAGE_SIZE,
+                PROT_READ,
+                MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
+            ),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn mmap_anon_fixed_below_user_start_rejected() {
+        let mut t = VmaTable::new();
+        // A page-aligned address below USER_SPACE_START is out of the window.
+        assert_eq!(
+            do_mmap_anonymous(
+                &mut t,
+                PAGE_SIZE,
+                PAGE_SIZE,
+                PROT_READ,
+                MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
+            ),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn mmap_anon_kernel_half_hint_falls_back() {
+        let mut t = VmaTable::new();
+        // A non-user hint must not be honoured verbatim; it falls back to the
+        // kernel-chosen allocator (which returns an in-window address).
+        let addr = do_mmap_anonymous(
+            &mut t,
+            0xFFFF_8000_0000_0000,
+            PAGE_SIZE,
+            PROT_READ,
+            MAP_ANONYMOUS | MAP_PRIVATE,
+        )
+        .unwrap();
+        assert!(addr >= USER_SPACE_START && addr <= USER_SPACE_END);
     }
 
     #[test]
