@@ -220,9 +220,17 @@ pub struct RingBuf {
     /// Flat byte storage representing the ring data area.
     data: [u8; RING_DATA_SIZE],
     /// Record metadata table (parallel to `data` slots).
+    ///
+    /// Treated as a reusable slot pool keyed by [`Record::state`]: a slot in
+    /// [`RecordState::Free`] is available for a new reservation. Slots are
+    /// reclaimed (set back to `Free`) on consume and on discard-consume, so
+    /// the pool never exhausts under steady-state produce/consume traffic.
     records: [Record; MAX_RECORDS],
-    /// Number of records in the record table.
-    record_count: usize,
+    /// Number of currently live (non-`Free`) slots in `records`.
+    ///
+    /// Incremented on [`RingBuf::reserve`] and decremented when a slot is
+    /// returned to [`RecordState::Free`] by consume/discard handling.
+    live_records: usize,
     /// Producer write position (byte offset into `data`, wraps at RING_DATA_SIZE).
     producer: usize,
     /// Consumer read position (byte offset into `data`, wraps at RING_DATA_SIZE).
@@ -241,7 +249,7 @@ impl RingBuf {
         let mut rb = Self {
             data: [0u8; RING_DATA_SIZE],
             records: core::array::from_fn(|_| Record::default()),
-            record_count: 0,
+            live_records: 0,
             producer: 0,
             consumer: 0,
             stats: RingBufStats::default(),
@@ -278,6 +286,12 @@ impl RingBuf {
         self.producer == self.consumer
     }
 
+    /// Return the number of currently live (reserved, committed, or discarded
+    /// but not yet consumed) records occupying slots in the pool.
+    pub fn live_records(&self) -> usize {
+        self.live_records
+    }
+
     /// Reserve a slot of `payload_size` bytes for the producer to fill.
     ///
     /// Returns a [`RecordHandle`] on success. The caller must call
@@ -304,10 +318,20 @@ impl RingBuf {
             return Err(Error::OutOfMemory);
         }
 
-        if self.record_count >= MAX_RECORDS {
-            self.stats.reserve_failures += 1;
-            return Err(Error::OutOfMemory);
-        }
+        // Find a free slot in the reusable pool. Slots are reclaimed on
+        // consume/discard, so a full table only means MAX_RECORDS records are
+        // genuinely in-flight, not that the ring has been used MAX_RECORDS times.
+        let slot = match self
+            .records
+            .iter()
+            .position(|r| r.state == RecordState::Free)
+        {
+            Some(idx) => idx,
+            None => {
+                self.stats.reserve_failures += 1;
+                return Err(Error::OutOfMemory);
+            }
+        };
 
         // Write busy header into data ring (marks reservation in-flight).
         let offset = self.producer & RING_MASK;
@@ -318,14 +342,13 @@ impl RingBuf {
         self.producer = self.producer.wrapping_add(total);
 
         // Fill record metadata.
-        let slot = self.record_count;
         self.records[slot] = Record {
             data: [0u8; MAX_RECORD_PAYLOAD],
             len: payload_size,
             state: RecordState::Reserved,
             offset,
         };
-        self.record_count += 1;
+        self.live_records += 1;
         self.stats.reserved += 1;
 
         Ok(RecordHandle::new(slot))
@@ -339,7 +362,7 @@ impl RingBuf {
     ///
     /// - [`Error::NotFound`] if `slot` is invalid or not in `Reserved` state.
     pub fn write_payload(&mut self, slot: usize, data: &[u8]) -> Result<()> {
-        if slot >= self.record_count {
+        if slot >= MAX_RECORDS {
             return Err(Error::NotFound);
         }
         if self.records[slot].state != RecordState::Reserved {
@@ -352,7 +375,7 @@ impl RingBuf {
 
     /// Commit the record at `slot`, making it visible to the consumer.
     fn commit_slot(&mut self, slot: usize) -> Result<()> {
-        if slot >= self.record_count {
+        if slot >= MAX_RECORDS {
             return Err(Error::NotFound);
         }
         if self.records[slot].state != RecordState::Reserved {
@@ -377,7 +400,7 @@ impl RingBuf {
 
     /// Discard the record at `slot`.
     fn discard_slot(&mut self, slot: usize) -> Result<()> {
-        if slot >= self.record_count {
+        if slot >= MAX_RECORDS {
             return Err(Error::NotFound);
         }
         if self.records[slot].state != RecordState::Reserved {
@@ -393,6 +416,21 @@ impl RingBuf {
         Ok(())
     }
 
+    /// Return a slot to the free pool and update the live-slot count.
+    ///
+    /// Resets the slot to its default `Free` state and saturatingly
+    /// decrements [`RingBuf::live_records`] (saturating guards against any
+    /// double-free path leaving the counter consistent).
+    fn free_slot(&mut self, slot: usize) {
+        if slot >= MAX_RECORDS {
+            return;
+        }
+        if self.records[slot].state != RecordState::Free {
+            self.live_records = self.live_records.saturating_sub(1);
+        }
+        self.records[slot] = Record::default();
+    }
+
     /// Consume the next committed record from the ring buffer.
     ///
     /// Skips discarded records. Returns `Ok(None)` when no committed record
@@ -402,10 +440,13 @@ impl RingBuf {
     ///
     /// Returns [`Error::IoError`] if the ring data is structurally inconsistent.
     pub fn consume(&mut self) -> Result<Option<ConsumedRecord>> {
-        // Walk records in order of their offset (reservation order).
+        // Walk the full slot pool: freed slots leave holes anywhere in the
+        // table, so the search must span all of `records`, not a prefix. The
+        // state predicate naturally skips `Free`/`Reserved` slots.
         // Find the first committed record whose offset matches the consumer pointer.
         let consumer_offset = self.consumer & RING_MASK;
-        let pos = self.records[..self.record_count]
+        let pos = self
+            .records
             .iter()
             .position(|r| r.offset == consumer_offset && r.state == RecordState::Committed);
 
@@ -420,14 +461,15 @@ impl RingBuf {
             // Advance consumer past this record.
             let total = align_up(RECORD_HDR_SIZE + len, RECORD_ALIGN);
             self.consumer = self.consumer.wrapping_add(total);
-            self.records[idx].state = RecordState::Free;
+            self.free_slot(idx);
             self.stats.consumed += 1;
             return Ok(Some(out));
         }
 
         // Check for discarded records at the consumer position so we can
         // advance past them.
-        let dis_pos = self.records[..self.record_count]
+        let dis_pos = self
+            .records
             .iter()
             .position(|r| r.offset == consumer_offset && r.state == RecordState::Discarded);
 
@@ -435,7 +477,7 @@ impl RingBuf {
             let len = self.records[idx].len;
             let total = align_up(RECORD_HDR_SIZE + len, RECORD_ALIGN);
             self.consumer = self.consumer.wrapping_add(total);
-            self.records[idx].state = RecordState::Free;
+            self.free_slot(idx);
             // Recursively consume the next record (tail-call style loop).
             return self.consume();
         }
@@ -752,6 +794,37 @@ mod tests {
     fn reserve_too_large_fails() {
         let mut rb = RingBuf::new(b"big");
         assert!(rb.reserve(MAX_RECORD_PAYLOAD + 1).is_err());
+    }
+
+    #[test]
+    fn slots_are_reclaimed_after_consume() {
+        // Reserve/commit/consume a small record far more than MAX_RECORDS
+        // times. With a monotonic slot counter this exhausts the table; with
+        // the reusable pool it must keep succeeding indefinitely.
+        let mut rb = RingBuf::new(b"reclaim");
+        for _ in 0..(MAX_RECORDS * 4) {
+            let h = rb.reserve(8).expect("reserve should not exhaust the pool");
+            rb.write_payload(h.slot, b"01234567")
+                .expect("write payload");
+            h.commit(&mut rb).expect("commit");
+            let rec = rb.consume().expect("consume Ok").expect("Some record");
+            assert_eq!(rec.payload(), b"01234567");
+            // After consuming the only record, no slots remain live.
+            assert_eq!(rb.live_records(), 0);
+        }
+    }
+
+    #[test]
+    fn discard_reclaims_slot() {
+        let mut rb = RingBuf::new(b"discard_reclaim");
+        for _ in 0..(MAX_RECORDS * 2) {
+            let h = rb.reserve(4).expect("reserve");
+            rb.write_payload(h.slot, b"AAAA").expect("write");
+            h.discard(&mut rb).expect("discard");
+            // consume advances past the discarded record and frees the slot.
+            assert!(rb.consume().expect("consume Ok").is_none());
+            assert_eq!(rb.live_records(), 0);
+        }
     }
 
     #[test]

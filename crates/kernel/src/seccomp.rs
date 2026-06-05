@@ -301,8 +301,10 @@ impl SeccompFilter {
 
     /// Initialize a filter from a slice of BPF instructions.
     ///
-    /// Returns `InvalidArgument` if `prog` is empty or exceeds
-    /// [`MAX_INSNS`] instructions.
+    /// Returns `InvalidArgument` if:
+    /// - `prog` is empty or exceeds [`MAX_INSNS`] instructions.
+    /// - Any jump target (jt, jf, or ja/k) is out of bounds.
+    /// - The last instruction is not a RET.
     fn from_prog(prog: &[BpfInsn]) -> Result<Self> {
         if prog.is_empty() || prog.len() > MAX_INSNS {
             return Err(Error::InvalidArgument);
@@ -314,7 +316,68 @@ impl SeccompFilter {
             i = i.saturating_add(1);
         }
         filter.len = prog.len();
+        filter.validate()?;
         Ok(filter)
+    }
+
+    /// Validate the BPF program.
+    ///
+    /// Checks:
+    /// - Non-empty and within [`MAX_INSNS`].
+    /// - Last instruction is a RET.
+    /// - All jump targets (jt, jf, ja) are strictly forward and in
+    ///   bounds — cBPF prohibits backward jumps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] on any validation failure.
+    fn validate(&self) -> Result<()> {
+        if self.len == 0 || self.len > MAX_INSNS {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Last instruction must be a RET.
+        let last = self.instructions[self.len.saturating_sub(1)];
+        if last.code & 0x07 != BPF_RET {
+            return Err(Error::InvalidArgument);
+        }
+
+        let mut i = 0;
+        while i < self.len {
+            let insn = self.instructions[i];
+            let class = insn.code & 0x07;
+
+            if class == BPF_JMP {
+                let op = insn.code & 0xF0;
+                if op == 0x00 {
+                    // JA (unconditional): target = pc+1 + k
+                    let target = i
+                        .checked_add(1)
+                        .and_then(|v| v.checked_add(insn.k as usize))
+                        .ok_or(Error::InvalidArgument)?;
+                    if target >= self.len {
+                        return Err(Error::InvalidArgument);
+                    }
+                } else {
+                    // Conditional: check jt and jf targets.
+                    let t_target = i
+                        .checked_add(1)
+                        .and_then(|v| v.checked_add(insn.jt as usize))
+                        .ok_or(Error::InvalidArgument)?;
+                    let f_target = i
+                        .checked_add(1)
+                        .and_then(|v| v.checked_add(insn.jf as usize))
+                        .ok_or(Error::InvalidArgument)?;
+                    if t_target >= self.len || f_target >= self.len {
+                        return Err(Error::InvalidArgument);
+                    }
+                }
+            }
+
+            i = i.saturating_add(1);
+        }
+
+        Ok(())
     }
 
     /// Execute this BPF program against `data`.

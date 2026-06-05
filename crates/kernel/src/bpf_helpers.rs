@@ -664,11 +664,25 @@ impl BpfHelperRegistry {
 
     /// Call a helper function by ID with arguments.
     ///
-    /// Validates the helper exists, checks argument count,
-    /// and dispatches to the built-in implementation.
+    /// Validates the helper exists, enforces that the caller-supplied
+    /// `arg_count` exactly matches the helper's declared arity, and dispatches
+    /// to the built-in implementation.
+    ///
+    /// `args` is a fixed-size register array; only the first `arg_count`
+    /// entries are meaningful for this call. BPF call sites are unprivileged
+    /// and attacker-controlled, so a call whose `arg_count` differs from the
+    /// helper's declared `arg_count` is rejected rather than silently reading
+    /// uninitialized register slots (which a helper could treat as pointers).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if no registered helper matches `id`.
+    /// - [`Error::InvalidArgument`] if `arg_count` does not equal the helper's
+    ///   declared `arg_count`, or exceeds [`MAX_HELPER_ARGS`].
     pub fn call_helper(
         &mut self,
         id: u32,
+        arg_count: u8,
         args: &[u64; MAX_HELPER_ARGS],
         ctx: &BpfHelperContext,
     ) -> Result<u64> {
@@ -679,6 +693,14 @@ impl BpfHelperRegistry {
                 return Err(Error::NotFound);
             }
         };
+
+        // Reject any call whose arity does not match the declared helper
+        // signature. `arg_count` can never legitimately exceed the register
+        // file, so an out-of-range value is also a mismatch.
+        if arg_count as usize > MAX_HELPER_ARGS || arg_count != helper.arg_count {
+            self.stats.record_arg_mismatch();
+            return Err(Error::InvalidArgument);
+        }
 
         self.stats.record_call(id);
         bpf_dispatch_helper(id, args, ctx, &helper)
@@ -873,13 +895,92 @@ fn bpf_skb_load_bytes(_skb_ptr: u64, offset: u32, _to_ptr: u64, len: u32) -> Res
 
 /// Convenience function to call a BPF helper by ID.
 ///
-/// This is the top-level dispatch entry point that validates the
-/// helper exists in the given registry and invokes it.
+/// This is the top-level dispatch entry point that validates the helper
+/// exists in the given registry, enforces its declared argument arity, and
+/// invokes it. See [`BpfHelperRegistry::call_helper`] for the error contract.
 pub fn bpf_call_helper(
     registry: &mut BpfHelperRegistry,
     id: u32,
+    arg_count: u8,
     args: &[u64; MAX_HELPER_ARGS],
     ctx: &BpfHelperContext,
 ) -> Result<u64> {
-    registry.call_helper(id, args, ctx)
+    registry.call_helper(id, arg_count, args, ctx)
+}
+
+// ══════════════════════════════════════════════════════════════
+// Unit tests
+// ══════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> BpfHelperRegistry {
+        let mut reg = BpfHelperRegistry::new();
+        reg.init_builtins().expect("init builtins");
+        reg
+    }
+
+    #[test]
+    fn correct_arity_is_accepted() {
+        let mut reg = registry();
+        let ctx = BpfHelperContext::new();
+        let args = [0u64; MAX_HELPER_ARGS];
+        // KtimeGetNs declares 0 args.
+        assert!(
+            reg.call_helper(BpfHelperId::KtimeGetNs.as_u32(), 0, &args, &ctx)
+                .is_ok()
+        );
+        // MapLookupElem declares 2 args.
+        assert!(
+            reg.call_helper(BpfHelperId::MapLookupElem.as_u32(), 2, &args, &ctx)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn wrong_arity_is_rejected() {
+        let mut reg = registry();
+        let ctx = BpfHelperContext::new();
+        let args = [0u64; MAX_HELPER_ARGS];
+        // MapLookupElem declares 2 args; calling with 1 or 3 must fail.
+        assert_eq!(
+            reg.call_helper(BpfHelperId::MapLookupElem.as_u32(), 1, &args, &ctx),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(
+            reg.call_helper(BpfHelperId::MapLookupElem.as_u32(), 3, &args, &ctx),
+            Err(Error::InvalidArgument)
+        );
+        // The mismatch must be accounted for in stats.
+        assert_eq!(reg.get_stats().arg_mismatch_calls, 2);
+    }
+
+    #[test]
+    fn out_of_range_arity_is_rejected() {
+        let mut reg = registry();
+        let ctx = BpfHelperContext::new();
+        let args = [0u64; MAX_HELPER_ARGS];
+        // An arg_count exceeding the register file is always a mismatch.
+        assert_eq!(
+            reg.call_helper(
+                BpfHelperId::KtimeGetNs.as_u32(),
+                (MAX_HELPER_ARGS + 1) as u8,
+                &args,
+                &ctx,
+            ),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn unknown_helper_is_rejected_before_arity() {
+        let mut reg = registry();
+        let ctx = BpfHelperContext::new();
+        let args = [0u64; MAX_HELPER_ARGS];
+        // Unregistered ID returns NotFound regardless of arg_count.
+        assert_eq!(reg.call_helper(9999, 0, &args, &ctx), Err(Error::NotFound));
+        assert_eq!(reg.get_stats().unknown_helper_calls, 1);
+    }
 }

@@ -261,8 +261,33 @@ impl JitCompiler {
 
     /// Compile a BPF program to native code.
     ///
+    /// # Security — verified gate (fail closed)
+    ///
+    /// JIT-compiled code runs with full kernel privilege and bypasses
+    /// the bytecode interpreter, so it MUST NOT be produced for a
+    /// program that has not passed the eBPF verifier (the TCB). The
+    /// `verified` argument carries the source program's `verified` flag;
+    /// when it is `false` this refuses to compile and returns
+    /// [`Error::PermissionDenied`], mirroring the interpreter gate in
+    /// `bpf.rs` ([`BpfVm::run`] / [`BpfRegistry::load`], which both
+    /// reject unverified programs with `PermissionDenied`).
+    ///
+    /// The caller MUST pass the program's real verification status, i.e.
+    /// `prog.verified`. This default fails closed: passing `false` (or a
+    /// default-constructed, never-verified program) can never yield an
+    /// executable JIT image.
+    ///
+    // SECURITY: the JIT has no caller in `bpf.rs` yet. When one is added
+    // it MUST invoke `compile(prog.prog_id, prog.len, size, prog.verified)`
+    // — passing the `verified` field of the `BpfProgram` being compiled
+    // (the same field gated by `BpfVm::run` at bpf.rs:433 and
+    // `BpfRegistry::load` at bpf.rs:828). Hard-coding `true` here, or at
+    // that future call site, would reintroduce an unverified-code path.
+    ///
     /// # Errors
     ///
+    /// - `PermissionDenied` if `verified` is `false` (program has not
+    ///   passed the verifier).
     /// - `InvalidArgument` if `insn_count` exceeds the limit.
     /// - `OutOfMemory` if no free program slots remain.
     /// - `NotImplemented` if the JIT is disabled.
@@ -271,7 +296,13 @@ impl JitCompiler {
         prog_id: u64,
         insn_count: usize,
         estimated_size: usize,
+        verified: bool,
     ) -> Result<usize> {
+        // Fail closed: never compile an unverified program. This gate
+        // mirrors BpfVm::run / BpfRegistry::load in bpf.rs.
+        if !verified {
+            return Err(Error::PermissionDenied);
+        }
         if !self.enabled {
             return Err(Error::NotImplemented);
         }
