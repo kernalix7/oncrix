@@ -59,6 +59,13 @@ const MAX_LISTENERS: usize = 16;
 /// Maximum number of pending ADDFD requests per listener.
 const MAX_ADDFD_PENDING: usize = 16;
 
+/// Maximum valid file descriptor number accepted in ADDFD requests.
+///
+/// Mirrors the Linux `NR_OPEN_MAX` / `RLIMIT_NOFILE` hard ceiling.
+/// Any `new_fd` value above this is rejected as invalid input from
+/// the supervisor process.
+const MAX_FD_VALUE: u32 = 1_048_575;
+
 // -------------------------------------------------------------------
 // SeccompNotifReq
 // -------------------------------------------------------------------
@@ -359,11 +366,18 @@ impl NotifListener {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidArgument`] if `resp.flags` contains any
+    ///   bits outside [`SECCOMP_USER_NOTIF_FLAG_CONTINUE`].
     /// - [`Error::NotFound`] if no pending request with the given
     ///   id exists.
     /// - [`Error::InvalidArgument`] if the request is not in the
     ///   Pending state.
     pub fn send_resp(&mut self, resp: SeccompNotifResp) -> Result<()> {
+        // Reject any unknown flag bits supplied by the supervisor.
+        // Only SECCOMP_USER_NOTIF_FLAG_CONTINUE is currently defined.
+        if resp.flags & !SECCOMP_USER_NOTIF_FLAG_CONTINUE != 0 {
+            return Err(Error::InvalidArgument);
+        }
         let mut i = 0;
         while i < MAX_PENDING {
             if self.entries[i].active && self.entries[i].request.id == resp.id {
@@ -458,9 +472,26 @@ impl NotifListener {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidArgument`] if `req.flags` contains bits
+    ///   outside `SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND`.
+    /// - [`Error::InvalidArgument`] if `req.new_fd` is negative and
+    ///   not the sentinel value `-1` (next-free-fd).
+    /// - [`Error::InvalidArgument`] if `req.new_fd` exceeds the
+    ///   per-process fd limit ([`MAX_FD_VALUE`]).
     /// - [`Error::NotFound`] if the notification id is not valid.
     /// - [`Error::OutOfMemory`] if the ADDFD queue is full.
     pub fn submit_addfd(&mut self, req: AddFdRequest) -> Result<()> {
+        // Validate flags — only SETFD and SEND are defined.
+        let valid_addfd_flags = SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND;
+        if req.flags & !valid_addfd_flags != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // new_fd == -1 means "allocate next free fd"; any other
+        // negative value is invalid. Positive values must be within
+        // the per-process fd table limit.
+        if req.new_fd < -1 || req.new_fd > MAX_FD_VALUE as i32 {
+            return Err(Error::InvalidArgument);
+        }
         if !self.check_id_valid(req.id) {
             return Err(Error::NotFound);
         }

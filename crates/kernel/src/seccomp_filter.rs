@@ -388,18 +388,46 @@ impl SeccompFilter {
             let class = insn.code & 0x07;
 
             match class {
+                cls if cls == BPF_LD => {
+                    // BPF_LD from scratch memory: k is a scratch index.
+                    let mode = insn.code & 0xE0;
+                    if mode == BPF_MEM && insn.k >= SCRATCH_SIZE as u32 {
+                        return Err(Error::InvalidArgument);
+                    }
+                }
+                cls if cls == BPF_LDX => {
+                    // BPF_LDX from scratch memory: k is a scratch index.
+                    let mode = insn.code & 0xE0;
+                    if mode == BPF_MEM && insn.k >= SCRATCH_SIZE as u32 {
+                        return Err(Error::InvalidArgument);
+                    }
+                }
+                cls if (cls == BPF_ST || cls == BPF_STX) && insn.k >= SCRATCH_SIZE as u32 => {
+                    // BPF_ST/STX store A/X at scratch[k]; reject an
+                    // out-of-range scratch index.
+                    return Err(Error::InvalidArgument);
+                }
                 cls if cls == BPF_JMP => {
                     let op = insn.code & 0xF0;
                     if op == JMP_JA {
                         // Unconditional jump.
-                        let target = i.saturating_add(1).saturating_add(insn.k as usize);
+                        let target = i
+                            .checked_add(1)
+                            .and_then(|v| v.checked_add(insn.k as usize))
+                            .ok_or(Error::InvalidArgument)?;
                         if target >= self.insn_count {
                             return Err(Error::InvalidArgument);
                         }
                     } else {
                         // Conditional jump — check both targets.
-                        let t_target = i.saturating_add(1).saturating_add(insn.jt as usize);
-                        let f_target = i.saturating_add(1).saturating_add(insn.jf as usize);
+                        let t_target = i
+                            .checked_add(1)
+                            .and_then(|v| v.checked_add(insn.jt as usize))
+                            .ok_or(Error::InvalidArgument)?;
+                        let f_target = i
+                            .checked_add(1)
+                            .and_then(|v| v.checked_add(insn.jf as usize))
+                            .ok_or(Error::InvalidArgument)?;
                         if t_target >= self.insn_count || f_target >= self.insn_count {
                             return Err(Error::InvalidArgument);
                         }
@@ -428,10 +456,13 @@ impl SeccompFilter {
     /// - 16-slot scratch memory (`M[0..15]`)
     ///
     /// Returns [`SeccompAction::Kill`] if the program is empty
-    /// or encounters an illegal instruction.
+    /// or encounters an illegal instruction. An empty program is
+    /// fail-closed: it kills rather than allowing, so a partially
+    /// constructed filter chain cannot be silently bypassed.
     pub fn execute(&self, data: &SeccompData) -> SeccompAction {
         if self.insn_count == 0 {
-            return self.default_action;
+            // Fail-closed: an empty program must never allow.
+            return SeccompAction::Kill;
         }
 
         let mut a: u32 = 0; // accumulator

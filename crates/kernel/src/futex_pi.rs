@@ -31,6 +31,21 @@ const MAX_ENTRIES: usize = 256;
 /// Default bitset matching all bits.
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
+/// Maximum depth of a PI-chain walk during deadlock detection.
+///
+/// Bounds the owner -> blocked-on -> owner traversal so a crafted
+/// lock graph cannot make the walk run unbounded. A chain can never
+/// legitimately exceed the number of distinct lock entries.
+const MAX_PI_CHAIN_DEPTH: usize = MAX_ENTRIES;
+
+/// Upper bound on the wake/requeue counts accepted by a single
+/// requeue operation, mirroring a sane Linux-style cap.
+///
+/// Counts above this are clamped to it, which both prevents absurd
+/// loop trip counts and never under-serves a real waiter set, since
+/// no entry can hold more than `MAX_ENTRY_WAITERS` waiters anyway.
+const FUTEX_REQUEUE_MAX: u32 = MAX_ENTRY_WAITERS as u32;
+
 /// Futex operation codes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FutexOp {
@@ -67,6 +82,11 @@ pub struct PiState {
     owner_pid: u64,
     /// PIDs of tasks waiting for this lock.
     waiters: [u64; MAX_PI_WAITERS],
+    /// Scheduling priority of each waiter, parallel to `waiters`.
+    ///
+    /// `waiter_prios[i]` is the priority recorded for `waiters[i]`.
+    /// Lower numeric values mean higher scheduling priority.
+    waiter_prios: [u8; MAX_PI_WAITERS],
     /// Number of active waiters.
     waiter_count: usize,
     /// Owner's priority before any boosting.
@@ -80,6 +100,7 @@ impl Default for PiState {
         Self {
             owner_pid: 0,
             waiters: [0; MAX_PI_WAITERS],
+            waiter_prios: [0; MAX_PI_WAITERS],
             waiter_count: 0,
             original_priority: 0,
             boosted_priority: 0,
@@ -108,6 +129,7 @@ impl PiState {
             return Err(Error::OutOfMemory);
         }
         self.waiters[self.waiter_count] = pid;
+        self.waiter_prios[self.waiter_count] = priority;
         self.waiter_count += 1;
 
         // Boost owner if waiter has higher priority (lower value).
@@ -120,31 +142,51 @@ impl PiState {
 
     /// Remove a waiter by PID.
     ///
-    /// After removal, recalculates the boosted priority from
-    /// remaining waiters. This is a no-op if the PID is not found.
+    /// After removal, recalculates the boosted priority from the
+    /// remaining waiters plus the owner's base priority, so a boost
+    /// granted by a still-present higher-priority waiter is retained.
+    /// This is a no-op if the PID is not found.
     pub fn remove_waiter(&mut self, pid: u64) {
         let mut found = false;
         for i in 0..self.waiter_count {
             if self.waiters[i] == pid {
-                // Shift remaining waiters down.
+                // Shift remaining waiters (and their priorities) down.
                 let mut j = i;
                 while j + 1 < self.waiter_count {
                     self.waiters[j] = self.waiters[j + 1];
+                    self.waiter_prios[j] = self.waiter_prios[j + 1];
                     j += 1;
                 }
-                self.waiters[self.waiter_count.saturating_sub(1)] = 0;
-                self.waiter_count = self.waiter_count.saturating_sub(1);
+                let last = self.waiter_count.saturating_sub(1);
+                self.waiters[last] = 0;
+                self.waiter_prios[last] = 0;
+                self.waiter_count = last;
                 found = true;
                 break;
             }
         }
 
         if found {
-            // Recalculate boosted priority from remaining waiters.
-            // Since we don't store per-waiter priority, restore to
-            // original after removal (conservative approach).
-            self.boosted_priority = self.original_priority;
+            self.recompute_boost();
         }
+    }
+
+    /// Recompute the boosted priority from the owner's base priority
+    /// and every remaining waiter.
+    ///
+    /// The boosted priority is the highest scheduling priority (the
+    /// lowest numeric value) among the owner's original priority and
+    /// all current waiters. With no waiters this restores the original
+    /// priority; with higher-priority waiters still present the boost
+    /// is preserved rather than dropped.
+    fn recompute_boost(&mut self) {
+        let mut best = self.original_priority;
+        for i in 0..self.waiter_count {
+            if self.waiter_prios[i] < best {
+                best = self.waiter_prios[i];
+            }
+        }
+        self.boosted_priority = best;
     }
 
     /// Boost the owner's priority to the highest waiter priority.
@@ -270,6 +312,7 @@ impl FutexPiRegistry {
             pi: PiState {
                 owner_pid: 0,
                 waiters: [0; MAX_PI_WAITERS],
+                waiter_prios: [0; MAX_PI_WAITERS],
                 waiter_count: 0,
                 original_priority: 0,
                 boosted_priority: 0,
@@ -373,6 +416,21 @@ impl FutexPiRegistry {
         wake_count: u32,
         requeue_count: u32,
     ) -> Result<u32> {
+        // Requeue to the same key would loop migrating a waiter out of
+        // and back into one entry, up to `requeue_count` (attacker
+        // controlled, up to u32::MAX) iterations: reject like Linux's
+        // EINVAL before doing any work.
+        if from_key == to_key {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Clamp both counts to a sane maximum. No entry can ever hold
+        // more than `MAX_ENTRY_WAITERS` waiters, so clamping never
+        // under-serves a legitimate request, but it bounds the wake
+        // scan and the requeue loop to a small constant.
+        let wake_count = wake_count.min(FUTEX_REQUEUE_MAX);
+        let requeue_count = requeue_count.min(FUTEX_REQUEUE_MAX);
+
         // First, wake waiters on from_key.
         let woken = self.futex_wake(from_key, wake_count, FUTEX_BITSET_MATCH_ANY)?;
 
@@ -459,6 +517,16 @@ impl FutexPiRegistry {
             return Err(Error::Busy);
         }
 
+        // Walk the PI chain before committing: if blocking on this
+        // owner would close a cycle (owner -> ... -> caller), or the
+        // chain is pathologically deep, reject instead of deadlocking.
+        let owner = entry.pi.owner_pid;
+        if self.pi_chain_would_deadlock(pid, owner) {
+            return Err(Error::Busy);
+        }
+
+        let entry = &mut self.entries[idx];
+
         // Owned by someone else — add as waiter with priority boost.
         entry.pi.add_waiter(pid, priority)?;
         entry.pi.boost();
@@ -519,9 +587,14 @@ impl FutexPiRegistry {
 
         entry.pi.remove_waiter(new_owner);
 
-        // Set new owner (use original priority as default since we
-        // don't track per-waiter priorities in the general list).
-        entry.pi.set_owner(new_owner, entry.pi.original_priority);
+        // Set new owner. The general waiter list does not carry per-task
+        // priorities, so the prior owner's base priority is used as the
+        // new owner's base. Any PI waiters that are still blocked on this
+        // lock must continue to boost the new owner, so recompute the
+        // boost from those remaining waiters rather than leaving it reset.
+        let base = entry.pi.original_priority;
+        entry.pi.set_owner(new_owner, base);
+        entry.pi.recompute_boost();
 
         Ok(())
     }
@@ -626,6 +699,50 @@ impl FutexPiRegistry {
     /// Find an existing entry by key.
     fn find_entry(&self, key: u64) -> Option<usize> {
         self.entries.iter().position(|e| e.in_use && e.key == key)
+    }
+
+    /// Find the PI lock entry that `pid` is currently blocked on.
+    ///
+    /// A task is "blocked on" a lock when it appears in that lock's PI
+    /// waiter list. Returns the index of the first such entry, if any.
+    fn entry_blocking(&self, pid: u64) -> Option<usize> {
+        self.entries.iter().position(|e| {
+            if !e.in_use || !e.has_pi {
+                return false;
+            }
+            e.pi.waiters[..e.pi.waiter_count].contains(&pid)
+        })
+    }
+
+    /// Detect whether `waiter` blocking on the lock owned by `owner`
+    /// would close a cycle in the PI (owner-blocked-on) graph.
+    ///
+    /// Walks owner -> (lock owner is blocked on) -> next owner ... up to
+    /// [`MAX_PI_CHAIN_DEPTH`]. Returns `true` if the walk reaches
+    /// `waiter` (a deadlock) or exceeds the depth cap (treated as a
+    /// deadlock to stay bounded). A zero/absent owner ends the chain.
+    fn pi_chain_would_deadlock(&self, waiter: u64, owner: u64) -> bool {
+        let mut current = owner;
+        let mut depth = 0;
+        while current != 0 {
+            if current == waiter {
+                // The owner chain leads back to the new waiter: cycle.
+                return true;
+            }
+            depth += 1;
+            if depth >= MAX_PI_CHAIN_DEPTH {
+                // Refuse to walk further; treat as a deadlock.
+                return true;
+            }
+            // Advance: find the lock `current` is itself blocked on and
+            // move to that lock's owner. If it is blocked on nothing,
+            // the chain terminates safely.
+            match self.entry_blocking(current) {
+                Some(idx) => current = self.entries[idx].pi.owner_pid,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Find an existing entry or create a new one for the given key.
