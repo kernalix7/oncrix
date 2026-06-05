@@ -450,6 +450,55 @@ pub unsafe fn sys_clock_getres(clk_id: u32, res_ptr: u64) -> i64 {
 
 // ── clock_settime / adjtimex / clock_adjtime ──────────────────────
 
+/// `struct timex` `modes` field: any bit set requests a clock adjustment.
+///
+/// Linux defines the per-field modify flags `ADJ_OFFSET` (0x0001) ..
+/// `ADJ_TICK` (0x4000), plus `ADJ_OFFSET_SS_READ` etc. A non-zero `modes`
+/// always indicates the caller wants to *change* something; `modes == 0`
+/// is a pure read-only query of the current clock state. We therefore gate
+/// on `modes != 0` rather than enumerating individual bits, which is both
+/// forward-compatible and fail-closed for any unknown adjust bit.
+const ADJ_MODES_QUERY_ONLY: u32 = 0;
+
+/// Effective capability set of the caller, for time-adjustment gating.
+///
+/// The SYSCALL dispatch path does not yet thread a per-task capability set
+/// into the time syscalls (the scheduler tracks no `CapSet`, and there is
+/// no global current-task credential accessor reachable here). Until that
+/// plumbing exists this returns an **empty** set, which is fail-closed: any
+/// caller requesting a clock adjustment is treated as lacking `CAP_SYS_TIME`
+/// and denied with `EPERM`. A pure query (`modes == 0`) never consults this.
+///
+/// # SECURITY
+///
+/// When the dispatch site (`arch/x86_64/syscall_entry.rs`, owned by the
+/// syscall-api team) is extended to thread the calling thread's effective
+/// `CapSet` through, replace this with that real set and check
+/// `caps.has(capability::CAP_SYS_TIME)`. Returning a non-empty set here
+/// without that wiring would silently grant time-adjust privilege to every
+/// caller — keep this empty until the real set is available.
+fn caller_effective_caps() -> crate::capability::CapSet {
+    crate::capability::CapSet::EMPTY
+}
+
+/// Returns `Ok(())` if the caller may perform a clock adjustment described
+/// by `modes`, else `Err(())` (mapped to `EPERM` by the caller).
+///
+/// A `modes` of zero is a read-only query and is always permitted. Any
+/// non-zero `modes` requires `CAP_SYS_TIME` in the caller's effective set;
+/// with the current fail-closed [`caller_effective_caps`] that means every
+/// adjustment is denied.
+fn adjust_permitted(modes: u32) -> core::result::Result<(), ()> {
+    if modes == ADJ_MODES_QUERY_ONLY {
+        return Ok(());
+    }
+    if caller_effective_caps().has(crate::capability::CAP_SYS_TIME) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 /// `clock_settime(clk_id, tp)` — attempt to set a POSIX clock.
 ///
 /// ONCRIX has no settable clock source.  The syscall validates both
@@ -460,9 +509,13 @@ pub unsafe fn sys_clock_getres(clk_id: u32, res_ptr: u64) -> i64 {
 /// Validation order (mirrors POSIX.1-2024 `clock_settime(3p)`):
 /// 1. `clk_id` — only `CLOCK_REALTIME` (0) and `CLOCK_MONOTONIC` (1) are
 ///    known; any other value returns `-EINVAL` (-22).
-/// 2. `tp_ptr` — must be non-null and below the kernel/user split
+/// 2. `CLOCK_MONOTONIC` (1) is non-settable by definition — setting it
+///    returns `-EINVAL` (-22) before any pointer access (POSIX: a monotonic
+///    clock cannot be set, distinct from "no settable source").
+/// 3. `tp_ptr` — must be non-null and below the kernel/user split
 ///    (`0xFFFF_8000_0000_0000`); otherwise `-EFAULT` (-14).
-/// 3. All checks pass → `-EPERM` (-1): the clock exists but cannot be set.
+/// 4. All checks pass → `-EPERM` (-1): the (REALTIME) clock exists but ONCRIX
+///    has no settable source.
 ///
 /// POSIX.1-2024 reference: `functions/clock_settime.html`.
 ///
@@ -476,6 +529,12 @@ pub unsafe fn sys_clock_settime(clk_id: u32, tp_ptr: u64) -> i64 {
     if clk_id > 1 {
         return -22; // EINVAL
     }
+    // CLOCK_MONOTONIC (1) is non-settable by definition — reject before any
+    // pointer access. (REALTIME falls through to the EPERM "no source" path.)
+    const CLOCK_MONOTONIC: u32 = 1;
+    if clk_id == CLOCK_MONOTONIC {
+        return -22; // EINVAL
+    }
     // tp must be a valid user-space pointer (non-null, not kernel-space).
     if tp_ptr == 0 || tp_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
@@ -486,52 +545,102 @@ pub unsafe fn sys_clock_settime(clk_id: u32, tp_ptr: u64) -> i64 {
 
 /// `adjtimex(buf)` — query or adjust kernel clock parameters.
 ///
-/// ONCRIX performs no NTP clock discipline.  The syscall validates the
-/// `buf` pointer and returns `TIME_OK` (0) without reading or writing the
-/// `struct timex` payload, indicating that the clock is considered
-/// synchronised (the only state ONCRIX can truthfully report).
+/// ONCRIX performs no NTP clock discipline.  The syscall reads the `modes`
+/// field of the user `struct timex` to decide whether the caller wants a
+/// read-only query (`modes == 0`) or an adjustment (`modes != 0`):
 ///
-/// Returns `0` (`TIME_OK`) on a valid pointer, `-EFAULT` (-14) for a
-/// null or kernel-space pointer.
+/// - A query validates the pointer and returns `TIME_OK` (0) — the only
+///   state ONCRIX can truthfully report (the clock is free-running).
+/// - An adjustment requires `CAP_SYS_TIME`; without it the call returns
+///   `-EPERM` (-1) and changes nothing. The current dispatch path threads
+///   no capability set in, so [`adjust_permitted`] is fail-closed and every
+///   adjustment is denied (see its `# SECURITY` note).
+///
+/// Returns `0` (`TIME_OK`) on a valid query, `-EFAULT` (-14) for a null /
+/// kernel-space / unbacked `buf` pointer, `-EPERM` (-1) for an adjustment
+/// the caller is not privileged to make.
 ///
 /// POSIX.1-2024 / Linux reference: `adjtimex(2)`.
 ///
 /// # Safety
 ///
 /// Must be called from the single-CPU SYSCALL dispatch path.  `buf_ptr` is
-/// validated user-canonical; no dereference is performed by this function.
+/// validated user-canonical before the `modes` field is read; the kernel
+/// page-fault handler converts an unmapped user read to `SIGSEGV` without
+/// panicking.
 pub unsafe fn sys_adjtimex(buf_ptr: u64) -> i64 {
     // Reject null and kernel-space addresses without touching the pointer.
     if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
     }
-    // No adjustment performed; report TIME_OK (0).
+    // The `modes` field is the first member of `struct timex` (offset 0,
+    // 4 bytes). Span-verify the backed window before reading it.
+    if crate::uaccess::verify_user_access(buf_ptr, 4, false).is_err() {
+        return -14; // EFAULT
+    }
+    // SAFETY: pointer validated user-canonical and span-checked above; the
+    // page-fault handler converts an unmapped read to SIGSEGV.
+    let modes = unsafe { (buf_ptr as *const u32).read_volatile() };
+
+    // Gate any requested adjustment behind CAP_SYS_TIME (fail-closed).
+    if adjust_permitted(modes).is_err() {
+        return -1; // EPERM
+    }
+    // Query (or a privileged no-op adjustment): report TIME_OK (0).
     0
 }
 
 /// `clock_adjtime(clk_id, buf)` — adjust the time of a specific POSIX clock.
 ///
-/// ONCRIX performs no NTP clock discipline.  Like [`sys_adjtimex`], this
-/// validates the `buf` pointer and returns `TIME_OK` (0) without modifying
-/// any state.  `clk_id` is accepted for any value (unknown clocks are also
-/// harmlessly no-oped) because POSIX leaves the behaviour for unsupported
-/// clocks implementation-defined and returning EINVAL here would break
-/// programs that probe clock adjustability.
+/// ONCRIX performs no NTP clock discipline.  Like [`sys_adjtimex`], it reads
+/// the `modes` field of the user `struct timex` and only permits an
+/// adjustment (`modes != 0`) to a caller holding `CAP_SYS_TIME`; a query
+/// (`modes == 0`) is always allowed and reports `TIME_OK` (0). The current
+/// dispatch path threads no capability set in, so [`adjust_permitted`] is
+/// fail-closed and every adjustment is denied with `-EPERM`.
 ///
-/// Returns `0` (`TIME_OK`) on a valid pointer, `-EFAULT` (-14) for a
-/// null or kernel-space pointer.
+/// `CLOCK_MONOTONIC` (1) is non-settable by definition: any adjustment
+/// targeting it returns `-EINVAL` (-22) regardless of privilege. Other
+/// `clk_id` values are accepted (a query is harmlessly no-oped) because
+/// POSIX leaves probing of unsupported clocks implementation-defined.
+///
+/// Returns `0` (`TIME_OK`) on a valid query, `-EFAULT` (-14) for a null /
+/// kernel-space / unbacked `buf` pointer, `-EINVAL` (-22) for an adjustment
+/// of `CLOCK_MONOTONIC`, `-EPERM` (-1) for an adjustment the caller is not
+/// privileged to make.
 ///
 /// POSIX.1-2024 / Linux reference: `clock_adjtime(2)`.
 ///
 /// # Safety
 ///
 /// Must be called from the single-CPU SYSCALL dispatch path.  `buf_ptr` is
-/// validated user-canonical; no dereference is performed by this function.
-pub unsafe fn sys_clock_adjtime(_clk_id: u32, buf_ptr: u64) -> i64 {
+/// validated user-canonical before the `modes` field is read; the kernel
+/// page-fault handler converts an unmapped user read to `SIGSEGV` without
+/// panicking.
+pub unsafe fn sys_clock_adjtime(clk_id: u32, buf_ptr: u64) -> i64 {
     // Reject null and kernel-space addresses without touching the pointer.
     if buf_ptr == 0 || buf_ptr >= 0xFFFF_8000_0000_0000 {
         return -14; // EFAULT
     }
-    // No adjustment performed; report TIME_OK (0).
+    // The `modes` field is the first member of `struct timex` (offset 0,
+    // 4 bytes). Span-verify the backed window before reading it.
+    if crate::uaccess::verify_user_access(buf_ptr, 4, false).is_err() {
+        return -14; // EFAULT
+    }
+    // SAFETY: pointer validated user-canonical and span-checked above; the
+    // page-fault handler converts an unmapped read to SIGSEGV.
+    let modes = unsafe { (buf_ptr as *const u32).read_volatile() };
+
+    // CLOCK_MONOTONIC (1) cannot be set/adjusted — reject any adjustment
+    // request against it as invalid (a pure query still succeeds below).
+    const CLOCK_MONOTONIC: u32 = 1;
+    if modes != ADJ_MODES_QUERY_ONLY && clk_id == CLOCK_MONOTONIC {
+        return -22; // EINVAL
+    }
+    // Gate any requested adjustment behind CAP_SYS_TIME (fail-closed).
+    if adjust_permitted(modes).is_err() {
+        return -1; // EPERM
+    }
+    // Query (or a privileged no-op adjustment): report TIME_OK (0).
     0
 }
