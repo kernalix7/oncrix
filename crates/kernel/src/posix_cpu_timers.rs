@@ -755,7 +755,11 @@ impl PosixCpuTimerSubsystem {
             return TimerFireResult::FiredOneShot;
         }
 
-        // Interval timer: compute overruns and reload.
+        // Interval timer: compute overruns and reload. `interval_ns`,
+        // `current_cpu`, and `expires_ns` derive from attacker-
+        // influenced values, so every operation is checked/saturating
+        // to keep a ring-0 panic (which would halt the kernel) off the
+        // table. Guard the divisor before dividing.
         let elapsed = current_cpu.saturating_sub(timer.expires_ns);
         let overruns = if timer.interval_ns > 0 {
             elapsed / timer.interval_ns
@@ -763,11 +767,14 @@ impl PosixCpuTimerSubsystem {
             0
         };
 
-        timer.overrun_count = (timer.overrun_count + overruns).min(MAX_OVERRUN);
-        self.stats.total_overruns += overruns;
+        timer.overrun_count = timer
+            .overrun_count
+            .saturating_add(overruns)
+            .min(MAX_OVERRUN);
+        self.stats.total_overruns = self.stats.total_overruns.saturating_add(overruns);
 
         // Reload: set next expiration.
-        timer.expires_ns = current_cpu + timer.interval_ns;
+        timer.expires_ns = current_cpu.saturating_add(timer.interval_ns);
         timer.state = CpuTimerState::Armed;
 
         if overruns > 0 {
@@ -801,14 +808,27 @@ impl PosixCpuTimerSubsystem {
             .iter()
             .position(|t| !t.is_free() && t.target_pid == pid && t.clock_id == clock_id);
 
+        // A non-zero interval must clear the minimum-interval floor so a
+        // caller cannot demand per-nanosecond CPU re-arming (matches the
+        // `arm_timer` guard used by the create path below).
+        if interval_ns > 0 && interval_ns < MIN_INTERVAL_NS {
+            return Err(Error::InvalidArgument);
+        }
+
         if let Some(idx) = existing {
             if value_ns == 0 {
                 // Disarm.
                 self.timers[idx].state = CpuTimerState::Disarmed;
                 return Ok(self.timers[idx].timer_id);
             }
+            // `value_ns` is attacker-controlled; a raw `cpu_now + value_ns`
+            // can overflow u64 and panic (ring-0 panic = kernel halt).
+            // Reject an overflowing expiry as an invalid argument.
             let cpu_now = self.get_process_cpu(pid);
-            self.timers[idx].expires_ns = cpu_now + value_ns;
+            let expires_ns = cpu_now
+                .checked_add(value_ns)
+                .ok_or(Error::InvalidArgument)?;
+            self.timers[idx].expires_ns = expires_ns;
             self.timers[idx].interval_ns = interval_ns;
             self.timers[idx].state = CpuTimerState::Armed;
             return Ok(self.timers[idx].timer_id);
@@ -818,9 +838,21 @@ impl PosixCpuTimerSubsystem {
             return Err(Error::NotFound);
         }
 
-        let timer_id = self.create_timer(clock_id, pid, 0, DEFAULT_SIGNAL, 0, pid)?;
+        // Validate the expiry overflow guard BEFORE allocating a timer slot.
+        // `create_timer` consumes a slot and bumps `timers_created` /
+        // `active_timers`; if the `cpu_now + value_ns` overflow check ran
+        // afterwards, the Err path would leak the just-created slot (and skew
+        // the counters) because nothing deletes it. `value_ns` is
+        // attacker-controlled, so a raw add can overflow u64 and panic
+        // (ring-0 panic = kernel halt) — reject the overflow up front so no
+        // slot is consumed on the error path.
         let cpu_now = self.get_process_cpu(pid);
-        self.arm_timer(timer_id, cpu_now + value_ns, interval_ns)?;
+        let expires_ns = cpu_now
+            .checked_add(value_ns)
+            .ok_or(Error::InvalidArgument)?;
+
+        let timer_id = self.create_timer(clock_id, pid, 0, DEFAULT_SIGNAL, 0, pid)?;
+        self.arm_timer(timer_id, expires_ns, interval_ns)?;
         Ok(timer_id)
     }
 

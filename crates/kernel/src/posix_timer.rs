@@ -55,6 +55,15 @@ pub const TIMER_ABSTIME: i32 = 1;
 /// Number of nanoseconds in one second.
 const _NANOS_PER_SEC: u64 = 1_000_000_000;
 
+/// Minimum periodic interval (1 microsecond in ns).
+///
+/// A non-zero interval below this floor is clamped up to it. Without a
+/// floor, a 1 ns periodic timer would re-arm every tick and let an
+/// unprivileged caller drive an unbounded signal flood at the owning
+/// process (a denial-of-service). Mirrors `MIN_INTERVAL_NS` in
+/// `posix_cpu_timers.rs`. A zero interval (one-shot) is left untouched.
+const MIN_INTERVAL_NS: u64 = 1_000;
+
 // ── Timespec ─────────────────────────────────────────────────
 
 /// POSIX `struct timespec` for timer intervals and values.
@@ -370,8 +379,18 @@ impl PosixTimerRegistry {
         // Capture old value.
         let old = get_itimerspec(timer, now_ns);
 
-        // Set the interval.
-        timer.interval = new_value.it_interval;
+        // Set the interval, applying the minimum-interval floor. A non-zero
+        // periodic interval below `MIN_INTERVAL_NS` is clamped up so an
+        // unprivileged caller cannot request per-nanosecond re-arming and
+        // drive a signal flood against the owning process. A zero interval
+        // (one-shot) is preserved unchanged. `it_interval` was already
+        // validated (tv_sec >= 0, tv_nsec in [0, 1e9)) above, so `to_nanos`
+        // only returns `None` on >u64 overflow — treat that as "above the
+        // floor" and keep the caller's value verbatim.
+        timer.interval = match new_value.it_interval.to_nanos() {
+            Some(ns) if ns > 0 && ns < MIN_INTERVAL_NS => Timespec::from_nanos(MIN_INTERVAL_NS),
+            _ => new_value.it_interval,
+        };
 
         if new_value.it_value.is_zero() {
             // Disarm.

@@ -209,6 +209,33 @@ pub const KEYCTL_CAPS1_NS_KEY_TAG: u8 = 0x01;
 pub const KEYCTL_CAPS1_NOTIFICATIONS: u8 = 0x02;
 
 // ---------------------------------------------------------------------------
+// User-space address validation
+// ---------------------------------------------------------------------------
+
+/// Exclusive upper bound of the canonical lower-half user address space
+/// on x86-64.  Any address at or above this value is either kernel-half or
+/// non-canonical and must never be dereferenced from ring 0.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// Return `true` if the byte range `[addr, addr + len)` lies entirely within
+/// the canonical user-space window and does not wrap.
+///
+/// Both `addr == 0` and any range that touches or crosses `USER_ADDR_MAX` are
+/// rejected.  An attacker-supplied `buf` of `0xffff_ffff_8000_0000` with
+/// `len == 2` would otherwise reach kernel text and produce a ring-0 write.
+#[inline]
+const fn is_valid_user_range(addr: u64, len: usize) -> bool {
+    if addr == 0 || len == 0 {
+        return false;
+    }
+    // Checked add prevents wrap-around from bypassing the upper bound check.
+    match addr.checked_add(len as u64) {
+        Some(end) => end <= USER_ADDR_MAX,
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
@@ -288,6 +315,14 @@ fn do_update(key: i32, payload: u64, plen: u32) -> Result<i64> {
         return Err(Error::InvalidArgument);
     }
     let _ = (payload, plen);
+    // SECURITY TODO (when key store is implemented):
+    //   1. Look up the key by serial.  Fail with NotFound if absent.
+    //   2. Check that the caller holds WRITE permission on the key
+    //      (KEY_POS_WRITE for possessor, KEY_USR_WRITE for owner, etc.).
+    //      Fail-closed with PermissionDenied if the bit is not set.
+    //   3. Validate payload pointer: if plen > 0, call
+    //      is_valid_user_range(payload, plen as usize) before copying.
+    //   4. Copy payload from user space via copy_from_user equivalent.
     Err(Error::NotImplemented)
 }
 
@@ -303,6 +338,14 @@ fn do_chown(key: i32, uid: u32, gid: u32) -> Result<i64> {
         return Err(Error::InvalidArgument);
     }
     let _ = (uid, gid);
+    // SECURITY TODO (when key store is implemented):
+    //   1. Look up the key by serial.  Fail with NotFound if absent.
+    //   2. Check that the caller is the key owner OR holds CAP_SYS_ADMIN.
+    //      Fail-closed with PermissionDenied if neither holds.
+    //   3. uid/gid values of u32::MAX mean "do not change"; validate that any
+    //      non-MAX uid/gid either matches the caller's own credentials or the
+    //      caller holds CAP_SETUID/CAP_SETGID respectively.
+    //   4. Update the key's uid/gid atomically under the key's spin-lock.
     Err(Error::NotImplemented)
 }
 
@@ -311,6 +354,15 @@ fn do_setperm(key: i32, perm: u32) -> Result<i64> {
         return Err(Error::InvalidArgument);
     }
     let _ = perm;
+    // SECURITY TODO (when key store is implemented):
+    //   1. Look up the key by serial.  Fail with NotFound if absent.
+    //   2. Check that the caller is the key owner OR holds CAP_SYS_ADMIN.
+    //      Fail-closed with PermissionDenied if neither holds.
+    //   3. Reject any `perm` bits outside the defined KEY_POS_* / KEY_USR_* /
+    //      KEY_GRP_* / KEY_OTH_* mask to prevent future bit-smuggling.
+    //   4. Non-owners may not grant permissions they do not themselves hold
+    //      (no privilege escalation through SETPERM).
+    //   5. Atomically store the new permission mask under the key's spin-lock.
     Err(Error::NotImplemented)
 }
 
@@ -429,6 +481,7 @@ fn do_capabilities(buf: u64, buflen: u32) -> Result<i64> {
     if buf == 0 || buflen == 0 {
         return Err(Error::InvalidArgument);
     }
+
     let caps: [u8; 2] = [
         KEYCTL_CAPS0_CAPABILITIES
             | KEYCTL_CAPS0_PERSISTENT_KEYRINGS
@@ -438,11 +491,31 @@ fn do_capabilities(buf: u64, buflen: u32) -> Result<i64> {
             | KEYCTL_CAPS0_MOVE,
         KEYCTL_CAPS1_NOTIFICATIONS,
     ];
+
+    // Clamp the write length to the smaller of caller's buffer and our caps
+    // array, then validate the destination range before touching it.
+    //
+    // Without this check a caller can pass buf=0xffff_ffff_8000_0000 and
+    // trigger a ring-0 write into kernel text, halting the machine or giving
+    // an arbitrary 2-byte kernel-memory write primitive.
     let copy_len = (buflen as usize).min(caps.len());
-    // SAFETY: Caller validates user-space pointer.
+
+    // SECURITY: Reject any destination that is not inside the canonical
+    // lower-half user window.  `is_valid_user_range` performs a checked-add
+    // to prevent wrap-around and verifies addr + len <= USER_ADDR_MAX.
+    if !is_valid_user_range(buf, copy_len) {
+        return Err(Error::InvalidArgument);
+    }
+
+    // SAFETY: `is_valid_user_range` above confirmed that `buf` is non-null,
+    // non-wrapping, and lies entirely within the canonical user address space
+    // [0, USER_ADDR_MAX).  `copy_len` is at most `caps.len()` (== 2) bytes so
+    // the source slice is valid.  No aliasing with kernel data is possible
+    // because kernel addresses start at USER_ADDR_MAX (0x0000_8000_0000_0000).
     unsafe {
         core::ptr::copy_nonoverlapping(caps.as_ptr(), buf as *mut u8, copy_len);
     }
+
     Ok(copy_len as i64)
 }
 

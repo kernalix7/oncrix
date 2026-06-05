@@ -95,6 +95,12 @@ impl ChaChaState {
     }
 
     /// Seed the ChaCha state from the entropy pool.
+    ///
+    /// Copies the first 8 pool words as the key and the next 3 as the
+    /// nonce. The caller ([`RandomSubsystem::reseed`]) is responsible
+    /// for *consuming* the extracted pool words afterwards so the same
+    /// key/nonce cannot be re-derived by a subsequent reseed that adds
+    /// no fresh entropy (see [`RandomSubsystem::reseed`]).
     fn seed(&mut self, pool: &[u32; POOL_WORDS]) {
         // Use the first 8 words of the pool as the key.
         self.key.copy_from_slice(&pool[..CHACHA_KEY_WORDS]);
@@ -103,6 +109,27 @@ impl ChaChaState {
         self.counter = 0;
         self.seeded = true;
         self.generation += 1;
+    }
+
+    /// Fast-key-erasure rekey.
+    ///
+    /// Generates one ChaCha block that is **never emitted** and uses
+    /// it to overwrite the key (and re-randomise the nonce). Because
+    /// the new key is derived from a discarded block of the *current*
+    /// keystream, an attacker who later compromises the state cannot
+    /// run the cipher backwards to recover previously emitted output
+    /// (forward secrecy / backtracking resistance). Resets the block
+    /// counter so the next emitted block starts a fresh keystream.
+    fn rekey_fast_erasure(&mut self) {
+        // Reserve one block purely for rekeying; it is discarded.
+        let block = self.generate_block();
+        self.key.copy_from_slice(&block[..CHACHA_KEY_WORDS]);
+        // Fold fresh keystream words into the nonce as well so the
+        // (key, nonce, counter) tuple never repeats across batches.
+        self.nonce[0] ^= block[CHACHA_KEY_WORDS];
+        self.nonce[1] ^= block[CHACHA_KEY_WORDS + 1];
+        self.nonce[2] ^= block[CHACHA_KEY_WORDS + 2];
+        self.counter = 0;
     }
 
     /// Generate a ChaCha20 block (64 bytes = 16 × u32).
@@ -223,6 +250,33 @@ impl EntropyPool {
     fn debit(&mut self, bits: u32) {
         self.entropy_count = self.entropy_count.saturating_sub(bits);
     }
+
+    /// Consume the seed material (the 11 words read by
+    /// [`ChaChaState::seed`]) by overwriting it with `fresh` keystream
+    /// words drawn from the just-seeded cipher.
+    ///
+    /// Without this, two reseeds with no intervening fresh entropy
+    /// would re-extract identical key/nonce words and reproduce the
+    /// same keystream. Folding discarded keystream over the consumed
+    /// words makes the seed region one-way: it cannot be re-derived
+    /// from the pool and old reseed inputs are destroyed.
+    fn consume_seed_material(&mut self, fresh: &[u32; 16]) {
+        // Words 0..11 are the key (0..8) and nonce (8..11) that
+        // `ChaChaState::seed` consumed. Overwrite them with fresh
+        // keystream so they cannot be recovered or reused.
+        let mut i = 0usize;
+        while i < 11 {
+            self.pool[i] ^= fresh[i];
+            i += 1;
+        }
+        // Stir the remainder of the first block into the tail so the
+        // whole pool advances rather than just the seed window.
+        let mut j = 11usize;
+        while j < 16 {
+            self.pool[(j + 16) % POOL_WORDS] ^= fresh[j];
+            j += 1;
+        }
+    }
 }
 
 // ── RandomStats ─────────────────────────────────────────────
@@ -329,8 +383,22 @@ impl RandomSubsystem {
     }
 
     /// Force a reseed of the CRNG from the pool.
+    ///
+    /// After loading key/nonce from the pool, the extracted seed words
+    /// are *consumed* (overwritten with discarded keystream) so a
+    /// subsequent reseed that received no fresh entropy cannot
+    /// re-derive the same key and reproduce the keystream. The cipher
+    /// is then immediately rekeyed via fast key erasure so the live
+    /// key differs from the one momentarily present in the pool.
     pub fn reseed(&mut self) {
         self.chacha.seed(&self.pool.pool);
+        // Draw one block from the freshly seeded cipher and fold it
+        // back over the consumed seed words (one-way), destroying the
+        // material that produced this key.
+        let consume_block = self.chacha.generate_block();
+        self.pool.consume_seed_material(&consume_block);
+        // Rotate to a key that was never present in the pool.
+        self.chacha.rekey_fast_erasure();
         self.pool.debit(SEED_THRESHOLD);
         self.output_remaining = 0;
         self.stats.seeded = true;
@@ -400,6 +468,12 @@ impl RandomSubsystem {
     // ── Internal ────────────────────────────────────────────
 
     /// Refill the output buffer from ChaCha20.
+    ///
+    /// After the buffer is filled, the cipher key is rotated via fast
+    /// key erasure ([`ChaChaState::rekey_fast_erasure`]). The rekey
+    /// block is never emitted, so an attacker who compromises the
+    /// state after this batch cannot wind the cipher backwards to
+    /// recover the bytes just produced (backtracking resistance).
     fn refill_buffer(&mut self) {
         let mut pos = 0;
         while pos < OUTPUT_BUFFER_SIZE {
@@ -417,6 +491,9 @@ impl RandomSubsystem {
         }
         self.output_pos = 0;
         self.output_remaining = OUTPUT_BUFFER_SIZE;
+        // Fast key erasure: rotate the key away from the one that
+        // generated this batch so past output is unrecoverable.
+        self.chacha.rekey_fast_erasure();
     }
 }
 

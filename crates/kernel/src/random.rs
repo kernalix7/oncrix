@@ -8,6 +8,23 @@
 //! collects timing jitter from interrupts, disk I/O, and keyboard
 //! input.
 //!
+//! # SECURITY — DO NOT WIRE THIS AS A LIVE RNG
+//!
+//! This module is **unused legacy scaffolding** and is retained only
+//! for reference. The live CSPRNG behind `getrandom(2)` and all kernel
+//! cryptographic randomness is [`crate::random_kern::RandomSubsystem`]
+//! (reached via [`crate::random_syscall`]); this `KernelRng` is not
+//! reachable from any syscall.
+//!
+//! [`ChaCha20State::generate`] **rekeys the cipher from its own emitted
+//! output**, which is predictable and provides no forward secrecy: an
+//! observer who sees one block can derive the next key. The types here
+//! are marked `#[deprecated]` to prevent accidental use. If this module
+//! is ever revived, [`ChaCha20State::generate`] MUST be rewritten to
+//! advance the block counter (and rekey only from *reserved,
+//! never-emitted* keystream, as `random_kern.rs` does) before it is
+//! connected to any security-relevant consumer.
+//!
 //! # Design
 //!
 //! - [`EntropyPool`]: 256-byte ring buffer that accumulates raw
@@ -269,8 +286,17 @@ impl ChaCha20State {
 
     /// Fill `out` with PRNG output, rekeying after each block.
     ///
-    /// After producing each 64-byte block, the first 32 bytes of
-    /// the output are used to re-seed the key (forward secrecy).
+    /// # SECURITY — predictable rekey, do not use
+    ///
+    /// This rekeys from the cipher's **own emitted output** (the first
+    /// 32 bytes of each block become the next key), so an observer of
+    /// one block can derive every subsequent key. It provides no
+    /// forward secrecy and MUST NOT back any security-relevant RNG.
+    /// Use [`crate::random_kern::RandomSubsystem`] instead. If revived,
+    /// advance the block counter and rekey only from reserved,
+    /// never-emitted keystream.
+    #[deprecated(note = "predictable: rekeys from emitted output. Use \
+                random_kern::RandomSubsystem; never wire this live.")]
     pub fn generate(&mut self, out: &mut [u8]) {
         let mut offset = 0usize;
         while offset < out.len() {
@@ -416,6 +442,10 @@ impl KernelRng {
             return Err(Error::WouldBlock);
         }
         self.reseed();
+        // SECURITY: `generate` is deprecated (predictable rekey). This
+        // legacy path is not wired to any syscall; allow the call so
+        // the crate stays clippy-clean without reviving the hazard.
+        #[allow(deprecated)]
         self.chacha.generate(buf);
         Ok(buf.len())
     }
@@ -435,6 +465,8 @@ impl KernelRng {
         if !self.initialized || self.pool.available_entropy() >= MIN_RESEED_ENTROPY {
             self.reseed();
         }
+        // SECURITY: deprecated predictable-rekey path; not syscall-wired.
+        #[allow(deprecated)]
         self.chacha.generate(buf);
         buf.len()
     }

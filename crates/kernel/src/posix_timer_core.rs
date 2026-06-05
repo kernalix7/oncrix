@@ -582,9 +582,18 @@ impl PosixTimerTable {
             if timer.interval_ns > 0 {
                 // Re-arm: advance expiry by one interval, handling
                 // the case where multiple intervals have elapsed.
-                let elapsed = now_ns - timer.expiry_ns;
-                let periods = (elapsed / timer.interval_ns) + 1;
-                timer.expiry_ns += periods * timer.interval_ns;
+                //
+                // All arithmetic is saturating: `now_ns`, `expiry_ns`,
+                // and `interval_ns` ultimately derive from attacker-
+                // influenced timer values, so a raw `*`/`+` could
+                // overflow i64 and panic — a ring-0 panic halts the
+                // kernel. `interval_ns > 0` is checked above, so the
+                // division cannot divide by zero.
+                let elapsed = now_ns.saturating_sub(timer.expiry_ns);
+                let periods = (elapsed / timer.interval_ns).saturating_add(1);
+                timer.expiry_ns = timer
+                    .expiry_ns
+                    .saturating_add(periods.saturating_mul(timer.interval_ns));
             } else {
                 // One-shot: disarm.
                 timer.armed = false;
