@@ -54,7 +54,14 @@ const EAGAIN: i64 = -11;
 /// even if a few draws are weak.
 const SEED_DRAWS: usize = 12;
 
-/// Conservative entropy credit (bits) per 64-bit hardware draw.
+/// Conservative entropy credit (bits) per 64-bit *hardware* draw.
+///
+/// This credit is only applied when a real CPU hardware RNG
+/// (`RDSEED`/`RDRAND`) is present (see [`hw_rng_present`]). When the
+/// only entropy source is the TSC fallback, draws are credited **zero**
+/// bits — timing jitter alone must never push the pool past the seed
+/// threshold, since that would let an attacker who can model boot
+/// timing predict the CSPRNG seed.
 const CREDIT_BITS_PER_DRAW: u32 = 32;
 
 /// Largest chunk passed to a single `get_random_bytes` call.
@@ -84,12 +91,59 @@ static mut KERNEL_CSPRNG: RandomSubsystem = RandomSubsystem::new();
 /// Same single-CPU SYSCALL-path guarantee as [`KERNEL_CSPRNG`].
 static mut KERNEL_CSPRNG_SEEDED: bool = false;
 
+/// Whether a real CPU hardware RNG (`RDSEED` or `RDRAND`) is present.
+///
+/// This mirrors the CPUID feature gates inside
+/// [`crate::kaslr::hw_entropy_u64`]. When this returns `false`, that
+/// function can only return TSC-derived values, which are **not**
+/// cryptographic-grade; the seeding loop therefore credits zero
+/// entropy bits and `getrandom(2)` fails closed until a real entropy
+/// source exists.
+///
+/// # SECURITY
+///
+/// `hw_entropy_u64` (in `kaslr.rs`, out of this lane) returns a bare
+/// `u64` with no signal of whether the value came from `RDSEED`/
+/// `RDRAND` or the TSC fallback. The robust long-term fix is for
+/// `kaslr.rs` to expose a quality flag, e.g.
+/// `hw_entropy_u64_quality() -> (u64, bool)` returning `true` only on
+/// a confirmed `RDSEED`/`RDRAND` draw. Until that exists, this helper
+/// re-derives availability from CPUID so the credit decision is made
+/// fail-closed in this lane.
+#[cfg(target_arch = "x86_64")]
+fn hw_rng_present() -> bool {
+    // CPUID leaf 1 ECX bit 30 = RDRAND; leaf 7 sub-leaf 0 EBX bit 18
+    // = RDSEED. Leaves 1 and 7 exist on every x86_64 CPU.
+    let max_leaf = oncrix_hal::cpu_feature::cpuid(0, 0).eax;
+    if max_leaf >= 7 {
+        let ebx7 = oncrix_hal::cpu_feature::cpuid(7, 0).ebx;
+        if ebx7 & (1 << 18) != 0 {
+            return true;
+        }
+    }
+    let ecx1 = oncrix_hal::cpu_feature::cpuid(1, 0).ecx;
+    ecx1 & (1 << 30) != 0
+}
+
+/// Non-x86 fallback: no hardware RNG modelled, so credit nothing.
+#[cfg(not(target_arch = "x86_64"))]
+fn hw_rng_present() -> bool {
+    false
+}
+
 /// Borrow the kernel-global CSPRNG, seeding it on first use.
 ///
 /// Returns a mutable reference to the singleton. On the first call it
 /// drives the entropy pool past its seed threshold using hardware
 /// entropy ([`crate::kaslr::hw_entropy_u64`]); subsequent calls return
 /// the already-seeded instance.
+///
+/// Seeding only credits entropy bits when a real hardware RNG is
+/// present ([`hw_rng_present`]). On a platform with no hardware RNG the
+/// pool never reaches the seed threshold from the TSC fallback alone,
+/// so [`RandomSubsystem::is_seeded`] stays `false` and `getrandom(2)`
+/// fails closed until real entropy (interrupt/jitter) is accumulated
+/// elsewhere.
 ///
 /// # Safety
 ///
@@ -114,11 +168,23 @@ unsafe fn kernel_csprng() -> &'static mut RandomSubsystem {
     if !already {
         // `init` only fails if already initialised; ignore that case.
         let _ = rng.init();
+        // Credit real entropy bits only when a hardware RNG backs the
+        // draws. With TSC-only fallback, mix the words for pool state
+        // but credit zero, so timing alone cannot reach the threshold.
+        let credit = if hw_rng_present() {
+            CREDIT_BITS_PER_DRAW
+        } else {
+            0
+        };
         let mut i = 0usize;
         while i < SEED_DRAWS {
-            rng.add_entropy(crate::kaslr::hw_entropy_u64(), CREDIT_BITS_PER_DRAW);
+            rng.add_entropy(crate::kaslr::hw_entropy_u64(), credit);
             i += 1;
         }
+        // Mark the lazy-seed attempt complete regardless: if the pool
+        // did not cross the threshold (no hardware RNG), the CSPRNG
+        // stays unseeded and callers fail closed via `is_seeded`. We do
+        // not retry the same zero-credit draws on every call.
         // SAFETY: single-CPU SYSCALL path; see KERNEL_CSPRNG_SEEDED note.
         unsafe {
             let p = &raw mut KERNEL_CSPRNG_SEEDED;
