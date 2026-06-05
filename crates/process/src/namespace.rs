@@ -39,6 +39,64 @@ const MAX_NAMESPACES: usize = 128;
 /// Number of distinct namespace types.
 const NS_TYPE_COUNT: usize = 8;
 
+/// Number of 64-bit words in a capability set (128 capabilities).
+const CAP_WORDS: usize = 2;
+
+/// `CAP_SETGID` capability index (Linux value; mirrors
+/// `oncrix_kernel::capability::CAP_SETGID`). Required by a privileged
+/// writer to install a GID map with more than the single self-map entry.
+const CAP_SETGID: u32 = 6;
+
+/// `CAP_SETUID` capability index (Linux value; mirrors
+/// `oncrix_kernel::capability::CAP_SETUID`). Required by a privileged
+/// writer to install a UID map with more than the single self-map entry.
+const CAP_SETUID: u32 = 7;
+
+/// `CAP_SYS_ADMIN` capability index (Linux value; mirrors
+/// `oncrix_kernel::capability::CAP_SYS_ADMIN`). Required to `setns`/
+/// `unshare` any namespace type other than an unprivileged new user
+/// namespace.
+const CAP_SYS_ADMIN: u32 = 21;
+
+// ── CapSet — effective capability bitmask ─────────────────────────
+
+/// An effective capability set for namespace authorization checks.
+///
+/// Wraps the caller's effective capability words so namespace operations
+/// can test individual capability bits without trusting any namespace-
+/// stored authority (which would re-introduce an owner-confusion bypass).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapSet {
+    /// Capability bits, 64 capabilities per word.
+    bits: [u64; CAP_WORDS],
+}
+
+impl CapSet {
+    /// An empty capability set (no capabilities held). Fail-closed
+    /// default for callers whose real credentials are not threaded
+    /// through.
+    pub const EMPTY: Self = Self {
+        bits: [0; CAP_WORDS],
+    };
+
+    /// Create a capability set from raw effective capability words.
+    pub const fn from_bits(bits: [u64; CAP_WORDS]) -> Self {
+        Self { bits }
+    }
+
+    /// Return `true` if capability `cap` is raised.
+    ///
+    /// Out-of-range capability indices are treated as not held.
+    pub const fn has(&self, cap: u32) -> bool {
+        let word = (cap / 64) as usize;
+        let bit = cap % 64;
+        if word >= CAP_WORDS {
+            return false;
+        }
+        (self.bits[word] & (1u64 << bit)) != 0
+    }
+}
+
 // ── NsFlags bitmask ───────────────────────────────────────────────
 
 /// Bitmask flags for namespace operations (`clone`, `unshare`).
@@ -642,6 +700,18 @@ impl IdMapping {
     pub const fn count(&self) -> u32 {
         self.count
     }
+
+    /// Exclusive end of the namespace-ID range, or `None` if it would
+    /// overflow `u32::MAX`.
+    const fn ns_end(&self) -> Option<u32> {
+        self.ns_id.checked_add(self.count)
+    }
+
+    /// Exclusive end of the host-ID range, or `None` if it would overflow
+    /// `u32::MAX`.
+    const fn host_end(&self) -> Option<u32> {
+        self.host_id.checked_add(self.count)
+    }
 }
 
 // ── UserNamespace ─────────────────────────────────────────────────
@@ -704,40 +774,169 @@ impl UserNamespace {
         self.gid_count
     }
 
-    /// Add a UID mapping.
+    /// Install the UID mapping for this user namespace.
+    ///
+    /// The map is **write-once**: the whole validated set must be
+    /// installed in a single call before any process relies on it.
+    ///
+    /// `caller_uid` is the writer's host (parent-namespace) UID and
+    /// `caller_caps` its effective capability set. Authorization mirrors
+    /// the Linux `new_idmap_permitted` rule (see
+    /// [`UserNamespace::authorize_id_map`]):
+    ///
+    /// * **Privileged** — a caller holding `CAP_SETUID` may install any
+    ///   set of ranges.
+    /// * **Unprivileged** — a caller may install only the single entry
+    ///   mapping its own host UID (`count == 1`, `host_id == caller_uid`).
     ///
     /// # Errors
     ///
-    /// - `OutOfMemory` if the UID mapping table is full
-    /// - `InvalidArgument` if `count` is zero
-    pub fn add_uid_mapping(&mut self, mapping: IdMapping) -> Result<()> {
-        if mapping.count == 0 {
-            return Err(Error::InvalidArgument);
+    /// - `PermissionDenied` if the write is not authorized
+    /// - `AlreadyExists` if a UID map has already been installed
+    /// - `InvalidArgument` if `entries` is empty, exceeds capacity,
+    ///   contains a zero-count entry, overflows, or overlaps
+    pub fn add_uid_mapping(
+        &mut self,
+        caller_uid: u32,
+        caller_caps: CapSet,
+        entries: &[IdMapping],
+    ) -> Result<()> {
+        // Write-once: reject if a map is already present.
+        if self.uid_count > 0 {
+            return Err(Error::AlreadyExists);
         }
-        if self.uid_count >= MAX_ID_MAPPINGS {
-            return Err(Error::OutOfMemory);
+        Self::validate_id_map(entries)?;
+        Self::authorize_id_map(caller_uid, caller_caps, CAP_SETUID, entries)?;
+        for (i, entry) in entries.iter().enumerate() {
+            self.uid_map[i] = *entry;
         }
-        self.uid_map[self.uid_count] = mapping;
-        self.uid_count = self.uid_count.saturating_add(1);
+        self.uid_count = entries.len();
         Ok(())
     }
 
-    /// Add a GID mapping.
+    /// Install the GID mapping for this user namespace.
+    ///
+    /// Write-once and authorized exactly like
+    /// [`UserNamespace::add_uid_mapping`], but the privileged path gates
+    /// on `CAP_SETGID`.
     ///
     /// # Errors
     ///
-    /// - `OutOfMemory` if the GID mapping table is full
-    /// - `InvalidArgument` if `count` is zero
-    pub fn add_gid_mapping(&mut self, mapping: IdMapping) -> Result<()> {
-        if mapping.count == 0 {
+    /// - `PermissionDenied` if the write is not authorized
+    /// - `AlreadyExists` if a GID map has already been installed
+    /// - `InvalidArgument` if `entries` is empty, exceeds capacity,
+    ///   contains a zero-count entry, overflows, or overlaps
+    pub fn add_gid_mapping(
+        &mut self,
+        caller_uid: u32,
+        caller_caps: CapSet,
+        entries: &[IdMapping],
+    ) -> Result<()> {
+        // Write-once: reject if a map is already present.
+        if self.gid_count > 0 {
+            return Err(Error::AlreadyExists);
+        }
+        Self::validate_id_map(entries)?;
+        Self::authorize_id_map(caller_uid, caller_caps, CAP_SETGID, entries)?;
+        for (i, entry) in entries.iter().enumerate() {
+            self.gid_map[i] = *entry;
+        }
+        self.gid_count = entries.len();
+        Ok(())
+    }
+
+    /// Validate a complete ID-map set for capacity, zero counts, range
+    /// overflow, and overlap in both the namespace-ID and host-ID
+    /// dimensions.
+    ///
+    /// Range ends use `checked_add`: any `[base, base + count)` interval
+    /// that would wrap past `u32::MAX` is rejected with
+    /// `InvalidArgument`, so a wrapped end can never defeat the overlap
+    /// test and the subtraction-based translate helpers stay exact.
+    /// Mirrors `UserNsTable::validate_map_entries` in
+    /// `crates/kernel/src/user_namespace.rs`.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidArgument` for an empty/oversized set, a zero-count
+    ///   entry, an overflowing range, or overlapping ranges
+    fn validate_id_map(entries: &[IdMapping]) -> Result<()> {
+        if entries.is_empty() || entries.len() > MAX_ID_MAPPINGS {
             return Err(Error::InvalidArgument);
         }
-        if self.gid_count >= MAX_ID_MAPPINGS {
-            return Err(Error::OutOfMemory);
+        for entry in entries {
+            if entry.count == 0 {
+                return Err(Error::InvalidArgument);
+            }
+            // Reject ranges that wrap past u32::MAX in either dimension.
+            if entry.ns_end().is_none() || entry.host_end().is_none() {
+                return Err(Error::InvalidArgument);
+            }
         }
-        self.gid_map[self.gid_count] = mapping;
-        self.gid_count = self.gid_count.saturating_add(1);
+        // Reject overlap in both the ns_id and host_id dimensions. Ends
+        // are guaranteed non-overflowing by the loop above.
+        let mut i = 0;
+        while i < entries.len() {
+            let a = &entries[i];
+            let mut j = i.saturating_add(1);
+            while j < entries.len() {
+                let b = &entries[j];
+                let (Some(a_ns_end), Some(b_ns_end)) = (a.ns_end(), b.ns_end()) else {
+                    return Err(Error::InvalidArgument);
+                };
+                if a.ns_id < b_ns_end && b.ns_id < a_ns_end {
+                    return Err(Error::InvalidArgument);
+                }
+                let (Some(a_host_end), Some(b_host_end)) = (a.host_end(), b.host_end()) else {
+                    return Err(Error::InvalidArgument);
+                };
+                if a.host_id < b_host_end && b.host_id < a_host_end {
+                    return Err(Error::InvalidArgument);
+                }
+                j = j.saturating_add(1);
+            }
+            i = i.saturating_add(1);
+        }
         Ok(())
+    }
+
+    /// Authorize an ID-map write against the kernel mapping policy
+    /// (subset of Linux `new_idmap_permitted`). Fail-closed.
+    ///
+    /// * **Privileged path** — the caller holds `setid_cap`
+    ///   (`CAP_SETUID`/`CAP_SETGID`) in its effective set and may install
+    ///   any validated ranges.
+    /// * **Unprivileged path** — permitted only for a single entry with
+    ///   `count == 1` whose `host_id` equals the writer's own
+    ///   `caller_uid`, i.e. a process mapping just its own identity.
+    ///
+    /// Note: unlike the table-based `UserNsTable::authorize_map_write`,
+    /// this standalone namespace holds no reference to its parent's map,
+    /// so a parent-subset (`parent_owns_ranges`) check cannot be
+    /// performed here; the in-lane caller is responsible for only
+    /// presenting ranges the parent can project. The capability gate and
+    /// self-map restriction below are the load-bearing escalation guard.
+    ///
+    /// # Errors
+    ///
+    /// - `PermissionDenied` if neither the privileged nor the self-map
+    ///   path is satisfied
+    fn authorize_id_map(
+        caller_uid: u32,
+        caller_caps: CapSet,
+        setid_cap: u32,
+        entries: &[IdMapping],
+    ) -> Result<()> {
+        if caller_caps.has(setid_cap) {
+            return Ok(());
+        }
+        // Unprivileged: only the writer's own single identity entry.
+        let self_map =
+            entries.len() == 1 && entries[0].count == 1 && entries[0].host_id == caller_uid;
+        if self_map {
+            return Ok(());
+        }
+        Err(Error::PermissionDenied)
     }
 
     /// Translate a namespace-local UID to a host UID.
@@ -1025,11 +1224,22 @@ impl NamespaceRegistry {
 /// `ns_set` is updated to reference it. The new namespaces are
 /// children of the caller's current namespaces.
 ///
+/// `caller_caps` is the calling process's effective capability set in
+/// its current user namespace. Per the Linux `unshare(2)` rule, creating
+/// any namespace type other than a user namespace requires
+/// `CAP_SYS_ADMIN`; creating a new user namespace (`CLONE_NEWUSER`) is
+/// the sole unprivileged-permitted case. The check is performed once up
+/// front so no namespace is created when the caller is unprivileged and
+/// requests a privileged type. Fail-closed.
+///
 /// # Errors
 ///
+/// - `PermissionDenied` if a privileged namespace type is requested
+///   without `CAP_SYS_ADMIN`
 /// - `OutOfMemory` if the registry cannot accommodate new namespaces
 pub fn unshare(
     flags: NsFlags,
+    caller_caps: CapSet,
     ns_set: &mut NamespaceSet,
     registry: &mut NamespaceRegistry,
 ) -> Result<()> {
@@ -1044,6 +1254,15 @@ pub fn unshare(
         NamespaceType::Cgroup,
         NamespaceType::Time,
     ];
+
+    // Capability gate: any requested type other than CLONE_NEWUSER needs
+    // CAP_SYS_ADMIN. Mask off the user-ns flag and require the capability
+    // if anything privileged remains. Checked before any creation so the
+    // operation is all-or-nothing.
+    let privileged_flags = NsFlags::from_bits(flags.bits() & !NsFlags::CLONE_NEWUSER.bits());
+    if !privileged_flags.is_empty() && !caller_caps.has(CAP_SYS_ADMIN) {
+        return Err(Error::PermissionDenied);
+    }
 
     let mut i = 0;
     while i < NS_TYPE_COUNT {
@@ -1065,17 +1284,32 @@ pub fn unshare(
 /// to the namespace identified by `ns_id`. The old namespace's
 /// reference count is decremented and the new one's is incremented.
 ///
+/// `caller_caps` is the calling process's effective capability set. Per
+/// the Linux `setns(2)` rule, joining any namespace type other than a
+/// user namespace requires `CAP_SYS_ADMIN`; joining a user namespace
+/// (`NamespaceType::User`) is the sole unprivileged-permitted case. The
+/// check is performed before any reference count is mutated. Fail-closed.
+///
 /// # Errors
 ///
+/// - `PermissionDenied` if joining a privileged namespace type without
+///   `CAP_SYS_ADMIN`
 /// - `NotFound` if `ns_id` does not exist in the registry
 /// - `InvalidArgument` if the namespace's type does not match
 ///   `ns_type`
 pub fn setns(
     ns_id: u64,
     ns_type: NamespaceType,
+    caller_caps: CapSet,
     ns_set: &mut NamespaceSet,
     registry: &mut NamespaceRegistry,
 ) -> Result<()> {
+    // Capability gate: every type except joining a user namespace
+    // requires CAP_SYS_ADMIN. Checked before any state mutation.
+    if ns_type != NamespaceType::User && !caller_caps.has(CAP_SYS_ADMIN) {
+        return Err(Error::PermissionDenied);
+    }
+
     // Validate the target namespace exists and has the right type.
     let target = registry.lookup(ns_id)?;
     if target.ns_type() != ns_type {
