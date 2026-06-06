@@ -27,6 +27,7 @@
 //! outcome. Child cgroups cannot grant permissions not held by their
 //! parent (hierarchical constraint).
 
+use crate::capability::{CAP_SYS_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -592,6 +593,14 @@ impl DeviceCgroupController {
 /// array. Each controller is identified by a unique `u64` ID
 /// assigned at creation time. Supports hierarchical permission
 /// inheritance between parent and child cgroups.
+///
+// SECURITY: every mutating entry point (`create`, `create_child`,
+// `destroy`, `add_rule`, `add_pid`, `remove_pid`) takes a caller
+// `CapSet` and requires `CAP_SYS_ADMIN` fail-closed. The future
+// syscall dispatch site (cgroupfs write handler) MUST pass the
+// calling thread's real *effective* capability set here — never a
+// synthesised `CapSet::FULL`. When the capability is unavailable the
+// caller must supply `CapSet::EMPTY`, which denies the operation.
 pub struct DeviceCgroupRegistry {
     /// Fixed-size array of controller slots.
     controllers: [DeviceCgroupController; MAX_DEVICE_CGROUPS],
@@ -628,15 +637,38 @@ impl DeviceCgroupRegistry {
         self.count == 0
     }
 
+    /// Fail-closed capability gate for device-cgroup mutations.
+    ///
+    /// Device-cgroup writes are unprivileged, attacker-controlled
+    /// inputs, so every mutating entry point requires `CAP_SYS_ADMIN`
+    /// in the caller's effective set. When the capability is absent
+    /// (the unprivileged default) the operation is denied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::PermissionDenied` if `caller_caps` lacks
+    /// `CAP_SYS_ADMIN`.
+    fn require_admin(caller_caps: CapSet) -> Result<()> {
+        if caller_caps.has(CAP_SYS_ADMIN) {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
+        }
+    }
+
     /// Creates a new device cgroup controller with the given name.
     ///
     /// Returns the new controller's unique ID.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::InvalidArgument` — name is empty or too long.
     /// - `Error::OutOfMemory` — no free slots available.
-    pub fn create(&mut self, name: &[u8]) -> Result<u64> {
+    pub fn create(&mut self, name: &[u8], caller_caps: CapSet) -> Result<u64> {
+        Self::require_admin(caller_caps)?;
         if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(Error::InvalidArgument);
         }
@@ -671,12 +703,21 @@ impl DeviceCgroupRegistry {
     /// time. The child cannot later add rules that exceed the
     /// parent's permissions.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::InvalidArgument` — name is empty or too long.
     /// - `Error::NotFound` — parent ID does not exist.
     /// - `Error::OutOfMemory` — no free slots or rule overflow.
-    pub fn create_child(&mut self, name: &[u8], parent_id: u64) -> Result<u64> {
+    pub fn create_child(
+        &mut self,
+        name: &[u8],
+        parent_id: u64,
+        caller_caps: CapSet,
+    ) -> Result<u64> {
+        Self::require_admin(caller_caps)?;
         // Validate parent exists and collect its rules.
         let parent_idx = self.index_of(parent_id)?;
         let parent_rule_count = self.controllers[parent_idx].rule_count;
@@ -688,8 +729,8 @@ impl DeviceCgroupRegistry {
         }
         let parent_default = self.controllers[parent_idx].default_action;
 
-        // Create the child.
-        let child_id = self.create(name)?;
+        // Create the child (capability already verified above).
+        let child_id = self.create(name, caller_caps)?;
         let child_idx = self.index_of(child_id)?;
         let child = &mut self.controllers[child_idx];
         child.parent_id = parent_id;
@@ -718,12 +759,16 @@ impl DeviceCgroupRegistry {
 
     /// Destroys a device cgroup controller by ID.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::NotFound` — controller does not exist.
     /// - `Error::Busy` — controller still has attached PIDs or
     ///   child cgroups.
-    pub fn destroy(&mut self, id: u64) -> Result<()> {
+    pub fn destroy(&mut self, id: u64, caller_caps: CapSet) -> Result<()> {
+        Self::require_admin(caller_caps)?;
         let idx = self.index_of(id)?;
 
         if self.controllers[idx].pid_count > 0 {
@@ -761,10 +806,13 @@ impl DeviceCgroupRegistry {
     /// the parent's rules to enforce hierarchical constraints: a
     /// child cannot allow access that the parent denies.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`, or
+    ///   the rule exceeds parent permissions.
     /// - `Error::NotFound` — controller does not exist.
-    /// - `Error::PermissionDenied` — rule exceeds parent permissions.
     /// - `Error::InvalidArgument` — empty access mask.
     /// - `Error::OutOfMemory` — rule list is full.
     pub fn add_rule(
@@ -775,7 +823,9 @@ impl DeviceCgroupRegistry {
         minor: u32,
         access: DeviceAccess,
         action: RuleAction,
+        caller_caps: CapSet,
     ) -> Result<usize> {
+        Self::require_admin(caller_caps)?;
         let idx = self.index_of(id)?;
         let parent_id = self.controllers[idx].parent_id;
 
@@ -831,23 +881,31 @@ impl DeviceCgroupRegistry {
 
     /// Attaches a PID to a controller.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::NotFound` — controller does not exist.
     /// - `Error::AlreadyExists` — PID is already attached.
     /// - `Error::OutOfMemory` — PID list is full.
-    pub fn add_pid(&mut self, id: u64, pid: u64) -> Result<()> {
+    pub fn add_pid(&mut self, id: u64, pid: u64, caller_caps: CapSet) -> Result<()> {
+        Self::require_admin(caller_caps)?;
         let idx = self.index_of(id)?;
         self.controllers[idx].add_pid(pid)
     }
 
     /// Detaches a PID from a controller.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::NotFound` — controller does not exist or PID is
     ///   not attached.
-    pub fn remove_pid(&mut self, id: u64, pid: u64) -> Result<()> {
+    pub fn remove_pid(&mut self, id: u64, pid: u64, caller_caps: CapSet) -> Result<()> {
+        Self::require_admin(caller_caps)?;
         let idx = self.index_of(id)?;
         self.controllers[idx].remove_pid(pid)
     }
@@ -869,11 +927,18 @@ impl DeviceCgroupRegistry {
             .position(|c| c.in_use && c.id == parent_id)
     }
 
-    /// Checks whether the parent controller permits the given
-    /// device access.
+    /// Checks whether the parent controller effectively permits the
+    /// given device access.
     ///
-    /// Walks the parent's rules to determine if a matching allow
-    /// rule exists. Used to enforce hierarchical constraints.
+    /// Evaluates the parent's FULL rule list in order and returns the
+    /// LAST matching rule's verdict (last-match wins). A first-match
+    /// scan is incorrect: a later parent `Deny` carve-out would be
+    /// ignored, letting a child grant itself a device the parent
+    /// effectively denies (device-cgroup escape). Only when the
+    /// parent's effective verdict for the exact requested
+    /// `(type, major, minor, access)` tuple is `Allow` may the child
+    /// add the allow rule. If no parent rule matches, the parent's
+    /// default action applies.
     fn parent_permits(
         &self,
         parent: &DeviceCgroupController,
@@ -882,14 +947,14 @@ impl DeviceCgroupRegistry {
         minor: u32,
         access: &DeviceAccess,
     ) -> bool {
+        // Start from the parent's default; let later matches override.
+        let mut effective_allow = parent.default_action == RuleAction::Allow;
         for i in 0..parent.rule_count {
             let rule = &parent.rules[i];
             if rule.matches(dev_type, major, minor, access) {
-                return rule.action == RuleAction::Allow;
+                effective_allow = rule.action == RuleAction::Allow;
             }
         }
-
-        // No matching rule — fall back to parent's default.
-        parent.default_action == RuleAction::Allow
+        effective_allow
     }
 }

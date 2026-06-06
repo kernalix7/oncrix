@@ -33,6 +33,7 @@
 //! - `setpriority(3p)` — `functions/setpriority.html`
 //! - `nice(3p)` — `functions/nice.html`
 
+use crate::capability::{CAP_SYS_NICE, CapSet};
 use crate::current::{current_pid, current_thread_mut, yield_now};
 use oncrix_hal::timer::Timer;
 use oncrix_process::pid::Pid;
@@ -89,7 +90,25 @@ pub unsafe fn sys_getpriority(_which: i64, _who: i64) -> i64 {
 /// # Safety
 ///
 /// See [`sys_getpriority`].
-pub unsafe fn sys_setpriority(which: i64, _who: i64, prio: i64) -> i64 {
+pub unsafe fn sys_setpriority(which: i64, who: i64, prio: i64) -> i64 {
+    // SECURITY: caps fail closed to EMPTY — lowering nice is denied for all
+    // callers until syscall_entry.rs threads the real per-thread effective
+    // CapSet into `sys_setpriority_checked`.
+    // SAFETY: forwarded unchanged under the same SYSCALL dispatch contract.
+    unsafe { sys_setpriority_checked(which, who, prio, caller_effective_caps()) }
+}
+
+/// Capability-checked core of [`sys_setpriority`].
+///
+/// Lowering the calling thread's nice (the privilege-raising direction)
+/// requires [`CAP_SYS_NICE`] in `caller_caps`; otherwise `-1` (`EPERM`) is
+/// returned and the priority is left unchanged. Raising or keeping nice is
+/// always permitted.
+///
+/// # Safety
+///
+/// See [`sys_getpriority`].
+unsafe fn sys_setpriority_checked(which: i64, _who: i64, prio: i64, caller_caps: CapSet) -> i64 {
     // Only PRIO_PROCESS is meaningfully distinct today; PGRP/USER are
     // accepted as aliases for "current thread". Reject unknown selectors.
     if which != PRIO_PROCESS && which != _PRIO_PGRP && which != _PRIO_USER {
@@ -99,6 +118,13 @@ pub unsafe fn sys_setpriority(which: i64, _who: i64, prio: i64) -> i64 {
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
     match unsafe { current_thread_mut() } {
         Some(t) => {
+            let cur_nice = t.priority().to_nice();
+            // Gate the privilege-raising direction (nice lowered) on
+            // CAP_SYS_NICE; the policy is unchanged here so pass the current
+            // policy to the shared authorizer.
+            if let Err(e) = authorize_sched_change(caller_caps, t.policy(), cur_nice, nice) {
+                return e;
+            }
             t.set_priority(Priority::from_nice(nice));
             0
         }
@@ -123,11 +149,34 @@ pub unsafe fn sys_setpriority(which: i64, _who: i64, prio: i64) -> i64 {
 ///
 /// See [`sys_getpriority`].
 pub unsafe fn sys_nice(inc: i64) -> i64 {
+    // SECURITY: caps fail closed to EMPTY — a negative `inc` (lowering nice)
+    // is denied for all callers until syscall_entry.rs threads the real
+    // per-thread effective CapSet into `sys_nice_checked`.
+    // SAFETY: forwarded unchanged under the same SYSCALL dispatch contract.
+    unsafe { sys_nice_checked(inc, caller_effective_caps()) }
+}
+
+/// Capability-checked core of [`sys_nice`].
+///
+/// A negative `inc` lowers nice (the privilege-raising direction) and
+/// requires [`CAP_SYS_NICE`] in `caller_caps`; without it `-1` (`EPERM`) is
+/// returned and the nice value is left unchanged. A non-negative `inc`
+/// (raising nice / yielding favour) is always permitted.
+///
+/// # Safety
+///
+/// See [`sys_getpriority`].
+unsafe fn sys_nice_checked(inc: i64, caller_caps: CapSet) -> i64 {
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
     match unsafe { current_thread_mut() } {
         Some(t) => {
             let cur = t.priority().to_nice();
             let new = clamp_nice(cur.saturating_add(inc as i32));
+            // Gate the privilege-raising direction (nice lowered below the
+            // current value) on CAP_SYS_NICE; policy is unchanged.
+            if let Err(e) = authorize_sched_change(caller_caps, t.policy(), cur, new) {
+                return e;
+            }
             t.set_priority(Priority::from_nice(new));
             new as i64
         }
@@ -144,6 +193,73 @@ const fn clamp_nice(nice: i32) -> i32 {
     } else {
         nice
     }
+}
+
+/// POSIX `EPERM` errno returned when a privileged scheduling change is
+/// requested without `CAP_SYS_NICE`.
+const EPERM: i64 = -1;
+
+/// Fetch the calling thread's effective capability set for scheduling
+/// authorization, **failing closed** to an empty (unprivileged) set.
+///
+/// The kernel [`Thread`](oncrix_process::thread::Thread) does not yet
+/// carry a [`ThreadCapState`](crate::capability::ThreadCapState), so there
+/// is no per-thread credential to consult here. Until one is plumbed
+/// through, this accessor returns [`CapSet::EMPTY`] so every
+/// privilege-raising scheduling request (real-time policy, more-favourable
+/// nice/priority) is denied for *all* callers — the safe default for a
+/// Ring-0 gate that an unprivileged, attacker-controlled syscall reaches.
+///
+/// # SECURITY
+///
+/// This deliberately denies real-time promotion and nice-lowering to every
+/// caller, including legitimately privileged ones, rather than leaving the
+/// operation open. The out-of-lane dispatcher
+/// `crates/kernel/src/arch/x86_64/syscall_entry.rs` (the
+/// `SYS_SCHED_SETSCHEDULER`, `SYS_SCHED_SETPARAM`, `SYS_SCHED_SETATTR`,
+/// `SYS_SETPRIORITY`, and `SYS_NICE` arms) MUST be updated to read the real
+/// per-thread effective `CapSet` and pass it into the `*_checked`
+/// entry points below; this accessor is the single place that change lands.
+fn caller_effective_caps() -> CapSet {
+    // Fail closed: no credential is wired to the kernel Thread yet, so we
+    // cannot prove the caller holds CAP_SYS_NICE — treat them as unprivileged.
+    CapSet::EMPTY
+}
+
+/// Return `true` if applying `requested_nice` to a thread currently at
+/// `current_nice` is a privilege-raising change that requires
+/// `CAP_SYS_NICE`.
+///
+/// POSIX nice is `[-20, 19]` with **lower = more favourable**; lowering the
+/// value (making the thread more favoured) is the privileged direction.
+/// Raising or keeping the nice value is always permitted.
+const fn nice_change_needs_privilege(current_nice: i32, requested_nice: i32) -> bool {
+    requested_nice < current_nice
+}
+
+/// Authorize a scheduling change against the caller's effective caps,
+/// **failing closed**.
+///
+/// Denies (returns `Err(EPERM)`) when the request raises privilege —
+/// either selecting a real-time policy (`SCHED_FIFO`/`SCHED_RR`) or
+/// lowering nice below `current_nice` — and the caller lacks
+/// [`CAP_SYS_NICE`]. A non-real-time policy whose nice is not more
+/// favourable than the current value is always allowed (the valid path).
+fn authorize_sched_change(
+    caller_caps: CapSet,
+    requested_policy: SchedPolicy,
+    current_nice: i32,
+    requested_nice: i32,
+) -> Result<(), i64> {
+    let wants_realtime = matches!(
+        requested_policy,
+        SchedPolicy::Fifo | SchedPolicy::RoundRobin
+    );
+    let wants_favourable = nice_change_needs_privilege(current_nice, requested_nice);
+    if (wants_realtime || wants_favourable) && !caller_caps.has(CAP_SYS_NICE) {
+        return Err(EPERM);
+    }
+    Ok(())
 }
 
 /// `sched_yield()` — relinquish the CPU to the next runnable thread.
@@ -206,7 +322,32 @@ pub unsafe fn sys_sched_getscheduler(_pid: i64) -> i64 {
 /// See [`sys_getpriority`]. `param` is a raw user pointer; we reject
 /// non-canonical addresses and rely on the user page-fault handler to
 /// turn any unmapped-but-canonical access into a SIGSEGV.
-pub unsafe fn sys_sched_setscheduler(_pid: i64, policy: i64, param: u64) -> i64 {
+pub unsafe fn sys_sched_setscheduler(pid: i64, policy: i64, param: u64) -> i64 {
+    // SECURITY: caps fail closed to EMPTY — selecting SCHED_FIFO/SCHED_RR or
+    // raising priority is denied for all callers until syscall_entry.rs
+    // threads the real per-thread effective CapSet into
+    // `sys_sched_setscheduler_checked`.
+    // SAFETY: forwarded unchanged under the same SYSCALL dispatch contract.
+    unsafe { sys_sched_setscheduler_checked(pid, policy, param, caller_effective_caps()) }
+}
+
+/// Capability-checked core of [`sys_sched_setscheduler`].
+///
+/// Selecting a real-time policy (`SCHED_FIFO`/`SCHED_RR`) or raising the
+/// thread's priority above its current value requires [`CAP_SYS_NICE`] in
+/// `caller_caps`; otherwise `-1` (`EPERM`) is returned and neither policy
+/// nor priority is changed. Setting `SCHED_OTHER` with an equal-or-lower
+/// priority is always permitted.
+///
+/// # Safety
+///
+/// See [`sys_sched_setscheduler`].
+unsafe fn sys_sched_setscheduler_checked(
+    _pid: i64,
+    policy: i64,
+    param: u64,
+    caller_caps: CapSet,
+) -> i64 {
     let Some(pol) = SchedPolicy::from_raw(policy as i32) else {
         return -22; // EINVAL
     };
@@ -231,6 +372,15 @@ pub unsafe fn sys_sched_setscheduler(_pid: i64, policy: i64, param: u64) -> i64 
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
     match unsafe { current_thread_mut() } {
         Some(t) => {
+            // Authorize before mutating: compare on the nice axis (lower nice
+            // == more favourable == higher RT priority). A null `param`
+            // leaves priority unchanged, so reuse the current nice in that
+            // case — only the policy can then raise privilege.
+            let cur_nice = t.priority().to_nice();
+            let req_nice = new_priority.map_or(cur_nice, |p| p.to_nice());
+            if let Err(e) = authorize_sched_change(caller_caps, pol, cur_nice, req_nice) {
+                return e;
+            }
             t.set_policy(pol);
             if let Some(p) = new_priority {
                 t.set_priority(p);
@@ -281,7 +431,25 @@ pub unsafe fn sys_sched_getparam(_pid: i64, param: u64) -> i64 {
 /// # Safety
 ///
 /// See [`sys_sched_setscheduler`] regarding the `param` pointer.
-pub unsafe fn sys_sched_setparam(_pid: i64, param: u64) -> i64 {
+pub unsafe fn sys_sched_setparam(pid: i64, param: u64) -> i64 {
+    // SECURITY: caps fail closed to EMPTY — raising priority is denied for
+    // all callers until syscall_entry.rs threads the real per-thread
+    // effective CapSet into `sys_sched_setparam_checked`.
+    // SAFETY: forwarded unchanged under the same SYSCALL dispatch contract.
+    unsafe { sys_sched_setparam_checked(pid, param, caller_effective_caps()) }
+}
+
+/// Capability-checked core of [`sys_sched_setparam`].
+///
+/// Raising the thread's priority above its current value (the same RT
+/// promotion surface as `sched_setscheduler`) requires [`CAP_SYS_NICE`] in
+/// `caller_caps`; otherwise `-1` (`EPERM`) is returned and the priority is
+/// left unchanged. The policy is not changed by this call.
+///
+/// # Safety
+///
+/// See [`sys_sched_setscheduler`] regarding the `param` pointer.
+unsafe fn sys_sched_setparam_checked(_pid: i64, param: u64, caller_caps: CapSet) -> i64 {
     // Only the leading 4-byte `int sched_priority` is read; span- and
     // backed-window-validate exactly those bytes before the read.
     if crate::uaccess::verify_user_access(param, 4, false).is_err() {
@@ -293,6 +461,14 @@ pub unsafe fn sys_sched_setparam(_pid: i64, param: u64) -> i64 {
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
     match unsafe { current_thread_mut() } {
         Some(t) => {
+            // Policy unchanged; gate on the priority (nice axis) rising above
+            // the current value.
+            let cur_nice = t.priority().to_nice();
+            if let Err(e) =
+                authorize_sched_change(caller_caps, t.policy(), cur_nice, prio.to_nice())
+            {
+                return e;
+            }
             t.set_priority(prio);
             0
         }
@@ -1538,7 +1714,25 @@ const SCHED_ATTR_SIZE_V0: u32 = 48;
 /// scheduler borrow taken via [`current_thread_mut`] is exclusive.
 /// `attr` is a raw user-space pointer; non-canonical addresses are
 /// rejected and unmapped-canonical accesses fault into the user handler.
-pub unsafe fn sys_sched_setattr(_pid: i64, attr: u64, flags: i64) -> i64 {
+pub unsafe fn sys_sched_setattr(pid: i64, attr: u64, flags: i64) -> i64 {
+    // SECURITY: caps fail closed to EMPTY — selecting SCHED_FIFO/SCHED_RR or
+    // lowering nice is denied for all callers until syscall_entry.rs threads
+    // the real per-thread effective CapSet into `sys_sched_setattr_checked`.
+    // SAFETY: forwarded unchanged under the same SYSCALL dispatch contract.
+    unsafe { sys_sched_setattr_checked(pid, attr, flags, caller_effective_caps()) }
+}
+
+/// Capability-checked core of [`sys_sched_setattr`].
+///
+/// Selecting a real-time policy (`SCHED_FIFO`/`SCHED_RR`) or lowering the
+/// requested `sched_nice` below the thread's current nice requires
+/// [`CAP_SYS_NICE`] in `caller_caps`; otherwise `-1` (`EPERM`) is returned
+/// and neither policy nor nice is changed.
+///
+/// # Safety
+///
+/// See [`sys_sched_setattr`].
+unsafe fn sys_sched_setattr_checked(_pid: i64, attr: u64, flags: i64, caller_caps: CapSet) -> i64 {
     if flags != 0 {
         return -22; // EINVAL
     }
@@ -1568,6 +1762,12 @@ pub unsafe fn sys_sched_setattr(_pid: i64, attr: u64, flags: i64) -> i64 {
     // SAFETY: SYSCALL dispatch context — exclusive scheduler access.
     match unsafe { current_thread_mut() } {
         Some(t) => {
+            // Authorize before mutating: RT policy or a more-favourable nice
+            // requires CAP_SYS_NICE.
+            let cur_nice = t.priority().to_nice();
+            if let Err(e) = authorize_sched_change(caller_caps, pol, cur_nice, nice) {
+                return e;
+            }
             t.set_policy(pol);
             t.set_priority(Priority::from_nice(nice));
             0
