@@ -421,7 +421,10 @@ pub fn do_sendfile(
     offset: SendfileOffset,
     count: usize,
 ) -> Result<TransferInfo> {
-    stats.total_calls += 1;
+    // SECURITY: saturating_add on all counters — plain += panics on overflow
+    // under overflow-checks=on (dev/test) when an attacker drives millions of
+    // calls from user space.
+    stats.total_calls = stats.total_calls.saturating_add(1);
 
     let (src_offset, src_size) = setup_transfer(state, in_fd, out_fd, offset, count)?;
 
@@ -430,9 +433,9 @@ pub fn do_sendfile(
     let actual = available_bytes(src_offset, src_size, count);
 
     if actual == 0 {
-        stats.zero_transfers += 1;
+        stats.zero_transfers = stats.zero_transfers.saturating_add(1);
         if eof {
-            stats.eof_count += 1;
+            stats.eof_count = stats.eof_count.saturating_add(1);
         }
         return Ok(TransferInfo {
             bytes_sent: 0,
@@ -455,12 +458,12 @@ pub fn do_sendfile(
     }
 
     // Track statistics.
-    stats.bytes_sent += actual as u64;
+    stats.bytes_sent = stats.bytes_sent.saturating_add(actual as u64);
     if actual < count {
-        stats.short_transfers += 1;
+        stats.short_transfers = stats.short_transfers.saturating_add(1);
     }
     if eof_after {
-        stats.eof_count += 1;
+        stats.eof_count = stats.eof_count.saturating_add(1);
     }
 
     Ok(TransferInfo {
