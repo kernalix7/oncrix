@@ -897,12 +897,18 @@ impl XhciController {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `slot_id` is invalid.
+    /// Returns [`Error::InvalidArgument`] if `slot_id` is out of range or
+    /// refers to a slot that has not been allocated.  The allocated check
+    /// prevents a device-supplied slot ID from indexing a slot that was
+    /// never assigned, which would expose uninitialised kernel state.
     pub fn slot(&self, slot_id: u8) -> Result<&DeviceSlot> {
         let idx = (slot_id as usize)
             .checked_sub(1)
             .ok_or(Error::InvalidArgument)?;
         if idx >= MAX_SLOTS {
+            return Err(Error::InvalidArgument);
+        }
+        if !self.slots[idx].allocated {
             return Err(Error::InvalidArgument);
         }
         Ok(&self.slots[idx])
@@ -912,12 +918,18 @@ impl XhciController {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `slot_id` is invalid.
+    /// Returns [`Error::InvalidArgument`] if `slot_id` is out of range or
+    /// refers to a slot that has not been allocated.  The allocated check
+    /// prevents a device-supplied slot ID from indexing a slot that was
+    /// never assigned, which would expose uninitialised kernel state.
     pub fn slot_mut(&mut self, slot_id: u8) -> Result<&mut DeviceSlot> {
         let idx = (slot_id as usize)
             .checked_sub(1)
             .ok_or(Error::InvalidArgument)?;
         if idx >= MAX_SLOTS {
+            return Err(Error::InvalidArgument);
+        }
+        if !self.slots[idx].allocated {
             return Err(Error::InvalidArgument);
         }
         Ok(&mut self.slots[idx])
@@ -955,12 +967,19 @@ impl XhciController {
 
     /// Handles an interrupt from this controller.
     ///
-    /// Processes all pending events on the event ring and returns
-    /// the number of events handled.
+    /// Drains at most [`EVENT_RING_SIZE`] events per invocation so that a
+    /// device that continuously re-arms the cycle bit cannot livelock the
+    /// interrupt handler.  Returns the number of events processed.
     pub fn handle_interrupt(&mut self) -> usize {
         self.interrupt_count += 1;
         let mut count = 0;
-        while let Some(_event) = self.event_ring.dequeue() {
+        // Cap iterations to one full ring's worth of events.  A well-behaved
+        // controller will exhaust the ring before hitting the cap; a malicious
+        // or buggy device that keeps flipping cycle bits is bounded here.
+        while count < EVENT_RING_SIZE {
+            if self.event_ring.dequeue().is_none() {
+                break;
+            }
             count += 1;
         }
         count

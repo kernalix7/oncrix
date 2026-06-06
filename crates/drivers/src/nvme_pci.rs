@@ -305,6 +305,11 @@ impl NvmePciCommand {
 // ---------------------------------------------------------------------------
 
 /// NVMe PCI transport completion queue entry (16 bytes).
+///
+/// DW3 layout per NVMe Base Spec 2.0, Figure 93:
+///   bits 31:16 — Command Identifier (CID)
+///   bits 15:1  — Status Field (SCT[11:9], SC[8:1], …)
+///   bit  0     — Phase Tag (P)
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct NvmePciCompletion {
@@ -312,31 +317,31 @@ pub struct NvmePciCompletion {
     pub dw0: u32,
     /// Reserved (DW1).
     pub dw1: u32,
-    /// SQ head pointer (15:0) and SQ identifier (31:16).
+    /// SQ head pointer (15:0) and SQ identifier (31:16) (DW2).
     pub sq_head_sqid: u32,
-    /// CID (15:0), phase tag (bit 16), status field (31:17).
+    /// CID (31:16), status field (15:1), phase tag (bit 0) (DW3).
     pub cid_status: u32,
 }
 
 impl NvmePciCompletion {
-    /// Extracts the command ID.
+    /// Extracts the Command Identifier (bits 31:16 of DW3).
     pub fn command_id(&self) -> u16 {
-        self.cid_status as u16
+        (self.cid_status >> 16) as u16
     }
 
-    /// Extracts the phase tag bit.
+    /// Extracts the phase tag (bit 0 of DW3).
     pub fn phase(&self) -> bool {
-        (self.cid_status >> 16) & 1 != 0
+        self.cid_status & 1 != 0
     }
 
-    /// Extracts the status code (SC) field.
+    /// Extracts the Status Code (SC, bits 8:1 of DW3).
     pub fn status_code(&self) -> u8 {
-        ((self.cid_status >> 17) & 0xFF) as u8
+        ((self.cid_status >> 1) & 0xFF) as u8
     }
 
-    /// Extracts the status code type (SCT) field.
+    /// Extracts the Status Code Type (SCT, bits 11:9 of DW3).
     pub fn status_code_type(&self) -> u8 {
-        ((self.cid_status >> 25) & 0x7) as u8
+        ((self.cid_status >> 9) & 0x7) as u8
     }
 
     /// Returns `true` if the completion indicates success.
@@ -344,7 +349,7 @@ impl NvmePciCompletion {
         self.status_code() == 0 && self.status_code_type() == 0
     }
 
-    /// Extracts the SQ head pointer.
+    /// Extracts the SQ head pointer (bits 15:0 of DW2).
     pub fn sq_head(&self) -> u16 {
         self.sq_head_sqid as u16
     }
@@ -355,22 +360,54 @@ impl NvmePciCompletion {
 // ---------------------------------------------------------------------------
 
 /// NVMe PCI submission queue with doorbell tracking.
+///
+/// The SQ is a circular ring of depth `depth` (must be >= 2).
+/// Full-ring detection uses the standard one-slot-open convention:
+/// the ring is full when `(tail + 1) % depth == head`.
+/// `head` is updated from each consumed CQE's SQ Head Pointer field
+/// by calling [`NvmePciSq::update_head`].
+///
+/// # In-flight CID tracking
+///
+/// CIDs are allocated from a bitmap (`in_flight`), set on submit and
+/// cleared on a validated completion.  `poll_completion` in
+/// [`NvmePciQueuePair`] rejects any device-supplied CQE whose CID is
+/// not currently marked as in-flight, preventing double-completion and
+/// never-submitted-command acceptance from a malicious device.
+///
+/// The bitmap covers `MAX_QUEUE_DEPTH` (256) bits packed into 4 × `u64`
+/// words, matching the maximum queue depth.
 pub struct NvmePciSq {
     /// Command entries.
     entries: [NvmePciCommand; MAX_QUEUE_DEPTH],
     /// Tail index (next write position).
     tail: u16,
-    /// Queue depth.
+    /// Head index as last reported by the controller via CQE.sq_head.
+    head: u16,
+    /// Queue depth (always >= 2).
     depth: u16,
-    /// Next command ID.
-    next_cid: u16,
+    /// In-flight CID occupancy bitmap; bit `i` set when CID `i` is in use.
+    /// 4 × 64 = 256 bits — covers the full MAX_QUEUE_DEPTH range.
+    in_flight: [u64; 4],
     /// Doorbell register offset from BAR0 base.
     doorbell_offset: usize,
 }
 
 impl NvmePciSq {
     /// Creates a new submission queue.
+    ///
+    /// `depth` is clamped to `[2, MAX_QUEUE_DEPTH]`; values below 2 are
+    /// raised to 2 so the full-ring check `(tail+1)%depth == head` is always
+    /// well-defined and the modulo never divides by zero.
     pub const fn new(depth: u16, doorbell_offset: usize) -> Self {
+        // Ensure depth is at least 2 (const-compatible clamp).
+        let depth = if depth < 2 {
+            2
+        } else if depth as usize > MAX_QUEUE_DEPTH {
+            MAX_QUEUE_DEPTH as u16
+        } else {
+            depth
+        };
         Self {
             entries: [NvmePciCommand {
                 cdw0: 0,
@@ -388,23 +425,87 @@ impl NvmePciSq {
                 cdw15: 0,
             }; MAX_QUEUE_DEPTH],
             tail: 0,
+            head: 0,
             depth,
-            next_cid: 0,
+            in_flight: [0u64; 4],
             doorbell_offset,
         }
     }
 
-    /// Submits a command to the queue. Returns the assigned CID.
+    /// Updates the SQ head from a completion queue entry's SQ Head Pointer.
+    ///
+    /// Called after consuming a CQE so the full-ring guard stays current.
+    /// The value is bounded to `[0, depth)` before storing; an out-of-range
+    /// device-supplied value is silently ignored to avoid an invalid head.
+    pub fn update_head(&mut self, cqe_sq_head: u16) {
+        if (cqe_sq_head as usize) < self.depth as usize {
+            self.head = cqe_sq_head;
+        }
+        // Out-of-range value from a malicious device: keep previous head.
+    }
+
+    /// Returns `true` when the ring is full.
+    ///
+    /// Uses the one-slot-open convention: full when the next tail slot
+    /// equals the controller-reported head.
+    pub fn is_full(&self) -> bool {
+        // depth >= 2 enforced in new(); no risk of div-by-zero.
+        let next = (self.tail as usize + 1) % self.depth as usize;
+        next == self.head as usize
+    }
+
+    /// Allocates a free CID from the in-flight bitmap.
+    ///
+    /// Scans `[0, depth)` for the first clear bit, marks it in-flight, and
+    /// returns the CID.  Returns `None` when all slots are occupied.
+    fn alloc_cid(&mut self) -> Option<u16> {
+        for i in 0..self.depth as usize {
+            if self.in_flight[i / 64] & (1u64 << (i % 64)) == 0 {
+                let cid = i as u16;
+                self.in_flight[cid as usize / 64] |= 1u64 << (cid as usize % 64);
+                return Some(cid);
+            }
+        }
+        None
+    }
+
+    /// Clears the in-flight bit for `cid`.
+    ///
+    /// Called by [`NvmePciQueuePair::poll_completion`] after a valid CQE is
+    /// accepted.  A `cid` outside `[0, depth)` is silently ignored.
+    pub fn free_cid(&mut self, cid: u16) {
+        if (cid as usize) < self.depth as usize {
+            self.in_flight[cid as usize / 64] &= !(1u64 << (cid as usize % 64));
+        }
+    }
+
+    /// Returns `true` if `cid` is currently marked as in-flight.
+    ///
+    /// A device-supplied CID outside `[0, depth)` always returns `false`.
+    pub fn is_in_flight(&self, cid: u16) -> bool {
+        if (cid as usize) >= self.depth as usize {
+            return false; // Out-of-range CID from a malicious device.
+        }
+        self.in_flight[cid as usize / 64] & (1u64 << (cid as usize % 64)) != 0
+    }
+
+    /// Submits a command to the queue.
+    ///
+    /// Allocates a CID from the in-flight bitmap (embedded into CDW0 bits
+    /// 31:16) and advances the tail.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::OutOfMemory`] if the queue is full.
+    /// Returns [`Error::Busy`] if the SQ ring is full or no CID is available.
     pub fn submit(&mut self, mut cmd: NvmePciCommand) -> Result<u16> {
-        let cid = self.next_cid;
+        if self.is_full() {
+            return Err(Error::Busy);
+        }
+        let cid = self.alloc_cid().ok_or(Error::Busy)?;
         cmd.cdw0 = (cmd.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+        // Tail is always < depth (depth >= 2, tail wraps below).
         self.entries[self.tail as usize] = cmd;
-        self.tail = (self.tail + 1) % self.depth;
-        self.next_cid = self.next_cid.wrapping_add(1);
+        self.tail = (self.tail as usize + 1) as u16 % self.depth;
         Ok(cid)
     }
 
@@ -444,7 +545,19 @@ pub struct NvmePciCq {
 
 impl NvmePciCq {
     /// Creates a new completion queue.
+    ///
+    /// `depth` is clamped to `[2, MAX_QUEUE_DEPTH]`, matching the SQ minimum,
+    /// so that a queue pair built via [`NvmePciQueuePair::new`] always has
+    /// `sq.depth == cq.depth` and the head index is always a valid array
+    /// offset.
     pub const fn new(depth: u16, doorbell_offset: usize) -> Self {
+        let depth = if depth < 2 {
+            2
+        } else if depth as usize > MAX_QUEUE_DEPTH {
+            MAX_QUEUE_DEPTH as u16
+        } else {
+            depth
+        };
         Self {
             entries: [NvmePciCompletion {
                 dw0: 0,
@@ -460,8 +573,14 @@ impl NvmePciCq {
     }
 
     /// Returns `true` if a new completion is available.
+    ///
+    /// The head is always kept in `[0, depth)` by `consume`, so the index is
+    /// always in-bounds for the fixed-size `entries` array.
     pub fn has_completion(&self) -> bool {
-        self.entries[self.head as usize].phase() == self.phase
+        // head is always < depth <= MAX_QUEUE_DEPTH (maintained by consume).
+        debug_assert!((self.head as usize) < self.depth as usize);
+        let head = (self.head as usize).min(MAX_QUEUE_DEPTH - 1);
+        self.entries[head].phase() == self.phase
     }
 
     /// Consumes the next completion entry.
@@ -471,7 +590,10 @@ impl NvmePciCq {
         if !self.has_completion() {
             return None;
         }
-        let entry = self.entries[self.head as usize];
+        // head is guaranteed < depth by has_completion's debug_assert + the
+        // wrap logic below, and < MAX_QUEUE_DEPTH by the depth clamp in new().
+        let head = (self.head as usize).min(MAX_QUEUE_DEPTH - 1);
+        let entry = self.entries[head];
         self.head += 1;
         if self.head >= self.depth {
             self.head = 0;
@@ -499,6 +621,13 @@ impl NvmePciCq {
 // ---------------------------------------------------------------------------
 // NvmePciQueuePair
 // ---------------------------------------------------------------------------
+
+/// Maximum CQ drain iterations per `poll_completion` call.
+///
+/// Prevents an infinite drain loop driven by a malicious or buggy device
+/// that writes phase-bit-matching entries faster than software can consume
+/// them.
+const MAX_PCI_CQ_DRAIN_ITERS: usize = 1024;
 
 /// A paired submission and completion queue.
 pub struct NvmePciQueuePair {
@@ -533,7 +662,7 @@ impl NvmePciQueuePair {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::OutOfMemory`] if the SQ is full.
+    /// Returns [`Error::Busy`] if the SQ is full.
     pub unsafe fn submit(&mut self, cmd: NvmePciCommand, bar0: usize) -> Result<u16> {
         let cid = self.sq.submit(cmd)?;
         // SAFETY: Caller guarantees bar0 is valid MMIO base.
@@ -545,16 +674,53 @@ impl NvmePciQueuePair {
 
     /// Polls for a completion and rings the CQ doorbell.
     ///
+    /// On each loop iteration a CQE is consumed from the CQ.  The
+    /// device-supplied CID is validated against the SQ's in-flight bitmap:
+    ///
+    /// - **Valid CID** (in-flight bit set): the bit is cleared, the SQ head is
+    ///   updated from the CQE's SQ Head Pointer field, and the CQE is returned.
+    /// - **Invalid CID** (not in-flight, out-of-range, or already completed):
+    ///   the CQE is silently dropped and the drain continues.  This prevents
+    ///   double-completion and never-submitted-command acceptance from a
+    ///   malicious or buggy device.
+    ///
+    /// The drain is capped at [`MAX_PCI_CQ_DRAIN_ITERS`] iterations to prevent
+    /// an infinite loop.
+    ///
     /// # Safety
     ///
     /// `bar0` must be the valid BAR0 MMIO base address.
     pub unsafe fn poll_completion(&mut self, bar0: usize) -> Option<NvmePciCompletion> {
-        let cqe = self.cq.consume()?;
-        // SAFETY: Caller guarantees bar0 is valid MMIO base.
-        unsafe {
-            write_mmio32(bar0 + self.cq.doorbell_offset(), self.cq.head() as u32);
+        let mut iters = 0usize;
+        loop {
+            if iters >= MAX_PCI_CQ_DRAIN_ITERS {
+                return None;
+            }
+            iters = iters.saturating_add(1);
+
+            let cqe = self.cq.consume()?;
+            let cid = cqe.command_id();
+
+            // Reject any CID the device has not been given by submit().
+            if !self.sq.is_in_flight(cid) {
+                // Malicious or stale CQE: doorbell already advanced by consume();
+                // ring it and continue draining.
+                // SAFETY: Caller guarantees bar0 is valid MMIO base.
+                unsafe {
+                    write_mmio32(bar0 + self.cq.doorbell_offset(), self.cq.head() as u32);
+                }
+                continue;
+            }
+
+            // Valid completion: clear in-flight, update SQ head, ring doorbell.
+            self.sq.free_cid(cid);
+            self.sq.update_head(cqe.sq_head());
+            // SAFETY: Caller guarantees bar0 is valid MMIO base.
+            unsafe {
+                write_mmio32(bar0 + self.cq.doorbell_offset(), self.cq.head() as u32);
+            }
+            return Some(cqe);
         }
-        Some(cqe)
     }
 }
 
@@ -773,10 +939,18 @@ impl NvmePciController {
 
     /// Creates an I/O queue pair.
     ///
+    /// `depth` must be at least 2 (NVMe requires a usable queue slot beyond
+    /// the one-slot-open sentinel).  Values below 2 are rejected so the
+    /// modulo in the full-ring check can never divide by zero.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::OutOfMemory`] if all I/O queue slots are used.
+    /// Returns [`Error::InvalidArgument`] if `depth` is less than 2.
     pub fn create_io_queue(&mut self, depth: u16) -> Result<u16> {
+        if depth < 2 {
+            return Err(Error::InvalidArgument);
+        }
         if self.io_queue_count >= MAX_IO_QUEUES {
             return Err(Error::OutOfMemory);
         }

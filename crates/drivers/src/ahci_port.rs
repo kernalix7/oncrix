@@ -233,6 +233,10 @@ pub struct FisDmaSetup {
 // ---------------------------------------------------------------------------
 
 /// One entry in the AHCI Command List (32 bytes per slot, up to 32 slots).
+///
+/// The `prdbc` field is **device/DMA-written** and must not be used directly
+/// as a byte count.  Call [`PortCmdSlot::transferred_bytes`] which bounds the
+/// value against the expected transfer size before returning it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PortCmdSlot {
@@ -240,12 +244,41 @@ pub struct PortCmdSlot {
     pub dw0: u16,
     /// PRD Table Length (number of PRD entries).
     pub prdtl: u16,
-    /// PRD Byte Count (written by hardware after command completion).
-    pub prdbc: u32,
+    /// PRD Byte Count: written by the HBA after command completion.
+    ///
+    /// This field is filled by the hardware/DMA engine and reflects
+    /// device-controlled data.  Do **not** read it directly; use
+    /// [`transferred_bytes`](Self::transferred_bytes) to obtain a bounds-
+    /// checked value.
+    prdbc: u32,
     /// Command Table Base Address (64-bit physical address).
     pub ctba: u64,
     /// Reserved.
     _reserved: [u32; 4],
+}
+
+impl PortCmdSlot {
+    /// Returns the HBA-written PRD byte count after bounding it.
+    ///
+    /// # Parameters
+    ///
+    /// * `max_bytes` — The maximum number of bytes that the transfer was
+    ///   programmed to move (sum of all PRD entry byte counts).  This is
+    ///   a caller-supplied invariant derived from the PRD table, not from
+    ///   the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IoError`] if the device-reported count exceeds
+    /// `max_bytes`, which would indicate a device supplying a bogus count
+    /// that could lead to an out-of-bounds copy.
+    pub fn transferred_bytes(&self, max_bytes: usize) -> Result<usize> {
+        let count = self.prdbc as usize;
+        if count > max_bytes {
+            return Err(Error::IoError);
+        }
+        Ok(count)
+    }
 }
 
 /// One Physical Region Descriptor entry.

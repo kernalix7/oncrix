@@ -221,6 +221,11 @@ pub struct TransferRing {
     capacity: usize,
     /// Current enqueue pointer (index of next slot to write).
     enqueue: usize,
+    /// Current dequeue pointer (advanced by the caller on completion events).
+    ///
+    /// Tracked by software so the ring-full condition can be detected without
+    /// reading hardware registers.
+    dequeue: usize,
     /// Current Producer Cycle State.
     cycle: bool,
 }
@@ -234,9 +239,14 @@ impl TransferRing {
     /// - `capacity`: Number of usable TRB slots (Link TRB will be placed at `capacity`).
     ///
     /// # Errors
-    /// Returns `Error::InvalidArgument` if `capacity == 0` or `capacity > MAX_RING_SIZE`.
+    /// Returns `Error::InvalidArgument` if `capacity < 2` or `capacity > MAX_RING_SIZE`.
+    ///
+    /// A minimum of two slots is required: the one-slot-sacrifice full-detection
+    /// convention means a ring of capacity 1 has `next == 0 == dequeue` on the
+    /// very first enqueue call and would immediately return `Error::Busy`, making
+    /// the ring permanently unusable.
     pub fn new(phys_base: u64, virt_base: u64, capacity: usize) -> Result<Self> {
-        if capacity == 0 || capacity > MAX_RING_SIZE {
+        if capacity < 2 || capacity > MAX_RING_SIZE {
             return Err(Error::InvalidArgument);
         }
         let ring = Self {
@@ -244,6 +254,7 @@ impl TransferRing {
             virt_base,
             capacity,
             enqueue: 0,
+            dequeue: 0,
             cycle: true,
         };
         // Write the Link TRB at index `capacity`.
@@ -281,11 +292,25 @@ impl TransferRing {
     /// Automatically advances past the Link TRB and toggles the cycle bit.
     ///
     /// # Errors
-    /// Returns `Error::Busy` if the ring is full.
+    /// Returns `Error::Busy` if the ring is full (enqueue has caught up to
+    /// dequeue, meaning all capacity slots are occupied by in-flight TRBs).
     ///
     /// # Safety
-    /// `virt_base` must point to a valid DMA ring allocation.
+    /// `virt_base` must point to a valid DMA ring allocation of at least
+    /// `(capacity + 1) * TRB_SIZE` bytes.
     pub unsafe fn enqueue(&mut self, mut trb: Trb) -> Result<u64> {
+        // Ring-full: next writable slot (after this one) would equal dequeue.
+        // We use `capacity` as the modulus because indices 0..capacity-1 are
+        // the usable slots; the Link TRB lives at index `capacity`.
+        let next = if self.enqueue + 1 >= self.capacity {
+            0
+        } else {
+            self.enqueue + 1
+        };
+        if next == self.dequeue {
+            return Err(Error::Busy);
+        }
+
         // Set cycle bit in the TRB.
         if self.cycle {
             trb.dw3 |= 1;
@@ -296,26 +321,40 @@ impl TransferRing {
         let slot = self.enqueue;
         let slot_virt = self.trb_virt(slot);
 
-        // SAFETY: Caller guarantees virt_base is a valid ring.
+        // SAFETY: Caller guarantees virt_base is a valid ring; `slot` is
+        // bounded to [0, capacity) by the ring-full check above.
         unsafe {
             core::ptr::write_volatile(slot_virt as *mut Trb, trb);
         }
 
-        self.enqueue += 1;
-        // Wrap at Link TRB.
-        if self.enqueue >= self.capacity {
-            self.enqueue = 0;
+        self.enqueue = next;
+        // Wrap at Link TRB when we have just moved back to index 0.
+        if self.enqueue == 0 {
             self.cycle = !self.cycle;
             // Rewrite the Link TRB with the new cycle bit.
             let link_virt = self.trb_virt(self.capacity);
             let link = Trb::link(self.phys_base, true, self.cycle);
-            // SAFETY: link_virt is within the allocated ring.
+            // SAFETY: link_virt is within the allocated ring (index `capacity`).
             unsafe {
                 core::ptr::write_volatile(link_virt as *mut Trb, link);
             }
         }
 
         Ok(self.phys_base + (slot * TRB_SIZE) as u64)
+    }
+
+    /// Advances the software-tracked dequeue pointer by one slot.
+    ///
+    /// The owning controller **must** call this once for each Transfer or
+    /// Command Completion Event received from the hardware; failure to do so
+    /// will cause the ring-full guard to trigger prematurely and block further
+    /// enqueues even when slots have been retired by the controller.
+    pub fn advance_dequeue(&mut self) {
+        self.dequeue = if self.dequeue + 1 >= self.capacity {
+            0
+        } else {
+            self.dequeue + 1
+        };
     }
 }
 

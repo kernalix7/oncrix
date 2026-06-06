@@ -197,17 +197,39 @@ const EERD_TIMEOUT: u32 = 10_000;
 // RX/TX Descriptor structures
 // ---------------------------------------------------------------------------
 
+/// Maximum valid Ethernet receive frame size (MTU 1500 + 14-byte header +
+/// 4-byte CRC).  Frames reported by the device beyond this length must be
+/// rejected as malformed.
+pub const RX_MAX_FRAME_SIZE: u16 = 1518;
+
+/// Minimum valid Ethernet receive frame size when [`RCTL_SECRC`] is set.
+///
+/// [`enable_rx`](E1000Hw::enable_rx) sets `RCTL_SECRC` (Strip Ethernet CRC),
+/// so the hardware removes the 4-byte CRC before reporting the length.  A
+/// minimum 64-byte on-wire frame therefore arrives as 60 bytes.  Using 64 as
+/// the floor would wrongly reject every minimum-sized frame.
+pub const RX_MIN_FRAME_SIZE: u16 = 60;
+
 /// RX legacy descriptor (16 bytes, `#[repr(C)]` for DMA).
+///
+/// The `length` field is **device-controlled** and must not be used directly
+/// as a copy size.  Always call [`RxDesc::validated_length`] which verifies
+/// that the DD and EOP status bits are set and that `length` is within the
+/// expected `[RX_MIN_FRAME_SIZE, buf_size]` range before returning it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RxDesc {
     /// Buffer physical address.
     pub buf_addr: u64,
-    /// Packet length (filled by hardware on receive).
-    pub length: u16,
+    /// Packet length in bytes (filled by hardware on receive).
+    ///
+    /// This field is written by the device/DMA engine.  Do **not** use it
+    /// directly as a copy length.  Call [`validated_length`](Self::validated_length)
+    /// instead.
+    length: u16,
     /// Checksum (filled by hardware).
     pub checksum: u16,
-    /// Status bits (bit 0 = DD: descriptor done).
+    /// Status bits (bit 0 = DD: descriptor done, bit 1 = EOP: end of packet).
     pub status: u8,
     /// Error bits.
     pub errors: u8,
@@ -220,9 +242,47 @@ impl RxDesc {
     pub fn is_done(&self) -> bool {
         self.status & 0x01 != 0
     }
+
     /// Checks if End of Packet bit (EOP) is set.
     pub fn is_eop(&self) -> bool {
         self.status & 0x02 != 0
+    }
+
+    /// Returns the device-supplied packet length after validating it.
+    ///
+    /// # Validation
+    ///
+    /// Requires all of the following to hold:
+    /// - The Descriptor Done (DD) bit is set.
+    /// - The End of Packet (EOP) bit is set (no multi-descriptor frames for
+    ///   legacy descriptors).
+    /// - `length` is at least [`RX_MIN_FRAME_SIZE`] (60 bytes; [`enable_rx`]
+    ///   sets `RCTL_SECRC` which strips the 4-byte CRC, so 64-byte minimum
+    ///   on-wire frames arrive as 60 bytes).
+    /// - `length` is at most the smaller of `buf_size` and
+    ///   [`RX_MAX_FRAME_SIZE`].
+    ///
+    /// [`enable_rx`]: E1000Hw::enable_rx
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::IoError`] if any condition is not met, preventing a
+    /// device-controlled length from being used as a copy size without bounds
+    /// checking.
+    pub fn validated_length(&self, buf_size: usize) -> Result<usize> {
+        // Descriptor must be done and must be a single complete packet.
+        if !self.is_done() || !self.is_eop() {
+            return Err(Error::IoError);
+        }
+        let len = self.length as usize;
+        // Upper bound: the smaller of the caller's buffer and the maximum
+        // Ethernet frame size we will ever accept (1518 bytes).
+        let max_allowed = buf_size.min(RX_MAX_FRAME_SIZE as usize);
+        // Reject runts (< 60 with SECRC) and oversized / out-of-buffer frames.
+        if len < RX_MIN_FRAME_SIZE as usize || len > max_allowed {
+            return Err(Error::IoError);
+        }
+        Ok(len)
     }
 }
 

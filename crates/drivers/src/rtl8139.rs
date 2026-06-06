@@ -81,7 +81,7 @@ const REG_CMD: u16 = 0x37;
 const REG_CAPR: u16 = 0x38;
 
 /// Current Buffer Address (write pointer, read-only).
-const _REG_CBR: u16 = 0x3A;
+const REG_CBR: u16 = 0x3A;
 
 /// Interrupt Mask Register.
 const REG_IMR: u16 = 0x3C;
@@ -164,6 +164,22 @@ pub const RX_BUF_SIZE: usize = 8192 + 16 + 1500;
 
 /// Maximum single TX packet size.
 const MAX_TX_SIZE: usize = 1536;
+
+/// Minimum valid Ethernet frame size (dest + src + ethertype, no CRC).
+///
+/// 14 bytes without the 4-byte CRC that the RTL8139 includes in `length`.
+/// The device-reported length includes the CRC, so the minimum is 64.
+const MIN_FRAME_SIZE: usize = 64;
+
+/// Maximum valid Ethernet frame size (MTU 1500 + 14-byte header + 4-byte CRC).
+///
+/// Frames reported larger than this are bogus and must be rejected.
+const MAX_FRAME_SIZE: usize = 1518;
+
+/// Logical size of the RX ring that the hardware and CAPR arithmetic use.
+///
+/// The physical buffer is 8 KiB + 16 + 1500.  The ring pointer wraps at 8 KiB.
+const RX_RING_SIZE: usize = 8192;
 
 /// Maximum number of RTL8139 devices in the registry.
 pub const MAX_RTL8139_DEVICES: usize = 4;
@@ -523,13 +539,21 @@ impl Rtl8139Device {
 
     /// Poll for a received packet.
     ///
-    /// Checks the RX buffer at the current read offset for a
-    /// completed packet header. The RTL8139 prepends a 4-byte
-    /// header (status + length) before each packet.
+    /// Checks the RX buffer at the current read offset for a completed
+    /// packet header.  The RTL8139 prepends a 4-byte header (status u16 +
+    /// length u16, both little-endian) before each packet.
     ///
-    /// Returns `Some((offset_in_rx_buf, length))` pointing to
-    /// the packet data (after the 4-byte header), or `None` if
-    /// no packet is ready.
+    /// The 4-byte header is read as a single `u32` to avoid acting on a
+    /// partially-written (torn) header.  The device-supplied `length` field
+    /// is validated against [`MIN_FRAME_SIZE`] and [`MAX_FRAME_SIZE`] before
+    /// any ring arithmetic is performed.  A bogus length resets `rx_offset`
+    /// to 0 and resyncs CAPR rather than advancing by an attacker-controlled
+    /// amount.
+    ///
+    /// Returns `Some((data_offset, length))` where `data_offset` is the index
+    /// of the first payload byte in `rx_buffer` and `length` is the validated
+    /// packet length (including the 4-byte hardware CRC).  Returns `None` if
+    /// the buffer is empty or the header is not yet valid.
     pub fn receive(&mut self) -> Option<(usize, usize)> {
         if !self.initialized {
             return None;
@@ -543,32 +567,102 @@ impl Rtl8139Device {
 
         let offset = self.rx_offset;
 
-        // Read the 4-byte packet header from the RX buffer.
-        // Bytes 0-1: status, Bytes 2-3: length (incl. CRC).
-        let status = u16::from_le_bytes([self.rx_buffer[offset], self.rx_buffer[offset + 1]]);
-
-        // Check ROK bit in the packet header status.
-        if status & 0x0001 == 0 {
+        // Guard against an rx_offset that somehow fell outside the ring
+        // (e.g., corrupted from a previous bogus-length recovery).
+        if offset + 4 > RX_BUF_SIZE {
+            self.resync_rx_ring();
             return None;
         }
 
-        let length =
-            u16::from_le_bytes([self.rx_buffer[offset + 2], self.rx_buffer[offset + 3]]) as usize;
+        // Read the 4-byte packet header as a single atomic u32 to prevent
+        // acting on a torn header written by the device mid-update.
+        // Byte layout: [status_lo, status_hi, length_lo, length_hi].
+        let header = u32::from_le_bytes([
+            self.rx_buffer[offset],
+            self.rx_buffer[offset + 1],
+            self.rx_buffer[offset + 2],
+            self.rx_buffer[offset + 3],
+        ]);
 
-        // Data starts after the 4-byte header.
+        // Extract status (lower 16 bits) and length (upper 16 bits).
+        let status = (header & 0xFFFF) as u16;
+        let raw_length = (header >> 16) as usize;
+
+        // The ROK bit (bit 0) must be set; if not, the descriptor is not yet
+        // committed by hardware — do not consume it.
+        if status & ISR_ROK == 0 {
+            return None;
+        }
+
+        // Validate the device-supplied length before using it for any
+        // arithmetic.  The RTL8139 includes the 4-byte CRC in `length`, so
+        // a valid frame must be in [MIN_FRAME_SIZE, MAX_FRAME_SIZE].
+        //
+        // An out-of-range value indicates a malicious or buggy device; reset
+        // the ring to a known-good state rather than advancing by a bogus
+        // amount.
+        if !(MIN_FRAME_SIZE..=MAX_FRAME_SIZE).contains(&raw_length) {
+            self.resync_rx_ring();
+            return None;
+        }
+
+        // Verify the entire frame (header + payload) fits within the physical
+        // RX buffer before exposing any offset to the caller.
+        let frame_end = offset.saturating_add(4).saturating_add(raw_length);
+        if frame_end > RX_BUF_SIZE {
+            self.resync_rx_ring();
+            return None;
+        }
+
+        // Data starts after the 4-byte hardware header.
         let data_offset = offset + 4;
 
-        // Advance rx_offset: header(4) + length, aligned to
-        // 4-byte boundary, wrapped within 8K.
-        let next = (offset + 4 + length + 3) & !3;
-        self.rx_offset = next % 8192;
+        // Advance rx_offset: skip the 4-byte header + packet payload, then
+        // align up to the next 4-byte boundary, and wrap within the 8 KiB
+        // ring.  All operands are now validated so this arithmetic is safe.
+        let next = (offset + 4 + raw_length + 3) & !3usize;
+        self.rx_offset = next % RX_RING_SIZE;
 
         // Update CAPR (read pointer) for the hardware.
-        // CAPR = rx_offset - 16 (hardware quirk).
+        // Hardware quirk: CAPR = rx_offset - 16.
         let capr = (self.rx_offset as u16).wrapping_sub(16);
         self.write_reg16(REG_CAPR, capr);
 
-        Some((data_offset, length))
+        Some((data_offset, raw_length))
+    }
+
+    /// Resync the RX ring to the hardware's current write position after a bad
+    /// packet header.
+    ///
+    /// Reads the Current Buffer Register (CBR) — the byte offset at which the
+    /// device has written — and aligns `rx_offset` to that position, then
+    /// updates CAPR so the hardware and driver agree on the read pointer.  This
+    /// is safer than resetting to offset 0: resetting to 0 while CBR is
+    /// elsewhere causes the driver to re-parse whatever stale bytes happen to
+    /// sit at the start of the ring, potentially wedging the RX path in a
+    /// tight loop.
+    ///
+    /// CBR is a 16-bit value in the range `[0, RX_RING_SIZE)`.  We round it
+    /// down to the nearest 4-byte boundary and mask to the ring size to obtain
+    /// a safe `rx_offset`.
+    fn resync_rx_ring(&mut self) {
+        // Read the hardware write pointer (CBR).  The RTL8139 manual names
+        // this register "Current Buffer Address" at offset 0x3A.  It reflects
+        // where the NIC will write the *next* incoming byte inside the 8 KiB
+        // ring.
+        let cbr = self.read_reg16(REG_CBR);
+
+        // Align the hardware pointer down to a 4-byte boundary so that the
+        // driver cursor always sits on a valid packet-header boundary.
+        // The mask `!3u16` clears the low two bits; casting to usize before
+        // the modulo keeps all arithmetic in the ring's address space.
+        let aligned = (cbr & !3u16) as usize % RX_RING_SIZE;
+        self.rx_offset = aligned;
+
+        // Update CAPR to match.  Hardware quirk: CAPR = rx_offset - 16;
+        // wrapping_sub is intentional (the hardware accepts the wrapped value).
+        let capr = (self.rx_offset as u16).wrapping_sub(16);
+        self.write_reg16(REG_CAPR, capr);
     }
 
     /// Handle an RTL8139 interrupt.
