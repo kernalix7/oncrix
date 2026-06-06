@@ -562,7 +562,14 @@ pub fn audit_log(
     let seq = log.next_seq;
     let event = AuditEvent::new(seq, timestamp, event_type, pid, uid, success, severity, msg);
     log.push(event);
-    log.next_seq += 1;
+    // Use wrapping_add to avoid UB on overflow. When the counter wraps,
+    // clamp it back to 1 (sequence 0 is reserved for "no event") so
+    // read_events' arithmetic stays valid: the next assigned sequence is
+    // never 0 and `next_seq - oldest_seq` cannot underflow after a wrap.
+    log.next_seq = match log.next_seq.wrapping_add(1) {
+        0 => 1,
+        n => n,
+    };
     Ok(seq)
 }
 

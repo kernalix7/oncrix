@@ -28,6 +28,8 @@
 
 use oncrix_lib::{Error, Result};
 
+use crate::capability::{CAP_AUDIT_CONTROL, ThreadCapState};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -446,8 +448,31 @@ impl AuditCore {
     }
 
     /// Enable or disable the audit subsystem.
-    pub fn set_enabled(&mut self, enabled: bool) {
+    ///
+    /// Requires [`CAP_AUDIT_CONTROL`] in the caller's effective capability
+    /// set. Returns [`Error::PermissionDenied`] fail-closed when absent.
+    ///
+    /// Passing `enabled = false` disables auditing globally; without the
+    /// required capability the request is silently rejected so the subsystem
+    /// stays in its current state.
+    ///
+    /// # SECURITY
+    ///
+    /// The syscall dispatch site (arch/x86_64/syscall_entry.rs) MUST pass
+    /// the real per-thread [`ThreadCapState`] here. Passing
+    /// `ThreadCapState::new_unprivileged()` (the fail-closed default) blocks
+    /// the operation when credentials are unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PermissionDenied`] if `caller_caps` lacks
+    /// [`CAP_AUDIT_CONTROL`].
+    pub fn set_enabled(&mut self, caller_caps: &ThreadCapState, enabled: bool) -> Result<()> {
+        if !caller_caps.capable(CAP_AUDIT_CONTROL) {
+            return Err(Error::PermissionDenied);
+        }
         self.enabled = enabled;
+        Ok(())
     }
 
     /// Returns true if auditing is enabled.
