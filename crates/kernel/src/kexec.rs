@@ -32,6 +32,8 @@
 //! Reference: Linux `kernel/kexec.c`, `kernel/kexec_core.c`,
 //! `arch/x86/kernel/machine_kexec_64.c`.
 
+use crate::capability::{CAP_SYS_BOOT, CapSet};
+
 // ── Constants ──────────────────────────────────────────────────────
 
 /// Maximum number of segments in a kexec image.
@@ -101,6 +103,13 @@ pub enum KexecError {
         /// The invalid entry point.
         entry: usize,
     },
+    /// A segment destination range overflows the address space.
+    SegmentRangeOverflow {
+        /// Segment index.
+        index: usize,
+    },
+    /// Caller lacks `CAP_SYS_BOOT`.
+    PermissionDenied,
     /// Unknown or invalid flags.
     InvalidFlags {
         /// The invalid flag bits.
@@ -138,6 +147,10 @@ impl core::fmt::Display for KexecError {
             Self::InvalidEntryPoint { entry } => {
                 write!(f, "invalid entry point 0x{:x}", entry)
             }
+            Self::SegmentRangeOverflow { index } => {
+                write!(f, "segment {} destination range overflows", index)
+            }
+            Self::PermissionDenied => write!(f, "permission denied (CAP_SYS_BOOT)"),
             Self::InvalidFlags { flags } => {
                 write!(f, "invalid flags 0x{:x}", flags)
             }
@@ -184,8 +197,15 @@ impl KexecSegment {
     }
 
     /// Return the end address of the destination region.
+    ///
+    /// Uses saturating arithmetic so an attacker-supplied
+    /// `dst_addr`/`dst_size` that would overflow `usize` saturates to
+    /// `usize::MAX` instead of wrapping. A wrapped (small) end address
+    /// would falsely pass the overlap and bound checks; saturating is
+    /// the fail-closed choice (an out-of-range segment is rejected by
+    /// the explicit `checked_add` bound check in [`kexec_load`]).
     pub const fn dst_end(&self) -> usize {
-        self.dst_addr + self.dst_size
+        self.dst_addr.saturating_add(self.dst_size)
     }
 }
 
@@ -357,15 +377,36 @@ impl KexecState {
 /// If `flags` includes [`KEXEC_ON_CRASH`], the image is stored in
 /// the crash slot instead.
 ///
+/// Loading a replacement kernel is the single most privileged
+/// operation in the system: each segment names an attacker-controlled
+/// physical write target. The caller must hold `CAP_SYS_BOOT`.
+///
+/// `caller` is the authenticated capability set of the requesting
+/// task. Per-task credentials are not yet threaded through the syscall
+/// dispatcher, so this entry point fails closed: the dispatcher MUST
+/// pass the real caller cred once available.
+///
+// SECURITY: `caller` MUST be the authenticated effective capability set
+// of the requesting task. Until the syscall dispatcher threads per-task
+// creds, callers without `CAP_SYS_BOOT` are denied (fail closed). Do not
+// default this to `CapSet::FULL`.
+///
 /// # Errors
 ///
-/// Returns a [`KexecError`] if validation fails.
+/// Returns [`KexecError::PermissionDenied`] if `caller` lacks
+/// `CAP_SYS_BOOT`, or another [`KexecError`] if validation fails.
 pub fn kexec_load(
     state: &mut KexecState,
+    caller: CapSet,
     entry: usize,
     segments: &[KexecSegment],
     flags: u32,
 ) -> Result<(), KexecError> {
+    // Fail closed: loading a kernel requires CAP_SYS_BOOT.
+    if !caller.has(CAP_SYS_BOOT) {
+        return Err(KexecError::PermissionDenied);
+    }
+
     // Validate flags.
     if flags & !VALID_FLAGS != 0 {
         return Err(KexecError::InvalidFlags { flags });
@@ -417,6 +458,10 @@ pub fn kexec_load(
                 addr: seg.dst_addr,
             });
         }
+        // Destination range must not overflow the address space.
+        if seg.dst_addr.checked_add(seg.dst_size).is_none() {
+            return Err(KexecError::SegmentRangeOverflow { index: i });
+        }
     }
 
     // Check for overlapping segments.
@@ -428,6 +473,20 @@ pub fn kexec_load(
                 return Err(KexecError::OverlappingSegments { seg_a: i, seg_b: j });
             }
         }
+    }
+
+    // The entry point must be page-aligned and land inside an accepted
+    // segment; otherwise machine_kexec would jump to an address with no
+    // loaded code (or an attacker-chosen location). Mirrors the
+    // containment check the file/load loaders apply at finalize time.
+    if entry & 0xFFF != 0 {
+        return Err(KexecError::InvalidEntryPoint { entry });
+    }
+    if !segments
+        .iter()
+        .any(|s| entry >= s.dst_addr && entry < s.dst_end())
+    {
+        return Err(KexecError::InvalidEntryPoint { entry });
     }
 
     // Build the image.
