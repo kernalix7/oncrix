@@ -22,6 +22,7 @@
 //! [`MAX_NETLINK_SOCKETS`] sockets and provides unicast,
 //! multicast, and kernel notification delivery.
 
+use crate::capability::{CAP_NET_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -285,6 +286,17 @@ impl NetlinkSocket {
 /// Manages creation, lookup, message delivery, and teardown
 /// of up to [`MAX_NETLINK_SOCKETS`] sockets. Supports unicast,
 /// multicast, and kernel-originated notifications.
+///
+// SECURITY: socket port IDs and multicast subscriptions are
+// security-relevant and reachable from unprivileged userspace.
+// `create` binds the socket's port id (`pid`) to the *authenticated*
+// calling task — the dispatcher MUST pass the current task's port id,
+// never a caller-supplied value — so a process cannot impersonate
+// another's netlink address. Joining a multicast group (`bind` with a
+// non-zero mask) and broadcasting to a group (`multicast`) require
+// `CAP_NET_ADMIN` fail-closed: the netlink dispatch site MUST pass the
+// calling thread's real effective `CapSet`, and supply `CapSet::EMPTY`
+// when no capability context is available, which denies the operation.
 pub struct NetlinkRegistry {
     /// Socket table.
     sockets: [NetlinkSocket; MAX_NETLINK_SOCKETS],
@@ -320,11 +332,48 @@ impl NetlinkRegistry {
         self.count == 0
     }
 
-    /// Create a new netlink socket for the given family and PID.
+    /// Fail-closed `CAP_NET_ADMIN` gate for privileged netlink
+    /// operations (multicast group subscription and broadcast).
     ///
-    /// Returns the new socket's unique ID, or `OutOfMemory` when
-    /// the socket table is full.
+    /// When the capability is absent (the unprivileged default,
+    /// including `CapSet::EMPTY`) the operation is denied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::PermissionDenied` if `caller_caps` lacks
+    /// `CAP_NET_ADMIN`.
+    fn require_net_admin(caller_caps: CapSet) -> Result<()> {
+        if caller_caps.has(CAP_NET_ADMIN) {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
+        }
+    }
+
+    /// Create a new netlink socket for the given family and port id.
+    ///
+    /// `pid` is the socket's netlink port id and MUST be the
+    /// *authenticated* calling task's port id supplied by the
+    /// dispatcher — never a value taken directly from an untrusted
+    /// request — so a process cannot bind another's netlink address.
+    /// The port id `0` is reserved for the kernel and is rejected, and
+    /// a port id already bound by an active socket cannot be reused.
+    ///
+    /// Returns the new socket's unique ID.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::InvalidArgument` — `pid` is zero (kernel-reserved).
+    /// - `Error::AlreadyExists` — `pid` is already bound by an active
+    ///   socket.
+    /// - `Error::OutOfMemory` — the socket table is full.
     pub fn create(&mut self, family: NetlinkFamily, pid: u32) -> Result<u32> {
+        if pid == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if self.sockets.iter().any(|s| s.active && s.pid == pid) {
+            return Err(Error::AlreadyExists);
+        }
         if self.count >= MAX_NETLINK_SOCKETS {
             return Err(Error::OutOfMemory);
         }
@@ -361,8 +410,21 @@ impl NetlinkRegistry {
     /// Bind a socket to one or more multicast groups.
     ///
     /// The `groups` bitmask is OR-ed into the socket's existing
-    /// group subscriptions.
-    pub fn bind(&mut self, id: u32, groups: u32) -> Result<()> {
+    /// group subscriptions. Subscribing to any multicast group is a
+    /// privileged operation and requires `CAP_NET_ADMIN` in
+    /// `caller_caps` (fail-closed). A no-op call with `groups == 0`
+    /// makes no subscription change and is permitted without the
+    /// capability.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — `groups` is non-zero and
+    ///   `caller_caps` lacks `CAP_NET_ADMIN`.
+    /// - `Error::NotFound` — no active socket with `id`.
+    pub fn bind(&mut self, id: u32, groups: u32, caller_caps: CapSet) -> Result<()> {
+        if groups != 0 {
+            Self::require_net_admin(caller_caps)?;
+        }
         let sock = self.find_mut(id)?;
         sock.groups |= groups;
         Ok(())
@@ -403,14 +465,30 @@ impl NetlinkRegistry {
     /// Deliver a message to all sockets of the given `family`
     /// that are subscribed to `group`.
     ///
-    /// Sockets whose receive ring is full silently drop the
+    /// Broadcasting to a multicast group is a privileged operation and
+    /// requires `CAP_NET_ADMIN` in `caller_caps` (fail-closed); the
+    /// dispatcher MUST pass the broadcasting task's real effective
+    /// `CapSet`. Sockets whose receive ring is full silently drop the
     /// message.
-    pub fn multicast(&mut self, family: NetlinkFamily, group: u32, data: &[u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::PermissionDenied` if `caller_caps` lacks
+    /// `CAP_NET_ADMIN`.
+    pub fn multicast(
+        &mut self,
+        family: NetlinkFamily,
+        group: u32,
+        data: &[u8],
+        caller_caps: CapSet,
+    ) -> Result<()> {
+        Self::require_net_admin(caller_caps)?;
         for sock in &mut self.sockets {
             if sock.active && sock.family == family && (sock.groups & group) != 0 {
                 let _ = sock.enqueue(data);
             }
         }
+        Ok(())
     }
 
     /// Send a kernel-originated notification to all sockets of
