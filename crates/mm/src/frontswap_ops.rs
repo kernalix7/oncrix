@@ -256,7 +256,20 @@ impl FrontswapBackend {
         Ok(())
     }
 
+    /// Find a reusable slot: an invalidated entry within the used range.
+    ///
+    /// Returns the index of the first non-valid entry below `count`,
+    /// allowing invalidated slots to be reclaimed instead of growing
+    /// the table monotonically.
+    fn find_reusable_slot(&self) -> Option<usize> {
+        self.entries[..self.count].iter().position(|e| !e.valid)
+    }
+
     /// Store a page.
+    ///
+    /// Reuses an invalidated slot when available; only grows the table
+    /// (`count`) when no reclaimable slot exists, so the backend does
+    /// not permanently fail after the cap once entries are invalidated.
     pub fn store(&mut self, swap_type: u32, offset: u64, timestamp: u64) -> Result<()> {
         if !self.enabled {
             return Err(Error::NotImplemented);
@@ -267,13 +280,21 @@ impl FrontswapBackend {
             self.stats.store_failures += 1;
             return Err(Error::InvalidArgument);
         }
-        if self.count >= MAX_ENTRIES {
-            self.stats.store_failures += 1;
-            return Err(Error::OutOfMemory);
-        }
 
-        self.entries[self.count] = FrontswapEntry::new(swap_type, offset, timestamp);
-        self.count += 1;
+        let slot = match self.find_reusable_slot() {
+            Some(idx) => idx,
+            None => {
+                if self.count >= MAX_ENTRIES {
+                    self.stats.store_failures += 1;
+                    return Err(Error::OutOfMemory);
+                }
+                let idx = self.count;
+                self.count += 1;
+                idx
+            }
+        };
+
+        self.entries[slot] = FrontswapEntry::new(swap_type, offset, timestamp);
         self.stats.store_successes += 1;
         self.stats.io_saved += 1;
         Ok(())
