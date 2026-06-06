@@ -262,7 +262,21 @@ impl CqEntry {
 
 // ── QueuePair ────────────────────────────────────────────────────────────────
 
+/// Maximum CQ drain iterations per call to `poll_completion`.
+///
+/// Prevents an infinite loop if a malicious / buggy device writes phase-bit-
+/// matching entries faster than software can drain them.
+const MAX_CQ_DRAIN_ITERS: usize = 1024;
+
 /// An NVMe submission + completion queue pair of fixed depth.
+///
+/// # In-flight CID tracking
+///
+/// `SQ_DEPTH` must be in the range `[2, 256]` so that all assigned CIDs fit
+/// inside a `u8` index.  `alloc_cid` searches the `in_flight` bitmap for a
+/// free slot; `poll_completion` rejects any CID from the device that is not
+/// currently marked as in-flight, preventing double-completions and
+/// use-after-free of the associated DMA buffer.
 pub struct QueuePair<const SQ_DEPTH: usize, const CQ_DEPTH: usize> {
     /// Submission queue entries.
     sq: [SqEntry; SQ_DEPTH],
@@ -276,8 +290,9 @@ pub struct QueuePair<const SQ_DEPTH: usize, const CQ_DEPTH: usize> {
     cq_head: u16,
     /// Expected phase bit for next CQE.
     cq_phase: bool,
-    /// Next command ID to assign.
-    next_cid: u16,
+    /// In-flight CID occupancy bitmap; bit `i` is set when CID `i` is in use.
+    /// Length covers `SQ_DEPTH` bits packed into `u64` words.
+    in_flight: [u64; 4],
     /// Controller MMIO base (for doorbell access).
     ctrl_base: u64,
     /// Whether this queue is active.
@@ -285,6 +300,14 @@ pub struct QueuePair<const SQ_DEPTH: usize, const CQ_DEPTH: usize> {
 }
 
 impl<const SQ_DEPTH: usize, const CQ_DEPTH: usize> QueuePair<SQ_DEPTH, CQ_DEPTH> {
+    // Const assertion: SQ_DEPTH must fit in the bitmap (max 256 bits = 4×u64).
+    // CQ_DEPTH must be >= 1 to avoid an empty queue.
+    //
+    // NOTE: these are referenced inside `new()` so they are always
+    // monomorphized and the assert is actually evaluated at compile time.
+    const _ASSERT_SQ_DEPTH: () = assert!(SQ_DEPTH >= 2 && SQ_DEPTH <= 256);
+    const _ASSERT_CQ_DEPTH: () = assert!(CQ_DEPTH >= 1 && CQ_DEPTH <= 256);
+
     /// SQ tail doorbell register offset.
     fn sq_doorbell_offset(&self) -> u64 {
         0x1000 + (2 * self.queue_id as u64) * (1u64 << DOORBELL_STRIDE_SHIFT)
@@ -315,29 +338,66 @@ impl<const SQ_DEPTH: usize, const CQ_DEPTH: usize> QueuePair<SQ_DEPTH, CQ_DEPTH>
         }
     }
 
-    /// Allocate a command ID.
-    fn alloc_cid(&mut self) -> u16 {
-        let cid = self.next_cid;
-        self.next_cid = self.next_cid.wrapping_add(1);
-        cid
+    /// Mark CID `cid` as in-flight.
+    fn set_in_flight(&mut self, cid: u16) {
+        let idx = cid as usize;
+        self.in_flight[idx / 64] |= 1u64 << (idx % 64);
+    }
+
+    /// Clear the in-flight bit for `cid`.
+    fn clear_in_flight(&mut self, cid: u16) {
+        let idx = cid as usize;
+        self.in_flight[idx / 64] &= !(1u64 << (idx % 64));
+    }
+
+    /// Returns `true` if `cid` is currently marked as in-flight.
+    fn is_in_flight(&self, cid: u16) -> bool {
+        let idx = cid as usize;
+        if idx >= SQ_DEPTH {
+            return false; // Device-supplied CID outside our range.
+        }
+        self.in_flight[idx / 64] & (1u64 << (idx % 64)) != 0
+    }
+
+    /// Allocate a free command ID from the in-flight bitmap.
+    ///
+    /// Scans `[0, SQ_DEPTH)` for the first clear bit.
+    /// Returns `None` when all slots are occupied (queue full).
+    fn alloc_cid(&mut self) -> Option<u16> {
+        for i in 0..SQ_DEPTH {
+            if self.in_flight[i / 64] & (1u64 << (i % 64)) == 0 {
+                let cid = i as u16;
+                self.set_in_flight(cid);
+                return Some(cid);
+            }
+        }
+        None
     }
 
     /// Submit a pre-built SqEntry.
     ///
-    /// Assigns a command ID, writes to SQ, rings doorbell.
+    /// Assigns a command ID (from the in-flight bitmap), writes to SQ, and
+    /// rings the doorbell.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Busy`] if the SQ is full.
+    /// Returns [`Error::Busy`] if the SQ ring or the CID bitmap is full.
     pub fn submit(&mut self, mut entry: SqEntry) -> Result<u16> {
+        // Force evaluation of the const-depth assertions so that invalid
+        // const parameters (e.g. SQ_DEPTH == 0) are caught at compile time
+        // for every monomorphization that actually calls submit().
+        let () = Self::_ASSERT_SQ_DEPTH;
+        let () = Self::_ASSERT_CQ_DEPTH;
+
         if !self.active {
             return Err(Error::NotImplemented);
         }
+        // Ring-full check: one-slot-open convention.
         let next_tail = (self.sq_tail as usize + 1) % SQ_DEPTH;
         if next_tail == self.cq_head as usize {
             return Err(Error::Busy);
         }
-        let cid = self.alloc_cid();
+        let cid = self.alloc_cid().ok_or(Error::Busy)?;
         // Embed CID into CDW0 bits 31:16.
         entry.cdw0 = (entry.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
 
@@ -352,20 +412,61 @@ impl<const SQ_DEPTH: usize, const CQ_DEPTH: usize> QueuePair<SQ_DEPTH, CQ_DEPTH>
 
     /// Poll for a completion entry.
     ///
-    /// Returns `None` if no completion is ready (phase tag mismatch).
+    /// Validates that the CID in the CQE was actually submitted (in-flight
+    /// check).  A CQE whose CID is not in-flight is silently dropped and the
+    /// head advances — this guards against double-completion and
+    /// never-submitted-command scenarios from a malicious device.
+    ///
+    /// Returns `None` if no valid completion is ready (phase tag mismatch).
+    ///
+    /// # Destructive drain — single-consumer contract
+    ///
+    /// This method is a **destructive** drain: every CQE it reads advances the
+    /// CQ head and rings the doorbell, consuming the entry permanently.  The
+    /// queue has no "peek" operation; once a CQE is consumed it cannot be
+    /// recovered.
+    ///
+    /// Callers that submit multiple commands and then poll for a specific CID
+    /// **must not** discard completions for other CIDs — doing so would lose
+    /// those completions forever.  The correct pattern is to buffer or dispatch
+    /// every returned [`CqEntry`] (matched by `command_id()`) rather than
+    /// spinning on this method waiting for a single CID.
+    ///
+    /// Only one software thread may call `poll_completion` on a given
+    /// [`QueuePair`] at a time; no concurrent drain is permitted.
     pub fn poll_completion(&mut self) -> Option<CqEntry> {
-        // SAFETY: Reading CQE from DMA memory with volatile.
-        let cqe = unsafe { core::ptr::read_volatile(&self.cq[self.cq_head as usize]) };
-        if cqe.phase() != self.cq_phase {
-            return None;
+        // Guard against an infinite drain loop driven by the device.
+        let mut iters = 0usize;
+        loop {
+            if iters >= MAX_CQ_DRAIN_ITERS {
+                return None;
+            }
+            iters = iters.saturating_add(1);
+
+            // Bounds: cq_head is always kept in [0, CQ_DEPTH) below.
+            let head = (self.cq_head as usize).min(CQ_DEPTH - 1);
+            // SAFETY: Reading CQE from DMA memory with volatile.
+            let cqe = unsafe { core::ptr::read_volatile(&self.cq[head]) };
+            if cqe.phase() != self.cq_phase {
+                return None; // No new completion.
+            }
+            // Advance CQ head and flip phase on wrap.
+            self.cq_head = (self.cq_head as usize + 1) as u16 % CQ_DEPTH as u16;
+            if self.cq_head == 0 {
+                self.cq_phase = !self.cq_phase;
+            }
+            self.ring_cq_doorbell();
+
+            // Reject CID not in our in-flight table (double-completion /
+            // never-submitted).
+            let cid = cqe.command_id();
+            if !self.is_in_flight(cid) {
+                // Malicious or stale CQE: drop and continue drain.
+                continue;
+            }
+            self.clear_in_flight(cid);
+            return Some(cqe);
         }
-        let result = cqe;
-        self.cq_head = (self.cq_head + 1) as u16 % CQ_DEPTH as u16;
-        if self.cq_head == 0 {
-            self.cq_phase = !self.cq_phase;
-        }
-        self.ring_cq_doorbell();
-        Some(result)
     }
 
     /// Return the physical address of the SQ.
@@ -431,7 +532,7 @@ impl AdminQueue {
                 sq_tail: 0,
                 cq_head: 0,
                 cq_phase: true,
-                next_cid: 0,
+                in_flight: [0u64; 4],
                 ctrl_base,
                 active: false,
             },
@@ -521,7 +622,7 @@ impl IoQueue {
                 sq_tail: 0,
                 cq_head: 0,
                 cq_phase: true,
-                next_cid: 0,
+                in_flight: [0u64; 4],
                 ctrl_base,
                 active: false,
             },
