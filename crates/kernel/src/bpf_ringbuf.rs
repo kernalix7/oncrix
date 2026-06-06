@@ -99,7 +99,13 @@ pub struct Record {
     len: usize,
     /// Lifecycle state.
     state: RecordState,
-    /// Byte offset of this record's header in the ring data area.
+    /// Full (unwrapped) producer byte position of this record's header.
+    ///
+    /// This is the monotonically increasing producer position at reservation
+    /// time, **not** the wrapped `& RING_MASK` data-area offset. Matching the
+    /// consumer against this full position prevents two live records that
+    /// happen to share the same wrapped offset (after a `RING_DATA_SIZE` wrap)
+    /// from aliasing each other during [`RingBuf::consume`].
     offset: usize,
 }
 
@@ -125,7 +131,7 @@ impl Record {
         &mut self.data[..self.len]
     }
 
-    /// Return the record's byte offset within the ring.
+    /// Return the record's full (unwrapped) producer position.
     pub fn offset(&self) -> usize {
         self.offset
     }
@@ -306,7 +312,7 @@ impl RingBuf {
     ///   table is exhausted.
     pub fn reserve(&mut self, payload_size: usize) -> Result<RecordHandle> {
         if payload_size == 0 || payload_size > MAX_RECORD_PAYLOAD {
-            self.stats.reserve_failures += 1;
+            self.stats.reserve_failures = self.stats.reserve_failures.saturating_add(1);
             return Err(Error::InvalidArgument);
         }
 
@@ -314,7 +320,7 @@ impl RingBuf {
         let total = align_up(RECORD_HDR_SIZE + payload_size, RECORD_ALIGN);
 
         if total > self.available_bytes() {
-            self.stats.reserve_failures += 1;
+            self.stats.reserve_failures = self.stats.reserve_failures.saturating_add(1);
             return Err(Error::OutOfMemory);
         }
 
@@ -328,28 +334,33 @@ impl RingBuf {
         {
             Some(idx) => idx,
             None => {
-                self.stats.reserve_failures += 1;
+                self.stats.reserve_failures = self.stats.reserve_failures.saturating_add(1);
                 return Err(Error::OutOfMemory);
             }
         };
 
+        // Full (unwrapped) producer position is the record's stable identity;
+        // the wrapped value is only used to address bytes in the data ring.
+        let seq = self.producer;
+        let wrapped = self.producer & RING_MASK;
+
         // Write busy header into data ring (marks reservation in-flight).
-        let offset = self.producer & RING_MASK;
         let hdr: u64 = ((payload_size as u64) & 0x3FFF_FFFF) | ((HDR_BUSY_BIT as u64) << 32);
-        write_u64_ring(&mut self.data, offset, hdr);
+        write_u64_ring(&mut self.data, wrapped, hdr);
 
         // Advance producer past header + payload region.
         self.producer = self.producer.wrapping_add(total);
 
-        // Fill record metadata.
+        // Fill record metadata. `offset` holds the unwrapped `seq` so that a
+        // later consumer match cannot alias a different wrapped slot.
         self.records[slot] = Record {
             data: [0u8; MAX_RECORD_PAYLOAD],
             len: payload_size,
             state: RecordState::Reserved,
-            offset,
+            offset: seq,
         };
         self.live_records += 1;
-        self.stats.reserved += 1;
+        self.stats.reserved = self.stats.reserved.saturating_add(1);
 
         Ok(RecordHandle::new(slot))
     }
@@ -381,20 +392,21 @@ impl RingBuf {
         if self.records[slot].state != RecordState::Reserved {
             return Err(Error::InvalidArgument);
         }
-        let offset = self.records[slot].offset;
+        // `offset` is the unwrapped position; wrap it to address the data ring.
+        let wrapped = self.records[slot].offset & RING_MASK;
         let len = self.records[slot].len;
         // Clear busy bit: write committed header (length only, no flags).
         let hdr: u64 = (len as u64) & 0x3FFF_FFFF;
-        write_u64_ring(&mut self.data, offset, hdr);
+        write_u64_ring(&mut self.data, wrapped, hdr);
 
         // Copy payload into the data ring immediately after the header.
-        let payload_start = (offset + RECORD_HDR_SIZE) & RING_MASK;
+        let payload_start = (wrapped + RECORD_HDR_SIZE) & RING_MASK;
         for i in 0..len {
             self.data[(payload_start + i) & RING_MASK] = self.records[slot].data[i];
         }
 
         self.records[slot].state = RecordState::Committed;
-        self.stats.committed += 1;
+        self.stats.committed = self.stats.committed.saturating_add(1);
         Ok(())
     }
 
@@ -406,13 +418,14 @@ impl RingBuf {
         if self.records[slot].state != RecordState::Reserved {
             return Err(Error::InvalidArgument);
         }
-        let offset = self.records[slot].offset;
+        // `offset` is the unwrapped position; wrap it to address the data ring.
+        let wrapped = self.records[slot].offset & RING_MASK;
         let len = self.records[slot].len;
         // Set discard bit in header.
         let hdr: u64 = ((len as u64) & 0x3FFF_FFFF) | ((HDR_DISCARD_BIT as u64) << 32);
-        write_u64_ring(&mut self.data, offset, hdr);
+        write_u64_ring(&mut self.data, wrapped, hdr);
         self.records[slot].state = RecordState::Discarded;
-        self.stats.discarded += 1;
+        self.stats.discarded = self.stats.discarded.saturating_add(1);
         Ok(())
     }
 
@@ -440,46 +453,60 @@ impl RingBuf {
     ///
     /// Returns [`Error::IoError`] if the ring data is structurally inconsistent.
     pub fn consume(&mut self) -> Result<Option<ConsumedRecord>> {
-        // Walk the full slot pool: freed slots leave holes anywhere in the
-        // table, so the search must span all of `records`, not a prefix. The
-        // state predicate naturally skips `Free`/`Reserved` slots.
-        // Find the first committed record whose offset matches the consumer pointer.
-        let consumer_offset = self.consumer & RING_MASK;
-        let pos = self
-            .records
-            .iter()
-            .position(|r| r.offset == consumer_offset && r.state == RecordState::Committed);
+        // Skip at most `MAX_RECORDS` discarded records before giving up. The
+        // pool can hold no more than `MAX_RECORDS` live entries, so this bound
+        // can never truncate a legitimate consume while it caps the loop (and
+        // replaces the previous unbounded recursion that risked ring-0 stack
+        // overflow).
+        for _ in 0..MAX_RECORDS {
+            // Walk the full slot pool: freed slots leave holes anywhere in the
+            // table, so the search must span all of `records`, not a prefix.
+            // The state predicate naturally skips `Free`/`Reserved` slots.
+            //
+            // SECURITY: match on the full (unwrapped) consumer position, never
+            // the `& RING_MASK` value. Records store their unwrapped
+            // reservation position in `offset`, so after a `RING_DATA_SIZE`
+            // wrap two live records cannot collide on a shared wrapped offset
+            // and be consumed out of order / aliased.
+            let consumer_pos = self.consumer;
+            let pos = self
+                .records
+                .iter()
+                .position(|r| r.offset == consumer_pos && r.state == RecordState::Committed);
 
-        if let Some(idx) = pos {
-            let len = self.records[idx].len;
-            let mut out = ConsumedRecord {
-                data: [0u8; MAX_RECORD_PAYLOAD],
-                len,
-            };
-            out.data[..len].copy_from_slice(&self.records[idx].data[..len]);
+            if let Some(idx) = pos {
+                let len = self.records[idx].len;
+                let mut out = ConsumedRecord {
+                    data: [0u8; MAX_RECORD_PAYLOAD],
+                    len,
+                };
+                out.data[..len].copy_from_slice(&self.records[idx].data[..len]);
 
-            // Advance consumer past this record.
-            let total = align_up(RECORD_HDR_SIZE + len, RECORD_ALIGN);
-            self.consumer = self.consumer.wrapping_add(total);
-            self.free_slot(idx);
-            self.stats.consumed += 1;
-            return Ok(Some(out));
-        }
+                // Advance consumer past this record.
+                let total = align_up(RECORD_HDR_SIZE + len, RECORD_ALIGN);
+                self.consumer = self.consumer.wrapping_add(total);
+                self.free_slot(idx);
+                self.stats.consumed = self.stats.consumed.saturating_add(1);
+                return Ok(Some(out));
+            }
 
-        // Check for discarded records at the consumer position so we can
-        // advance past them.
-        let dis_pos = self
-            .records
-            .iter()
-            .position(|r| r.offset == consumer_offset && r.state == RecordState::Discarded);
+            // Check for a discarded record at the consumer position so we can
+            // advance past it, then loop to look for the next committed one.
+            let dis_pos = self
+                .records
+                .iter()
+                .position(|r| r.offset == consumer_pos && r.state == RecordState::Discarded);
 
-        if let Some(idx) = dis_pos {
-            let len = self.records[idx].len;
-            let total = align_up(RECORD_HDR_SIZE + len, RECORD_ALIGN);
-            self.consumer = self.consumer.wrapping_add(total);
-            self.free_slot(idx);
-            // Recursively consume the next record (tail-call style loop).
-            return self.consume();
+            match dis_pos {
+                Some(idx) => {
+                    let len = self.records[idx].len;
+                    let total = align_up(RECORD_HDR_SIZE + len, RECORD_ALIGN);
+                    self.consumer = self.consumer.wrapping_add(total);
+                    self.free_slot(idx);
+                    // Continue the loop to consume the next record.
+                }
+                None => return Ok(None),
+            }
         }
 
         Ok(None)
@@ -647,7 +674,9 @@ impl RingBufRegistry {
         desc.name[..copy_len].copy_from_slice(&name[..copy_len]);
         desc.name_len = copy_len;
         self.descs[idx] = desc;
-        self.next_fd += 1;
+        // Monotonic across create/destroy cycles; saturate rather than panic
+        // on `u32` exhaustion under overflow-checks.
+        self.next_fd = self.next_fd.saturating_add(1);
         self.count += 1;
         Ok(desc.fd)
     }
@@ -833,5 +862,39 @@ mod tests {
         assert_eq!(align_up(1, 8), 8);
         assert_eq!(align_up(8, 8), 8);
         assert_eq!(align_up(9, 8), 16);
+    }
+
+    #[test]
+    fn consume_survives_full_wrap_without_aliasing() {
+        // Produce/consume enough bytes to wrap the data ring more than once.
+        // With wrapped-offset matching, a record after the wrap could alias an
+        // earlier record sharing the same `& RING_MASK` offset; with full
+        // (unwrapped) position matching it must always return payloads in
+        // order and never panic in ring 0.
+        let mut rb = RingBuf::new(b"wrap");
+        // Each record consumes align_up(8 + 64) = 72 bytes; iterate well past
+        // RING_DATA_SIZE / 72 so the producer position wraps multiple times.
+        let iters = (RING_DATA_SIZE / 64) * 3;
+        for i in 0..iters {
+            let h = rb.reserve(64).expect("reserve 64");
+            let tag = (i as u32).to_le_bytes();
+            let mut payload = [0u8; 64];
+            payload[..4].copy_from_slice(&tag);
+            rb.write_payload(h.slot, &payload).expect("write");
+            h.commit(&mut rb).expect("commit");
+            let rec = rb.consume().expect("consume Ok").expect("Some record");
+            // The payload tag must match the iteration that produced it,
+            // proving no aliasing across the wrap boundary.
+            assert_eq!(&rec.payload()[..4], &tag);
+            assert_eq!(rb.live_records(), 0);
+        }
+        // Producer has wrapped past RING_DATA_SIZE at least once.
+        assert!(rb.producer_pos() > RING_DATA_SIZE);
+    }
+
+    #[test]
+    fn consume_empty_returns_none_not_panic() {
+        let mut rb = RingBuf::new(b"empty");
+        assert!(rb.consume().expect("consume Ok").is_none());
     }
 }

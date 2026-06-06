@@ -691,6 +691,10 @@ struct RingBufEntry {
     data: [u8; MAX_VALUE_SIZE],
     /// Actual length of data in this entry.
     len: usize,
+    /// Whether this slot currently holds a live reservation (set by
+    /// `reserve`, cleared on consume). A `submit` is only valid against a
+    /// reserved-but-not-yet-committed slot.
+    reserved: bool,
     /// Whether this slot has been submitted (ready to consume).
     committed: bool,
 }
@@ -700,6 +704,7 @@ impl Default for RingBufEntry {
         Self {
             data: [0u8; MAX_VALUE_SIZE],
             len: 0,
+            reserved: false,
             committed: false,
         }
     }
@@ -760,15 +765,23 @@ impl BpfRingBuf {
     pub fn reserve(&mut self) -> usize {
         let slot = self.head;
 
-        // If the buffer is full, advance the tail to overwrite
-        // the oldest entry.
+        // If the buffer is full, advance the tail to overwrite the oldest
+        // entry. The overwritten slot is dropped, so clear its committed flag
+        // and only decrement `pending` if it actually held a committed entry
+        // (a reserved-but-uncommitted slot was never counted in `pending`).
         if self.pending >= self.capacity {
+            let evicted = self.tail;
+            if self.entries[evicted].committed {
+                self.pending = self.pending.saturating_sub(1);
+            }
+            self.entries[evicted].committed = false;
+            self.entries[evicted].reserved = false;
             self.tail = (self.tail + 1) % self.capacity;
-            self.pending = self.pending.saturating_sub(1);
         }
 
-        // Clear the slot for the new reservation.
+        // Clear the slot and mark it as holding a live reservation.
         self.entries[slot].committed = false;
+        self.entries[slot].reserved = true;
         self.entries[slot].len = 0;
 
         self.head = (self.head + 1) % self.capacity;
@@ -777,22 +790,37 @@ impl BpfRingBuf {
 
     /// Submit data to a previously reserved slot.
     ///
+    /// The slot must currently hold a live reservation from [`reserve`]
+    /// (Self::reserve) that has not already been submitted. This prevents a
+    /// double-submit or a submit against a stale/never-reserved slot from
+    /// inflating the `pending` counter (which would later be read as
+    /// available entries that do not exist).
+    ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] if `slot` is out of bounds
-    ///   or `data` exceeds `value_size`.
+    /// - [`Error::InvalidArgument`] if `slot` is out of bounds or `data`
+    ///   exceeds `value_size`.
+    /// - [`Error::InvalidArgument`] if the slot was not reserved or has
+    ///   already been committed.
     pub fn submit(&mut self, slot: usize, data: &[u8]) -> Result<()> {
         if slot >= self.capacity {
             return Err(Error::InvalidArgument);
         }
-        let len = data.len().min(self.value_size);
         if data.len() > self.value_size {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: fail closed unless the slot is reserved and not yet
+        // committed. Without this, a repeated or forged `submit` would push
+        // `pending` above the true number of committed entries and let
+        // `consume` hand out stale / uninitialized slots.
+        if !self.entries[slot].reserved || self.entries[slot].committed {
+            return Err(Error::InvalidArgument);
+        }
+        let len = data.len().min(self.value_size);
         self.entries[slot].data[..len].copy_from_slice(&data[..len]);
         self.entries[slot].len = len;
         self.entries[slot].committed = true;
-        self.pending += 1;
+        self.pending = self.pending.saturating_add(1);
         Ok(())
     }
 
@@ -816,7 +844,10 @@ impl BpfRingBuf {
         }
 
         let len = self.entries[idx].len;
+        // Clear both flags: the slot is now consumed and must be re-reserved
+        // before it can be submitted again.
         self.entries[idx].committed = false;
+        self.entries[idx].reserved = false;
         self.tail = (self.tail + 1) % self.capacity;
         self.pending = self.pending.saturating_sub(1);
         Ok(&self.entries[idx].data[..len])
@@ -1195,5 +1226,68 @@ impl BpfMapRegistry {
     /// Return whether the registry is empty.
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ringbuf_reserve_submit_consume_roundtrip() {
+        let mut rb = BpfRingBuf::new(8, 4).expect("new ringbuf");
+        let slot = rb.reserve();
+        assert_eq!(rb.submit(slot, b"abcd"), Ok(()));
+        assert_eq!(rb.pending_count(), 1);
+        assert_eq!(rb.consume().expect("consume"), b"abcd");
+        assert_eq!(rb.pending_count(), 0);
+    }
+
+    #[test]
+    fn ringbuf_double_submit_rejected_and_pending_stable() {
+        let mut rb = BpfRingBuf::new(8, 4).expect("new ringbuf");
+        let slot = rb.reserve();
+        assert!(rb.submit(slot, b"one").is_ok());
+        assert_eq!(rb.pending_count(), 1);
+        // Second submit to the same (now committed) slot must fail and must
+        // NOT inflate the pending counter.
+        assert_eq!(rb.submit(slot, b"two"), Err(Error::InvalidArgument));
+        assert_eq!(rb.pending_count(), 1);
+    }
+
+    #[test]
+    fn ringbuf_submit_unreserved_slot_rejected() {
+        let mut rb = BpfRingBuf::new(8, 4).expect("new ringbuf");
+        // Never reserved: a forged submit against slot 2 must fail closed.
+        assert_eq!(rb.submit(2, b"x"), Err(Error::InvalidArgument));
+        assert_eq!(rb.pending_count(), 0);
+    }
+
+    #[test]
+    fn ringbuf_submit_after_consume_rejected() {
+        let mut rb = BpfRingBuf::new(8, 4).expect("new ringbuf");
+        let slot = rb.reserve();
+        rb.submit(slot, b"data").expect("submit");
+        rb.consume().expect("consume");
+        // The slot was consumed; re-submitting without re-reserving must fail
+        // and leave pending at zero (no phantom entry).
+        assert_eq!(rb.submit(slot, b"again"), Err(Error::InvalidArgument));
+        assert_eq!(rb.pending_count(), 0);
+    }
+
+    #[test]
+    fn ringbuf_submit_oversized_rejected() {
+        let mut rb = BpfRingBuf::new(4, 4).expect("new ringbuf");
+        let slot = rb.reserve();
+        assert_eq!(rb.submit(slot, b"toolong"), Err(Error::InvalidArgument));
+        assert_eq!(rb.pending_count(), 0);
+    }
+
+    #[test]
+    fn ringbuf_new_rejects_zero_params() {
+        assert!(BpfRingBuf::new(0, 4).is_err());
+        assert!(BpfRingBuf::new(8, 0).is_err());
     }
 }

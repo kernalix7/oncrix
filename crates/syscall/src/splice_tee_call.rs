@@ -60,6 +60,13 @@ use oncrix_lib::{Error, Result};
 /// Maximum number of page slots in a pipe buffer.
 pub const PIPE_MAX_PAGES: usize = 16;
 
+/// Hard upper limit on a page ref_count.
+///
+/// A single page can be shared by at most this many concurrent tee consumers.
+/// `saturating_add` clamps at this value; reaching it causes the tee to return
+/// [`Error::WouldBlock`] on the next attempt.
+pub const PAGE_REF_COUNT_MAX: u32 = u32::MAX;
+
 /// Size of a single page (4 KiB, standard x86_64).
 pub const PAGE_SIZE: usize = 4096;
 
@@ -567,24 +574,32 @@ pub fn move_pages(
             break;
         }
 
-        let bytes = src_slot.bytes_used.min(remaining);
+        let slot_bytes = src_slot.bytes_used;
         let pfn = src_slot.pfn;
 
+        // Only move whole slots.  A partial-slot move would release the slot
+        // but under-account src.total_bytes, permanently wedging free_bytes().
+        // SECURITY: refuse to split a slot — stop the loop instead.
+        if slot_bytes > remaining {
+            break;
+        }
+
         // Move the page reference to destination.
-        dst.pages[dst.head] = PageSlot::filled(bytes, pfn);
+        dst.pages[dst.head] = PageSlot::filled(slot_bytes, pfn);
         dst.head = (dst.head + 1) % PIPE_MAX_PAGES;
         dst.filled_count += 1;
-        dst.total_bytes += bytes;
+        dst.total_bytes += slot_bytes;
 
-        // Release from source.
+        // Release from source, subtracting the full slot size so that
+        // total_bytes stays consistent with what was actually freed.
         src.pages[src.tail].release();
         src.filled_count -= 1;
-        src.total_bytes -= bytes;
+        src.total_bytes = src.total_bytes.saturating_sub(slot_bytes);
         src.tail = (src.tail + 1) % PIPE_MAX_PAGES;
 
-        moved += bytes;
-        remaining -= bytes;
-        stats.page_moves += 1;
+        moved += slot_bytes;
+        remaining -= slot_bytes;
+        stats.page_moves = stats.page_moves.saturating_add(1);
     }
 
     Ok(moved)
@@ -640,20 +655,23 @@ pub fn copy_pages(
         let pfn = src_slot.pfn;
 
         // Copy page reference to destination (bump ref count on source).
+        // SECURITY: use saturating_add — a tee() loop driven by untrusted
+        // user-space could otherwise overflow ref_count (u32) and trigger a
+        // ring-0 panic under overflow-checks=on (dev/test profile).
         dst.pages[dst.head] = PageSlot::filled(bytes, pfn);
-        dst.pages[dst.head].ref_count = src_slot.ref_count + 1;
+        dst.pages[dst.head].ref_count = src_slot.ref_count.saturating_add(1);
         dst.head = (dst.head + 1) % PIPE_MAX_PAGES;
         dst.filled_count += 1;
         dst.total_bytes += bytes;
 
-        // Increment ref count on source page.
-        src.pages[read_idx].ref_count += 1;
+        // Increment ref count on source page (saturating for the same reason).
+        src.pages[read_idx].ref_count = src.pages[read_idx].ref_count.saturating_add(1);
 
         copied += bytes;
         remaining -= bytes;
         read_idx = (read_idx + 1) % PIPE_MAX_PAGES;
         slots_checked += 1;
-        stats.page_copies += 1;
+        stats.page_copies = stats.page_copies.saturating_add(1);
     }
 
     Ok(copied)
@@ -690,7 +708,7 @@ pub fn sys_splice(
     info: &SpliceInfo,
     stats: &mut SpliceStats,
 ) -> Result<usize> {
-    stats.splice_calls += 1;
+    stats.splice_calls = stats.splice_calls.saturating_add(1);
 
     validate_len(info.len)?;
     validate_distinct_fds(info.fd_in, info.fd_out)?;
@@ -711,7 +729,7 @@ pub fn sys_splice(
         pipe.push(info.len, 0x1000)?
     };
 
-    stats.splice_bytes += transferred as u64;
+    stats.splice_bytes = stats.splice_bytes.saturating_add(transferred as u64);
     Ok(transferred)
 }
 
@@ -750,7 +768,7 @@ pub fn sys_tee(
     state: &mut TeeState,
     stats: &mut SpliceStats,
 ) -> Result<usize> {
-    stats.tee_calls += 1;
+    stats.tee_calls = stats.tee_calls.saturating_add(1);
 
     let _flags = SpliceFlags::from_raw(flags)?;
     validate_len(len)?;
@@ -760,7 +778,7 @@ pub fn sys_tee(
 
     state.bytes_teed += copied;
     state.pages_shared += 1;
-    stats.tee_bytes += copied as u64;
+    stats.tee_bytes = stats.tee_bytes.saturating_add(copied as u64);
 
     Ok(copied)
 }
@@ -802,7 +820,7 @@ pub fn sys_vmsplice(
     into_pipe: bool,
     stats: &mut SpliceStats,
 ) -> Result<usize> {
-    stats.vmsplice_calls += 1;
+    stats.vmsplice_calls = stats.vmsplice_calls.saturating_add(1);
 
     let _flags = SpliceFlags::from_raw(flags)?;
 
@@ -848,7 +866,7 @@ pub fn sys_vmsplice(
         pipe.pop(total_len)?
     };
 
-    stats.vmsplice_bytes += transferred as u64;
+    stats.vmsplice_bytes = stats.vmsplice_bytes.saturating_add(transferred as u64);
     Ok(transferred)
 }
 
@@ -1040,6 +1058,25 @@ mod tests {
         );
     }
 
+    /// Verify the partial-slot-split guard: when `max_bytes` is smaller than
+    /// the first slot's `bytes_used`, `move_pages` must stop without splitting
+    /// the slot and without corrupting `src.total_bytes`.
+    #[test]
+    fn move_pages_no_partial_slot_split() {
+        // One full 4096-byte slot; only 1024 bytes requested.
+        let mut src = filled_pipe(3, PAGE_SIZE);
+        let mut dst = make_pipe(4);
+        let mut stats = SpliceStats::new();
+
+        // The slot (4096 bytes) is larger than max_bytes (1024), so the loop
+        // must break immediately without moving anything.
+        let moved = move_pages(&mut src, &mut dst, 1024, &mut stats).unwrap();
+        assert_eq!(moved, 0);
+        // src accounting must remain consistent — no bytes should be lost.
+        assert_eq!(src.total_bytes(), PAGE_SIZE);
+        assert_eq!(dst.total_bytes(), 0);
+    }
+
     #[test]
     fn move_pages_closed_pipe_interrupted() {
         let mut src = filled_pipe(3, 4096);
@@ -1091,6 +1128,22 @@ mod tests {
 
         // Source page ref_count should be incremented.
         assert!(src.pages[src.tail].ref_count >= 2);
+    }
+
+    /// Verify that ref_count saturates rather than wrapping/panicking when a
+    /// tee() loop bumps it repeatedly.
+    #[test]
+    fn copy_pages_ref_count_saturates() {
+        let mut src = filled_pipe(3, PAGE_SIZE);
+        // Pre-set ref_count to near-max so one more bump would overflow.
+        src.pages[src.tail].ref_count = u32::MAX;
+        let mut dst = make_pipe(4);
+        let mut stats = SpliceStats::new();
+
+        // Must not panic — saturating_add keeps both counts at u32::MAX.
+        copy_pages(&mut src, &mut dst, PAGE_SIZE, &mut stats).unwrap();
+        assert_eq!(src.pages[src.tail].ref_count, u32::MAX);
+        assert_eq!(dst.pages[dst.tail].ref_count, u32::MAX);
     }
 
     // --- sys_splice ---

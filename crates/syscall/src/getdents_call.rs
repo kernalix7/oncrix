@@ -60,6 +60,14 @@ pub const DT_SOCK: u8 = 12;
 /// Minimum size of a `linux_dirent64` record (fixed fields + 1-byte name + NUL).
 pub const DIRENT64_MIN_RECLEN: usize = 8 + 8 + 2 + 1 + 1 + 1; // ~21 bytes
 
+/// Maximum caller-supplied buffer size for `getdents64`.
+///
+/// An unbounded `buf_size` from user space could trigger OOB access or
+/// excessive allocation at the VFS integration layer.  1 MiB matches the cap
+/// used in `getdents_ext.rs` and is the practical upper bound for a single
+/// directory-read batch.
+pub const MAX_GETDENTS_BUF: usize = 1 << 20; // 1 MiB
+
 /// Maximum directory entry name length.
 pub const NAME_MAX: usize = 255;
 
@@ -286,6 +294,11 @@ pub fn do_getdents64(
     if buf_size < DIRENT64_MIN_RECLEN {
         return Err(Error::InvalidArgument);
     }
+    // SECURITY: reject a huge buf_size supplied by user space — an unbounded
+    // value could drive OOB access or excessive allocation at the VFS layer.
+    if buf_size > MAX_GETDENTS_BUF {
+        return Err(Error::InvalidArgument);
+    }
 
     if dir.pos >= dir.entry_count {
         return Ok((0, alloc::vec::Vec::new()));
@@ -369,6 +382,18 @@ mod tests {
         let mut t = DirFdTable::new();
         t.insert(make_dir(3)).unwrap();
         assert_eq!(do_getdents64(&mut t, 3, 5), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn getdents64_buffer_too_large() {
+        // A buf_size above MAX_GETDENTS_BUF supplied by an attacker must be
+        // rejected; an unbounded value would stress the VFS layer.
+        let mut t = DirFdTable::new();
+        t.insert(make_dir(3)).unwrap();
+        assert_eq!(
+            do_getdents64(&mut t, 3, MAX_GETDENTS_BUF + 1),
+            Err(Error::InvalidArgument)
+        );
     }
 
     #[test]

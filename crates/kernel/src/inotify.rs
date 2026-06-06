@@ -287,7 +287,13 @@ impl InotifyInstance {
         for watch in &mut self.watches {
             if !watch.active {
                 let wd = self.next_wd;
-                self.next_wd = self.next_wd.saturating_add(1);
+                // SECURITY: never wrap or silently clamp next_wd.
+                // saturating_add would stall at i32::MAX and silently
+                // return the same wd on every subsequent call, causing
+                // rm_watch to remove the wrong (newer) watch.
+                // checked_add returns None on overflow; treat as
+                // resource exhaustion.
+                self.next_wd = self.next_wd.checked_add(1).ok_or(Error::OutOfMemory)?;
                 let combined = if oneshot {
                     event_bits | IN_ONESHOT
                 } else {

@@ -75,6 +75,13 @@ pub const MAX_FILE_DESCRIPTORS: usize = 64;
 /// Maximum file size supported by the stub.
 pub const MAX_FILE_SIZE: u64 = 1 << 40; // 1 TiB
 
+/// Maximum number of bytes transferred in a single `copy_file_range` call.
+///
+/// Mirrors Linux's `MAX_RW_COUNT` (2 GiB − page size).  Capping the
+/// attacker-supplied `len` here prevents unbounded ring-0 loops and
+/// overflow in offset arithmetic.
+pub const MAX_RW_COUNT: u64 = (2u64 * 1024 * 1024 * 1024) - 4096; // 2 GiB − 4 KiB
+
 /// A stub representation of an open file descriptor.
 #[derive(Debug, Clone, Copy)]
 pub struct FileDescriptor {
@@ -251,8 +258,9 @@ impl CopyRange {
         off_out: Option<u64>,
         len: u64,
     ) -> Result<Self> {
-        // Validate length.
-        if len == 0 || len > MAX_FILE_SIZE {
+        // Validate length: zero is rejected; cap at MAX_RW_COUNT to prevent
+        // ring-0 overflow in offset arithmetic and unbounded copy loops.
+        if len == 0 || len > MAX_RW_COUNT {
             return Err(Error::InvalidArgument);
         }
 
@@ -271,7 +279,12 @@ impl CopyRange {
             return Err(Error::IoError);
         }
 
-        // Resolve offsets.
+        // Resolve offsets.  For explicit offsets the caller value is
+        // validated against MAX_FILE_SIZE.  For implicit offsets we use the
+        // fd's current position, but we must still confirm that
+        // position + len does not overflow u64 or exceed MAX_FILE_SIZE,
+        // because position is an attacker-influenced value stored in the fd
+        // table from a prior write/seek.
         let (src_off, src_explicit) = match off_in {
             Some(o) => {
                 if o >= MAX_FILE_SIZE {
@@ -279,7 +292,14 @@ impl CopyRange {
                 }
                 (o, true)
             }
-            None => (in_desc.position, false),
+            None => {
+                let pos = in_desc.position;
+                // Guard: pos + len must not overflow and must be <= MAX_FILE_SIZE.
+                if pos.checked_add(len).map_or(true, |end| end > MAX_FILE_SIZE) {
+                    return Err(Error::InvalidArgument);
+                }
+                (pos, false)
+            }
         };
 
         let (dst_off, dst_explicit) = match off_out {
@@ -289,7 +309,14 @@ impl CopyRange {
                 }
                 (o, true)
             }
-            None => (out_desc.position, false),
+            None => {
+                let pos = out_desc.position;
+                // Guard: pos + len must not overflow and must be <= MAX_FILE_SIZE.
+                if pos.checked_add(len).map_or(true, |end| end > MAX_FILE_SIZE) {
+                    return Err(Error::InvalidArgument);
+                }
+                (pos, false)
+            }
         };
 
         // Same-file overlap check.
@@ -398,16 +425,30 @@ fn do_copy_file_range_validated(table: &mut FdTable, range: &CopyRange) -> Resul
     // In a real kernel: vfs_copy_file_range() -> on-disk reflink
     // or page-cache copy. Stub: just update positions/sizes.
 
-    // Update fd_in position if offset was implicit.
-    let new_off_in = range.off_in + bytes_to_copy;
+    // Validate BOTH new offsets before mutating any descriptor, so a
+    // failure on the destination check cannot leave the source position
+    // half-advanced (non-atomic partial update).  Use checked_add:
+    // off_{in,out} + bytes_to_copy must not overflow u64 or exceed
+    // MAX_FILE_SIZE.  Both were validated in CopyRange::from_raw, but
+    // bytes_to_copy is derived from the source file's size so we guard
+    // defensively here.
+    let new_off_in = range
+        .off_in
+        .checked_add(bytes_to_copy)
+        .filter(|&end| end <= MAX_FILE_SIZE)
+        .ok_or(Error::InvalidArgument)?;
+    let new_off_out = range
+        .off_out
+        .checked_add(bytes_to_copy)
+        .filter(|&end| end <= MAX_FILE_SIZE)
+        .ok_or(Error::InvalidArgument)?;
+
+    // Both validated — now apply the position/size updates.
     if !range.off_in_explicit {
         if let Some(desc) = table.find_mut(range.fd_in) {
             desc.position = new_off_in;
         }
     }
-
-    // Update fd_out position / size.
-    let new_off_out = range.off_out + bytes_to_copy;
     if let Some(desc) = table.find_mut(range.fd_out) {
         if new_off_out > desc.size {
             desc.size = new_off_out;
@@ -535,6 +576,11 @@ pub fn copy_file_range_batched(
         return Err(Error::InvalidArgument);
     }
 
+    // Cap the attacker-supplied total_len to MAX_RW_COUNT before entering the
+    // loop.  Without this cap, a u64::MAX value would spin the loop for
+    // ~4 billion iterations in ring 0, constituting a kernel DoS.
+    let total_len = total_len.min(MAX_RW_COUNT);
+
     let mut remaining = total_len;
     let mut src_pos = off_in;
     let mut dst_pos = off_out;
@@ -545,10 +591,13 @@ pub fn copy_file_range_batched(
         let result =
             do_copy_file_range(table, fd_in, Some(src_pos), fd_out, Some(dst_pos), chunk, 0)?;
 
-        total_copied += result.bytes_copied;
+        // Guard accumulator: total_copied + bytes_copied must not overflow.
+        total_copied = total_copied
+            .checked_add(result.bytes_copied)
+            .ok_or(Error::InvalidArgument)?;
 
         if result.bytes_copied == 0 {
-            // Reached end of source.
+            // Reached end of source — no forward progress, stop now.
             break;
         }
 
@@ -902,5 +951,94 @@ mod tests {
         t.remove(1);
         assert_eq!(t.count(), 0);
         assert!(t.find(1).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Security regression tests — finding 1/2/3
+    // ------------------------------------------------------------------
+
+    /// Finding 1 / Finding 3: an implicit fd position near u64::MAX must be
+    /// rejected rather than overflowing the offset arithmetic.
+    #[test]
+    fn implicit_position_near_max_u64_rejected() {
+        let mut t = FdTable::new();
+        // fd 30: position just below u64::MAX — adding any len would overflow.
+        t.insert(FileDescriptor {
+            fd: 30,
+            caps: FILE_READABLE | FILE_REGULAR,
+            size: u64::MAX,
+            position: u64::MAX - 10,
+            fs_id: 1,
+            in_use: true,
+        })
+        .unwrap();
+        t.insert(FileDescriptor {
+            fd: 31,
+            caps: FILE_WRITABLE | FILE_REGULAR,
+            size: 0,
+            position: 0,
+            fs_id: 1,
+            in_use: true,
+        })
+        .unwrap();
+        // len=100 with position near u64::MAX must be rejected (overflow / > MAX_FILE_SIZE).
+        assert_eq!(
+            do_copy_file_range(&mut t, 30, None, 31, None, 100, 0),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    /// Finding 1: explicit offsets near u64::MAX with a large len must not
+    /// produce an overflowed new_off_in / new_off_out.
+    #[test]
+    fn explicit_offset_overflow_rejected() {
+        let mut t = FdTable::new();
+        // off_in = MAX_FILE_SIZE - 1 is accepted, but off_in + len > MAX_FILE_SIZE.
+        let big_off = MAX_FILE_SIZE - 1;
+        t.insert(FileDescriptor {
+            fd: 32,
+            caps: FILE_READABLE | FILE_REGULAR,
+            size: MAX_FILE_SIZE,
+            position: 0,
+            fs_id: 1,
+            in_use: true,
+        })
+        .unwrap();
+        t.insert(FileDescriptor {
+            fd: 33,
+            caps: FILE_WRITABLE | FILE_REGULAR,
+            size: 0,
+            position: 0,
+            fs_id: 1,
+            in_use: true,
+        })
+        .unwrap();
+        // off_in is just below the file-size limit; len=512 pushes the end past
+        // MAX_FILE_SIZE, so the validated copy will read 1 byte available and
+        // then new_off_in = big_off + 1 which is exactly MAX_FILE_SIZE — that
+        // should be accepted (end == MAX_FILE_SIZE is allowed).
+        let r = do_copy_file_range(&mut t, 32, Some(big_off), 33, Some(0), 512, 0).unwrap();
+        assert_eq!(r.bytes_copied, 1);
+        assert_eq!(r.new_off_in, MAX_FILE_SIZE);
+    }
+
+    /// Finding 2: len above MAX_RW_COUNT is rejected by do_copy_file_range.
+    #[test]
+    fn len_above_max_rw_count_rejected() {
+        let mut t = make_table();
+        assert_eq!(
+            do_copy_file_range(&mut t, 3, Some(0), 4, Some(0), MAX_RW_COUNT + 1, 0),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    /// Finding 2: batched copy with u64::MAX total_len is clamped to MAX_RW_COUNT
+    /// and terminates (not an infinite loop); source EOF is reached normally.
+    #[test]
+    fn batched_copy_huge_len_clamped_and_terminates() {
+        let mut t = make_table();
+        // Source has 4096 bytes; asking for u64::MAX must be clamped and stop at EOF.
+        let total = copy_file_range_batched(&mut t, 3, 0, 4, 0, u64::MAX).unwrap();
+        assert_eq!(total, 4096);
     }
 }
