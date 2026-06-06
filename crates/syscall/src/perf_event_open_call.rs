@@ -54,6 +54,15 @@ const PERF_TYPE_BREAKPOINT: u32 = 5;
 const PERF_COUNT_HW_MAX: u64 = 10;
 const PERF_COUNT_SW_MAX: u64 = 9;
 
+/// Maximum perf ring-buffer size in pages (1 control + `2^n` data pages).
+/// Caps an attacker-requested mmap so `pages * PAGE_SIZE` stays bounded
+/// (here 1 + 2^16 = 65537 pages ≈ 256 MiB of data).
+const MAX_MMAP_PAGES: u32 = 1 + (1 << 16);
+
+/// Maximum frequency-based sampling rate (Hz). An unbounded `sample_freq`
+/// would let an unprivileged event request an interrupt storm (DoS).
+const MAX_SAMPLE_FREQ: u64 = 100_000;
+
 const PERF_SAMPLE_IP: u64 = 1 << 0;
 const PERF_SAMPLE_TID: u64 = 1 << 1;
 const PERF_SAMPLE_TIME: u64 = 1 << 2;
@@ -521,7 +530,10 @@ impl PerfConfig {
         frequency: u64,
         sample_type: SampleType,
     ) -> Result<Self> {
-        if frequency == 0 {
+        // Bound the requested rate: zero is invalid and an unbounded
+        // frequency would let an unprivileged event drive an interrupt
+        // storm (DoS).
+        if frequency == 0 || frequency > MAX_SAMPLE_FREQ {
             return Err(Error::InvalidArgument);
         }
         Ok(Self {
@@ -713,8 +725,18 @@ impl PerfEventAttrExt {
     ///
     /// Returns `InvalidArgument` if `mmap_pages` is not a power of 2.
     pub fn from_config(config: &PerfConfig, mmap_pages: u32) -> Result<Self> {
-        if mmap_pages != 0 && (mmap_pages & (mmap_pages - 1)) != 0 {
-            return Err(Error::InvalidArgument);
+        // A perf ring buffer is one control page plus a power-of-two
+        // number of data pages, i.e. `mmap_pages == 1 + 2^n`. A bare
+        // power-of-two check accepted an off-by-one layout; also cap the
+        // total so `pages * PAGE_SIZE` cannot overflow.
+        if mmap_pages != 0 {
+            let data_pages = mmap_pages - 1;
+            if mmap_pages > MAX_MMAP_PAGES
+                || data_pages == 0
+                || (data_pages & (data_pages - 1)) != 0
+            {
+                return Err(Error::InvalidArgument);
+            }
         }
         let attr = config.to_attr();
         let sample_record_size = config.sample_type.record_size();
