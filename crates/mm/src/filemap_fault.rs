@@ -158,8 +158,12 @@ pub struct FilemapFaultContext {
     pub vma_start: u64,
     /// VMA end address.
     pub vma_end: u64,
-    /// Page offset within the file (in pages).
+    /// File page offset of the VMA's first page (`vm_pgoff`).
+    pub vma_pgoff: u64,
+    /// Page offset within the file (in pages), absolute.
     pub pgoff: u64,
+    /// Number of pages backing the file, `ceil(i_size / PAGE_SIZE)`.
+    pub file_pages: u64,
     /// Faulting virtual address.
     pub address: u64,
     /// Fault flags.
@@ -168,22 +172,39 @@ pub struct FilemapFaultContext {
 
 impl FilemapFaultContext {
     /// Creates a new fault context.
+    ///
+    /// `vma_pgoff` is the file page offset of `vma_start` (the VMA's
+    /// `vm_pgoff`); `i_size` is the backing file size in bytes. The
+    /// absolute file page offset is computed as
+    /// `vma_pgoff + (address - vma_start) / PAGE_SIZE` using checked
+    /// arithmetic so an attacker-influenced VMA offset cannot wrap and
+    /// alias a low file region. The resulting offset is range-checked
+    /// against EOF by [`FilemapFaultHandler::filemap_fault`].
     pub fn new(
         file_id: u64,
         vma_start: u64,
         vma_end: u64,
+        vma_pgoff: u64,
+        i_size: u64,
         address: u64,
         flags: FaultFlags,
     ) -> Result<Self> {
         if address < vma_start || address >= vma_end {
             return Err(Error::InvalidArgument);
         }
-        let pgoff = (address - vma_start) / PAGE_SIZE;
+        let vma_offset = (address - vma_start) / PAGE_SIZE;
+        let pgoff = vma_pgoff
+            .checked_add(vma_offset)
+            .ok_or(Error::InvalidArgument)?;
+        // ceil(i_size / PAGE_SIZE) without overflowing on a huge i_size.
+        let file_pages = i_size / PAGE_SIZE + u64::from(i_size % PAGE_SIZE != 0);
         Ok(Self {
             file_id,
             vma_start,
             vma_end,
+            vma_pgoff,
             pgoff,
+            file_pages,
             address,
             flags,
         })
@@ -345,6 +366,21 @@ impl FilemapFaultHandler {
     ) -> FilemapFaultResult {
         self.stats.total_faults += 1;
 
+        // Reject faults beyond EOF. A fault at or past the last file
+        // page must not read in or map a page (it would expose stale or
+        // out-of-bounds backing-store data); deliver SIGBUS instead, as
+        // Linux `filemap_fault` does when `index >= max_idx`.
+        if ctx.pgoff >= ctx.file_pages {
+            let ft = VmFaultType::empty().set(VmFaultType::SIGBUS);
+            self.log_fault(ctx, ft, timestamp_ns);
+            return FilemapFaultResult {
+                fault_type: ft,
+                pfn: 0,
+                around_pages: 0,
+                readahead_pages: 0,
+            };
+        }
+
         // Look up in local cache.
         let cached = self.find_cached(ctx.file_id, ctx.pgoff);
 
@@ -403,13 +439,21 @@ impl FilemapFaultHandler {
     }
 
     /// Maps pages around the fault (speculative mapping).
+    ///
+    /// Speculation is bounded by both the VMA extent and the file size
+    /// (EOF): mapping a neighbour past either bound would map memory the
+    /// faulting process has no right to, or read past end-of-file.
     fn filemap_map_pages(&mut self, ctx: &FilemapFaultContext) -> usize {
         let mut mapped = 0;
-        let vma_pages = (ctx.vma_end - ctx.vma_start) / PAGE_SIZE;
+        let limit = Self::speculation_limit(ctx);
 
         for offset in 1..=MAX_AROUND_PAGES as u64 {
-            let pgoff = ctx.pgoff + offset;
-            if pgoff >= vma_pages {
+            // checked_add: stop rather than wrap a near-u64::MAX pgoff.
+            let pgoff = match ctx.pgoff.checked_add(offset) {
+                Some(p) => p,
+                None => break,
+            };
+            if pgoff >= limit {
                 break;
             }
             if self.find_cached(ctx.file_id, pgoff).is_some() {
@@ -421,14 +465,31 @@ impl FilemapFaultHandler {
         mapped
     }
 
+    /// Upper bound (exclusive, absolute file page offset) for around-fault
+    /// and readahead speculation: the smaller of the VMA's end-of-mapping
+    /// file offset and the file's EOF. Both are computed with `checked_add`
+    /// so a crafted `vma_pgoff` cannot wrap and widen the window.
+    fn speculation_limit(ctx: &FilemapFaultContext) -> u64 {
+        let vma_pages = (ctx.vma_end - ctx.vma_start) / PAGE_SIZE;
+        let vma_end_pgoff = ctx.vma_pgoff.checked_add(vma_pages).unwrap_or(u64::MAX);
+        vma_end_pgoff.min(ctx.file_pages)
+    }
+
     /// Triggers readahead for major faults.
+    ///
+    /// Readahead is bounded by both the VMA extent and EOF so it never
+    /// reads in a page outside the mapping or past end-of-file.
     fn trigger_readahead(&mut self, ctx: &FilemapFaultContext) -> usize {
         let mut pages = 0;
-        let vma_pages = (ctx.vma_end - ctx.vma_start) / PAGE_SIZE;
+        let limit = Self::speculation_limit(ctx);
 
         for offset in 1..=MAX_READAHEAD_PAGES as u64 {
-            let pgoff = ctx.pgoff + offset;
-            if pgoff >= vma_pages {
+            // checked_add: stop rather than wrap a near-u64::MAX pgoff.
+            let pgoff = match ctx.pgoff.checked_add(offset) {
+                Some(p) => p,
+                None => break,
+            };
+            if pgoff >= limit {
                 break;
             }
             if self.find_cached(ctx.file_id, pgoff).is_none() {

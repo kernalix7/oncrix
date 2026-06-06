@@ -17,6 +17,7 @@
 
 use crate::addr::{PAGE_SIZE, VirtAddr};
 use crate::frame::FrameAllocator;
+use crate::page_ref_count::PageRefTable;
 use crate::page_table::{PageTable, PageTableEntry, flags};
 use oncrix_lib::{Error, Result};
 
@@ -63,19 +64,38 @@ pub fn is_cow_fault(error_code: u64) -> bool {
 
 /// Handle a copy-on-write page fault.
 ///
+/// The faulting frame's reference count (tracked in `refs`, keyed by
+/// PFN) decides the outcome:
+///
+/// - **count == 1** — this mapping is the sole owner. No copy is made:
+///   the PTE is upgraded in place by setting `WRITABLE` and clearing
+///   `COW_BIT`, so subsequent writes no longer fault. This is the
+///   "reuse" path Linux takes when `page_mapcount() == 1`.
+/// - **count > 1** — the frame is still shared. A new frame is
+///   allocated, the contents are copied, and the PTE is repointed at
+///   the new frame (writable, no `COW_BIT`). The old frame's reference
+///   count is then dropped exactly once via [`PageRefTable::put_page`],
+///   and the new frame is registered with an initial count of 1.
+///
+/// Both paths leave the faulting mapping writable and never expose a
+/// still-shared frame as writable, so the contract is self-contained
+/// and no separate caller step is required.
+///
 /// # Arguments
 ///
 /// - `pml4`: the faulting process's root page table
 /// - `fault_addr`: the virtual address that caused the fault (CR2)
 /// - `error_code`: the x86_64 page fault error code
 /// - `allocator`: a frame allocator for the new page
+/// - `refs`: per-PFN reference counts for shared frames
 ///
 /// # Returns
 ///
-/// - `Ok(Resolved)` if the CoW copy was performed and the PTE updated
+/// - `Ok(Resolved)` if the CoW fault was handled and the PTE updated
 /// - `Ok(NotCow)` if this is not a CoW fault
 /// - `Ok(NotMapped)` if the address has no mapping
 /// - `Err(OutOfMemory)` if no frames are available
+/// - `Err(NotFound)` if the faulting frame is not tracked in `refs`
 ///
 /// # Safety
 ///
@@ -89,6 +109,7 @@ pub unsafe fn handle_cow_fault(
     fault_addr: u64,
     error_code: u64,
     allocator: &mut dyn FrameAllocator,
+    refs: &mut PageRefTable,
 ) -> Result<PageFaultAction> {
     // Only handle write protection violations.
     if !is_cow_fault(error_code) {
@@ -154,9 +175,37 @@ pub unsafe fn handle_cow_fault(
         return Ok(PageFaultAction::NotCow);
     }
 
-    // This is a CoW fault. Allocate a new frame.
-    let new_frame = allocator.allocate_frame().ok_or(Error::OutOfMemory)?;
+    // This is a CoW fault. Consult the reference count for the frame
+    // this mapping currently points at.
     let old_phys = pte.addr();
+    let old_pfn = old_phys.as_u64() / PAGE_SIZE as u64;
+    let shared = match refs.lookup(old_pfn) {
+        Some(page) => page.count() > 1,
+        None => return Err(Error::NotFound),
+    };
+
+    if !shared {
+        // Sole owner — reuse the frame in place. No new frame, no copy:
+        // just grant write access and drop the CoW marker so subsequent
+        // writes do not fault. The reference count is already 1, so
+        // nothing else maps this frame and it is safe to make writable.
+        let old_flags = pte.entry_flags();
+        let new_flags = (old_flags | flags::WRITABLE) & !COW_BIT;
+        pte.set_flags(new_flags);
+        return Ok(PageFaultAction::Resolved);
+    }
+
+    // Shared frame — allocate a private copy.
+    let new_frame = allocator.allocate_frame().ok_or(Error::OutOfMemory)?;
+    let new_pfn = new_frame.start_addr().as_u64() / PAGE_SIZE as u64;
+
+    // Register the new frame's refcount BEFORE mutating the PTE. If the
+    // table is full this fails cleanly with the old mapping intact and
+    // the freshly allocated frame returned to the allocator.
+    if let Err(e) = refs.register(new_pfn) {
+        allocator.deallocate_frame(new_frame);
+        return Err(e);
+    }
 
     // Copy the old page contents to the new frame.
     // SAFETY: Both old and new frame addresses point to valid 4 KiB
@@ -175,24 +224,11 @@ pub unsafe fn handle_cow_fault(
     let new_flags = (old_flags | flags::WRITABLE) & !COW_BIT;
     pte.set(new_frame.start_addr(), new_flags);
 
-    // Safety invariant: this handler ALWAYS copies. The faulting PTE is
-    // repointed at the freshly allocated `new_frame`; the shared frame
-    // `old_phys` is never made writable for this mapping. Therefore a
-    // still-shared page can never be handed out writable, even though
-    // this signature cannot reach the per-frame `PageRefPool` to learn
-    // whether `old_phys` is now privately owned.
-    //
-    // The caller is responsible for:
-    // 1. Flushing the TLB entry for this address.
-    // 2. Decrementing the CoW reference count for `old_phys` (the frame
-    //    this mapping no longer references). When that drop leaves the
-    //    refcount at 1, the caller should upgrade the sole remaining
-    //    mapping to writable (clearing COW_BIT) so it stops re-copying.
-    // 3. Initialising the new frame's refcount to 1.
-    //
-    // Because the refcount pool is not threaded through this signature,
-    // (2)/(3) live with the caller; conservatively always copying keeps
-    // this path memory-safe regardless.
+    // This mapping no longer references the old frame; drop its count
+    // exactly once. The lookup above proved it is present with count > 1,
+    // so this put cannot underflow and cannot free a frame still mapped
+    // elsewhere. The caller must still flush the TLB for `fault_addr`.
+    let _ = refs.put_page(old_pfn);
 
     Ok(PageFaultAction::Resolved)
 }

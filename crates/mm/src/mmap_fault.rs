@@ -339,6 +339,13 @@ impl MmapFaultHandler {
     }
 
     /// Handle a page fault.
+    ///
+    /// Classifies and records the fault. A resolvable classification
+    /// reports *which* handler should run; it does not allocate or map a
+    /// frame, so the result carries pfn 0. The PFN must come from the
+    /// component that owns the page tables and frame allocator after it
+    /// re-validates the fault against the VMA — deriving a PFN from the
+    /// fault address here would fabricate a frame identity.
     pub fn handle(&mut self, info: FaultInfo) -> FaultResult {
         // Log the fault.
         self.log[self.log_pos % MAX_FAULT_LOG] = info;
@@ -349,25 +356,46 @@ impl MmapFaultHandler {
         self.stats.record(fault_type);
 
         if fault_type.is_resolvable() {
-            let pfn = info.page_addr() / PAGE_SIZE;
-            FaultResult::resolved(fault_type, pfn)
+            // No frame is mapped at this layer; pfn 0 = "not yet mapped".
+            FaultResult::resolved(fault_type, 0)
         } else {
             FaultResult::signal(fault_type)
         }
     }
 
     /// Classify a fault based on its info.
+    ///
+    /// # Fail-closed without a VMA
+    ///
+    /// A correct classification requires the faulting VMA (to check
+    /// permissions and whether the mapping is private-writable) and the
+    /// PTE (to check the CoW marker). This dispatcher is not wired to a
+    /// VMA tree, so it cannot prove a fault is resolvable. Reporting an
+    /// unverified fault as resolvable would be exploitable: a write to a
+    /// genuinely read-only page would be mis-reported as a resolvable
+    /// CoW, and a fault outside any VMA as a resolvable anonymous fault.
+    ///
+    /// Therefore every fault on a *present* page (a protection violation)
+    /// is classified `PermissionViolation` — a non-resolvable signal —
+    /// regardless of read/write. Only a *not-present* fault is reported
+    /// as a resolvable `Anonymous` demand-zero candidate, and even that
+    /// must be re-validated against the VMA by whichever component owns
+    /// the page tables before a frame is mapped. The pfn returned by
+    /// [`MmapFaultHandler::handle`] for the not-present case is advisory
+    /// (the page-aligned fault index), never authoritative.
     fn classify(&self, info: &FaultInfo) -> FaultType {
         if info.fault_addr() == 0 {
             return FaultType::InvalidAddress;
         }
-        if info.not_present() {
-            return FaultType::Anonymous;
+        if !info.not_present() {
+            // Present page + fault = protection violation. Without VMA
+            // perms and the PTE CoW marker we cannot distinguish a real
+            // CoW from a write to a read-only page, so fail closed.
+            return FaultType::PermissionViolation;
         }
-        if info.is_write() {
-            return FaultType::CopyOnWrite;
-        }
-        FaultType::PermissionViolation
+        // Not-present fault: a demand-fill candidate, still subject to
+        // VMA validation by the page-table owner before mapping.
+        FaultType::Anonymous
     }
 
     /// Return the number of logged faults.
