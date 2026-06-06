@@ -180,8 +180,13 @@ impl BuddyBlock {
     }
 
     /// Returns the physical address of the first page.
+    ///
+    /// Uses `saturating_mul` so a high PFN (`pfn * PAGE_SIZE` past
+    /// `u64::MAX`) clamps instead of wrapping to a bogus low address or
+    /// overflow-panicking in ring 0. Zone-add validates PFNs against the
+    /// direct-map ceiling, so in practice this never saturates.
     pub const fn phys_addr(&self) -> u64 {
-        self.pfn * PAGE_SIZE
+        self.pfn.saturating_mul(PAGE_SIZE)
     }
 }
 
@@ -405,23 +410,47 @@ impl BuddyZone {
     }
 
     /// Initialises this zone with the given parameters.
-    pub fn init(&mut self, zone_type: BuddyZoneType, start_pfn: u64, total_pages: u64) {
+    ///
+    /// Rejects a degenerate (`total_pages == 0`) or overflowing
+    /// (`start_pfn + total_pages` wraps past `u64::MAX`) descriptor so a
+    /// malformed zone can never be installed. Without this, the unchecked
+    /// `start_pfn + total_pages` recomputed on every `contains_pfn`/
+    /// `end_pfn` lookup would overflow-panic in ring 0 on the first probe.
+    pub fn init(
+        &mut self,
+        zone_type: BuddyZoneType,
+        start_pfn: u64,
+        total_pages: u64,
+    ) -> Result<()> {
+        if total_pages == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Validate the end up front; `contains_pfn`/`end_pfn` then only ever
+        // see a non-overflowing range.
+        start_pfn
+            .checked_add(total_pages)
+            .ok_or(Error::InvalidArgument)?;
         self.zone_type = zone_type;
         self.start_pfn = start_pfn;
         self.total_pages = total_pages;
         self.free_pages = 0;
         self.watermarks = BuddyWatermarks::from_zone_pages(total_pages);
         self.active = true;
+        Ok(())
     }
 
     /// Returns the end PFN (exclusive) of this zone.
+    ///
+    /// Uses `saturating_add` so a lookup can never overflow-panic even if a
+    /// malformed range somehow bypassed the [`init`](Self::init) validation;
+    /// a saturated end merely clamps the zone, it cannot wrap.
     pub const fn end_pfn(&self) -> u64 {
-        self.start_pfn + self.total_pages
+        self.start_pfn.saturating_add(self.total_pages)
     }
 
     /// Returns whether `pfn` falls within this zone.
     pub const fn contains_pfn(&self, pfn: u64) -> bool {
-        pfn >= self.start_pfn && pfn < self.start_pfn + self.total_pages
+        pfn >= self.start_pfn && pfn < self.end_pfn()
     }
 
     /// Adds a free block of the given order at `pfn`.
@@ -772,7 +801,10 @@ impl BuddyAllocator {
             return Err(Error::OutOfMemory);
         }
         let idx = self.nr_zones;
-        self.zones[idx].init(zone_type, start_pfn, total_pages);
+        // Validate-then-install: only count the zone once `init` accepts the
+        // descriptor, so a rejected (zero/overflowing) range leaves
+        // `nr_zones` untouched and the slot inactive.
+        self.zones[idx].init(zone_type, start_pfn, total_pages)?;
         self.nr_zones += 1;
         Ok(idx)
     }
@@ -785,21 +817,46 @@ impl BuddyAllocator {
         if zone_idx >= self.nr_zones {
             return Err(Error::InvalidArgument);
         }
+        // `start_pfn`/`nr_pages` are untrusted u64. Reject an empty range and
+        // compute the end with `checked_add` so the sum cannot wrap past
+        // `u64::MAX` and overflow-panic in ring 0.
+        if nr_pages == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let end = start_pfn
+            .checked_add(nr_pages)
+            .ok_or(Error::InvalidArgument)?;
+        // Zone-containment: the whole range must lie inside this zone.
+        // `end_pfn` is the validated (`init`-checked) zone end. Without this,
+        // out-of-zone PFNs would be inserted into the free lists and later
+        // handed out as if they were real, allocator-owned frames.
+        let zone_start = self.zones[zone_idx].start_pfn;
+        let zone_end = self.zones[zone_idx].end_pfn();
+        if start_pfn < zone_start || end > zone_end {
+            return Err(Error::InvalidArgument);
+        }
         let mut pfn = start_pfn;
-        let end = start_pfn + nr_pages;
         while pfn < end {
             // Find the largest order that aligns at this PFN and fits.
             let mut order = 0;
             while order < MAX_ORDER {
                 let next_order = order + 1;
                 let block_pages = 1u64 << next_order;
-                if pfn % block_pages != 0 || pfn + block_pages > end {
+                // `pfn + block_pages` is bounded by `end <= zone_end`, but use
+                // a checked add so a future change cannot reintroduce a wrap.
+                let block_end = match pfn.checked_add(block_pages) {
+                    Some(v) => v,
+                    None => break,
+                };
+                if pfn % block_pages != 0 || block_end > end {
                     break;
                 }
                 order = next_order;
             }
             self.zones[zone_idx].add_free_block(pfn, order)?;
-            pfn += 1u64 << order;
+            // Advance by the block size; saturate so the loop terminates even
+            // at the very top of the address space instead of wrapping back.
+            pfn = pfn.saturating_add(1u64 << order);
         }
         Ok(())
     }
@@ -814,11 +871,15 @@ impl BuddyAllocator {
         let pref_idx = self.find_zone(req.zone_pref);
         if let Some(idx) = pref_idx {
             if let Ok(pfn) = self.zones[idx].alloc_pages(order, req.atomic) {
+                // Refuse to return a wrapped physical address: `pfn *
+                // PAGE_SIZE` past `u64::MAX` would otherwise overflow-panic
+                // in ring 0 (or, in release, hand back a bogus low address).
+                let phys_addr = pfn.checked_mul(PAGE_SIZE).ok_or(Error::InvalidArgument)?;
                 self.log_alloc(pfn, order as u32, idx as u8, req.tag, false);
                 self.record_block(pfn, req.order, idx as u8, req.tag);
                 return Ok(BuddyAllocResult {
                     pfn,
-                    phys_addr: pfn * PAGE_SIZE,
+                    phys_addr,
                     order: req.order,
                     zone_type: self.zones[idx].zone_type,
                     zone_idx: idx,
@@ -832,11 +893,12 @@ impl BuddyAllocator {
                     continue;
                 }
                 if let Ok(pfn) = self.zones[idx].alloc_pages(order, req.atomic) {
+                    let phys_addr = pfn.checked_mul(PAGE_SIZE).ok_or(Error::InvalidArgument)?;
                     self.log_alloc(pfn, order as u32, idx as u8, req.tag, false);
                     self.record_block(pfn, req.order, idx as u8, req.tag);
                     return Ok(BuddyAllocResult {
                         pfn,
-                        phys_addr: pfn * PAGE_SIZE,
+                        phys_addr,
                         order: req.order,
                         zone_type: self.zones[idx].zone_type,
                         zone_idx: idx,

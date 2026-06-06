@@ -54,9 +54,21 @@ impl BuddyOrder {
     /// Order 0 (single page).
     pub const ZERO: Self = Self(0);
 
-    /// Creates a new order value.
+    /// Creates a new order value, clamped to the largest valid order.
+    ///
+    /// The accessors ([`nr_pages`](Self::nr_pages),
+    /// [`block_size`](Self::block_size), [`buddy_pfn`](BuddyBlock::buddy_pfn))
+    /// shift `1 << self.0`; an untrusted `order >= 64` (or `>= usize::BITS`)
+    /// would be a shift overflow (UB in release, panic under the dev/test
+    /// overflow checks). Clamp to `MAX_ORDER - 1` here so every accessor is
+    /// always shift-safe regardless of the caller-supplied value.
     pub const fn new(order: u32) -> Self {
-        Self(order)
+        let max_valid = (MAX_ORDER - 1) as u32;
+        if order > max_valid {
+            Self(max_valid)
+        } else {
+            Self(order)
+        }
     }
 
     /// Returns the order value.

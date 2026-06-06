@@ -28,6 +28,7 @@
 //!
 //! Linux `kernel/kexec.c`, `kernel/kexec_file.c`.
 
+use crate::capability::{CAP_SYS_BOOT, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ══════════════════════════════════════════════════════════════
@@ -42,6 +43,16 @@ const MAX_SEGMENTS: usize = 16;
 
 /// Maximum image size (256 MB).
 const MAX_IMAGE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Maximum size of a single segment in bytes (256 MB).
+const MAX_SEGMENT_SIZE: usize = 256 * 1024 * 1024;
+
+/// Required alignment for segment physical addresses (4 KiB page).
+const SEGMENT_ALIGN: u64 = 0x1000;
+
+/// Minimum valid entry point address (above the 1 MiB real-mode region
+/// on x86_64).
+const MIN_ENTRY_ADDR: u64 = 0x10_0000;
 
 // ══════════════════════════════════════════════════════════════
 // ImageType
@@ -210,6 +221,11 @@ pub struct KexecLoader {
     initialised: bool,
     /// Whether kexec loading is allowed.
     load_allowed: bool,
+    /// Whether kernel lockdown / secure-boot enforcement is engaged.
+    ///
+    /// When engaged, an image may only become [`ImageState::Ready`] if
+    /// its signature verified. Defaults to engaged (fail closed).
+    lockdown: bool,
 }
 
 impl Default for KexecLoader {
@@ -226,6 +242,9 @@ impl KexecLoader {
             stats: KexecLoadStats::new(),
             initialised: false,
             load_allowed: true,
+            // Fail closed: lockdown engaged until policy explicitly
+            // relaxes it after a real verifier is wired up.
+            lockdown: true,
         }
     }
 
@@ -243,25 +262,63 @@ impl KexecLoader {
         self.load_allowed = allowed;
     }
 
+    /// Engage or relax kernel lockdown / secure-boot enforcement.
+    ///
+    /// When engaged, [`finalise`](Self::finalise) refuses to mark an
+    /// image ready unless its signature verified.
+    ///
+    // SECURITY: relaxing lockdown disables signature enforcement on the
+    // replacement kernel. Only a trusted policy path (with the platform
+    // secure-boot state) may call this with `false`.
+    pub fn set_lockdown(&mut self, engaged: bool) {
+        self.lockdown = engaged;
+    }
+
     // ── Load operations ──────────────────────────────────────
 
     /// Begin loading a kexec image.
     ///
+    /// Loading a replacement kernel is the most privileged operation in
+    /// the system; the caller must hold `CAP_SYS_BOOT`. `caller` is the
+    /// authenticated capability set of the requesting task.
+    ///
     /// Returns the image slot index.
+    ///
+    // SECURITY: `caller` MUST be the authenticated effective capability
+    // set of the requesting task. Per-task creds are not yet threaded
+    // through the syscall dispatcher, so this entry point fails closed:
+    // a caller without `CAP_SYS_BOOT` is denied. The dispatcher MUST
+    // pass the real caller cred once available; do not default to
+    // `CapSet::FULL`. `load_allowed` remains a separate global
+    // kill-switch and does not replace this per-caller check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PermissionDenied`] if `caller` lacks
+    /// `CAP_SYS_BOOT` or loading is globally disabled, or
+    /// [`Error::InvalidArgument`] if the image parameters are invalid.
     pub fn load(
         &mut self,
+        caller: CapSet,
         image_type: ImageType,
         entry_point: u64,
         image_size: usize,
         tick: u64,
     ) -> Result<usize> {
+        // Fail closed: loading a kernel requires CAP_SYS_BOOT.
+        if !caller.has(CAP_SYS_BOOT) {
+            return Err(Error::PermissionDenied);
+        }
         if !self.load_allowed {
             return Err(Error::PermissionDenied);
         }
         if image_size == 0 || image_size > MAX_IMAGE_SIZE {
             return Err(Error::InvalidArgument);
         }
-        if entry_point == 0 {
+        // Entry point must be non-zero, above the real-mode region, and
+        // page-aligned. Containment within an executable segment is
+        // verified in `finalise` once segments are known.
+        if entry_point < MIN_ENTRY_ADDR || entry_point % SEGMENT_ALIGN != 0 {
             return Err(Error::InvalidArgument);
         }
 
@@ -288,6 +345,21 @@ impl KexecLoader {
     }
 
     /// Add a segment to a loading image.
+    ///
+    /// `phys_addr` is an attacker-controlled physical write target, so
+    /// every field is bound-checked before the segment is accepted:
+    /// the size must be non-zero and within [`MAX_SEGMENT_SIZE`], the
+    /// file size must not exceed the memory size, the address must be
+    /// page-aligned, the `[phys_addr, phys_addr + mem_size)` range must
+    /// not overflow, and the range must not overlap any already-accepted
+    /// segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if any bound check fails,
+    /// [`Error::OutOfMemory`] if the segment table is full, or
+    /// [`Error::AlreadyExists`] if the range overlaps an existing
+    /// segment.
     pub fn add_segment(
         &mut self,
         slot: usize,
@@ -301,7 +373,36 @@ impl KexecLoader {
         if !matches!(self.images[slot].state, ImageState::Loading) {
             return Err(Error::InvalidArgument);
         }
-        let idx = self.images[slot].segment_count;
+        // Size bounds: non-zero, within the per-segment cap, and the file
+        // size must fit inside the memory size (BSS may extend it).
+        if size == 0 || size > MAX_SEGMENT_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+        if mem_size > MAX_SEGMENT_SIZE || size > mem_size {
+            return Err(Error::InvalidArgument);
+        }
+        // Physical destination must be page-aligned.
+        if phys_addr % SEGMENT_ALIGN != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // The destination range must not overflow the address space.
+        let mem_size_u64 = mem_size as u64;
+        let end = phys_addr
+            .checked_add(mem_size_u64)
+            .ok_or(Error::InvalidArgument)?;
+        // Reject overlap with any already-accepted segment in this image.
+        let count = self.images[slot].segment_count;
+        for existing in self.images[slot].segments.iter().take(count) {
+            if !existing.active {
+                continue;
+            }
+            let e_end = existing.phys_addr.saturating_add(existing.mem_size as u64);
+            if phys_addr < e_end && existing.phys_addr < end {
+                return Err(Error::AlreadyExists);
+            }
+        }
+
+        let idx = count;
         if idx >= MAX_SEGMENTS {
             return Err(Error::OutOfMemory);
         }
@@ -317,6 +418,24 @@ impl KexecLoader {
     }
 
     /// Finalise loading and mark the image as ready.
+    ///
+    /// An image is only promoted to [`ImageState::Ready`] if it has at
+    /// least one segment, its entry point is contained in an accepted
+    /// segment, and — when lockdown is engaged — its signature verified.
+    ///
+    // SECURITY: real ELF parsing and signature verification (constant
+    // time, against the platform keyring) MUST be implemented before
+    // kexec is enabled. No verifier exists yet, so `sig_verified` is
+    // always false and, under lockdown, finalise fails closed: an
+    // unverified image is marked `Invalid`, never `Ready`. The real
+    // verification state is recorded rather than assumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the image has no segments
+    /// or the entry point is not contained in an accepted segment, or
+    /// [`Error::PermissionDenied`] if lockdown is engaged and the image
+    /// signature did not verify.
     pub fn finalise(&mut self, slot: usize) -> Result<()> {
         if slot >= MAX_IMAGES {
             return Err(Error::InvalidArgument);
@@ -328,6 +447,34 @@ impl KexecLoader {
             self.images[slot].state = ImageState::Invalid;
             self.stats.total_failures += 1;
             return Err(Error::InvalidArgument);
+        }
+
+        // Entry point must fall within an accepted segment's range.
+        let entry = self.images[slot].entry_point;
+        let count = self.images[slot].segment_count;
+        let entry_ok = self.images[slot].segments.iter().take(count).any(|s| {
+            if !s.active {
+                return false;
+            }
+            let s_end = s.phys_addr.saturating_add(s.mem_size as u64);
+            entry >= s.phys_addr && entry < s_end
+        });
+        if !entry_ok {
+            self.images[slot].state = ImageState::Invalid;
+            self.stats.total_failures += 1;
+            return Err(Error::InvalidArgument);
+        }
+
+        // No real verifier exists yet, so the image cannot be trusted.
+        // Record the true verification state (false) explicitly.
+        self.images[slot].sig_verified = false;
+
+        // Fail closed: under lockdown an unverified image must never
+        // become ready.
+        if self.lockdown && !self.images[slot].sig_verified {
+            self.images[slot].state = ImageState::Invalid;
+            self.stats.total_failures += 1;
+            return Err(Error::PermissionDenied);
         }
 
         self.images[slot].state = ImageState::Ready;

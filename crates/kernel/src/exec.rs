@@ -199,6 +199,14 @@ fn page_align_up(val: u64) -> u64 {
 /// Maximum number of arguments and environment variables.
 const MAX_ARGC: usize = 128;
 
+/// Maximum combined byte size of all argv + envp strings (including NUL
+/// terminators) and their pointer arrays. The initial stack image must fit
+/// inside the fixed [`USER_STACK_SIZE`] region with room left for the program
+/// to run, so this is capped well below it. An attacker who supplies oversized
+/// argument strings is rejected here rather than driving the computed stack
+/// pointer below the mapped stack region (an out-of-bounds write).
+const MAX_ARG_BYTES: u64 = USER_STACK_SIZE / 2;
+
 /// Result of `do_execve` — contains everything needed to switch
 /// to the new process image.
 #[derive(Debug, Clone, Copy)]
@@ -241,6 +249,22 @@ pub fn do_execve(
         return Err(Error::InvalidArgument);
     }
     if argv.len() > MAX_ARGC || envp.len() > MAX_ARGC {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Bound the total argument/environment byte size *before* laying out the
+    // stack. Without this an attacker can pass 128 multi-megabyte strings:
+    // the per-array count check above passes, but the summed size drives the
+    // computed stack pointer below the fixed 64 KiB stack region, turning the
+    // subsequent argv/envp/string write into an out-of-bounds write.
+    let mut arg_bytes: u64 = 0;
+    for s in argv.iter().chain(envp.iter()) {
+        arg_bytes = arg_bytes
+            .checked_add(s.len() as u64)
+            .and_then(|n| n.checked_add(1)) // NUL terminator
+            .ok_or(Error::InvalidArgument)?;
+    }
+    if arg_bytes > MAX_ARG_BYTES {
         return Err(Error::InvalidArgument);
     }
 
@@ -306,8 +330,9 @@ pub fn do_execve(
     address_space.set_brk(VirtAddr::new(brk));
 
     // Compute the initial stack pointer with argc/argv/envp layout.
-    // The stack grows down from USER_STACK_TOP.
-    let sp = compute_initial_stack(argv, envp);
+    // The stack grows down from USER_STACK_TOP. This is fallible: it fails
+    // closed if the computed pointer would fall outside the mapped stack.
+    let sp = compute_initial_stack(argv, envp)?;
 
     let result = ExecveResult {
         entry: elf_info.entry,
@@ -364,7 +389,7 @@ pub fn reset_signals_on_exec(signals: &mut SignalState) {
 /// This function computes the resulting SP value. The actual string
 /// data and pointer arrays are written to the stack by the caller
 /// after mapping the stack pages.
-fn compute_initial_stack(argv: &[&[u8]], envp: &[&[u8]]) -> u64 {
+fn compute_initial_stack(argv: &[&[u8]], envp: &[&[u8]]) -> Result<u64> {
     let argc = argv.len();
     let envc = envp.len();
 
@@ -385,6 +410,17 @@ fn compute_initial_stack(argv: &[&[u8]], envp: &[&[u8]]) -> u64 {
     let total = string_bytes.saturating_add(pointer_bytes);
 
     // Align down to 16-byte boundary (ABI requirement).
-    let sp = USER_STACK_TOP.saturating_sub(total);
-    sp & !0xF
+    let sp = USER_STACK_TOP.saturating_sub(total) & !0xF;
+
+    // Fail closed: the computed stack pointer must land inside the mapped
+    // stack region [stack_bottom, USER_STACK_TOP). A pointer below
+    // stack_bottom means the argv/envp/string image does not fit and any
+    // subsequent write would be out of bounds. `do_execve` already bounds
+    // the total argument byte size, so valid callers never hit this; it is
+    // defense in depth for any other caller of this helper.
+    let stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
+    if sp < stack_bottom {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(sp)
 }
