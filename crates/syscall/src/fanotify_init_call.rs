@@ -153,28 +153,39 @@ impl FanotifyInitRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Capability constant
+// ---------------------------------------------------------------------------
+
+/// Linux capability bit for `CAP_SYS_ADMIN` (bit 21).
+const CAP_SYS_ADMIN: u32 = 21;
+
+// ---------------------------------------------------------------------------
 // Core handler
 // ---------------------------------------------------------------------------
 
 /// Handler for `fanotify_init(2)`.
 ///
-/// Validates `flags` and `event_f_flags`, parses the notification class, and
-/// returns a structured request.  Caller must hold `CAP_SYS_ADMIN` for
-/// `FAN_CLASS_CONTENT` or `FAN_CLASS_PRE_CONTENT`.
+/// Validates `flags` and `event_f_flags`, checks capability for privileged
+/// classes, parses the notification class, and returns a structured request.
 ///
 /// # Arguments
 ///
 /// - `flags`        — combination of class bits and option flags
 /// - `event_f_flags`— flags (e.g. `O_RDONLY`, `O_LARGEFILE`) for fds created
 ///   in event records
+/// - `caller_caps`  — caller capability bitmask; bit 21 = `CAP_SYS_ADMIN`
 ///
 /// # Errors
 ///
-/// | `Error`           | Condition                               |
-/// |-------------------|-----------------------------------------|
-/// | `InvalidArgument` | Unknown bits in `flags`                 |
-/// | `PermissionDenied`| Privileged class requested without cap  |
-pub fn do_fanotify_init(flags: u32, event_f_flags: u32) -> Result<FanotifyInitRequest> {
+/// | `Error`           | Condition                                      |
+/// |-------------------|------------------------------------------------|
+/// | `InvalidArgument` | Unknown bits in `flags`                        |
+/// | `PermissionDenied`| Content/PreContent class without `CAP_SYS_ADMIN`|
+pub fn do_fanotify_init(
+    flags: u32,
+    event_f_flags: u32,
+    caller_caps: u64,
+) -> Result<FanotifyInitRequest> {
     if flags & !VALID_FLAGS != 0 {
         return Err(Error::InvalidArgument);
     }
@@ -183,6 +194,20 @@ pub fn do_fanotify_init(flags: u32, event_f_flags: u32) -> Result<FanotifyInitRe
     if !VALID_CLASSES.contains(&class_raw) {
         return Err(Error::InvalidArgument);
     }
+
+    // SECURITY: FAN_CLASS_CONTENT and FAN_CLASS_PRE_CONTENT grant permission-decision
+    // authority over filesystem operations.  FAN_UNLIMITED_QUEUE and
+    // FAN_UNLIMITED_MARKS remove resource caps that protect against DoS.
+    // Both require CAP_SYS_ADMIN.  Per-task credential threading is not yet
+    // wired; default-deny until it is.
+    let has_admin = caller_caps & (1u64 << CAP_SYS_ADMIN) != 0;
+    if (class_raw == FAN_CLASS_CONTENT || class_raw == FAN_CLASS_PRE_CONTENT) && !has_admin {
+        return Err(Error::PermissionDenied);
+    }
+    if (flags & (FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS)) != 0 && !has_admin {
+        return Err(Error::PermissionDenied);
+    }
+
     let class = FanotifyClass::from_raw(flags)?;
     let parsed_flags = FanotifyInitFlags {
         cloexec: flags & FAN_CLOEXEC != 0,
@@ -213,26 +238,85 @@ pub fn is_unlimited_marks(flags: u32) -> bool {
 mod tests {
     use super::*;
 
+    const CAP_ADMIN: u64 = 1u64 << CAP_SYS_ADMIN;
+
     #[test]
     fn notif_class_ok() {
-        let req = do_fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, 0).unwrap();
+        // FAN_CLASS_NOTIF does not require CAP_SYS_ADMIN.
+        let req = do_fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC, 0, 0).unwrap();
         assert_eq!(req.class, FanotifyClass::Notif);
         assert!(req.flags.cloexec);
     }
 
     #[test]
-    fn content_class_ok() {
-        let req = do_fanotify_init(FAN_CLASS_CONTENT, 0).unwrap();
+    fn content_class_requires_cap() {
+        // Must be denied without CAP_SYS_ADMIN.
+        assert_eq!(
+            do_fanotify_init(FAN_CLASS_CONTENT, 0, 0),
+            Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn content_class_with_cap() {
+        let req = do_fanotify_init(FAN_CLASS_CONTENT, 0, CAP_ADMIN).unwrap();
         assert_eq!(req.class, FanotifyClass::Content);
+        assert!(req.class.allows_permission());
+    }
+
+    #[test]
+    fn pre_content_class_requires_cap() {
+        assert_eq!(
+            do_fanotify_init(FAN_CLASS_PRE_CONTENT, 0, 0),
+            Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn pre_content_class_with_cap() {
+        let req = do_fanotify_init(FAN_CLASS_PRE_CONTENT, 0, CAP_ADMIN).unwrap();
+        assert_eq!(req.class, FanotifyClass::PreContent);
         assert!(req.class.allows_permission());
     }
 
     #[test]
     fn unknown_flags_rejected() {
         assert_eq!(
-            do_fanotify_init(0xFFFF_0000, 0),
+            do_fanotify_init(0xFFFF_0000, 0, 0),
             Err(Error::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn unlimited_queue_requires_cap() {
+        // FAN_UNLIMITED_QUEUE without CAP_SYS_ADMIN must be denied.
+        assert_eq!(
+            do_fanotify_init(FAN_UNLIMITED_QUEUE, 0, 0),
+            Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn unlimited_queue_with_cap_ok() {
+        // FAN_UNLIMITED_QUEUE with CAP_SYS_ADMIN must succeed.
+        let req = do_fanotify_init(FAN_UNLIMITED_QUEUE, 0, CAP_ADMIN).unwrap();
+        assert_eq!(req.class, FanotifyClass::Notif);
+    }
+
+    #[test]
+    fn unlimited_marks_requires_cap() {
+        // FAN_UNLIMITED_MARKS without CAP_SYS_ADMIN must be denied.
+        assert_eq!(
+            do_fanotify_init(FAN_UNLIMITED_MARKS, 0, 0),
+            Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn unlimited_marks_with_cap_ok() {
+        // FAN_UNLIMITED_MARKS with CAP_SYS_ADMIN must succeed.
+        let req = do_fanotify_init(FAN_UNLIMITED_MARKS, 0, CAP_ADMIN).unwrap();
+        assert_eq!(req.class, FanotifyClass::Notif);
     }
 
     #[test]

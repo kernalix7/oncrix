@@ -125,9 +125,21 @@ pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
 /// Filesystem containing watched object was unmounted.
 pub const IN_UNMOUNT: u32 = 0x0000_2000;
 
-/// Mask of valid user-supplied `add_watch` flags.
-const IN_ADD_WATCH_VALID: u32 =
-    IN_ALL_EVENTS | IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD | IN_ONESHOT | IN_ISDIR;
+/// Flag-only bits that are valid alongside event bits but are NOT
+/// themselves event bits.  These (and `IN_ISDIR`) must never satisfy
+/// the "at least one real event" requirement on their own — that check
+/// is enforced separately against [`IN_ALL_EVENTS`].
+const IN_WATCH_FLAG_BITS: u32 = IN_DONT_FOLLOW | IN_EXCL_UNLINK | IN_MASK_ADD | IN_ONESHOT;
+
+/// Mask of ALL bits that may legally appear in a user-supplied
+/// `add_watch` mask: event bits, flag bits, and `IN_ISDIR`.
+///
+/// `IN_ISDIR` is a kernel-set flag in delivered events; Linux tolerates
+/// (and ignores) it in a user-supplied mask, so a combination such as
+/// `IN_CREATE | IN_ISDIR` is accepted here.  A mask of *pure* `IN_ISDIR`
+/// (or any flag-only mask) is still rejected by the separate
+/// `mask & IN_ALL_EVENTS == 0` guard, which requires a real event bit.
+const IN_ADD_WATCH_VALID: u32 = IN_ALL_EVENTS | IN_WATCH_FLAG_BITS | IN_ISDIR;
 
 // ---------------------------------------------------------------------------
 // inotify_init1 flags
@@ -395,12 +407,18 @@ impl InotifyInstance {
 
     /// Add or update a watch for `ino_id` with `mask`.
     ///
-    /// Returns the watch descriptor on success.
+    /// Returns the watch descriptor on success, or:
+    /// - [`Error::OutOfMemory`] if the watch table is full or the
+    ///   watch-descriptor counter has been exhausted (no reuse ever
+    ///   happens — a recycled wd while a live watch still holds the
+    ///   old wd would let `rm_watch` silently remove the wrong watch).
     pub fn add_watch(&mut self, ino_id: InoId, mask: u32) -> Result<WatchDesc> {
         if let Some(idx) = self.find_by_ino(ino_id) {
             // Update existing watch.
             let add_mode = (mask & IN_MASK_ADD) != 0;
-            let entry = self.watches[idx].as_mut().unwrap();
+            // SAFETY invariant: find_by_ino returned Some(idx) only
+            // because watches[idx] is Some; use ok_or to avoid unwrap.
+            let entry = self.watches[idx].as_mut().ok_or(Error::IoError)?;
             entry.update_mask(mask, add_mode);
             return Ok(entry.wd);
         }
@@ -408,8 +426,11 @@ impl InotifyInstance {
             return Err(Error::OutOfMemory);
         }
         let slot = self.free_slot().ok_or(Error::OutOfMemory)?;
+        // SECURITY: never wrap/reuse watch descriptors.  A recycled wd
+        // while an old watch still holds that wd would let rm_watch
+        // silently remove the wrong watch.  Return exhaustion instead.
         let wd = self.next_wd;
-        self.next_wd = self.next_wd.wrapping_add(1).max(1);
+        self.next_wd = self.next_wd.checked_add(1).ok_or(Error::OutOfMemory)?;
         self.watches[slot] = Some(WatchEntry::new(wd, ino_id, mask));
         self.watch_count += 1;
         Ok(wd)
@@ -435,7 +456,13 @@ impl InotifyInstance {
             None => return,
         };
         let (wd, oneshot, matches) = {
-            let entry = self.watches[idx].as_mut().unwrap();
+            // find_by_ino guarantees watches[idx] is Some; if it is
+            // somehow None (state corruption) skip silently rather
+            // than panicking in ring-0.
+            let entry = match self.watches[idx].as_mut() {
+                Some(e) => e,
+                None => return,
+            };
             let m = entry.matches(event_mask);
             if m {
                 entry.events_delivered = entry.events_delivered.saturating_add(1);
@@ -503,13 +530,21 @@ impl InotifyRegistry {
     }
 
     /// Allocate a new inotify instance, returning its fd.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::OutOfMemory`] — Registry is full or the fd counter
+    ///   has been exhausted (no fd reuse; a recycled fd would alias a
+    ///   live instance and allow access to the wrong instance).
     pub fn create(&mut self, flags: u32) -> Result<i32> {
         if self.count >= MAX_INOTIFY_INSTANCES {
             return Err(Error::OutOfMemory);
         }
         let slot = self.free_slot().ok_or(Error::OutOfMemory)?;
         let fd = self.next_fd;
-        self.next_fd = self.next_fd.wrapping_add(1).max(1);
+        // SECURITY: never wrap/reuse fd values — a recycled fd could
+        // alias a live instance.  Return exhaustion instead.
+        self.next_fd = self.next_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
         self.instances[slot] = Some(InotifyInstance::new(fd, flags));
         self.count += 1;
         Ok(fd)
@@ -591,7 +626,19 @@ pub fn sys_inotify_add_watch(
     ino_id: InoId,
     mask: u32,
 ) -> Result<WatchDesc> {
-    if mask & IN_ADD_WATCH_VALID == 0 {
+    // Reject any unknown bits.
+    if mask & !IN_ADD_WATCH_VALID != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    // At least one real event bit must be present.  Flag-only masks
+    // (e.g. pure IN_ISDIR, IN_DONT_FOLLOW, IN_MASK_ADD, IN_ONESHOT)
+    // would create a watch that can never fire; deny them.
+    //
+    // SECURITY: IN_ISDIR is a kernel-set flag in delivered events and
+    // must not be accepted as a user watch-mask bit; a mask of only
+    // IN_ISDIR passes the "any bit set" test without selecting any
+    // real event, bypassing the event-bit requirement.
+    if mask & IN_ALL_EVENTS == 0 {
         return Err(Error::InvalidArgument);
     }
     let instance = registry.get_mut(fd).ok_or(Error::NotFound)?;
@@ -672,6 +719,61 @@ mod tests {
         let wd = sys_inotify_add_watch(&mut reg, fd, 42, IN_CREATE | IN_DELETE).unwrap();
         assert!(wd > 0);
         sys_inotify_rm_watch(&mut reg, fd, wd).unwrap();
+    }
+
+    /// Finding 1 & 2: pure flag-only masks must be rejected.
+    #[test]
+    fn test_add_watch_flag_only_mask_rejected() {
+        let mut reg = InotifyRegistry::new();
+        let fd = sys_inotify_init(&mut reg).unwrap();
+
+        // IN_ISDIR alone — must be InvalidArgument (no real event bit).
+        assert!(matches!(
+            sys_inotify_add_watch(&mut reg, fd, 1, IN_ISDIR),
+            Err(Error::InvalidArgument)
+        ));
+
+        // IN_DONT_FOLLOW alone — no event bit.
+        assert!(matches!(
+            sys_inotify_add_watch(&mut reg, fd, 1, IN_DONT_FOLLOW),
+            Err(Error::InvalidArgument)
+        ));
+
+        // IN_MASK_ADD alone — no event bit.
+        assert!(matches!(
+            sys_inotify_add_watch(&mut reg, fd, 1, IN_MASK_ADD),
+            Err(Error::InvalidArgument)
+        ));
+
+        // IN_ONESHOT alone — no event bit.
+        assert!(matches!(
+            sys_inotify_add_watch(&mut reg, fd, 1, IN_ONESHOT),
+            Err(Error::InvalidArgument)
+        ));
+
+        // IN_ISDIR combined with a real event bit — must succeed.
+        // (IN_ISDIR set alongside an event is harmless; kernel strips it.)
+        let wd = sys_inotify_add_watch(&mut reg, fd, 1, IN_CREATE | IN_ISDIR).unwrap();
+        assert!(wd > 0);
+        sys_inotify_rm_watch(&mut reg, fd, wd).unwrap();
+    }
+
+    /// Finding 3: wd counter must not wrap; exhaustion returns OutOfMemory.
+    #[test]
+    fn test_wd_exhaustion_returns_error() {
+        let fd = 1;
+        let mut inst = InotifyInstance::new(fd, 0);
+        // Manually set next_wd to i32::MAX so the next allocation overflows.
+        inst.next_wd = i32::MAX;
+        // First allocation uses i32::MAX — succeeds.
+        let r1 = inst.add_watch(100, IN_CREATE);
+        assert!(r1.is_ok(), "first allocation at i32::MAX must succeed");
+        // Second allocation would overflow — must be an error.
+        let r2 = inst.add_watch(101, IN_CREATE);
+        assert!(
+            matches!(r2, Err(Error::OutOfMemory)),
+            "wd exhaustion must return OutOfMemory, got {r2:?}"
+        );
     }
 
     #[test]

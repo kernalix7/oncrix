@@ -154,11 +154,15 @@ pub const FAN_REPORT_NAME: u32 = 0x0000_0800;
 /// Include target entry name in events.
 pub const FAN_REPORT_TARGET_FID: u32 = 0x0000_1000;
 
-/// Unlimited event queue size.
-pub const FAN_UNLIMITED_QUEUE: u32 = 0x0001_0000;
+/// Unlimited event queue size (requires `CAP_SYS_ADMIN`).
+///
+/// ABI value matches Linux `fanotify.h`: bit 4 = `0x0000_0010`.
+pub const FAN_UNLIMITED_QUEUE: u32 = 0x0000_0010;
 
-/// Unlimited marks.
-pub const FAN_UNLIMITED_MARKS: u32 = 0x0002_0000;
+/// Unlimited marks (requires `CAP_SYS_ADMIN`).
+///
+/// ABI value matches Linux `fanotify.h`: bit 5 = `0x0000_0020`.
+pub const FAN_UNLIMITED_MARKS: u32 = 0x0000_0020;
 
 /// Valid `fanotify_init` flag bits.
 const FAN_INIT_VALID: u32 = FAN_CLASS_CONTENT
@@ -658,26 +662,24 @@ impl Default for FanotifyRegistry {
 ///
 /// # Arguments
 ///
-/// - `registry` — Mutable fanotify registry.
-/// - `flags` — `FAN_CLOEXEC`, `FAN_NONBLOCK`, class flags, report flags.
-/// - `event_f_flags` — Flags for file descriptors returned in events
+/// - `registry`     — Mutable fanotify registry.
+/// - `flags`        — `FAN_CLOEXEC`, `FAN_NONBLOCK`, class flags, report flags.
+/// - `event_f_flags`— Flags for file descriptors returned in events
 ///   (e.g. `O_RDONLY | O_LARGEFILE`).  Validated but not stored in stub.
-/// - `cap_sys_admin` — Caller holds `CAP_SYS_ADMIN`.
+/// - `cap_sys_admin`— Caller holds `CAP_SYS_ADMIN`.
 ///
 /// # Errors
 ///
-/// - [`Error::PermissionDenied`] — Requires `CAP_SYS_ADMIN`.
-/// - [`Error::InvalidArgument`] — Invalid flag bits.
-/// - [`Error::OutOfMemory`] — Registry full.
+/// - [`Error::PermissionDenied`] — Content/PreContent class or unlimited flags
+///   requested without `CAP_SYS_ADMIN`.
+/// - [`Error::InvalidArgument`]  — Invalid flag bits.
+/// - [`Error::OutOfMemory`]      — Registry full.
 pub fn sys_fanotify_init(
     registry: &mut FanotifyRegistry,
     flags: u32,
     event_f_flags: u32,
     cap_sys_admin: bool,
 ) -> Result<i32> {
-    if !cap_sys_admin {
-        return Err(Error::PermissionDenied);
-    }
     if flags & !FAN_INIT_VALID != 0 {
         return Err(Error::InvalidArgument);
     }
@@ -685,6 +687,17 @@ pub fn sys_fanotify_init(
     if event_f_flags & 0x1 != 0 && event_f_flags & 0x2 == 0 {
         return Err(Error::InvalidArgument);
     }
+
+    // SECURITY: FAN_CLASS_CONTENT and FAN_CLASS_PRE_CONTENT grant permission-decision
+    // authority.  FAN_UNLIMITED_QUEUE / FAN_UNLIMITED_MARKS remove resource caps.
+    // Both require CAP_SYS_ADMIN.  Per-task credential threading is not yet wired;
+    // default-deny until it is.
+    let class_bits = flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT);
+    let unlimited_bits = flags & (FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS);
+    if (class_bits != 0 || unlimited_bits != 0) && !cap_sys_admin {
+        return Err(Error::PermissionDenied);
+    }
+
     registry.create(flags)
 }
 
@@ -692,23 +705,27 @@ pub fn sys_fanotify_init(
 ///
 /// # Arguments
 ///
-/// - `registry` — Mutable fanotify registry.
-/// - `fd` — fanotify group fd.
-/// - `flags` — `FAN_MARK_ADD`, `FAN_MARK_REMOVE`, `FAN_MARK_FLUSH`, etc.
-/// - `mask` — Event types to mark.
-/// - `target` — Object to mark (inode, mount, or filesystem).
+/// - `registry`     — Mutable fanotify registry.
+/// - `fd`           — fanotify group fd.
+/// - `flags`        — `FAN_MARK_ADD`, `FAN_MARK_REMOVE`, `FAN_MARK_FLUSH`, etc.
+/// - `mask`         — Event types to mark.
+/// - `target`       — Object to mark (inode, mount, or filesystem).
+/// - `cap_sys_admin`— Caller holds `CAP_SYS_ADMIN`.
 ///
 /// # Errors
 ///
-/// - [`Error::NotFound`] — `fd` not found, or removing a non-existent mark.
+/// - [`Error::NotFound`]       — `fd` not found, or removing a non-existent mark.
 /// - [`Error::InvalidArgument`] — Invalid flags or mask.
-/// - [`Error::OutOfMemory`] — Mark table full.
+/// - [`Error::PermissionDenied`] — Permission events on a `FAN_CLASS_NOTIF` group,
+///   or `FAN_*_PERM` marks without `CAP_SYS_ADMIN`.
+/// - [`Error::OutOfMemory`]    — Mark table full.
 pub fn sys_fanotify_mark(
     registry: &mut FanotifyRegistry,
     fd: i32,
     flags: u32,
     mask: u64,
     target: MarkTarget,
+    cap_sys_admin: bool,
 ) -> Result<()> {
     let action = flags & FAN_MARK_ACTION_MASK;
     // Exactly one action must be specified.
@@ -717,6 +734,21 @@ pub fn sys_fanotify_mark(
     }
     if mask & !FAN_ALL_VALID != 0 && action != FAN_MARK_FLUSH {
         return Err(Error::InvalidArgument);
+    }
+
+    // SECURITY: Permission events (FAN_*_PERM) allow the listener to veto
+    // filesystem operations.  They require:
+    //   1. The group must be FAN_CLASS_CONTENT or FAN_CLASS_PRE_CONTENT.
+    //   2. The caller must hold CAP_SYS_ADMIN.
+    // Per-task credential threading is not yet wired; default-deny until it is.
+    if mask & FAN_ALL_PERM_EVENTS != 0 {
+        let group = registry.get(fd).ok_or(Error::NotFound)?;
+        if !group.can_perm() {
+            return Err(Error::PermissionDenied);
+        }
+        if !cap_sys_admin {
+            return Err(Error::PermissionDenied);
+        }
     }
 
     let group = registry.get_mut(fd).ok_or(Error::NotFound)?;
@@ -800,10 +832,43 @@ pub fn sys_fanotify_write_response(
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // fanotify_init tests
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_init_requires_cap() {
+    fn test_init_notif_no_cap_ok() {
+        // FAN_CLASS_NOTIF does not require CAP_SYS_ADMIN.
         let mut reg = FanotifyRegistry::new();
-        let result = sys_fanotify_init(&mut reg, FAN_CLOEXEC, 0, false);
+        let fd = sys_fanotify_init(&mut reg, FAN_CLOEXEC, 0, false).unwrap();
+        assert!(fd > 0);
+    }
+
+    #[test]
+    fn test_init_content_requires_cap() {
+        let mut reg = FanotifyRegistry::new();
+        let result = sys_fanotify_init(&mut reg, FAN_CLASS_CONTENT, 0, false);
+        assert!(matches!(result, Err(Error::PermissionDenied)));
+    }
+
+    #[test]
+    fn test_init_pre_content_requires_cap() {
+        let mut reg = FanotifyRegistry::new();
+        let result = sys_fanotify_init(&mut reg, FAN_CLASS_PRE_CONTENT, 0, false);
+        assert!(matches!(result, Err(Error::PermissionDenied)));
+    }
+
+    #[test]
+    fn test_init_unlimited_queue_requires_cap() {
+        let mut reg = FanotifyRegistry::new();
+        let result = sys_fanotify_init(&mut reg, FAN_UNLIMITED_QUEUE, 0, false);
+        assert!(matches!(result, Err(Error::PermissionDenied)));
+    }
+
+    #[test]
+    fn test_init_unlimited_marks_requires_cap() {
+        let mut reg = FanotifyRegistry::new();
+        let result = sys_fanotify_init(&mut reg, FAN_UNLIMITED_MARKS, 0, false);
         assert!(matches!(result, Err(Error::PermissionDenied)));
     }
 
@@ -816,18 +881,37 @@ mod tests {
     }
 
     #[test]
+    fn test_init_content_with_cap() {
+        let mut reg = FanotifyRegistry::new();
+        let fd = sys_fanotify_init(&mut reg, FAN_CLASS_CONTENT, 0, true).unwrap();
+        assert!(reg.get(fd).unwrap().can_perm());
+    }
+
+    #[test]
     fn test_init_invalid_flags() {
         let mut reg = FanotifyRegistry::new();
         let result = sys_fanotify_init(&mut reg, 0xFFFF_FFFF, 0, true);
         assert!(result.is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // fanotify_mark tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_mark_add_inode() {
         let mut reg = FanotifyRegistry::new();
         let fd = sys_fanotify_init(&mut reg, 0, 0, true).unwrap();
         let target = MarkTarget::inode(42);
-        sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_CREATE | FAN_DELETE, target).unwrap();
+        sys_fanotify_mark(
+            &mut reg,
+            fd,
+            FAN_MARK_ADD,
+            FAN_CREATE | FAN_DELETE,
+            target,
+            false,
+        )
+        .unwrap();
         let group = reg.get(fd).unwrap();
         assert_eq!(group.mark_count(), 1);
     }
@@ -837,13 +921,22 @@ mod tests {
         let mut reg = FanotifyRegistry::new();
         let fd = sys_fanotify_init(&mut reg, 0, 0, true).unwrap();
         let target = MarkTarget::inode(42);
-        sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_CREATE | FAN_DELETE, target).unwrap();
+        sys_fanotify_mark(
+            &mut reg,
+            fd,
+            FAN_MARK_ADD,
+            FAN_CREATE | FAN_DELETE,
+            target,
+            false,
+        )
+        .unwrap();
         sys_fanotify_mark(
             &mut reg,
             fd,
             FAN_MARK_REMOVE,
             FAN_CREATE | FAN_DELETE,
             target,
+            false,
         )
         .unwrap();
         let group = reg.get(fd).unwrap();
@@ -851,11 +944,41 @@ mod tests {
     }
 
     #[test]
+    fn test_perm_mark_notif_class_denied() {
+        // FAN_ACCESS_PERM on a FAN_CLASS_NOTIF group must be rejected.
+        let mut reg = FanotifyRegistry::new();
+        let fd = sys_fanotify_init(&mut reg, FAN_CLASS_NOTIF, 0, true).unwrap();
+        let target = MarkTarget::inode(42);
+        let result = sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_ACCESS_PERM, target, true);
+        assert!(matches!(result, Err(Error::PermissionDenied)));
+    }
+
+    #[test]
+    fn test_perm_mark_content_class_no_cap_denied() {
+        // FAN_OPEN_PERM on a CONTENT group without CAP_SYS_ADMIN must be rejected.
+        let mut reg = FanotifyRegistry::new();
+        let fd = sys_fanotify_init(&mut reg, FAN_CLASS_CONTENT, 0, true).unwrap();
+        let target = MarkTarget::inode(42);
+        let result = sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_OPEN_PERM, target, false);
+        assert!(matches!(result, Err(Error::PermissionDenied)));
+    }
+
+    #[test]
+    fn test_perm_mark_content_class_with_cap_ok() {
+        // FAN_OPEN_PERM on a CONTENT group with CAP_SYS_ADMIN must succeed.
+        let mut reg = FanotifyRegistry::new();
+        let fd = sys_fanotify_init(&mut reg, FAN_CLASS_CONTENT, 0, true).unwrap();
+        let target = MarkTarget::inode(42);
+        sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_OPEN_PERM, target, true).unwrap();
+        assert_eq!(reg.get(fd).unwrap().mark_count(), 1);
+    }
+
+    #[test]
     fn test_event_delivery() {
         let mut reg = FanotifyRegistry::new();
         let fd = sys_fanotify_init(&mut reg, 0, 0, true).unwrap();
         let target = MarkTarget::inode(42);
-        sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_CREATE, target).unwrap();
+        sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_CREATE, target, false).unwrap();
         let group = reg.get_mut(fd).unwrap();
         group.deliver_event(&target, FAN_CREATE, 1000);
         assert!(group.queue.has_events());
@@ -870,10 +993,10 @@ mod tests {
         let fd = sys_fanotify_init(&mut reg, 0, 0, true).unwrap();
         for i in 0..5u64 {
             let target = MarkTarget::inode(i);
-            sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_CREATE, target).unwrap();
+            sys_fanotify_mark(&mut reg, fd, FAN_MARK_ADD, FAN_CREATE, target, false).unwrap();
         }
         assert_eq!(reg.get(fd).unwrap().mark_count(), 5);
-        sys_fanotify_mark(&mut reg, fd, FAN_MARK_FLUSH, 0, MarkTarget::inode(0)).unwrap();
+        sys_fanotify_mark(&mut reg, fd, FAN_MARK_FLUSH, 0, MarkTarget::inode(0), false).unwrap();
         assert_eq!(reg.get(fd).unwrap().mark_count(), 0);
     }
 
@@ -888,6 +1011,7 @@ mod tests {
             FAN_MARK_ADD | FAN_MARK_MOUNT,
             FAN_ACCESS,
             target,
+            false,
         )
         .unwrap();
         assert_eq!(reg.get(fd).unwrap().mark_count(), 1);

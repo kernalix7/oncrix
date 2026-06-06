@@ -301,8 +301,8 @@ impl Default for FanotifySubsystem {
 
 /// Handle the `fanotify_init(2)` syscall.
 ///
-/// Validates `flags` and `event_f_flags`, checks privileges for unlimited
-/// resource flags, and creates a new fanotify group returning its identifier.
+/// Validates `flags` and `event_f_flags`, checks privileges for permission
+/// classes and unlimited resource flags, then creates a new fanotify group.
 ///
 /// # Arguments
 ///
@@ -318,7 +318,8 @@ impl Default for FanotifySubsystem {
 /// # Errors
 ///
 /// * [`Error::InvalidArgument`]  — Unknown flag bits or invalid class combination.
-/// * [`Error::PermissionDenied`] — `FAN_UNLIMITED_*` requested without `CAP_SYS_ADMIN`.
+/// * [`Error::PermissionDenied`] — Content/PreContent class or `FAN_UNLIMITED_*`
+///   requested without `CAP_SYS_ADMIN`.
 /// * [`Error::OutOfMemory`]      — Group table is full.
 pub fn sys_fanotify_init_handler(
     sys: &mut FanotifySubsystem,
@@ -336,9 +337,19 @@ pub fn sys_fanotify_init_handler(
         return Err(Error::InvalidArgument);
     }
 
-    // Unlimited resource flags require CAP_SYS_ADMIN.
+    let has_admin = caller_caps & (1u64 << CAP_SYS_ADMIN) != 0;
+
+    // SECURITY: FAN_CLASS_CONTENT and FAN_CLASS_PRE_CONTENT grant permission-decision
+    // authority (veto filesystem access).  These classes require CAP_SYS_ADMIN.
+    // Per-task credential threading is not yet wired; default-deny until it is.
+    let class_bits = flags & FAN_CLASS_MASK;
+    if (class_bits == FAN_CLASS_CONTENT || class_bits == FAN_CLASS_PRE_CONTENT) && !has_admin {
+        return Err(Error::PermissionDenied);
+    }
+
+    // Unlimited resource flags also require CAP_SYS_ADMIN.
     let needs_admin = (flags & FAN_UNLIMITED_QUEUE != 0) || (flags & FAN_UNLIMITED_MARKS != 0);
-    if needs_admin && caller_caps & (1u64 << CAP_SYS_ADMIN) == 0 {
+    if needs_admin && !has_admin {
         return Err(Error::PermissionDenied);
     }
 
@@ -394,17 +405,37 @@ mod tests {
     }
 
     #[test]
-    fn content_class() {
+    fn content_class_requires_cap() {
+        let mut sys = FanotifySubsystem::new();
+        // FAN_CLASS_CONTENT requires CAP_SYS_ADMIN; must fail without it.
+        assert_eq!(
+            sys_fanotify_init_handler(&mut sys, FAN_CLASS_CONTENT | FAN_NONBLOCK, 0, 0),
+            Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn content_class_with_cap() {
         let mut sys = FanotifySubsystem::new();
         let id =
-            sys_fanotify_init_handler(&mut sys, FAN_CLASS_CONTENT | FAN_NONBLOCK, 0, 0).unwrap();
+            sys_fanotify_init_handler(&mut sys, FAN_CLASS_CONTENT | FAN_NONBLOCK, 0, CAP_ADMIN)
+                .unwrap();
         let g = sys.get_group(id).unwrap();
         assert_eq!(g.config.class, FanotifyClass::Content);
         assert!(g.config.nonblock);
     }
 
     #[test]
-    fn pre_content_class() {
+    fn pre_content_class_requires_cap() {
+        let mut sys = FanotifySubsystem::new();
+        assert_eq!(
+            sys_fanotify_init_handler(&mut sys, FAN_CLASS_PRE_CONTENT, 0, 0),
+            Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn pre_content_class_with_cap() {
         let mut sys = FanotifySubsystem::new();
         let id = sys_fanotify_init_handler(&mut sys, FAN_CLASS_PRE_CONTENT, 0, CAP_ADMIN).unwrap();
         let g = sys.get_group(id).unwrap();
