@@ -574,8 +574,11 @@ impl SwapCgroupRegistry {
             return Ok(SwapChargeResult::Frozen);
         }
 
-        let charge_bytes = nr_pages as u64 * PAGE_SIZE;
-        let new_usage = self.cgroups[idx].counters.usage + charge_bytes;
+        let charge_bytes = (nr_pages as u64).saturating_mul(PAGE_SIZE);
+        let new_usage = self.cgroups[idx]
+            .counters
+            .usage
+            .saturating_add(charge_bytes);
 
         // Check limit.
         if new_usage > self.cgroups[idx].counters.limit {
@@ -585,17 +588,22 @@ impl SwapCgroupRegistry {
             return Ok(SwapChargeResult::LimitExceeded);
         }
 
+        // Reserve the charge slot first so a full charge table cannot
+        // leave the usage counters over-counted. All counter mutation
+        // below this point is infallible (record_event is a ring buffer).
+        self.record_charge(swap_area, slot_offset, cgroup_id, nr_pages, now_ns)?;
+
         // Apply charge.
         self.cgroups[idx].counters.usage = new_usage;
         if new_usage > self.cgroups[idx].counters.max_usage {
             self.cgroups[idx].counters.max_usage = new_usage;
         }
-        self.cgroups[idx].counters.total_swapout += charge_bytes;
+        self.cgroups[idx].counters.total_swapout = self.cgroups[idx]
+            .counters
+            .total_swapout
+            .saturating_add(charge_bytes);
         self.cgroups[idx].counters.swapout_events += 1;
         self.cgroups[idx].counters.charge_success += 1;
-
-        // Record charge entry.
-        self.record_charge(swap_area, slot_offset, cgroup_id, nr_pages, now_ns)?;
 
         self.cgroups[idx].record_event(SwapEventType::Charge, nr_pages, now_ns);
         self.record_global_event(SwapEventType::SwapOut, cgroup_id, nr_pages, now_ns);

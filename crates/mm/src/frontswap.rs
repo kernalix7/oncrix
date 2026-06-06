@@ -82,8 +82,10 @@ pub trait FrontswapOps {
     /// Invalidate a single page in the backend.
     ///
     /// Called when a swap slot is freed. The backend should discard
-    /// any stored data for this slot.
-    fn invalidate_page(&mut self, swap_type: usize, offset: u64) -> Result<()>;
+    /// any stored data for this slot. Returns `Ok(true)` if an entry
+    /// was actually present and removed, or `Ok(false)` if no entry
+    /// existed for the slot (so callers do not miscount stored pages).
+    fn invalidate_page(&mut self, swap_type: usize, offset: u64) -> Result<bool>;
 
     /// Invalidate all pages belonging to a swap type.
     ///
@@ -405,15 +407,16 @@ impl FrontswapOps for InMemoryBackend {
         Ok(())
     }
 
-    fn invalidate_page(&mut self, swap_type: usize, offset: u64) -> Result<()> {
+    fn invalidate_page(&mut self, swap_type: usize, offset: u64) -> Result<bool> {
         if swap_type >= MAX_SWAP_TYPES {
             return Err(Error::InvalidArgument);
         }
         if let Some(idx) = self.find_entry(swap_type, offset) {
             self.entries[idx].active = false;
             self.count = self.count.saturating_sub(1);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn invalidate_area(&mut self, swap_type: usize) -> Result<()> {
@@ -624,12 +627,16 @@ impl FrontswapManager {
             return Ok(());
         }
 
-        self.backend.invalidate_page(swap_type, offset)?;
+        let removed = self.backend.invalidate_page(swap_type, offset)?;
         self.swap_types[swap_type].invalidations += 1;
-        self.swap_types[swap_type].stored_pages =
-            self.swap_types[swap_type].stored_pages.saturating_sub(1);
         self.stats.total_invalidations += 1;
-        self.stats.total_stored = self.stats.total_stored.saturating_sub(1);
+        // Only decrement stored-page counters when an entry was actually
+        // present; otherwise the counters would underflow and miscount.
+        if removed {
+            self.swap_types[swap_type].stored_pages =
+                self.swap_types[swap_type].stored_pages.saturating_sub(1);
+            self.stats.total_stored = self.stats.total_stored.saturating_sub(1);
+        }
         Ok(())
     }
 
