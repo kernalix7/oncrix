@@ -372,12 +372,14 @@ impl PageVmaMappedWalk {
         }
     }
 
-    /// Advance the walk cursor.
+    /// Advance the walk cursor by one slot.
+    ///
+    /// Bounding the cursor against the page's *current* mapping count
+    /// (which may shrink underneath the walk) is the responsibility of
+    /// [`PageVmaMappedTable::walk_next`]; this helper only steps the
+    /// cursor and saturates to avoid wrap-around panics in ring 0.
     fn advance(&mut self) {
-        self.cursor += 1;
-        if self.cursor >= self.total {
-            self.finished = true;
-        }
+        self.cursor = self.cursor.saturating_add(1);
     }
 
     /// Current cursor position.
@@ -385,9 +387,24 @@ impl PageVmaMappedWalk {
         self.cursor
     }
 
-    /// Whether the walk still has entries to produce.
+    /// Mapping count captured when the walk started.
+    ///
+    /// Diagnostic hint only; deliberately *not* used to bound
+    /// iteration, since the page's mapping array may shrink after the
+    /// walk begins (see [`PageVmaMappedTable::walk_next`]).
+    pub fn start_count(&self) -> u32 {
+        self.total
+    }
+
+    /// Whether the walk has not yet been marked finished.
+    ///
+    /// The frozen `total` captured at walk start is only an upper-bound
+    /// hint: the authoritative end-of-walk decision is made against the
+    /// page's live `map_count` inside
+    /// [`PageVmaMappedTable::walk_next`], because the mapping array can
+    /// shrink (via `remove_mapping`/`unregister_page`) between steps.
     pub fn has_next(&self) -> bool {
-        !self.finished && self.cursor < self.total
+        !self.finished
     }
 }
 
@@ -496,29 +513,63 @@ impl PageVmaMappedTable {
     }
 
     /// Produce the next result from a walk.
+    ///
+    /// The page's mapping array can be shrunk or compacted between walk
+    /// steps by `remove_mapping`/`unregister_page` (TOCTOU). To avoid
+    /// returning logically-stale or cross-process descriptors, this
+    /// re-resolves the page by PFN and bounds the cursor against the
+    /// page's *current* `map_count` (clamped to the physical array
+    /// length) on every call — never the frozen `total` captured at
+    /// walk start. Invalid slots (e.g. emptied by compaction) are
+    /// skipped, and if the page has disappeared the walk ends cleanly.
     pub fn walk_next(&self, walk: &mut PageVmaMappedWalk) -> Result<Option<MappedVma>> {
-        if walk.finished || !walk.has_next() {
-            walk.finished = true;
+        if walk.finished {
             return Ok(None);
         }
         walk.started = true;
-        let idx = self.find_page(walk.pfn)?;
-        let page = &self.pages[idx];
-        let m = &page.mappings[walk.cursor as usize];
-        let result = MappedVma {
-            pfn: walk.pfn,
-            pid: m.pid,
-            vaddr: m.vaddr,
-            vma_start: m.vma_start,
-            vma_end: m.vma_end,
-            vma_prot: m.vma_prot,
-            pte_flags: m.pte_flags,
-            page_type: page.page_type,
-            valid: m.valid,
+
+        // Re-resolve the page each step; if it vanished, end the walk.
+        let idx = match self.find_page(walk.pfn) {
+            Ok(i) => i,
+            Err(_) => {
+                walk.finished = true;
+                return Ok(None);
+            }
         };
-        walk.produced += 1;
-        walk.advance();
-        Ok(Some(result))
+        let page = &self.pages[idx];
+
+        // Authoritative bound: the live mapping count, never the frozen
+        // `total`. Clamp to the physical array length so the slot index
+        // can never run out of bounds even if `map_count` is corrupt.
+        let live = (page.map_count as usize).min(MAX_MAPPINGS_PER_PAGE);
+
+        // Skip past any slots that are out of range or no longer valid.
+        loop {
+            let cur = walk.cursor as usize;
+            if cur >= live {
+                walk.finished = true;
+                return Ok(None);
+            }
+            let m = &page.mappings[cur];
+            if m.valid {
+                let result = MappedVma {
+                    pfn: walk.pfn,
+                    pid: m.pid,
+                    vaddr: m.vaddr,
+                    vma_start: m.vma_start,
+                    vma_end: m.vma_end,
+                    vma_prot: m.vma_prot,
+                    pte_flags: m.pte_flags,
+                    page_type: page.page_type,
+                    valid: true,
+                };
+                walk.produced = walk.produced.saturating_add(1);
+                walk.advance();
+                return Ok(Some(result));
+            }
+            // Emptied/compacted slot: advance and keep scanning.
+            walk.advance();
+        }
     }
 
     /// Collect all mappings of a page into a fixed-size array.

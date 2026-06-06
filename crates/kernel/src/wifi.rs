@@ -307,15 +307,23 @@ impl WifiInterface {
         }
 
         // Look for a matching BSS in scan results.
+        //
+        // `BssInfo::ssid_len` is a public field that a future beacon-RX
+        // path could populate directly from a radio SSID information
+        // element, whose advertised length byte is attacker-controlled
+        // and may exceed the 32-byte `ssid` buffer.  Clamp at the slice
+        // site so an out-of-bounds length can never index past the
+        // array (which would panic in ring 0 with overflow-checks on).
+        let cfg_len = config.ssid_len.min(32);
         let bss = self
             .scan_result
             .networks
             .iter()
             .take(self.scan_result.count)
             .find(|b| {
-                b.active
-                    && b.ssid_len == config.ssid_len
-                    && b.ssid[..b.ssid_len] == config.ssid[..config.ssid_len]
+                debug_assert!(b.ssid_len <= 32, "BssInfo::ssid_len exceeds ssid buffer");
+                let bss_len = b.ssid_len.min(32);
+                b.active && bss_len == cfg_len && b.ssid[..bss_len] == config.ssid[..cfg_len]
             });
 
         let bss = match bss {

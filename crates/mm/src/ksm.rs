@@ -318,6 +318,17 @@ impl KsmScanner {
     /// In a real kernel this would hash the page's physical memory
     /// contents. Here we use the physical address as a deterministic
     /// placeholder to avoid dereferencing raw pointers.
+    ///
+    /// # Security
+    ///
+    /// This hash is computed over `phys_addr`, **not** over the page
+    /// contents, so it is content-independent and MUST NOT be relied
+    /// on to decide that two pages are identical. Before KSM is
+    /// enabled this must be replaced with a hash of the actual
+    /// `PAGE_SIZE` bytes. Even then, the hash is only a candidate
+    /// filter: [`Self::try_merge`] always confirms identity with a
+    /// full byte-for-byte comparison ([`Self::memcmp_pages`]) so that
+    /// a weak or colliding hash can never cause a wrong merge.
     pub fn compute_hash(&self, page_idx: u16) -> u64 {
         let idx = page_idx as usize;
         if idx >= self.page_count {
@@ -414,14 +425,19 @@ impl KsmScanner {
 
             // Check unstable tree for a match.
             if let Some(unstable_match) = self.find_unstable(new_hash) {
-                // Promote the unstable match to stable and merge.
-                self.remove_unstable(unstable_match);
-                self.pages[unstable_match as usize].state = KsmPageState::Stable;
-                self.add_stable(unstable_match, new_hash);
-                self.stats.pages_shared += 1;
-                self.stats.pages_unshared = self.stats.pages_unshared.saturating_sub(1);
-
-                let _ = self.try_merge(unstable_match, page_idx);
+                // SECURITY: Only promote the candidate to the stable
+                // tree if the merge actually succeeds (contents proven
+                // identical). Promoting on a mere hash match would seed
+                // the stable tree with a page that future scans match
+                // on hash alone, drifting state/stats and risking a
+                // collision-based alias. Merge first, promote second.
+                if matches!(self.try_merge(unstable_match, page_idx), Ok(true)) {
+                    self.remove_unstable(unstable_match);
+                    self.pages[unstable_match as usize].state = KsmPageState::Stable;
+                    self.add_stable(unstable_match, new_hash);
+                    self.stats.pages_shared += 1;
+                    self.stats.pages_unshared = self.stats.pages_unshared.saturating_sub(1);
+                }
                 self.scan_cursor += 1;
                 processed += 1;
                 continue;
@@ -439,6 +455,43 @@ impl KsmScanner {
         Ok(processed)
     }
 
+    /// Performs a byte-for-byte comparison of the contents of two
+    /// tracked pages.
+    ///
+    /// A hash match is only a *candidate* filter: two distinct pages
+    /// can share a hash (collision). Before any merge, the actual
+    /// `PAGE_SIZE` bytes must be confirmed identical, otherwise a
+    /// collision would alias content-distinct frames across processes
+    /// (memory disclosure / corruption).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` only when the two pages are byte-for-byte identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if either index is out of
+    /// range, or [`Error::NotImplemented`] if page bytes cannot be
+    /// safely read in this build (fail-closed).
+    fn memcmp_pages(&self, page_a: u16, page_b: u16) -> Result<bool> {
+        let a = page_a as usize;
+        let b = page_b as usize;
+        if a >= self.page_count || b >= self.page_count {
+            return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: This module deliberately does not dereference raw
+        // physical frames (see `compute_hash`), so the real page bytes
+        // are not mappable here. Without a safe page-content accessor
+        // a full memcmp is impossible, so we FAIL CLOSED: report the
+        // pages as *not* identical. This MUST be replaced with a real
+        // `PAGE_SIZE` byte comparison (over a temporary kernel mapping
+        // of each frame) before KSM is enabled — a hash match alone is
+        // never proof of content identity.
+        let _ = (self.pages[a].phys_addr, self.pages[b].phys_addr);
+        Err(Error::NotImplemented)
+    }
+
     /// Attempts to merge two pages with identical content.
     ///
     /// Page `page_b` is marked as `Merged` and its reverse mappings
@@ -446,9 +499,15 @@ impl KsmScanner {
     /// `page_b`'s virtual mappings to `page_a`'s physical frame
     /// as CoW.
     ///
+    /// The merge only proceeds after a hash match is confirmed by a
+    /// full byte-for-byte page comparison ([`Self::memcmp_pages`]).
+    /// If the bytes are not provably identical, no merge happens and
+    /// `Ok(false)` is returned.
+    ///
     /// # Returns
     ///
-    /// `true` if the merge succeeded.
+    /// `true` if the merge succeeded; `false` if the pages were not
+    /// merged (e.g. same index, or contents not provably identical).
     ///
     /// # Errors
     ///
@@ -468,6 +527,20 @@ impl KsmScanner {
 
         if self.pages[a].hash != self.pages[b].hash {
             return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: Hash equality is only a candidate filter. A hash
+        // collision between content-distinct pages would otherwise
+        // alias two different frames as one CoW page (cross-process
+        // disclosure / corruption). Require a real byte-for-byte
+        // comparison before merging; if the bytes are not provably
+        // identical (including the fail-closed case where page bytes
+        // are not yet mappable), do NOT merge.
+        match self.memcmp_pages(page_a, page_b) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            // Fail closed: cannot prove identity -> never merge.
+            Err(_) => return Ok(false),
         }
 
         // Transfer reverse mappings from page_b to page_a.

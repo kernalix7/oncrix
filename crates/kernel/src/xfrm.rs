@@ -67,6 +67,32 @@ fn icv_eq_constant_time(a: &[u8; ICV_LEN], b: &[u8; ICV_LEN]) -> bool {
     diff == 0
 }
 
+/// Fail closed unless the SA's ESP cipher is one we can honestly apply.
+///
+/// # Security
+///
+/// ESP confidentiality in this module is a placeholder repeating-key
+/// XOR, NOT a real cipher. A non-`Null` `CipherAlg` (e.g. the
+/// [`CipherAlg::Aes128Cbc`] default) would therefore advertise AES
+/// while emitting XOR keystream — plaintext-equivalent to a passive
+/// eavesdropper. Until a genuine AES-CBC/GCM implementation is wired
+/// in, only [`CipherAlg::Null`] (authenticated, unencrypted ESP) is
+/// accepted; every other algorithm is rejected with
+/// [`Error::InvalidArgument`].
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] for any cipher other than
+/// [`CipherAlg::Null`].
+fn ensure_cipher_supported(alg: CipherAlg) -> Result<()> {
+    match alg {
+        CipherAlg::Null => Ok(()),
+        CipherAlg::Aes128Cbc | CipherAlg::Aes256Cbc | CipherAlg::Aes128Gcm => {
+            Err(Error::InvalidArgument)
+        }
+    }
+}
+
 // =========================================================================
 // Constants
 // =========================================================================
@@ -413,10 +439,45 @@ impl SecurityAssociation {
         Ok(())
     }
 
-    /// Check a received sequence number against the replay window.
+    /// Read-only anti-replay acceptance test (RFC 4303 3.4.3).
     ///
-    /// Returns `true` if the sequence number is acceptable.
-    pub fn check_replay(&mut self, seq: u64) -> bool {
+    /// Returns `true` if `seq` would be accepted by the replay window
+    /// *without* mutating any state. A sequence is acceptable if it is
+    /// ahead of the current high-water mark, or inside the window and
+    /// not already seen.
+    ///
+    /// # Security
+    ///
+    /// This MUST be the only replay check performed before the ICV is
+    /// verified. Because it does not mutate `seq_in_max` /
+    /// `replay_bitmap`, a spoofed (unauthenticated) packet cannot
+    /// advance the window and wedge the SA. The window is only moved
+    /// by [`replay_advance`](Self::replay_advance), which callers must
+    /// invoke solely after a successful ICV comparison.
+    pub fn replay_ok(&self, seq: u64) -> bool {
+        if seq > self.seq_in_max {
+            return true;
+        }
+        let diff = self.seq_in_max - seq;
+        if diff >= REPLAY_WINDOW {
+            return false;
+        }
+        self.replay_bitmap & (1u64 << diff) == 0
+    }
+
+    /// Advance the anti-replay window to record an authenticated `seq`.
+    ///
+    /// Shifts/sets the replay bitmap and updates the high-water mark.
+    ///
+    /// # Security
+    ///
+    /// Call this ONLY after [`replay_ok`](Self::replay_ok) returned
+    /// `true` *and* the packet's ICV verified. Mutating the window for
+    /// an unauthenticated packet is a remote denial-of-service
+    /// (RFC 4303 3.4.3 / RFC 4302). This method does NOT re-check
+    /// `replay_ok` — the caller is responsible for that gate; the set is
+    /// idempotent (`|=`), so a repeated in-window `seq` is harmless.
+    pub fn replay_advance(&mut self, seq: u64) {
         if seq > self.seq_in_max {
             let shift = seq - self.seq_in_max;
             if shift < REPLAY_WINDOW {
@@ -426,18 +487,11 @@ impl SecurityAssociation {
             }
             self.replay_bitmap |= 1;
             self.seq_in_max = seq;
-            true
         } else {
             let diff = self.seq_in_max - seq;
-            if diff >= REPLAY_WINDOW {
-                return false;
+            if diff < REPLAY_WINDOW {
+                self.replay_bitmap |= 1u64 << diff;
             }
-            let bit = 1u64 << diff;
-            if self.replay_bitmap & bit != 0 {
-                return false;
-            }
-            self.replay_bitmap |= bit;
-            true
         }
     }
 
@@ -873,6 +927,12 @@ impl XfrmEngine {
             .lookup_mut(spi, XfrmProto::Esp)
             .ok_or(Error::NotFound)?;
 
+        // SECURITY: refuse to "encrypt" with a placeholder XOR while
+        // claiming a real cipher. Only NULL ESP is honest today; a real
+        // AES-CBC/GCM cipher must replace the XOR below before
+        // non-NULL ciphers are accepted (see ensure_cipher_supported).
+        ensure_cipher_supported(sa.cipher_alg)?;
+
         let total = ESP_HEADER_LEN + cleartext.len() + ICV_LEN;
         if out.len() < total {
             return Err(Error::InvalidArgument);
@@ -934,8 +994,16 @@ impl XfrmEngine {
             .lookup_mut(spi, XfrmProto::Esp)
             .ok_or(Error::NotFound)?;
 
-        // Anti-replay check
-        if !sa.check_replay(seq as u64) {
+        // SECURITY: the decrypt path below is a placeholder XOR. Refuse
+        // any non-NULL cipher rather than pretend to decrypt AES, so an
+        // SA is symmetric with esp_encrypt and never yields bogus
+        // plaintext (see ensure_cipher_supported).
+        ensure_cipher_supported(sa.cipher_alg)?;
+
+        // Cheap read-only anti-replay drop BEFORE authentication. This
+        // does NOT mutate the replay window, so a spoofed sequence
+        // cannot wedge the SA (RFC 4303 3.4.3).
+        if !sa.replay_ok(seq as u64) {
             return Err(Error::PermissionDenied);
         }
 
@@ -953,6 +1021,10 @@ impl XfrmEngine {
         if !icv_eq_constant_time(&received_icv, &expected_icv) {
             return Err(Error::PermissionDenied);
         }
+
+        // ICV verified: the packet is authentic, so it is now safe to
+        // advance the anti-replay window.
+        sa.replay_advance(seq as u64);
 
         // XOR-decrypt
         let cipher_data = &packet[ESP_HEADER_LEN..icv_offset];
@@ -1058,7 +1130,10 @@ impl XfrmEngine {
             .lookup_mut(spi, XfrmProto::Ah)
             .ok_or(Error::NotFound)?;
 
-        if !sa.check_replay(seq as u64) {
+        // Cheap read-only anti-replay drop BEFORE authentication. This
+        // does NOT mutate the replay window, so a spoofed sequence
+        // cannot wedge the SA (RFC 4302 / RFC 4303 3.4.3).
+        if !sa.replay_ok(seq as u64) {
             return Err(Error::PermissionDenied);
         }
 
@@ -1081,6 +1156,10 @@ impl XfrmEngine {
         if !icv_eq_constant_time(&received_icv, &expected_icv) {
             return Err(Error::PermissionDenied);
         }
+
+        // ICV verified: the packet is authentic, so it is now safe to
+        // advance the anti-replay window.
+        sa.replay_advance(seq as u64);
 
         out[..payload.len()].copy_from_slice(payload);
         sa.account(payload.len() as u64);
@@ -1184,10 +1263,12 @@ mod tests {
                 [10, 0, 0, 2],
             )
             .unwrap();
-        // Set keys
+        // Set keys. Only NULL ESP is honestly supported (the cipher is
+        // a placeholder), so select it explicitly.
         let key = [0x42u8; CIPHER_KEY_SIZE];
         let auth = [0x99u8; AUTH_KEY_SIZE];
         let sa = eng.sad.lookup_mut(0x1000, XfrmProto::Esp).unwrap();
+        sa.cipher_alg = CipherAlg::Null;
         sa.set_cipher_key(&key).unwrap();
         sa.set_auth_key(&auth).unwrap();
 
@@ -1253,6 +1334,7 @@ mod tests {
         let key = [0x11u8; CIPHER_KEY_SIZE];
         let auth = [0x22u8; AUTH_KEY_SIZE];
         let sa = eng.sad.lookup_mut(0x3000, XfrmProto::Esp).unwrap();
+        sa.cipher_alg = CipherAlg::Null;
         sa.set_cipher_key(&key).unwrap();
         sa.set_auth_key(&auth).unwrap();
 
@@ -1271,6 +1353,110 @@ mod tests {
         // Replay of the same packet fails
         let result = eng.esp_decrypt(&cipher[..enc_len], &mut plain);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_replay_ok_is_read_only() {
+        // replay_ok must NOT mutate the window: probing a huge sequence
+        // many times leaves seq_in_max / replay_bitmap untouched, so a
+        // spoofed packet cannot advance the window before ICV checking.
+        let mut sa =
+            SecurityAssociation::new(0x10, XfrmProto::Esp, XfrmMode::Transport, [0; 4], [0; 4]);
+        sa.seq_in_max = 5;
+        sa.replay_bitmap = 0b1;
+        assert!(sa.replay_ok(0xFFFF_FFFF));
+        assert!(sa.replay_ok(0xFFFF_FFFF));
+        assert_eq!(sa.seq_in_max, 5);
+        assert_eq!(sa.replay_bitmap, 0b1);
+        // Already-seen sequence is rejected, still without mutation.
+        assert!(!sa.replay_ok(5));
+        assert_eq!(sa.seq_in_max, 5);
+    }
+
+    #[test]
+    fn test_spoofed_seq_does_not_wedge_sa() {
+        // A forged packet (bad ICV) carrying seq=0xFFFFFFFF must be
+        // dropped WITHOUT advancing the replay window, so a subsequent
+        // legitimate low-sequence packet still verifies (RFC 4303
+        // 3.4.3 anti-DoS).
+        let mut eng = XfrmEngine::new();
+        eng.sad
+            .add(
+                0x4000,
+                XfrmProto::Esp,
+                XfrmMode::Transport,
+                [10, 0, 0, 1],
+                [10, 0, 0, 2],
+            )
+            .unwrap();
+        let key = [0x33u8; CIPHER_KEY_SIZE];
+        let auth = [0x44u8; AUTH_KEY_SIZE];
+        let sa = eng.sad.lookup_mut(0x4000, XfrmProto::Esp).unwrap();
+        sa.cipher_alg = CipherAlg::Null;
+        sa.set_cipher_key(&key).unwrap();
+        sa.set_auth_key(&auth).unwrap();
+
+        // Build a genuine packet (seq 0) we will replay later.
+        let data = b"legit payload";
+        let mut good = [0u8; 256];
+        let good_len = eng.esp_encrypt(0x4000, data, &mut good).unwrap();
+
+        // Reset the inbound window as if nothing was received yet.
+        let sa = eng.sad.lookup_mut(0x4000, XfrmProto::Esp).unwrap();
+        sa.seq_in_max = 0;
+        sa.replay_bitmap = 0;
+
+        // Forge a packet: same SPI, seq = 0xFFFFFFFF, garbage ICV.
+        let mut forged = [0u8; 32];
+        forged[0..4].copy_from_slice(&0x4000u32.to_be_bytes());
+        forged[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        // bytes 8.. are zero ciphertext + zero ICV -> ICV will mismatch.
+        let mut scratch = [0u8; 256];
+        let spoof = eng.esp_decrypt(&forged, &mut scratch);
+        assert!(spoof.is_err());
+
+        // The window must be untouched: the genuine seq-0 packet still
+        // verifies and decrypts.
+        let mut plain = [0u8; 256];
+        let dec_len = eng.esp_decrypt(&good[..good_len], &mut plain).unwrap();
+        assert_eq!(&plain[..dec_len], data);
+    }
+
+    #[test]
+    fn test_non_null_cipher_rejected() {
+        // The placeholder XOR must never run while claiming AES: a
+        // non-NULL cipher fails closed on both encrypt and decrypt.
+        let mut eng = XfrmEngine::new();
+        eng.sad
+            .add(
+                0x6000,
+                XfrmProto::Esp,
+                XfrmMode::Transport,
+                [10, 0, 0, 1],
+                [10, 0, 0, 2],
+            )
+            .unwrap();
+        let sa = eng.sad.lookup_mut(0x6000, XfrmProto::Esp).unwrap();
+        // Aes128Cbc is the default; assert it is rejected explicitly.
+        sa.cipher_alg = CipherAlg::Aes128Cbc;
+        sa.set_auth_key(&[0x55u8; AUTH_KEY_SIZE]).unwrap();
+
+        let mut out = [0u8; 256];
+        assert_eq!(
+            eng.esp_encrypt(0x6000, b"secret", &mut out),
+            Err(Error::InvalidArgument)
+        );
+
+        // A packet addressed to this SA must be refused on decrypt
+        // before any XOR runs (SPI set so the SA lookup succeeds and
+        // the cipher guard — not NotFound — is what rejects it).
+        let mut packet = [0u8; ESP_HEADER_LEN + ICV_LEN + 4];
+        packet[0..4].copy_from_slice(&0x6000u32.to_be_bytes());
+        let mut plain = [0u8; 256];
+        assert_eq!(
+            eng.esp_decrypt(&packet, &mut plain),
+            Err(Error::InvalidArgument)
+        );
     }
 
     #[test]
