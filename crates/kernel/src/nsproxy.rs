@@ -46,6 +46,7 @@
 //! Linux `kernel/nsproxy.c`, `include/linux/nsproxy.h`,
 //! `include/uapi/linux/sched.h` (CLONE_NEW* flags).
 
+use crate::capability::{CAP_SYS_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -100,6 +101,62 @@ const CLONE_NEW_ALL: u64 = CLONE_NEWPID
     | CLONE_NEWUSER
     | CLONE_NEWCGROUP
     | CLONE_NEWTIME;
+
+// ── Privilege checks ─────────────────────────────────────────────────────────
+
+/// Authorize a `clone`/`unshare` request that creates new namespaces.
+///
+/// Creating or joining a namespace is a privileged operation. Following the
+/// Linux model, the caller must hold `CAP_SYS_ADMIN` to create any namespace,
+/// with one exception: creating a **new user namespace** (`CLONE_NEWUSER`) is
+/// permitted to an unprivileged caller. When `CLONE_NEWUSER` is combined with
+/// other flags, the new user namespace is created first and the caller becomes
+/// fully privileged within it, which authorizes the remaining namespaces in the
+/// same request.
+///
+/// `caller_caps` must be the *effective* capability set of the authenticated
+/// caller, threaded down by the syscall dispatcher.
+///
+/// # Errors
+/// Returns [`Error::PermissionDenied`] if the caller may not create the
+/// requested namespaces.
+//
+// SECURITY: fail closed — the dispatcher MUST thread the real caller's
+// effective `CapSet` here. Passing `CapSet::EMPTY` (the default) denies every
+// privileged namespace operation except an unprivileged user-ns create, so a
+// missing/unauthenticated caller can never silently gain a namespace.
+fn authorize_ns_create(caller_caps: CapSet, flags: u64) -> Result<()> {
+    // A new user namespace may be created without CAP_SYS_ADMIN; doing so
+    // grants privilege over any sibling namespaces requested alongside it.
+    if flags & CLONE_NEWUSER != 0 {
+        return Ok(());
+    }
+    if caller_caps.has(CAP_SYS_ADMIN) {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied)
+}
+
+/// Authorize a `setns` request that joins an existing namespace.
+///
+/// Joining a namespace always requires `CAP_SYS_ADMIN`; unlike create, there is
+/// no unprivileged user-namespace shortcut, because the target namespace already
+/// exists and is not owned by the caller.
+///
+/// `caller_caps` must be the *effective* capability set of the authenticated
+/// caller, threaded down by the syscall dispatcher.
+///
+/// # Errors
+/// Returns [`Error::PermissionDenied`] if the caller lacks `CAP_SYS_ADMIN`.
+//
+// SECURITY: fail closed — the dispatcher MUST thread the real caller's
+// effective `CapSet`. With `CapSet::EMPTY` this denies the join.
+fn authorize_ns_join(caller_caps: CapSet) -> Result<()> {
+    if caller_caps.has(CAP_SYS_ADMIN) {
+        return Ok(());
+    }
+    Err(Error::PermissionDenied)
+}
 
 // ── NamespaceType ───────────────────────────────────────────────────────────
 
@@ -543,8 +600,24 @@ impl NsProxyTable {
     /// namespaces that are not flagged and creates fresh ones for
     /// those that are.
     ///
+    /// `caller_caps` is the effective capability set of the authenticated
+    /// caller; creating namespaces requires `CAP_SYS_ADMIN` (except a new
+    /// user namespace). See [`authorize_ns_create`].
+    ///
     /// Returns the index of the new proxy.
-    pub fn copy_nsproxy(&mut self, src_idx: usize, clone_flags: u64, pid: u64) -> Result<usize> {
+    ///
+    /// # Errors
+    /// - [`Error::PermissionDenied`] — caller may not create the requested
+    ///   namespaces.
+    /// - [`Error::InvalidArgument`] / [`Error::NotFound`] — bad source proxy
+    ///   or unknown clone flags.
+    pub fn copy_nsproxy(
+        &mut self,
+        src_idx: usize,
+        clone_flags: u64,
+        pid: u64,
+        caller_caps: CapSet,
+    ) -> Result<usize> {
         if src_idx >= MAX_PROXIES {
             return Err(Error::InvalidArgument);
         }
@@ -554,7 +627,27 @@ impl NsProxyTable {
         if clone_flags & !CLONE_NEW_ALL != 0 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: gate namespace creation on CAP_SYS_ADMIN before any state
+        // mutation, so an unprivileged caller cannot allocate a proxy/ns.
+        if let Err(e) = authorize_ns_create(caller_caps, clone_flags) {
+            self.stats.failed_ops = self.stats.failed_ops.saturating_add(1);
+            return Err(e);
+        }
+        self.copy_nsproxy_unchecked(src_idx, clone_flags, pid)
+    }
 
+    /// Copy a proxy without re-checking caller privilege.
+    ///
+    /// Internal worker for [`Self::copy_nsproxy`]. Used directly for the
+    /// copy-on-write step of `unshare`/`setns`, where the caller was already
+    /// authorized for the overall operation and the COW copy itself creates no
+    /// user-requested namespace (it is invoked with `clone_flags == 0`).
+    fn copy_nsproxy_unchecked(
+        &mut self,
+        src_idx: usize,
+        clone_flags: u64,
+        pid: u64,
+    ) -> Result<usize> {
         let new_idx = self.alloc_proxy(pid)?;
 
         // Copy all namespace IDs from source.
@@ -571,13 +664,16 @@ impl NsProxyTable {
                 self.proxies[new_idx].ns_ids[ns_type.as_index()] = self.namespaces[ns_idx].id;
                 self.proxies[new_idx].flags.set(*ns_type);
 
-                // Increment ref on the new namespace.
-                self.namespaces[ns_idx].ref_count += 1;
+                // Increment ref on the new namespace (saturating: a ref-count
+                // loop must never wrap and panic in ring 0).
+                let rc = &mut self.namespaces[ns_idx].ref_count;
+                *rc = rc.saturating_add(1);
             } else {
                 // Sharing — increment ref on the existing namespace.
                 let ns_id = self.proxies[new_idx].ns_ids[ns_type.as_index()];
                 if let Some(ns_idx) = self.find_namespace(ns_id) {
-                    self.namespaces[ns_idx].ref_count += 1;
+                    let rc = &mut self.namespaces[ns_idx].ref_count;
+                    *rc = rc.saturating_add(1);
                 }
             }
         }
@@ -593,8 +689,25 @@ impl NsProxyTable {
     /// in its existing proxy with new ones.
     ///
     /// If the proxy has ref_count > 1, a new proxy is created first.
+    ///
+    /// `caller_caps` is the effective capability set of the authenticated
+    /// caller; unsharing namespaces requires `CAP_SYS_ADMIN` (except a new
+    /// user namespace). See [`authorize_ns_create`].
+    ///
     /// Returns the (possibly new) proxy index.
-    pub fn unshare(&mut self, proxy_idx: usize, flags: u64, pid: u64) -> Result<usize> {
+    ///
+    /// # Errors
+    /// - [`Error::PermissionDenied`] — caller may not create the requested
+    ///   namespaces.
+    /// - [`Error::InvalidArgument`] / [`Error::NotFound`] — bad proxy index or
+    ///   unknown flags.
+    pub fn unshare(
+        &mut self,
+        proxy_idx: usize,
+        flags: u64,
+        pid: u64,
+        caller_caps: CapSet,
+    ) -> Result<usize> {
         if proxy_idx >= MAX_PROXIES {
             return Err(Error::InvalidArgument);
         }
@@ -607,10 +720,16 @@ impl NsProxyTable {
         if flags == 0 {
             return Ok(proxy_idx);
         }
+        // SECURITY: gate before any COW/allocation; deny unprivileged unshare.
+        if let Err(e) = authorize_ns_create(caller_caps, flags) {
+            self.stats.failed_ops = self.stats.failed_ops.saturating_add(1);
+            return Err(e);
+        }
 
-        // If shared, must copy first.
+        // If shared, must copy first. The caller was already authorized above,
+        // and this COW creates no user-requested namespace (flags = 0).
         let target_idx = if self.proxies[proxy_idx].ref_count > 1 {
-            let new_idx = self.copy_nsproxy(proxy_idx, 0, pid)?;
+            let new_idx = self.copy_nsproxy_unchecked(proxy_idx, 0, pid)?;
             self.put_nsproxy(proxy_idx)?;
             new_idx
         } else {
@@ -630,7 +749,8 @@ impl NsProxyTable {
                 // Create new namespace.
                 let ns_idx = self.alloc_namespace(*ns_type, pid, old_ns_id)?;
                 self.proxies[target_idx].ns_ids[ns_type.as_index()] = self.namespaces[ns_idx].id;
-                self.namespaces[ns_idx].ref_count += 1;
+                let rc = &mut self.namespaces[ns_idx].ref_count;
+                *rc = rc.saturating_add(1);
                 self.proxies[target_idx].flags.set(*ns_type);
             }
         }
@@ -645,18 +765,34 @@ impl NsProxyTable {
     ///
     /// The task's proxy is updated to point to `target_ns_id` for the
     /// given namespace type. If the proxy is shared, it is copied first.
+    ///
+    /// `caller_caps` is the effective capability set of the authenticated
+    /// caller; joining a namespace always requires `CAP_SYS_ADMIN` (there is no
+    /// user-namespace shortcut for join). See [`authorize_ns_join`].
+    ///
+    /// # Errors
+    /// - [`Error::PermissionDenied`] — caller lacks `CAP_SYS_ADMIN`.
+    /// - [`Error::InvalidArgument`] / [`Error::NotFound`] — bad proxy index or
+    ///   target namespace.
     pub fn setns(
         &mut self,
         proxy_idx: usize,
         ns_type: NamespaceType,
         target_ns_id: u64,
         pid: u64,
+        caller_caps: CapSet,
     ) -> Result<usize> {
         if proxy_idx >= MAX_PROXIES {
             return Err(Error::InvalidArgument);
         }
         if self.proxies[proxy_idx].is_free() {
             return Err(Error::NotFound);
+        }
+        // SECURITY: joining an existing namespace requires CAP_SYS_ADMIN; gate
+        // before validating/mutating any state so denials are uniform.
+        if let Err(e) = authorize_ns_join(caller_caps) {
+            self.stats.failed_ops = self.stats.failed_ops.saturating_add(1);
+            return Err(e);
         }
 
         // Verify target namespace exists and is the right type.
@@ -668,9 +804,10 @@ impl NsProxyTable {
             return Err(Error::NotFound);
         }
 
-        // If shared proxy, copy first.
+        // If shared proxy, copy first. The caller was authorized above and this
+        // COW creates no user-requested namespace (flags = 0).
         let target_proxy = if self.proxies[proxy_idx].ref_count > 1 {
-            let new_idx = self.copy_nsproxy(proxy_idx, 0, pid)?;
+            let new_idx = self.copy_nsproxy_unchecked(proxy_idx, 0, pid)?;
             self.put_nsproxy(proxy_idx)?;
             new_idx
         } else {
@@ -683,9 +820,10 @@ impl NsProxyTable {
             self.decrement_ns_ref(old_idx);
         }
 
-        // Set new namespace.
+        // Set new namespace (saturating ref bump: cannot wrap/panic ring-0).
         self.proxies[target_proxy].ns_ids[ns_type.as_index()] = target_ns_id;
-        self.namespaces[target_ns_idx].ref_count += 1;
+        let rc = &mut self.namespaces[target_ns_idx].ref_count;
+        *rc = rc.saturating_add(1);
 
         self.stats.setns_ops += 1;
         Ok(target_proxy)
@@ -862,11 +1000,20 @@ mod tests {
         }
     }
 
+    /// Root capability set for privileged-path tests.
+    fn admin_caps() -> CapSet {
+        let mut c = CapSet::EMPTY;
+        c.set(CAP_SYS_ADMIN);
+        c
+    }
+
     #[test]
     fn test_clone_new_pid() {
         let mut table = NsProxyTable::new();
         table.init_boot().unwrap();
-        let new_idx = table.copy_nsproxy(0, CLONE_NEWPID, 42).unwrap();
+        let new_idx = table
+            .copy_nsproxy(0, CLONE_NEWPID, 42, admin_caps())
+            .unwrap();
         assert_ne!(new_idx, 0);
         // PID ns should differ, others should be shared.
         assert!(!table.shares_ns(0, new_idx, NamespaceType::Pid).unwrap());
@@ -874,24 +1021,71 @@ mod tests {
     }
 
     #[test]
+    fn test_clone_requires_cap_sys_admin() {
+        let mut table = NsProxyTable::new();
+        table.init_boot().unwrap();
+        // No CAP_SYS_ADMIN and no CLONE_NEWUSER → denied, fail closed.
+        let r = table.copy_nsproxy(0, CLONE_NEWNET, 42, CapSet::EMPTY);
+        assert_eq!(r, Err(Error::PermissionDenied));
+        assert_eq!(table.stats().failed_ops, 1);
+        // No proxy must have been allocated.
+        assert_eq!(table.active_proxy_count(), 1);
+    }
+
+    #[test]
+    fn test_clone_new_user_allowed_unprivileged() {
+        let mut table = NsProxyTable::new();
+        table.init_boot().unwrap();
+        // Creating a user namespace is permitted without CAP_SYS_ADMIN.
+        let r = table.copy_nsproxy(0, CLONE_NEWUSER, 42, CapSet::EMPTY);
+        assert!(r.is_ok());
+    }
+
+    #[test]
     fn test_unshare() {
         let mut table = NsProxyTable::new();
         table.init_boot().unwrap();
-        let new_idx = table.unshare(0, CLONE_NEWNET, 10).unwrap();
+        let new_idx = table.unshare(0, CLONE_NEWNET, 10, admin_caps()).unwrap();
         // Since init proxy has ref_count=1, we reuse it.
         assert_eq!(new_idx, 0);
         assert_eq!(table.stats().unshare_ops, 1);
     }
 
     #[test]
+    fn test_unshare_requires_cap_sys_admin() {
+        let mut table = NsProxyTable::new();
+        table.init_boot().unwrap();
+        let r = table.unshare(0, CLONE_NEWNET, 10, CapSet::EMPTY);
+        assert_eq!(r, Err(Error::PermissionDenied));
+        // The privileged unshare must not have run.
+        assert_eq!(table.stats().unshare_ops, 0);
+    }
+
+    #[test]
     fn test_setns() {
         let mut table = NsProxyTable::new();
         table.init_boot().unwrap();
-        let new_proxy = table.copy_nsproxy(0, CLONE_NEWUTS, 5).unwrap();
+        let new_proxy = table
+            .copy_nsproxy(0, CLONE_NEWUTS, 5, admin_caps())
+            .unwrap();
         let new_uts_id = table.proxy(new_proxy).unwrap().ns_id(NamespaceType::Uts);
         // setns back to the new UTS namespace.
-        let result = table.setns(0, NamespaceType::Uts, new_uts_id, 1);
+        let result = table.setns(0, NamespaceType::Uts, new_uts_id, 1, admin_caps());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_setns_requires_cap_sys_admin() {
+        let mut table = NsProxyTable::new();
+        table.init_boot().unwrap();
+        let new_proxy = table
+            .copy_nsproxy(0, CLONE_NEWUTS, 5, admin_caps())
+            .unwrap();
+        let new_uts_id = table.proxy(new_proxy).unwrap().ns_id(NamespaceType::Uts);
+        // Joining a namespace has no user-ns shortcut: empty caps → denied.
+        let r = table.setns(0, NamespaceType::Uts, new_uts_id, 1, CapSet::EMPTY);
+        assert_eq!(r, Err(Error::PermissionDenied));
+        assert_eq!(table.stats().setns_ops, 0);
     }
 
     #[test]
