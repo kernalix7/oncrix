@@ -66,6 +66,11 @@ pub struct SlubPage {
     free_count: usize,
     /// Total number of object slots in this page.
     total_objects: usize,
+    /// Per-slot allocated bitmap (bit set == slot handed out). This is
+    /// the authoritative allocated/free state for double-free detection;
+    /// it is NOT overloaded with the `NO_PAGE` free-list sentinel, so a
+    /// free of a free-list-tail slot can no longer escape the guard.
+    allocated: [u64; MAX_OBJECTS_PER_PAGE / 64],
     /// Size of each object in bytes.
     obj_size: usize,
     /// Whether this page is frozen (owned by a per-CPU cache).
@@ -82,6 +87,7 @@ impl Default for SlubPage {
             free_head: NO_PAGE,
             free_count: 0,
             total_objects: 0,
+            allocated: [0u64; MAX_OBJECTS_PER_PAGE / 64],
             obj_size: 0,
             frozen: false,
             in_use: false,
@@ -100,10 +106,14 @@ impl SlubPage {
             return Err(Error::InvalidArgument);
         }
 
-        let count = PAGE_SIZE / obj_size;
+        // Clamp the slot count to the free_list / allocated-bitmap
+        // capacity: a small obj_size yields PAGE_SIZE/obj_size > the
+        // 256-entry table, which would otherwise index out of bounds.
+        let count = (PAGE_SIZE / obj_size).min(MAX_OBJECTS_PER_PAGE);
         self.obj_size = obj_size;
         self.total_objects = count;
         self.free_count = count;
+        self.allocated = [0u64; MAX_OBJECTS_PER_PAGE / 64];
         self.in_use = true;
         self.frozen = false;
 
@@ -134,22 +144,55 @@ impl SlubPage {
         let slot = self.free_head;
         self.free_head = self.free_list[slot as usize];
         self.free_list[slot as usize] = NO_PAGE;
+        self.set_allocated(slot as usize);
         self.free_count -= 1;
 
         Ok(slot)
     }
 
+    /// Returns `true` when slot `idx` is currently allocated.
+    fn is_allocated(&self, idx: usize) -> bool {
+        let (word, bit) = (idx / 64, idx % 64);
+        word < self.allocated.len() && (self.allocated[word] & (1u64 << bit)) != 0
+    }
+
+    /// Mark slot `idx` allocated. `idx` is bounded by the caller (< total).
+    fn set_allocated(&mut self, idx: usize) {
+        let (word, bit) = (idx / 64, idx % 64);
+        if word < self.allocated.len() {
+            self.allocated[word] |= 1u64 << bit;
+        }
+    }
+
+    /// Mark slot `idx` free.
+    fn clear_allocated(&mut self, idx: usize) {
+        let (word, bit) = (idx / 64, idx % 64);
+        if word < self.allocated.len() {
+            self.allocated[word] &= !(1u64 << bit);
+        }
+    }
+
     /// Free a previously allocated slot back to this page.
     ///
     /// Returns [`Error::InvalidArgument`] if `offset` is out of range
-    /// or was not allocated.
+    /// or was not allocated (double-free detection).
     pub fn free(&mut self, offset: u16) -> Result<()> {
         let idx = offset as usize;
         if idx >= self.total_objects {
             return Err(Error::InvalidArgument);
         }
 
-        // Push onto the free-list head.
+        // Double-free guard, keyed on the authoritative allocated bitmap
+        // (not the overloaded `NO_PAGE` free-list sentinel): a slot that
+        // is not currently allocated is either never-allocated or already
+        // freed, and re-pushing it would duplicate it on the free list and
+        // later hand the same object to two callers (use-after-free).
+        if !self.is_allocated(idx) {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Push onto the free-list head and mark the slot free.
+        self.clear_allocated(idx);
         self.free_list[idx] = self.free_head;
         self.free_head = offset;
         self.free_count += 1;

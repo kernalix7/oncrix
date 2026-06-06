@@ -694,6 +694,13 @@ impl BuddyAllocCore {
 
     /// Frees a block at `pfn` of the given order, coalescing buddies.
     pub fn free_one_page(&mut self, pfn: u64, order: usize, migrate: MigrateType) -> Result<()> {
+        // Bound `order` before any `free_areas` indexing (mirrors
+        // `alloc_pages`). `free_areas` has `NR_ORDERS` (= MAX_ORDER + 1)
+        // entries, so any `order > MAX_ORDER` would index out of bounds
+        // in `coalesce_and_free`'s terminal `add`.
+        if order > MAX_ORDER {
+            return Err(Error::InvalidArgument);
+        }
         let zone_idx = self.find_zone(pfn).ok_or(Error::InvalidArgument)?;
 
         // Order-0: return to PCP list.
@@ -720,6 +727,22 @@ impl BuddyAllocCore {
         order: usize,
         migrate: MigrateType,
     ) -> Result<()> {
+        // Bound `order` so the terminal `add` indexes within
+        // `free_areas` even if the coalesce loop never runs, and
+        // validate the PFN belongs to this zone before touching it.
+        if zone_idx >= self.nr_zones || order > MAX_ORDER || !self.zones[zone_idx].contains_pfn(pfn)
+        {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Double-free detection: a block already present in this zone's
+        // free list at its requested order means the same `pfn`/`order`
+        // is being freed twice, which would corrupt the free list (and
+        // hand the same block out twice later). Reject it.
+        if self.zones[zone_idx].free_areas[order].is_free(pfn) {
+            return Err(Error::InvalidArgument);
+        }
+
         let mut current_pfn = pfn;
         let mut current_order = order;
 
@@ -745,6 +768,14 @@ impl BuddyAllocCore {
             self.zones[zone_idx].coalesce_count += 1;
         }
 
+        // Terminal double-free guard: the coalesced block must not
+        // already sit in its destination bucket. Reaching here with the
+        // slot occupied means a duplicate free survived coalescing;
+        // re-adding would put the same `current_pfn` on the free list
+        // twice, so reject rather than corrupt it.
+        if self.zones[zone_idx].free_areas[current_order].is_free(current_pfn) {
+            return Err(Error::InvalidArgument);
+        }
         self.zones[zone_idx].free_areas[current_order].add(current_pfn, migrate);
         self.zones[zone_idx].free_pages += 1u64 << current_order;
         self.zones[zone_idx].free_count += 1;
