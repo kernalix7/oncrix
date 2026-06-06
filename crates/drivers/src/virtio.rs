@@ -252,9 +252,27 @@ impl Virtqueue {
 
     /// Pop a completed request from the used ring.
     ///
-    /// Returns `(desc_chain_head, bytes_written)` or `None` if no
-    /// new completions or if the device-supplied descriptor id is out
-    /// of range (spurious/malicious completion guard).
+    /// Returns `(desc_chain_head, bytes_written)` or `None` if no new
+    /// completions are available or if the device-supplied descriptor `id` is
+    /// out of range (spurious/malicious completion guard).
+    ///
+    /// # Security notes
+    ///
+    /// Both fields of the returned tuple originate from device-DMA-writable
+    /// memory and must be treated as untrusted:
+    ///
+    /// - `desc_chain_head` (`elem.id`): validated here against `MAX_QUEUE_SIZE`
+    ///   before being returned.  Callers MUST additionally check that this head
+    ///   is currently in-flight (e.g. via a per-descriptor bitmap) to reject
+    ///   double-completions from a malicious device.
+    ///
+    /// - `bytes_written` (`elem.len`): returned as-is (the device may set any
+    ///   `u32` value).  Callers MUST NOT use this value to size a copy or DMA
+    ///   transfer without first clamping it to the actual buffer length.
+    ///   Current callers (`virtio_blk::poll_completion`,
+    ///   `virtio_scsi::poll_completion`) bind it to `_len` and do not perform
+    ///   any copy based on it, so no clamping is required today.  Any future
+    ///   caller that does use `len` must apply `.min(buf.len())` before use.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         if self.last_used_idx == self.used_idx {
             return None;

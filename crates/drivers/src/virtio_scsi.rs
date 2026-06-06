@@ -265,6 +265,12 @@ pub struct VirtioScsi {
     req_headers: [VirtioScsiReqHeader; MAX_INFLIGHT],
     /// Response headers (one per in-flight slot).
     resp_headers: [VirtioScsiRespHeader; MAX_INFLIGHT],
+    /// Per-descriptor in-flight bitmap for the request queue.
+    ///
+    /// `desc_inflight[i]` is `true` while descriptor `i` is the head of a
+    /// chain submitted to the device via `vq_request`.  A used-ring `id` that
+    /// is not set here is a spurious or double-completion and is dropped.
+    desc_inflight: [bool; crate::virtio::MAX_QUEUE_SIZE],
     /// Whether the device has been initialized.
     initialized: bool,
 }
@@ -311,6 +317,7 @@ impl VirtioScsi {
             next_tag: 1,
             req_headers: [ZERO_REQ; MAX_INFLIGHT],
             resp_headers: [ZERO_RESP; MAX_INFLIGHT],
+            desc_inflight: [false; crate::virtio::MAX_QUEUE_SIZE],
             initialized: false,
         }
     }
@@ -537,6 +544,9 @@ impl VirtioScsi {
         self.inflight[slot].tag = tag;
         self.inflight[slot].active = true;
         self.inflight_count += 1;
+        // Mark this descriptor head as in-flight so that a duplicate used-ring
+        // entry from a malicious device can be detected in poll_completion.
+        self.desc_inflight[d_req as usize] = true;
 
         self.vq_request.push_avail(d_req);
         self.mmio.notify(VQ_REQUEST as u32);
@@ -546,9 +556,34 @@ impl VirtioScsi {
 
     /// Poll the request queue for a completed command.
     ///
-    /// Returns `Some(slot)` if a command completed, `None` otherwise.
+    /// Returns `Some(slot)` if a command completed, `None` if no completions
+    /// are pending or if the completion was spurious/malicious.
+    ///
+    /// # Double-completion defence (Finding 4)
+    ///
+    /// `desc_head` is device-DMA-writable and can be replayed by a malicious
+    /// device.  We reject any completion whose `desc_head` is not recorded as
+    /// in-flight in `desc_inflight`, preventing premature retirement of a live
+    /// request that reused the same descriptor index.
+    ///
+    /// # Descriptor-chain bounds check (Finding 2)
+    ///
+    /// The `.next` fields traversed while freeing the chain are also
+    /// device-writable.  Each hop is validated against `MAX_QUEUE_SIZE` before
+    /// being used as a descriptor-table index; an out-of-range value stops the
+    /// walk early (remaining descriptors stay allocated — safe, the device is
+    /// already considered broken at this point).
     pub fn poll_completion(&mut self) -> Option<usize> {
         let (desc_head, _len) = self.vq_request.pop_used()?;
+
+        // Finding 4: reject completions for descriptor heads that are not
+        // currently in-flight.
+        let head_idx = desc_head as usize;
+        if !self.desc_inflight[head_idx] {
+            return None;
+        }
+        // Clear immediately; further replays of the same id are also dropped.
+        self.desc_inflight[head_idx] = false;
 
         for (i, req) in self.inflight.iter_mut().enumerate() {
             if req.active && req.head_desc == desc_head {
@@ -556,10 +591,16 @@ impl VirtioScsi {
                 self.inflight_count = self.inflight_count.saturating_sub(1);
 
                 // Free the three-descriptor chain.
+                // Finding 2: `d1` and `d2` are device-DMA-writable `.next`
+                // fields — validate each before indexing the descriptor table.
                 let d1 = self.vq_request.desc[desc_head as usize].next;
-                let d2 = self.vq_request.desc[d1 as usize].next;
-                self.vq_request.free_desc(d2);
-                self.vq_request.free_desc(d1);
+                if (d1 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                    let d2 = self.vq_request.desc[d1 as usize].next;
+                    if (d2 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                        self.vq_request.free_desc(d2);
+                    }
+                    self.vq_request.free_desc(d1);
+                }
                 self.vq_request.free_desc(desc_head);
 
                 return Some(i);

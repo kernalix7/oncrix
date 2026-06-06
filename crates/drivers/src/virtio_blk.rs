@@ -107,6 +107,13 @@ pub struct VirtioBlk {
     req_headers: [VirtioBlkReqHeader; MAX_INFLIGHT],
     /// Status byte storage (one per in-flight request).
     req_status: [u8; MAX_INFLIGHT],
+    /// Per-descriptor in-flight bitmap.
+    ///
+    /// `desc_inflight[i]` is `true` while descriptor `i` is the head of a
+    /// chain currently submitted to the device.  A device-supplied used-ring
+    /// `id` that is NOT set here is either a spurious or double-completion
+    /// from a malicious/buggy device and is silently dropped.
+    desc_inflight: [bool; crate::virtio::MAX_QUEUE_SIZE],
     /// Whether the device has been initialized.
     initialized: bool,
 }
@@ -129,6 +136,7 @@ impl VirtioBlk {
                 sector: 0,
             }; MAX_INFLIGHT],
             req_status: [0xFF; MAX_INFLIGHT],
+            desc_inflight: [false; crate::virtio::MAX_QUEUE_SIZE],
             initialized: false,
         }
     }
@@ -337,6 +345,9 @@ impl VirtioBlk {
         self.inflight[slot].head_desc = d_hdr;
         self.inflight[slot].active = true;
         self.inflight_count += 1;
+        // Mark this descriptor head as in-flight so that a duplicate used-ring
+        // entry from a malicious device can be detected in poll_completion.
+        self.desc_inflight[d_hdr as usize] = true;
 
         // Push to available ring and notify device.
         self.vq.push_avail(d_hdr);
@@ -347,10 +358,39 @@ impl VirtioBlk {
 
     /// Poll for a completed request.
     ///
-    /// Returns `Some(slot_index)` if a request completed, `None` if
-    /// no completions are available yet.
+    /// Returns `Some(slot_index)` if a request completed, `None` if no
+    /// completions are pending or if the completion was spurious/malicious.
+    ///
+    /// # Double-completion defence (Finding 4)
+    ///
+    /// `desc_head` comes from the device-DMA-writable used ring and can be
+    /// replayed.  We reject any completion whose `desc_head` is not currently
+    /// marked in `desc_inflight`.  This prevents a device from prematurely
+    /// retiring a live request that happens to share the same descriptor index.
+    ///
+    /// # Descriptor-chain bounds check (Finding 1)
+    ///
+    /// `.next` fields inside the descriptor table are also device-writable.
+    /// Every hop through the chain is validated against `MAX_QUEUE_SIZE` before
+    /// being used as an index; an out-of-range value causes the chain walk to
+    /// stop early (the remaining descriptors stay allocated, which is safe —
+    /// the device is already considered broken at that point).
     pub fn poll_completion(&mut self) -> Option<usize> {
         let (desc_head, _len) = self.vq.pop_used()?;
+
+        // Finding 4: reject completions for descriptor heads that are not
+        // currently in-flight.  A device can replay a used-ring entry for an
+        // already-completed (and potentially recycled) descriptor head; without
+        // this check that replay would prematurely retire the new request that
+        // reused the same index.
+        let head_idx = desc_head as usize;
+        if !self.desc_inflight[head_idx] {
+            return None;
+        }
+        // Clear the in-flight mark immediately — if the inflight-slot scan
+        // below finds no matching slot we still leave it cleared so that
+        // further replays of the same id are also dropped.
+        self.desc_inflight[head_idx] = false;
 
         // Find the in-flight slot for this descriptor chain.
         for (i, req) in self.inflight.iter_mut().enumerate() {
@@ -359,10 +399,18 @@ impl VirtioBlk {
                 self.inflight_count = self.inflight_count.saturating_sub(1);
 
                 // Free the 3-descriptor chain.
+                // Finding 1: `d1` and `d2` are device-DMA-writable `.next`
+                // fields.  Validate each index before using it to index `desc`.
+                // An out-of-range value from a malicious device would otherwise
+                // cause an OOB array access (panic / kernel memory corruption).
                 let d1 = self.vq.desc[desc_head as usize].next;
-                let d2 = self.vq.desc[d1 as usize].next;
-                self.vq.free_desc(d2);
-                self.vq.free_desc(d1);
+                if (d1 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                    let d2 = self.vq.desc[d1 as usize].next;
+                    if (d2 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                        self.vq.free_desc(d2);
+                    }
+                    self.vq.free_desc(d1);
+                }
                 self.vq.free_desc(desc_head);
 
                 return Some(i);
