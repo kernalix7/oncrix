@@ -220,7 +220,21 @@ impl NTty {
                     return;
                 }
                 CTRL_D => {
-                    // EOF — push an empty "line".
+                    // EOF — complete any pending partial line.
+                    //
+                    // If the buffer already holds undelivered bytes, treat ^D
+                    // as a line terminator for those bytes (do NOT push CTRL_D
+                    // itself; read() will return them and the caller interprets
+                    // the short read as EOF).
+                    //
+                    // If the buffer is empty the caller needs a zero-byte
+                    // "EOF line" to wake up and get Ok(0).  Push a CTRL_D
+                    // sentinel so read() has something to drain and decrement
+                    // line_count against; read() will return Ok(0) and strip
+                    // the sentinel from the buffer.
+                    if self.read_buf.is_empty() {
+                        self.read_buf.push(CTRL_D);
+                    }
                     self.line_count += 1;
                     return;
                 }
@@ -292,7 +306,20 @@ impl LdiscOps for NTty {
             if self.line_count == 0 {
                 return Err(Error::WouldBlock);
             }
-            // Find the first newline and return up to (and including) it.
+            // Find the first newline (or CTRL_D EOF sentinel) and return up
+            // to (and including) the delimiter.
+            //
+            // EOF sentinel case: read_buf starts with CTRL_D (inserted by
+            // process_char when ^D arrives on an empty buffer).  Drain the
+            // sentinel, decrement line_count, and return Ok(0) so the caller
+            // sees a POSIX-style zero-byte EOF without line_count getting
+            // permanently stuck above zero.
+            if self.read_buf.first() == Some(&CTRL_D) {
+                self.read_buf.drain(..1);
+                // Unconditional: line_count was incremented for this sentinel.
+                self.line_count = self.line_count.saturating_sub(1);
+                return Ok(0);
+            }
             let nl_pos = self
                 .read_buf
                 .iter()
@@ -302,9 +329,11 @@ impl LdiscOps for NTty {
             let to_copy = nl_pos.min(buf.len());
             buf[..to_copy].copy_from_slice(&self.read_buf[..to_copy]);
             self.read_buf.drain(..to_copy);
-            if to_copy > 0 && self.line_count > 0 {
-                self.line_count -= 1;
-            }
+            // Always decrement: a line token was consumed regardless of whether
+            // the caller-supplied buf was large enough for every byte (partial
+            // reads on the same line re-enter with line_count already 0, which
+            // is prevented by the guard at the top of this branch).
+            self.line_count = self.line_count.saturating_sub(1);
             Ok(to_copy)
         } else {
             if self.read_buf.is_empty() {
