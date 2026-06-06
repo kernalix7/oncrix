@@ -223,8 +223,19 @@ pub fn setsockopt_sol_socket(
             opts.sndlowat = v;
         }
         SO_MARK => {
-            let v = u32_val(val)?;
-            opts.mark = v;
+            // SECURITY: SO_MARK stamps a routing/firewall mark on every
+            // packet a socket emits and is a privileged operation — on
+            // Linux it requires CAP_NET_ADMIN (and CAP_NET_RAW for the
+            // related SO_BINDTODEVICE).  This handler does not yet have
+            // the caller's per-task credentials threaded in, so we cannot
+            // perform the capability check here.  Fail closed: reject the
+            // privileged set by default rather than silently honour an
+            // attacker-supplied mark.  The dispatcher MUST thread the
+            // caller cred and gate this (and SO_BINDTODEVICE when wired)
+            // on CAP_NET_ADMIN/CAP_NET_RAW before this arm is allowed to
+            // mutate `opts.mark`.
+            let _v = u32_val(val)?;
+            return Err(Error::PermissionDenied);
         }
         // Read-only options.
         SO_TYPE | SO_ERROR | SO_DOMAIN | SO_PROTOCOL => {

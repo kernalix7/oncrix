@@ -431,8 +431,18 @@ impl BtDevice {
     }
 
     /// Returns the local device name as a byte slice.
+    ///
+    /// `name_len` is clamped to the `name` buffer size: a future
+    /// HCI Read-Local-Name / Remote-Name-Request RX path could write a
+    /// controller-supplied length that exceeds the 248-byte buffer, and
+    /// an unclamped slice would panic in ring 0 (overflow-checks on).
     pub fn name(&self) -> &[u8] {
-        &self.name[..self.name_len]
+        let len = self.name_len.min(self.name.len());
+        debug_assert!(
+            self.name_len <= self.name.len(),
+            "name_len exceeds name buffer"
+        );
+        &self.name[..len]
     }
 }
 
@@ -455,6 +465,23 @@ pub struct BtPeerInfo {
     pub connected: bool,
     /// Connection handle (valid only when connected).
     pub handle: u16,
+}
+
+impl BtPeerInfo {
+    /// Returns the remote device name as a byte slice.
+    ///
+    /// `name_len` is clamped to the `name` buffer size so a future
+    /// inquiry / remote-name RX path writing a controller-supplied
+    /// length greater than 248 cannot slice out of bounds (which would
+    /// panic in ring 0 with overflow-checks enabled).
+    pub fn name(&self) -> &[u8] {
+        let len = self.name_len.min(self.name.len());
+        debug_assert!(
+            self.name_len <= self.name.len(),
+            "name_len exceeds name buffer"
+        );
+        &self.name[..len]
+    }
 }
 
 // =========================================================================
