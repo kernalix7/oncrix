@@ -267,9 +267,24 @@ impl MmLimits {
 
     /// Attempt to extend the brk region by `delta` bytes.
     ///
+    /// `ceiling` is a hard upper bound on the new brk end (typically the
+    /// process `task_size`, i.e. the start of the kernel half). The new
+    /// end must be strictly below it: a `delta` from an untrusted `brk`
+    /// syscall must never push the heap into the kernel address range,
+    /// regardless of `max_brk_size`.
+    ///
+    /// `max_brk_size` is treated as an *additional* cap, never as a way
+    /// to disable the `ceiling` check: `max_brk_size == 0` only means
+    /// "no per-region cap beyond the ceiling", it never means unlimited.
+    ///
     /// Returns the new brk end on success.
-    pub fn extend_brk(&mut self, delta: u64) -> Result<u64> {
+    pub fn extend_brk(&mut self, delta: u64, ceiling: u64) -> Result<u64> {
         let new_end = self.brk_end.checked_add(delta).ok_or(Error::OutOfMemory)?;
+        // Hard, non-optional ceiling: never extend into the kernel half.
+        if new_end > ceiling {
+            return Err(Error::OutOfMemory);
+        }
+        // Optional per-region cap, applied on top of the ceiling.
         if self.max_brk_size > 0 {
             let new_size = new_end.saturating_sub(self.brk_start);
             if new_size > self.max_brk_size {
@@ -387,18 +402,25 @@ impl MmStruct {
     }
 
     /// Total resident virtual memory in bytes.
+    ///
+    /// Saturates rather than wrapping: a poisoned `total_vm` page count
+    /// must never panic in ring 0 under `overflow-checks`.
     pub const fn total_vm_bytes(&self) -> u64 {
-        self.total_vm * PAGE_SIZE
+        self.total_vm.saturating_mul(PAGE_SIZE)
     }
 
     /// Locked memory in bytes.
+    ///
+    /// Saturates on overflow to avoid a ring-0 panic.
     pub const fn locked_bytes(&self) -> u64 {
-        self.locked_vm * PAGE_SIZE
+        self.locked_vm.saturating_mul(PAGE_SIZE)
     }
 
     /// Pinned memory in bytes.
+    ///
+    /// Saturates on overflow to avoid a ring-0 panic.
     pub const fn pinned_bytes(&self) -> u64 {
-        self.pinned_vm * PAGE_SIZE
+        self.pinned_vm.saturating_mul(PAGE_SIZE)
     }
 
     /// Code segment size in bytes.
@@ -733,9 +755,28 @@ impl MmTable {
         let new_id = self.alloc_mm(new_owner_pid, new_pgd_phys)?;
         let new_idx = new_id as usize;
 
+        // Sanitize the inherited user/kernel split before trusting it.
+        // `task_size` and `mmap_base` are public fields and `get_mm_mut`
+        // is public, so a prior path could have poisoned the source with
+        // a kernel-half `task_size` or an out-of-range `mmap_base`. If the
+        // child inherited those verbatim, every user-address upper-bound
+        // check (which compares against `task_size`) would be defeated.
+        // Clamp the split to the architectural default and keep the mmap
+        // base strictly inside the user half.
+        let task_size = if src.task_size > DEFAULT_TASK_SIZE {
+            DEFAULT_TASK_SIZE
+        } else {
+            src.task_size
+        };
+        let mmap_base = if src.mmap_base < task_size {
+            src.mmap_base
+        } else {
+            DEFAULT_MMAP_BASE
+        };
+
         // Copy layout and accounting from source.
-        self.entries[new_idx].mmap_base = src.mmap_base;
-        self.entries[new_idx].task_size = src.task_size;
+        self.entries[new_idx].mmap_base = mmap_base;
+        self.entries[new_idx].task_size = task_size;
         self.entries[new_idx].total_vm = src.total_vm;
         self.entries[new_idx].locked_vm = src.locked_vm;
         self.entries[new_idx].pinned_vm = 0; // pinned pages are not inherited
