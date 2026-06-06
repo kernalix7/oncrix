@@ -166,8 +166,18 @@ pub struct ArrayMap {
 
 impl ArrayMap {
     /// Create a new array map with the given number of entries (capped at max).
+    ///
+    /// A `max_entries` of `0` is clamped to `1`: a zero-length array map is
+    /// degenerate and every index lookup would already be rejected, but the
+    /// clamp guarantees the backing store always has at least one usable slot
+    /// and keeps construction infallible for the `const` callers. Use
+    /// [`ArrayMap::try_new`] to reject `max_entries == 0` explicitly.
     pub const fn new(max_entries: usize) -> Self {
-        let cap = if max_entries > ARRAY_MAP_MAX_ENTRIES {
+        // SECURITY: clamp to [1, ARRAY_MAP_MAX_ENTRIES]. A `0` capacity is
+        // forced to 1 so no later index/modulo path can ever see a zero bound.
+        let cap = if max_entries == 0 {
+            1
+        } else if max_entries > ARRAY_MAP_MAX_ENTRIES {
             ARRAY_MAP_MAX_ENTRIES
         } else {
             max_entries
@@ -179,6 +189,19 @@ impl ArrayMap {
             }; ARRAY_MAP_MAX_ENTRIES],
             max_entries: cap,
         }
+    }
+
+    /// Create a new array map, rejecting a zero `max_entries`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `max_entries` is `0`. The count
+    /// is otherwise capped at [`ARRAY_MAP_MAX_ENTRIES`].
+    pub fn try_new(max_entries: usize) -> Result<Self> {
+        if max_entries == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self::new(max_entries))
     }
 
     /// Look up entry by index.
@@ -244,8 +267,18 @@ pub struct HashMap {
 
 impl HashMap {
     /// Create a new hash map.
+    ///
+    /// A `max_entries` of `0` is clamped to `1`. This is a hard safety
+    /// invariant: the bucket index is computed as `hash % max_entries`, so a
+    /// zero capacity would divide by zero and panic in ring 0. Use
+    /// [`HashMap::try_new`] to reject `max_entries == 0` explicitly.
     pub const fn new(max_entries: usize) -> Self {
-        let cap = if max_entries > HASH_MAP_MAX_ENTRIES {
+        // SECURITY: clamp to [1, HASH_MAP_MAX_ENTRIES]. `max_entries` is the
+        // divisor of every `% max_entries` probe; forcing it >= 1 here makes a
+        // div-by-zero ring-0 panic structurally impossible.
+        let cap = if max_entries == 0 {
+            1
+        } else if max_entries > HASH_MAP_MAX_ENTRIES {
             HASH_MAP_MAX_ENTRIES
         } else {
             max_entries
@@ -267,6 +300,20 @@ impl HashMap {
         }
     }
 
+    /// Create a new hash map, rejecting a zero `max_entries`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `max_entries` is `0` (which would
+    /// make the `hash % max_entries` bucket computation divide by zero). The
+    /// count is otherwise capped at [`HASH_MAP_MAX_ENTRIES`].
+    pub fn try_new(max_entries: usize) -> Result<Self> {
+        if max_entries == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self::new(max_entries))
+    }
+
     fn hash(key: &MapKey) -> usize {
         // FNV-1a hash.
         let mut h: u64 = 0xcbf29ce484222325;
@@ -278,6 +325,12 @@ impl HashMap {
     }
 
     fn find_slot(&self, key: &MapKey) -> Option<usize> {
+        // SECURITY: guard the divisor explicitly. The constructor already
+        // clamps `max_entries` to >= 1, but a zero here would panic on the
+        // `% self.max_entries` below; fail closed by reporting "not found".
+        if self.max_entries == 0 {
+            return None;
+        }
         let start = Self::hash(key) % self.max_entries;
         for i in 0..self.max_entries {
             let idx = (start + i) % self.max_entries;
@@ -292,6 +345,10 @@ impl HashMap {
     }
 
     fn find_free_slot(&self, key: &MapKey) -> Option<usize> {
+        // SECURITY: same nonzero invariant as `find_slot` — never `% 0`.
+        if self.max_entries == 0 {
+            return None;
+        }
         let start = Self::hash(key) % self.max_entries;
         for i in 0..self.max_entries {
             let idx = (start + i) % self.max_entries;
@@ -330,7 +387,9 @@ impl HashMap {
         self.slots[idx].occupied = false;
         self.slots[idx].key = MapKey::default();
         self.slots[idx].value = MapValue::default();
-        self.count -= 1;
+        // SECURITY: saturating to avoid a ring-0 underflow panic under
+        // overflow-checks if `count` were ever out of sync with the slots.
+        self.count = self.count.saturating_sub(1);
         Ok(())
     }
 
@@ -429,8 +488,17 @@ pub struct LpmTrieMap {
 
 impl LpmTrieMap {
     /// Create a new LPM trie.
+    ///
+    /// A `max_entries` of `0` is clamped to `1` so the trie always has at
+    /// least one usable slot; insertion into a zero-capacity trie would
+    /// otherwise always fail. Use [`LpmTrieMap::try_new`] to reject
+    /// `max_entries == 0` explicitly.
     pub const fn new(max_entries: usize) -> Self {
-        let cap = if max_entries > LPM_TRIE_MAX_ENTRIES {
+        // SECURITY: clamp to [1, LPM_TRIE_MAX_ENTRIES] for a consistent
+        // nonzero capacity invariant across all map types.
+        let cap = if max_entries == 0 {
+            1
+        } else if max_entries > LPM_TRIE_MAX_ENTRIES {
             LPM_TRIE_MAX_ENTRIES
         } else {
             max_entries
@@ -451,6 +519,19 @@ impl LpmTrieMap {
             count: 0,
             max_entries: cap,
         }
+    }
+
+    /// Create a new LPM trie, rejecting a zero `max_entries`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `max_entries` is `0`. The count
+    /// is otherwise capped at [`LPM_TRIE_MAX_ENTRIES`].
+    pub fn try_new(max_entries: usize) -> Result<Self> {
+        if max_entries == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self::new(max_entries))
     }
 
     /// Longest-prefix lookup.
@@ -551,5 +632,60 @@ impl BpfMapHandle {
             Self::Hash(_) => BpfMapType::Hash,
             Self::LpmTrie(_) => BpfMapType::LpmTrie,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hashmap_zero_entries_never_divides_by_zero() {
+        // A zero-entry hash map must not panic on any operation. The divisor
+        // (`max_entries`) is clamped to >= 1 at construction.
+        let mut m = HashMap::new(0);
+        assert_eq!(m.max_entries, 1);
+        let k = MapKey::from_slice(b"k");
+        let v = MapValue::from_slice(b"v");
+        // None of these may panic with a div-by-zero in ring 0.
+        assert!(m.lookup(&k).is_none());
+        assert!(m.update(&k, &v).is_ok());
+        assert!(m.lookup(&k).is_some());
+        assert!(m.delete(&k).is_ok());
+        assert!(m.delete(&k).is_err());
+    }
+
+    #[test]
+    fn hashmap_try_new_rejects_zero() {
+        assert!(HashMap::try_new(0).is_err());
+        assert!(HashMap::try_new(8).is_ok());
+    }
+
+    #[test]
+    fn hashmap_caps_oversized_request() {
+        let m = HashMap::new(HASH_MAP_MAX_ENTRIES * 4);
+        assert_eq!(m.max_entries, HASH_MAP_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn arraymap_zero_entries_clamped_and_rejects_index() {
+        let m = ArrayMap::new(0);
+        assert_eq!(m.max_entries(), 1);
+        // Index 0 is in-bounds for the clamped capacity; index 1 is not.
+        assert!(m.lookup(1).is_none());
+        assert!(ArrayMap::try_new(0).is_err());
+        assert!(ArrayMap::try_new(4).is_ok());
+    }
+
+    #[test]
+    fn lpmtrie_zero_entries_clamped() {
+        let t = LpmTrieMap::new(0);
+        assert_eq!(t.max_entries, 1);
+        assert!(LpmTrieMap::try_new(0).is_err());
+        assert!(LpmTrieMap::try_new(4).is_ok());
     }
 }
