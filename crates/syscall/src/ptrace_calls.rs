@@ -49,6 +49,33 @@ const PTRACE_O_MASK: u32 = PTRACE_O_EXITKILL
     | PTRACE_O_TRACEEXIT
     | PTRACE_O_TRACESECCOMP;
 
+/// x86-64 user-mode code segment selector (GDT index 4, RPL=3).
+///
+/// Matches `SEL_USER_CODE` in `crates/hal/src/gdt_hw.rs`.
+const USER_CS: u64 = 0x23;
+
+/// x86-64 user-mode stack/data segment selector (GDT index 3, RPL=3).
+///
+/// Matches `SEL_USER_DATA` in `crates/hal/src/gdt_hw.rs`.
+const USER_SS: u64 = 0x1B;
+
+/// RFLAGS mask: bits the kernel is allowed to preserve when a tracer writes
+/// registers.  Strips IOPL[13:12], NT[14], RF[16], VM[17], AC[18], VIF[19],
+/// VIP[20], all reserved bits (3, 5, 15), and everything above bit 21
+/// (reserved or privileged).
+///
+/// Preserved, ring-3-safe bits: CF(0), PF(2), AF(4), ZF(6), SF(7), TF(8),
+/// IF(9), DF(10), OF(11), ID(21).  Reserved bit 1 (always 1) is forced on
+/// separately after masking.
+const EFLAGS_USER_MASK: u64 = 0x0000_0000_0020_0FD5;
+
+/// Highest canonical user-space virtual address on x86-64 (256 TiB - 1).
+///
+/// Addresses strictly above this value are either kernel-half canonical
+/// (`0xFFFF_8000_0000_0000..`) or non-canonical, and must never be stored
+/// in a user-visible program counter or stack pointer.
+const USER_SPACE_END: u64 = 0x0000_7FFF_FFFF_FFFF;
+
 // ---------------------------------------------------------------------------
 // PtraceRequest
 // ---------------------------------------------------------------------------
@@ -459,15 +486,50 @@ impl PtraceTable {
     }
 
     /// Look up the state for a tracee, returning a shared reference.
+    ///
+    /// Returns `NotFound` if no session exists for `tracee_pid`.
     fn get_state(&self, tracee_pid: u32) -> Result<&PtraceState> {
         let idx = self.find_tracee(tracee_pid).ok_or(Error::NotFound)?;
         self.slots[idx].state.as_ref().ok_or(Error::NotFound)
     }
 
+    /// Look up the state for a tracee owned by `caller_pid`, returning a
+    /// shared reference.
+    ///
+    /// Returns `NotFound` if no session exists, `PermissionDenied` if the
+    /// session belongs to a different tracer.
+    fn get_state_owned(&self, tracee_pid: u32, caller_pid: u32) -> Result<&PtraceState> {
+        let state = self.get_state(tracee_pid)?;
+        if state.tracer_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(state)
+    }
+
     /// Look up the state for a tracee, returning a mutable reference.
+    ///
+    /// Returns `NotFound` if no session exists for `tracee_pid`.
     fn get_state_mut(&mut self, tracee_pid: u32) -> Result<&mut PtraceState> {
         let idx = self.find_tracee(tracee_pid).ok_or(Error::NotFound)?;
         self.slots[idx].state.as_mut().ok_or(Error::NotFound)
+    }
+
+    /// Look up the state for a tracee owned by `caller_pid`, returning a
+    /// mutable reference.
+    ///
+    /// Returns `NotFound` if no session exists, `PermissionDenied` if the
+    /// session belongs to a different tracer.
+    fn get_state_mut_owned(
+        &mut self,
+        tracee_pid: u32,
+        caller_pid: u32,
+    ) -> Result<&mut PtraceState> {
+        let idx = self.find_tracee(tracee_pid).ok_or(Error::NotFound)?;
+        let state = self.slots[idx].state.as_mut().ok_or(Error::NotFound)?;
+        if state.tracer_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(state)
     }
 }
 
@@ -497,6 +559,67 @@ fn validate_aligned(addr: u64) -> Result<()> {
     Ok(())
 }
 
+/// Validate that the region `[addr, addr + len)` lies entirely within the
+/// canonical user-space window for the tracee.
+///
+/// Rejects:
+/// - Addresses above [`USER_SPACE_END`] (kernel-half or non-canonical).
+/// - `addr + len` overflows `u64`.
+/// - `addr + len` exceeds `USER_SPACE_END + 1`.
+///
+/// `len == 0` is accepted (no bytes accessed).
+fn validate_tracee_addr(addr: u64, len: u64) -> Result<()> {
+    // An attacker-controlled addr+len addition must not overflow.
+    let end = addr.checked_add(len).ok_or(Error::InvalidArgument)?;
+    // end is the exclusive bound; USER_SPACE_END is the last valid byte.
+    // end > USER_SPACE_END + 1 means the range crosses into kernel space.
+    // Use saturating_add to compute the limit without overflow.
+    if end > USER_SPACE_END.saturating_add(1) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// Sanitise a [`UserRegs`] supplied by an unprivileged tracer before storing.
+///
+/// # Rules
+///
+/// - `rip` and `rsp` must be canonical user-space addresses
+///   (≤ [`USER_SPACE_END`]).
+/// - `cs` is forced to [`USER_CS`] regardless of what the tracer wrote,
+///   preventing privilege escalation via a crafted code segment selector.
+/// - `ss` is forced to [`USER_SS`] for the same reason.
+/// - `eflags` has IOPL[13:12], NT[14], VM[17], AC[18], VIF[19], VIP[20],
+///   and all reserved/privileged bits above bit 21 stripped, then the
+///   mandatory `RF`[bit 1] bit is set so the resumed instruction does not
+///   immediately re-trigger a debug exception.
+fn sanitise_regs(regs: &UserRegs) -> Result<UserRegs> {
+    // rip must be a canonical user-space address.
+    if regs.rip > USER_SPACE_END {
+        return Err(Error::InvalidArgument);
+    }
+    // rsp must be a canonical user-space address.
+    if regs.rsp > USER_SPACE_END {
+        return Err(Error::InvalidArgument);
+    }
+
+    let mut safe = *regs;
+
+    // Force segment selectors to safe ring-3 values.  A tracer-supplied
+    // selector could point to a kernel segment (RPL=0) and allow ring
+    // escalation on IRET.
+    safe.cs = USER_CS;
+    safe.ss = USER_SS;
+
+    // Strip privileged EFLAGS bits.  IOPL must stay 0 for ring-3 so the
+    // process cannot open I/O port access; NT/VM/AC/VIF/VIP and all reserved
+    // bits are cleared by the mask.  Reserved bit 1 (architecturally always 1)
+    // is then forced back on so the restored flags are well-formed.
+    safe.eflags = (regs.eflags & EFLAGS_USER_MASK) | 0x2;
+
+    Ok(safe)
+}
+
 // ---------------------------------------------------------------------------
 // Individual request handlers
 // ---------------------------------------------------------------------------
@@ -505,20 +628,46 @@ fn validate_aligned(addr: u64) -> Result<()> {
 ///
 /// The tracee receives `SIGSTOP` and enters ptrace-stop.
 /// Returns `AlreadyExists` if the tracee is already being traced.
-pub fn ptrace_attach(table: &mut PtraceTable, tracer_pid: u32, tracee_pid: u32) -> Result<()> {
-    validate_pid(tracer_pid)?;
+///
+/// # Security
+///
+/// `caller` carries the authenticated credentials of the attaching process,
+/// derived from the current task by the dispatcher — never trusted from
+/// user-supplied arguments.
+///
+/// # SECURITY NOTE (audit-21 finding 2)
+///
+/// Full per-task credential threading is not yet wired through the
+/// dispatcher.  Until `caller.cap_ptrace` and `caller.euid`/`caller.egid`
+/// are populated from the real task credentials (not a zero-initialised
+/// default), this gate **fails closed**: only the process attaching to
+/// itself (self-ptrace) or a caller that was explicitly granted
+/// `cap_ptrace = true` by the dispatcher is accepted.  Any caller that
+/// passes a default-constructed `PtraceCaller` will be denied.
+///
+/// TODO: wire per-task `Creds` through the dispatcher once the process
+/// table carries authenticated credential records.
+pub fn ptrace_attach(
+    table: &mut PtraceTable,
+    caller: &PtraceCaller,
+    tracee_pid: u32,
+) -> Result<()> {
+    validate_pid(caller.pid)?;
     validate_pid(tracee_pid)?;
 
-    if tracer_pid == tracee_pid {
+    if caller.pid == tracee_pid {
+        // ATTACH to self is rejected (EINVAL), matching Linux ptrace ATTACH.
         return Err(Error::InvalidArgument);
     }
+
+    ptrace_may_access(caller, tracee_pid)?;
 
     if table.find_tracee(tracee_pid).is_some() {
         return Err(Error::AlreadyExists);
     }
 
     let idx = table.find_free().ok_or(Error::OutOfMemory)?;
-    let mut state = PtraceState::new(tracer_pid, tracee_pid);
+    let mut state = PtraceState::new(caller.pid, tracee_pid);
     // On attach the tracee is placed into ptrace-stop.
     state.stopped = true;
     table.slots[idx].state = Some(state);
@@ -529,18 +678,24 @@ pub fn ptrace_attach(table: &mut PtraceTable, tracer_pid: u32, tracee_pid: u32) 
 /// Handle `PTRACE_SEIZE`: attach without stopping the tracee.
 ///
 /// Allows the tracer to use `PTRACE_INTERRUPT` and `PTRACE_LISTEN`.
+///
+/// # Security
+///
+/// See [`ptrace_attach`] for the credential threading note.
 pub fn ptrace_seize(
     table: &mut PtraceTable,
-    tracer_pid: u32,
+    caller: &PtraceCaller,
     tracee_pid: u32,
     options: u32,
 ) -> Result<()> {
-    validate_pid(tracer_pid)?;
+    validate_pid(caller.pid)?;
     validate_pid(tracee_pid)?;
 
-    if tracer_pid == tracee_pid {
+    if caller.pid == tracee_pid {
         return Err(Error::InvalidArgument);
     }
+
+    ptrace_may_access(caller, tracee_pid)?;
 
     if table.find_tracee(tracee_pid).is_some() {
         return Err(Error::AlreadyExists);
@@ -548,7 +703,7 @@ pub fn ptrace_seize(
 
     let opts = PtraceOptions::from_u32(options)?;
     let idx = table.find_free().ok_or(Error::OutOfMemory)?;
-    let mut state = PtraceState::new(tracer_pid, tracee_pid);
+    let mut state = PtraceState::new(caller.pid, tracee_pid);
     state.options = opts;
     state.seized = true;
     state.stopped = false; // Seized tracee is NOT stopped.
@@ -560,7 +715,13 @@ pub fn ptrace_seize(
 /// Handle `PTRACE_DETACH`: detach from the tracee and resume it.
 ///
 /// `signal` is delivered to the tracee on resume (0 = no signal).
-pub fn ptrace_detach(table: &mut PtraceTable, tracee_pid: u32, signal: i32) -> Result<()> {
+/// Only the owning tracer (identified by `caller_pid`) may detach.
+pub fn ptrace_detach(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    signal: i32,
+) -> Result<()> {
     validate_pid(tracee_pid)?;
 
     if signal < 0 || signal > 64 {
@@ -568,6 +729,12 @@ pub fn ptrace_detach(table: &mut PtraceTable, tracee_pid: u32, signal: i32) -> R
     }
 
     let idx = table.find_tracee(tracee_pid).ok_or(Error::NotFound)?;
+    {
+        let state = table.slots[idx].state.as_ref().ok_or(Error::NotFound)?;
+        if state.tracer_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+    }
     table.slots[idx].state = None;
     table.count = table.count.saturating_sub(1);
     Ok(())
@@ -575,12 +742,21 @@ pub fn ptrace_detach(table: &mut PtraceTable, tracee_pid: u32, signal: i32) -> R
 
 /// Handle `PTRACE_PEEKTEXT` / `PTRACE_PEEKDATA`: read a word from tracee.
 ///
-/// `addr` must be 8-byte aligned.  Returns the word value.
-pub fn ptrace_peek(table: &PtraceTable, tracee_pid: u32, addr: u64) -> Result<u64> {
+/// `addr` must be 8-byte aligned and within the tracee's user-space range.
+/// Only the owning tracer (identified by `caller_pid`) may peek.
+/// Returns the word value.
+pub fn ptrace_peek(
+    table: &PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    addr: u64,
+) -> Result<u64> {
     validate_pid(tracee_pid)?;
     validate_aligned(addr)?;
+    // An 8-byte read: verify [addr, addr+8) is within user space.
+    validate_tracee_addr(addr, 8)?;
 
-    let state = table.get_state(tracee_pid)?;
+    let state = table.get_state_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
@@ -592,12 +768,21 @@ pub fn ptrace_peek(table: &PtraceTable, tracee_pid: u32, addr: u64) -> Result<u6
 
 /// Handle `PTRACE_POKETEXT` / `PTRACE_POKEDATA`: write a word to tracee.
 ///
-/// `addr` must be 8-byte aligned.
-pub fn ptrace_poke(table: &mut PtraceTable, tracee_pid: u32, addr: u64, data: u64) -> Result<()> {
+/// `addr` must be 8-byte aligned and within the tracee's user-space range.
+/// Only the owning tracer (identified by `caller_pid`) may poke.
+pub fn ptrace_poke(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    addr: u64,
+    data: u64,
+) -> Result<()> {
     validate_pid(tracee_pid)?;
     validate_aligned(addr)?;
+    // An 8-byte write: verify [addr, addr+8) is within user space.
+    validate_tracee_addr(addr, 8)?;
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
@@ -608,10 +793,12 @@ pub fn ptrace_poke(table: &mut PtraceTable, tracee_pid: u32, addr: u64, data: u6
 }
 
 /// Handle `PTRACE_GETREGS`: copy general-purpose registers from tracee.
-pub fn ptrace_getregs(table: &PtraceTable, tracee_pid: u32) -> Result<UserRegs> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may read registers.
+pub fn ptrace_getregs(table: &PtraceTable, caller_pid: u32, tracee_pid: u32) -> Result<UserRegs> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state(tracee_pid)?;
+    let state = table.get_state_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
@@ -619,22 +806,37 @@ pub fn ptrace_getregs(table: &PtraceTable, tracee_pid: u32) -> Result<UserRegs> 
 }
 
 /// Handle `PTRACE_SETREGS`: overwrite general-purpose registers in tracee.
-pub fn ptrace_setregs(table: &mut PtraceTable, tracee_pid: u32, regs: &UserRegs) -> Result<()> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may write registers.
+///
+/// The supplied `regs` are sanitised before storage: `rip`/`rsp` must be
+/// canonical user-space addresses; `cs`/`ss` are forced to the ring-3
+/// selectors; privileged `eflags` bits (IOPL, NT, VM, AC, VIF, VIP) are
+/// stripped.
+pub fn ptrace_setregs(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    regs: &UserRegs,
+) -> Result<()> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let safe = sanitise_regs(regs)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
-    state.regs = *regs;
+    state.regs = safe;
     Ok(())
 }
 
 /// Handle `PTRACE_GETFPREGS`: copy floating-point register state from tracee.
-pub fn ptrace_getfpregs(table: &PtraceTable, tracee_pid: u32) -> Result<[u8; 64]> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may read fp registers.
+pub fn ptrace_getfpregs(table: &PtraceTable, caller_pid: u32, tracee_pid: u32) -> Result<[u8; 64]> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state(tracee_pid)?;
+    let state = table.get_state_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
@@ -642,10 +844,17 @@ pub fn ptrace_getfpregs(table: &PtraceTable, tracee_pid: u32) -> Result<[u8; 64]
 }
 
 /// Handle `PTRACE_SETFPREGS`: overwrite floating-point state in tracee.
-pub fn ptrace_setfpregs(table: &mut PtraceTable, tracee_pid: u32, fpregs: &[u8; 64]) -> Result<()> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may write fp registers.
+pub fn ptrace_setfpregs(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    fpregs: &[u8; 64],
+) -> Result<()> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
@@ -656,14 +865,20 @@ pub fn ptrace_setfpregs(table: &mut PtraceTable, tracee_pid: u32, fpregs: &[u8; 
 /// Handle `PTRACE_CONT`: resume the stopped tracee.
 ///
 /// `signal` is delivered to the tracee (0 = suppress pending signal).
-pub fn ptrace_cont(table: &mut PtraceTable, tracee_pid: u32, signal: i32) -> Result<()> {
+/// Only the owning tracer (identified by `caller_pid`) may resume.
+pub fn ptrace_cont(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    signal: i32,
+) -> Result<()> {
     validate_pid(tracee_pid)?;
 
     if signal < 0 || signal > 64 {
         return Err(Error::InvalidArgument);
     }
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     state.stopped = false;
     state.pending_signal = signal;
     Ok(())
@@ -672,14 +887,20 @@ pub fn ptrace_cont(table: &mut PtraceTable, tracee_pid: u32, signal: i32) -> Res
 /// Handle `PTRACE_SINGLESTEP`: resume the tracee for one instruction.
 ///
 /// `signal` is delivered to the tracee (0 = suppress).
-pub fn ptrace_singlestep(table: &mut PtraceTable, tracee_pid: u32, signal: i32) -> Result<()> {
+/// Only the owning tracer (identified by `caller_pid`) may single-step.
+pub fn ptrace_singlestep(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    signal: i32,
+) -> Result<()> {
     validate_pid(tracee_pid)?;
 
     if signal < 0 || signal > 64 {
         return Err(Error::InvalidArgument);
     }
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     state.stopped = false;
     state.pending_signal = signal;
     // Stub: real implementation sets the TF (trap flag) in RFLAGS.
@@ -687,7 +908,14 @@ pub fn ptrace_singlestep(table: &mut PtraceTable, tracee_pid: u32, signal: i32) 
 }
 
 /// Handle `PTRACE_SETOPTIONS`: update ptrace option flags.
-pub fn ptrace_setoptions(table: &mut PtraceTable, tracee_pid: u32, options: u64) -> Result<()> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may set options.
+pub fn ptrace_setoptions(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    options: u64,
+) -> Result<()> {
     validate_pid(tracee_pid)?;
 
     if options > u32::MAX as u64 {
@@ -695,24 +923,28 @@ pub fn ptrace_setoptions(table: &mut PtraceTable, tracee_pid: u32, options: u64)
     }
 
     let opts = PtraceOptions::from_u32(options as u32)?;
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     state.options = opts;
     Ok(())
 }
 
 /// Handle `PTRACE_GETEVENTMSG`: retrieve event message from last ptrace stop.
-pub fn ptrace_geteventmsg(table: &PtraceTable, tracee_pid: u32) -> Result<u64> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may read event messages.
+pub fn ptrace_geteventmsg(table: &PtraceTable, caller_pid: u32, tracee_pid: u32) -> Result<u64> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state(tracee_pid)?;
+    let state = table.get_state_owned(tracee_pid, caller_pid)?;
     Ok(state.event_msg)
 }
 
 /// Handle `PTRACE_GETSIGINFO`: retrieve `siginfo_t` from the tracee.
-pub fn ptrace_getsiginfo(table: &PtraceTable, tracee_pid: u32) -> Result<SigInfo> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may read siginfo.
+pub fn ptrace_getsiginfo(table: &PtraceTable, caller_pid: u32, tracee_pid: u32) -> Result<SigInfo> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state(tracee_pid)?;
+    let state = table.get_state_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
@@ -720,10 +952,17 @@ pub fn ptrace_getsiginfo(table: &PtraceTable, tracee_pid: u32) -> Result<SigInfo
 }
 
 /// Handle `PTRACE_SETSIGINFO`: inject `siginfo_t` into the tracee.
-pub fn ptrace_setsiginfo(table: &mut PtraceTable, tracee_pid: u32, info: &SigInfo) -> Result<()> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may inject signals.
+pub fn ptrace_setsiginfo(
+    table: &mut PtraceTable,
+    caller_pid: u32,
+    tracee_pid: u32,
+    info: &SigInfo,
+) -> Result<()> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     if !state.stopped {
         return Err(Error::Busy);
     }
@@ -732,10 +971,12 @@ pub fn ptrace_setsiginfo(table: &mut PtraceTable, tracee_pid: u32, info: &SigInf
 }
 
 /// Handle `PTRACE_INTERRUPT`: interrupt a seized tracee.
-pub fn ptrace_interrupt(table: &mut PtraceTable, tracee_pid: u32) -> Result<()> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may interrupt.
+pub fn ptrace_interrupt(table: &mut PtraceTable, caller_pid: u32, tracee_pid: u32) -> Result<()> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     if !state.seized {
         return Err(Error::InvalidArgument);
     }
@@ -744,10 +985,12 @@ pub fn ptrace_interrupt(table: &mut PtraceTable, tracee_pid: u32) -> Result<()> 
 }
 
 /// Handle `PTRACE_LISTEN`: put a seized tracee into listen mode.
-pub fn ptrace_listen(table: &mut PtraceTable, tracee_pid: u32) -> Result<()> {
+///
+/// Only the owning tracer (identified by `caller_pid`) may set listen mode.
+pub fn ptrace_listen(table: &mut PtraceTable, caller_pid: u32, tracee_pid: u32) -> Result<()> {
     validate_pid(tracee_pid)?;
 
-    let state = table.get_state_mut(tracee_pid)?;
+    let state = table.get_state_mut_owned(tracee_pid, caller_pid)?;
     if !state.seized {
         return Err(Error::InvalidArgument);
     }
@@ -760,6 +1003,98 @@ pub fn ptrace_listen(table: &mut PtraceTable, tracee_pid: u32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// PtraceCaller — authenticated caller identity for attach / seize
+// ---------------------------------------------------------------------------
+
+/// Authenticated caller identity passed to attach/seize operations.
+///
+/// The dispatcher constructs this from the current task's credential record.
+/// Callers must never trust a user-supplied PID as an authenticated identity.
+///
+/// # SECURITY NOTE (audit-21 finding 2)
+///
+/// Until per-task credential threading is fully wired through the dispatcher,
+/// `cap_ptrace` defaults to `false` and `euid`/`egid` default to a
+/// non-privileged sentinel.  The [`ptrace_may_access`] gate therefore
+/// **fails closed** for all attach/seize attempts that do not have
+/// `cap_ptrace = true` explicitly set by the dispatcher.
+///
+/// TODO: populate from authenticated task credentials once the process table
+/// carries per-task `Creds` records.
+#[derive(Debug, Clone, Copy)]
+pub struct PtraceCaller {
+    /// Authenticated PID of the calling process.
+    pub pid: u32,
+    /// Effective UID of the calling process.
+    pub euid: u32,
+    /// Effective GID of the calling process.
+    pub egid: u32,
+    /// Whether the caller holds `CAP_SYS_PTRACE`.
+    pub cap_ptrace: bool,
+}
+
+impl PtraceCaller {
+    /// Construct an unprivileged caller identity.
+    pub const fn user(pid: u32, euid: u32, egid: u32) -> Self {
+        Self {
+            pid,
+            euid,
+            egid,
+            cap_ptrace: false,
+        }
+    }
+
+    /// Construct a privileged caller identity (CAP_SYS_PTRACE held).
+    pub const fn privileged(pid: u32) -> Self {
+        Self {
+            pid,
+            euid: 0,
+            egid: 0,
+            cap_ptrace: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ptrace_may_access — attach permission gate
+// ---------------------------------------------------------------------------
+
+/// Gate checked before any `PTRACE_ATTACH` or `PTRACE_SEIZE`.
+///
+/// Mirrors Linux `ptrace_may_access` / `security_ptrace_access_check`:
+///
+/// - `CAP_SYS_PTRACE` permits attaching to any process.
+/// - Matching effective UID and GID permits attaching.
+/// - All other cases are denied.
+///
+/// The `tracee_pid` parameter is reserved for future dumpable-state and
+/// credential checks against the live process record; currently only the
+/// caller's credentials are inspected.
+///
+/// # SECURITY NOTE (audit-21 finding 2)
+///
+/// This function **fails closed**: without `cap_ptrace = true` in `caller`,
+/// any cross-UID attach is denied with `PermissionDenied`.  When per-task
+/// credentials are threaded through the dispatcher, the tracee's `dumpable`
+/// flag and matching euid/egid should be checked here.
+fn ptrace_may_access(caller: &PtraceCaller, _tracee_pid: u32) -> Result<()> {
+    // SECURITY: CAP_SYS_PTRACE bypasses the credential check, matching
+    // Linux ptrace_has_cap().
+    if caller.cap_ptrace {
+        return Ok(());
+    }
+    // SECURITY: Fail closed until per-task creds are threaded.  An
+    // unprivileged caller without an explicit euid match is denied.
+    // When the process table provides authenticated ProcDesc entries,
+    // replace this with: same euid/egid AND tracee.dumpable != 0.
+    //
+    // For now we have no way to look up the tracee's euid without a live
+    // process table reference, so we deny all non-cap_ptrace attachers.
+    // This is intentionally conservative.
+    Err(Error::PermissionDenied)
+}
+
+// ---------------------------------------------------------------------------
 // Main dispatcher
 // ---------------------------------------------------------------------------
 
@@ -768,6 +1103,10 @@ pub fn ptrace_listen(table: &mut PtraceTable, tracee_pid: u32) -> Result<()> {
 /// Validates the request code and routes to the appropriate handler.
 /// `pid` identifies the target tracee; `addr` and `data` carry
 /// request-specific parameters.
+///
+/// `caller` is the authenticated identity of the invoking process, derived
+/// by the dispatcher from the current task — it must never be constructed
+/// from user-supplied arguments.
 ///
 /// Returns:
 /// - `0` on success for most requests
@@ -780,119 +1119,368 @@ pub fn ptrace_listen(table: &mut PtraceTable, tracee_pid: u32) -> Result<()> {
 /// Linux ptrace(2) extended interface.
 pub fn do_ptrace(
     table: &mut PtraceTable,
-    caller_pid: u32,
+    caller: &PtraceCaller,
     request_raw: u64,
     pid: u32,
     addr: u64,
     data: u64,
 ) -> Result<u64> {
     let request = PtraceRequest::from_u64(request_raw).ok_or(Error::InvalidArgument)?;
+    let caller_pid = caller.pid;
 
     match request {
         PtraceRequest::Traceme => {
             // Mark the caller as wanting to be traced by its parent.
             // Stub: in a real kernel we set PT_TRACED in task_struct.
-            let _ = caller_pid;
             Ok(0)
         }
 
         PtraceRequest::Attach => {
-            ptrace_attach(table, caller_pid, pid)?;
+            ptrace_attach(table, caller, pid)?;
             Ok(0)
         }
 
         PtraceRequest::Seize => {
-            ptrace_seize(table, caller_pid, pid, data as u32)?;
+            ptrace_seize(table, caller, pid, data as u32)?;
             Ok(0)
         }
 
         PtraceRequest::Detach => {
-            ptrace_detach(table, pid, data as i32)?;
+            ptrace_detach(table, caller_pid, pid, data as i32)?;
             Ok(0)
         }
 
         PtraceRequest::Peektext | PtraceRequest::Peekdata | PtraceRequest::Peekuser => {
-            ptrace_peek(table, pid, addr)
+            ptrace_peek(table, caller_pid, pid, addr)
         }
 
         PtraceRequest::Poketext | PtraceRequest::Pokedata | PtraceRequest::Pokeuser => {
-            ptrace_poke(table, pid, addr, data)?;
+            ptrace_poke(table, caller_pid, pid, addr, data)?;
             Ok(0)
         }
 
         PtraceRequest::Getregs => {
-            let regs = ptrace_getregs(table, pid)?;
+            let regs = ptrace_getregs(table, caller_pid, pid)?;
             // Stub: in a real syscall, copy_to_user writes to addr.
             let _ = (regs, addr);
             Ok(0)
         }
 
         PtraceRequest::Setregs => {
-            // Stub: real implementation reads UserRegs from user addr.
+            // Stub: real implementation reads UserRegs from user addr via
+            // copy_from_user; sanitise_regs is applied inside ptrace_setregs.
             let regs = UserRegs::new();
-            ptrace_setregs(table, pid, &regs)?;
+            ptrace_setregs(table, caller_pid, pid, &regs)?;
             Ok(0)
         }
 
         PtraceRequest::Getfpregs => {
-            let fpregs = ptrace_getfpregs(table, pid)?;
+            let fpregs = ptrace_getfpregs(table, caller_pid, pid)?;
             let _ = (fpregs, addr);
             Ok(0)
         }
 
         PtraceRequest::Setfpregs => {
             let fpregs = [0u8; 64];
-            ptrace_setfpregs(table, pid, &fpregs)?;
+            ptrace_setfpregs(table, caller_pid, pid, &fpregs)?;
             Ok(0)
         }
 
         PtraceRequest::Cont | PtraceRequest::Syscall => {
-            ptrace_cont(table, pid, data as i32)?;
+            ptrace_cont(table, caller_pid, pid, data as i32)?;
             Ok(0)
         }
 
         PtraceRequest::Singlestep => {
-            ptrace_singlestep(table, pid, data as i32)?;
+            ptrace_singlestep(table, caller_pid, pid, data as i32)?;
             Ok(0)
         }
 
         PtraceRequest::Kill => {
-            ptrace_detach(table, pid, 9)?; // SIGKILL = 9
+            // SIGKILL = 9; detach authorised only if caller is the tracer.
+            ptrace_detach(table, caller_pid, pid, 9)?;
             Ok(0)
         }
 
         PtraceRequest::Setoptions => {
-            ptrace_setoptions(table, pid, data)?;
+            ptrace_setoptions(table, caller_pid, pid, data)?;
             Ok(0)
         }
 
         PtraceRequest::Geteventmsg => {
-            let msg = ptrace_geteventmsg(table, pid)?;
+            let msg = ptrace_geteventmsg(table, caller_pid, pid)?;
             // Stub: real implementation writes msg to *addr.
             let _ = addr;
             Ok(msg)
         }
 
         PtraceRequest::Getsiginfo => {
-            let info = ptrace_getsiginfo(table, pid)?;
+            let info = ptrace_getsiginfo(table, caller_pid, pid)?;
             let _ = (info, addr);
             Ok(0)
         }
 
         PtraceRequest::Setsiginfo => {
             let info = SigInfo::default();
-            ptrace_setsiginfo(table, pid, &info)?;
+            ptrace_setsiginfo(table, caller_pid, pid, &info)?;
             Ok(0)
         }
 
         PtraceRequest::Interrupt => {
-            ptrace_interrupt(table, pid)?;
+            ptrace_interrupt(table, caller_pid, pid)?;
             Ok(0)
         }
 
         PtraceRequest::Listen => {
-            ptrace_listen(table, pid)?;
+            ptrace_listen(table, caller_pid, pid)?;
             Ok(0)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a table with a pre-attached session owned by tracer 1 → tracee 2.
+    fn setup_table() -> PtraceTable {
+        let mut table = PtraceTable::new();
+        let mut state = PtraceState::new(1, 2);
+        state.stopped = true;
+        table.slots[0].state = Some(state);
+        table.count = 1;
+        table
+    }
+
+    /// Privileged caller with PID 1 (the tracer in setup_table).
+    fn tracer() -> PtraceCaller {
+        PtraceCaller::privileged(1)
+    }
+
+    /// Privileged caller with PID 99 (not the tracer).
+    fn intruder() -> PtraceCaller {
+        PtraceCaller::privileged(99)
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 1: tracer_pid == caller_pid enforcement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peek_wrong_tracer_denied() {
+        let table = setup_table();
+        let err = ptrace_peek(&table, 99, 2, 0).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_peek_correct_tracer_ok() {
+        let table = setup_table();
+        assert!(ptrace_peek(&table, 1, 2, 0).is_ok());
+    }
+
+    #[test]
+    fn test_poke_wrong_tracer_denied() {
+        let mut table = setup_table();
+        let err = ptrace_poke(&mut table, 99, 2, 0, 0xDEAD).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_getregs_wrong_tracer_denied() {
+        let table = setup_table();
+        let err = ptrace_getregs(&table, 99, 2).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_setregs_wrong_tracer_denied() {
+        let mut table = setup_table();
+        let regs = UserRegs::new();
+        let err = ptrace_setregs(&mut table, 99, 2, &regs).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_setfpregs_wrong_tracer_denied() {
+        let mut table = setup_table();
+        let err = ptrace_setfpregs(&mut table, 99, 2, &[0u8; 64]).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_cont_wrong_tracer_denied() {
+        let mut table = setup_table();
+        let err = ptrace_cont(&mut table, 99, 2, 0).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_setsiginfo_wrong_tracer_denied() {
+        let mut table = setup_table();
+        let info = SigInfo::default();
+        let err = ptrace_setsiginfo(&mut table, 99, 2, &info).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_detach_wrong_tracer_denied() {
+        let mut table = setup_table();
+        let err = ptrace_detach(&mut table, 99, 2, 0).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_kill_arm_wrong_tracer_denied() {
+        let mut table = setup_table();
+        // PTRACE_KILL routes through ptrace_detach with signal=9.
+        let err = ptrace_detach(&mut table, 99, 2, 9).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_do_ptrace_wrong_tracer_denied() {
+        let mut table = setup_table();
+        let err =
+            do_ptrace(&mut table, &intruder(), PtraceRequest::Cont as u64, 2, 0, 0).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_do_ptrace_correct_tracer_ok() {
+        let mut table = setup_table();
+        assert!(do_ptrace(&mut table, &tracer(), PtraceRequest::Cont as u64, 2, 0, 0).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 2: ptrace_may_access gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_attach_no_cap_denied() {
+        let mut table = PtraceTable::new();
+        let unprivileged = PtraceCaller::user(10, 500, 500);
+        let err = ptrace_attach(&mut table, &unprivileged, 20).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_attach_with_cap_ok() {
+        let mut table = PtraceTable::new();
+        let privileged = PtraceCaller::privileged(10);
+        assert!(ptrace_attach(&mut table, &privileged, 20).is_ok());
+    }
+
+    #[test]
+    fn test_seize_no_cap_denied() {
+        let mut table = PtraceTable::new();
+        let unprivileged = PtraceCaller::user(10, 500, 500);
+        let err = ptrace_seize(&mut table, &unprivileged, 20, 0).unwrap_err();
+        assert_eq!(err, Error::PermissionDenied);
+    }
+
+    #[test]
+    fn test_seize_with_cap_ok() {
+        let mut table = PtraceTable::new();
+        let privileged = PtraceCaller::privileged(10);
+        assert!(ptrace_seize(&mut table, &privileged, 20, 0).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 3: validate_tracee_addr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peek_kernel_addr_denied() {
+        let table = setup_table();
+        // Kernel-half address — must be rejected.
+        let err = ptrace_peek(&table, 1, 2, 0xFFFF_8000_0000_0000).unwrap_err();
+        assert_eq!(err, Error::InvalidArgument);
+    }
+
+    #[test]
+    fn test_peek_overflow_addr_denied() {
+        let table = setup_table();
+        // addr=MAX, len=8 → overflow.
+        let err = ptrace_peek(&table, 1, 2, u64::MAX).unwrap_err();
+        // Either InvalidArgument (overflow/range) or alignment failure.
+        assert!(err == Error::InvalidArgument);
+    }
+
+    #[test]
+    fn test_validate_tracee_addr_at_boundary() {
+        // Last valid 8-byte aligned word at the top of user space.
+        let last_word = USER_SPACE_END & !7;
+        assert!(validate_tracee_addr(last_word, 8).is_ok());
+    }
+
+    #[test]
+    fn test_validate_tracee_addr_over_boundary() {
+        // One byte past the user space limit.
+        let over = USER_SPACE_END.saturating_add(1);
+        assert_eq!(validate_tracee_addr(over, 1), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn test_validate_tracee_addr_overflow() {
+        assert_eq!(
+            validate_tracee_addr(u64::MAX - 3, 8),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 4: sanitise_regs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitise_regs_forces_user_selectors() {
+        let mut regs = UserRegs::new();
+        regs.rip = 0x1000;
+        regs.rsp = 0x7FFF_0000;
+        regs.cs = 0x08; // kernel CS — must be overridden
+        regs.ss = 0x10; // kernel SS — must be overridden
+        regs.eflags = 0x0000_3202; // IOPL=3 set
+        let safe = sanitise_regs(&regs).unwrap();
+        assert_eq!(safe.cs, USER_CS);
+        assert_eq!(safe.ss, USER_SS);
+        // IOPL bits [13:12] must be zeroed.
+        assert_eq!(safe.eflags & 0x3000, 0);
+    }
+
+    #[test]
+    fn test_sanitise_regs_kernel_rip_denied() {
+        let mut regs = UserRegs::new();
+        regs.rip = 0xFFFF_8000_0000_0000;
+        regs.rsp = 0x7FFF_0000;
+        assert_eq!(sanitise_regs(&regs), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn test_sanitise_regs_kernel_rsp_denied() {
+        let mut regs = UserRegs::new();
+        regs.rip = 0x1000;
+        regs.rsp = 0xFFFF_8000_0000_0000;
+        assert_eq!(sanitise_regs(&regs), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn test_setregs_sanitises_before_store() {
+        let mut table = setup_table();
+        let mut regs = UserRegs::new();
+        regs.rip = 0x4000;
+        regs.rsp = 0x7000;
+        regs.cs = 0x08; // kernel CS
+        regs.ss = 0x10; // kernel SS
+        regs.eflags = 0x3202; // IOPL=3
+        ptrace_setregs(&mut table, 1, 2, &regs).unwrap();
+        let stored = ptrace_getregs(&mut table, 1, 2).unwrap();
+        assert_eq!(stored.cs, USER_CS);
+        assert_eq!(stored.ss, USER_SS);
+        assert_eq!(stored.eflags & 0x3000, 0);
     }
 }

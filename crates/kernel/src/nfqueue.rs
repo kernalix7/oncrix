@@ -34,6 +34,7 @@
 //!
 //! Reference: Linux `nfnetlink_queue`, `iptables -j NFQUEUE`
 
+use crate::capability::{CAP_NET_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -303,6 +304,27 @@ impl NfQueue {
         Ok(())
     }
 
+    /// Verifies that `caller_pid` is the handler bound to this queue.
+    ///
+    /// Verdict and dequeue operations are restricted to the owning
+    /// process so that a guessed `packet_id` cannot be used by an
+    /// unrelated process to influence packet fate.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::NotFound` — no handler is bound to this queue.
+    /// - `Error::PermissionDenied` — `caller_pid` does not match the
+    ///   bound handler PID.
+    fn ensure_handler(&self, caller_pid: u64) -> Result<()> {
+        if self.handler_pid == 0 {
+            return Err(Error::NotFound);
+        }
+        if self.handler_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(())
+    }
+
     /// Unbinds the current handler from this queue.
     ///
     /// Any pending packets are dropped.
@@ -547,6 +569,19 @@ impl NfQueue {
 ///
 /// Manages up to [`MAX_QUEUES`] queues identified by queue number.
 /// Provides centralized packet routing and verdict handling.
+///
+// SECURITY: queue lifecycle is a privileged network-administration
+// operation driven by attacker-controlled netlink/iptables input.
+// Every mutating entry point (`create`, `destroy`, `bind`, `unbind`)
+// takes the caller's effective `CapSet` and requires `CAP_NET_ADMIN`
+// fail-closed; the NFQUEUE control dispatcher MUST pass the calling
+// thread's real effective capability set here — never a synthesised
+// `CapSet::FULL`. When the capability is unavailable the caller must
+// supply `CapSet::EMPTY`, which denies the operation. `bind` also
+// records `handler_pid` from the authenticated current task (passed
+// by the dispatcher) rather than a caller-supplied identity, and
+// `set_verdict`/`dequeue_packet` require `caller_pid == handler_pid`
+// so an unprivileged process cannot steer another queue's verdicts.
 pub struct NfQueueRegistry {
     /// Fixed-size array of queue slots.
     queues: [NfQueue; MAX_QUEUES],
@@ -580,14 +615,39 @@ impl NfQueueRegistry {
         self.count == 0
     }
 
-    /// Creates a new queue with the given queue number.
+    /// Fail-closed `CAP_NET_ADMIN` gate for queue-state mutations.
+    ///
+    /// Queue lifecycle and handler binding are privileged operations
+    /// reachable from unprivileged, attacker-controlled netlink input,
+    /// so every mutating entry point requires `CAP_NET_ADMIN` in the
+    /// caller's effective set. When the capability is absent (the
+    /// unprivileged default, including `CapSet::EMPTY`) the operation
+    /// is denied.
     ///
     /// # Errors
     ///
+    /// Returns `Error::PermissionDenied` if `caller_caps` lacks
+    /// `CAP_NET_ADMIN`.
+    fn require_net_admin(caller_caps: CapSet) -> Result<()> {
+        if caller_caps.has(CAP_NET_ADMIN) {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
+        }
+    }
+
+    /// Creates a new queue with the given queue number.
+    ///
+    /// Requires `CAP_NET_ADMIN` in `caller_caps` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_NET_ADMIN`.
     /// - `Error::AlreadyExists` — a queue with this number already
     ///   exists.
     /// - `Error::OutOfMemory` — no free slots available.
-    pub fn create(&mut self, queue_num: u16) -> Result<()> {
+    pub fn create(&mut self, queue_num: u16, caller_caps: CapSet) -> Result<()> {
+        Self::require_net_admin(caller_caps)?;
         // Check for duplicate queue number.
         if self.find_queue(queue_num).is_some() {
             return Err(Error::AlreadyExists);
@@ -611,11 +671,14 @@ impl NfQueueRegistry {
     ///
     /// All pending packets are dropped.
     ///
+    /// Requires `CAP_NET_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
-    /// Returns `Error::NotFound` if no queue with the given number
-    /// exists.
-    pub fn destroy(&mut self, queue_num: u16) -> Result<()> {
+    /// - `Error::PermissionDenied` — caller lacks `CAP_NET_ADMIN`.
+    /// - `Error::NotFound` — no queue with the given number exists.
+    pub fn destroy(&mut self, queue_num: u16, caller_caps: CapSet) -> Result<()> {
+        Self::require_net_admin(caller_caps)?;
         let idx = self.find_queue(queue_num).ok_or(Error::NotFound)?;
 
         self.queues[idx] = NfQueue::empty();
@@ -625,23 +688,35 @@ impl NfQueueRegistry {
 
     /// Binds a userspace handler to a queue.
     ///
+    /// Requires `CAP_NET_ADMIN` in `caller_caps` (fail-closed). The
+    /// bound handler identity is `handler_pid`, which the dispatcher
+    /// MUST derive from the authenticated current task — never from a
+    /// caller-supplied argument — so that only the calling process can
+    /// later render verdicts on this queue's packets.
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_NET_ADMIN`.
     /// - `Error::NotFound` — queue does not exist.
     /// - `Error::InvalidArgument` — handler PID is zero.
     /// - `Error::Busy` — a handler is already bound.
-    pub fn bind(&mut self, queue_num: u16, handler_pid: u64) -> Result<()> {
+    pub fn bind(&mut self, queue_num: u16, handler_pid: u64, caller_caps: CapSet) -> Result<()> {
+        Self::require_net_admin(caller_caps)?;
         let idx = self.find_queue(queue_num).ok_or(Error::NotFound)?;
         self.queues[idx].bind(handler_pid)
     }
 
     /// Unbinds the handler from a queue.
     ///
+    /// Requires `CAP_NET_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_NET_ADMIN`.
     /// - `Error::NotFound` — queue does not exist or no handler
     ///   bound.
-    pub fn unbind(&mut self, queue_num: u16) -> Result<()> {
+    pub fn unbind(&mut self, queue_num: u16, caller_caps: CapSet) -> Result<()> {
+        Self::require_net_admin(caller_caps)?;
         let idx = self.find_queue(queue_num).ok_or(Error::NotFound)?;
         self.queues[idx].unbind()
     }
@@ -690,28 +765,52 @@ impl NfQueueRegistry {
 
     /// Sets a verdict on a queued packet.
     ///
+    /// Only the process that owns the queue (the bound `handler_pid`)
+    /// may render verdicts: `caller_pid` MUST be derived from the
+    /// authenticated current task and is checked against the queue's
+    /// bound handler. This prevents an unprivileged process from
+    /// steering another queue's verdicts by guessing the low,
+    /// sequential `packet_id`.
+    ///
     /// # Errors
     ///
     /// - `Error::NotFound` — queue or packet not found.
+    /// - `Error::PermissionDenied` — `caller_pid` is not the bound
+    ///   handler for this queue.
     /// - `Error::AlreadyExists` — verdict already set.
     pub fn set_verdict(
         &mut self,
         queue_num: u16,
         packet_id: u64,
         verdict: NfVerdict,
+        caller_pid: u64,
     ) -> Result<()> {
         let idx = self.find_queue(queue_num).ok_or(Error::NotFound)?;
+        self.queues[idx].ensure_handler(caller_pid)?;
         self.queues[idx].set_verdict(packet_id, verdict)
     }
 
     /// Dequeues a packet after its verdict has been set.
     ///
+    /// Only the process that owns the queue (the bound `handler_pid`)
+    /// may dequeue: `caller_pid` MUST be derived from the
+    /// authenticated current task and is checked against the queue's
+    /// bound handler.
+    ///
     /// # Errors
     ///
     /// - `Error::NotFound` — queue or packet not found.
+    /// - `Error::PermissionDenied` — `caller_pid` is not the bound
+    ///   handler for this queue.
     /// - `Error::WouldBlock` — verdict not yet set.
-    pub fn dequeue_packet(&mut self, queue_num: u16, packet_id: u64) -> Result<NfVerdict> {
+    pub fn dequeue_packet(
+        &mut self,
+        queue_num: u16,
+        packet_id: u64,
+        caller_pid: u64,
+    ) -> Result<NfVerdict> {
         let idx = self.find_queue(queue_num).ok_or(Error::NotFound)?;
+        self.queues[idx].ensure_handler(caller_pid)?;
         self.queues[idx].dequeue(packet_id)
     }
 

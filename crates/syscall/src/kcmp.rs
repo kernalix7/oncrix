@@ -352,9 +352,19 @@ impl KcmpContext {
                 Ok(KcmpResult::from_ptrs(ptr1, ptr2))
             }
             KCMP_EPOLL_TFD => {
-                // For KCMP_EPOLL_TFD, idx1/idx2 are pointers to
-                // KcmpEpollTfd structs. We compare the epoll fd
-                // pointers directly.
+                // For KCMP_EPOLL_TFD the Linux ABI passes a pointer to a
+                // `struct kcmp_epoll_slot { __u32 efd; __u32 tfd; __u32 toff; }`
+                // as idx1/idx2.  This stub does not yet dereference user
+                // pointers (no copy_from_user path), so idx1/idx2 are
+                // treated as raw fd indices into the process fd table —
+                // the same interpretation used by KCMP_FILE.  This is
+                // correct for in-kernel testing where the caller populates
+                // idx1/idx2 with the epoll fd directly.
+                //
+                // TODO: when copy_from_user is wired, decode the
+                // KcmpEpollTfd struct, validate efd/tfd/toff against
+                // MAX_FDS and the epoll interest list size, and compare
+                // the (efd, tfd, toff) triple rather than a raw fd pointer.
                 let ptr1 = res1.get_fd_ptr(idx1)?;
                 let ptr2 = res2.get_fd_ptr(idx2)?;
                 Ok(KcmpResult::from_ptrs(ptr1, ptr2))

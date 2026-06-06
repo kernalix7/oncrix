@@ -44,6 +44,38 @@
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
+// User-pointer safety
+// ---------------------------------------------------------------------------
+
+/// Inclusive upper bound of the canonical user-space lower half (x86_64).
+///
+/// Mirrors `oncrix_mm::address_space::USER_SPACE_END`.  Any pointer supplied
+/// by the caller must satisfy `ptr <= USER_PTR_MAX`.  A kernel-half or
+/// non-canonical pointer dereferenced in ring 0 causes a kernel fault.
+const USER_PTR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
+
+/// Validate that the half-open range `[ptr, ptr + len)` is entirely within
+/// the canonical user-space lower half.
+///
+/// Returns `Err(InvalidArgument)` (→ `EFAULT` at the syscall boundary) if
+/// `ptr` is zero, `ptr` is not a multiple of `align` (an under-aligned
+/// `core::ptr::read`/`write` is undefined behaviour), `ptr + len` overflows,
+/// or the range extends above `USER_PTR_MAX`.
+fn validate_user_ptr_range(ptr: u64, len: u64, align: u64) -> Result<()> {
+    if ptr == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    if align != 0 && ptr % align != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let end = ptr.checked_add(len).ok_or(Error::InvalidArgument)?;
+    if end > USER_PTR_MAX.saturating_add(1) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
 
@@ -369,13 +401,47 @@ pub fn sys_io_uring_setup(entries: u32, params: &mut IoUringParams) -> Result<Io
 }
 
 /// Entry point called from the syscall dispatcher.
+///
+/// Validates that `params_ptr` is a writable user-space address, copies
+/// the [`IoUringParams`] into a kernel-local binding, runs
+/// [`sys_io_uring_setup`] against it, then writes the completed params back
+/// to user space.
+///
+/// # Security
+///
+/// `params_ptr` is a raw user virtual address.  It must be validated for
+/// canonical range before any dereference.  Reading or writing through an
+/// unvalidated kernel-half address in ring 0 causes an unrecoverable fault.
+/// The copy-in / copy-out pattern ensures no kernel code ever holds a live
+/// reference into user memory — only kernel-local values are used between
+/// the two copies.
 pub fn do_io_uring_setup(entries: u32, params_ptr: u64) -> Result<u32> {
-    if params_ptr == 0 {
-        return Err(Error::InvalidArgument);
+    let sz = core::mem::size_of::<IoUringParams>() as u64;
+    let align = core::mem::align_of::<IoUringParams>() as u64;
+
+    // SECURITY: validate canonical user-space range and alignment for the
+    // full structure before touching the pointer.  The structure is both read
+    // (flags, sq_thread_cpu, cq_entries, ...) and written back (sq_entries,
+    // cq_entries, features, sq_off, cq_off) so we require write access; an
+    // under-aligned pointer would make the core::ptr::read/write UB.
+    validate_user_ptr_range(params_ptr, sz, align)?;
+
+    // Copy the caller-supplied params into a kernel-local binding.
+    // SAFETY: `validate_user_ptr_range` confirms the range is within the
+    // canonical user lower-half.  `IoUringParams` is `repr(C)` and the
+    // caller is responsible for initialising the structure.  We copy by
+    // value so no raw reference into user memory escapes this block.
+    let mut local_params = unsafe { core::ptr::read(params_ptr as *const IoUringParams) };
+
+    // Execute the setup logic entirely against the kernel-local copy.
+    let result = sys_io_uring_setup(entries, &mut local_params)?;
+
+    // Write the completed params (kernel-filled fields) back to user space.
+    // SAFETY: same range proven above; the pointer is still valid.
+    unsafe {
+        core::ptr::write(params_ptr as *mut IoUringParams, local_params);
     }
-    // SAFETY: Caller is expected to validate the pointer is user-accessible.
-    let params = unsafe { &mut *(params_ptr as *mut IoUringParams) };
-    let result = sys_io_uring_setup(entries, params)?;
+
     Ok(result.fd)
 }
 
@@ -430,6 +496,22 @@ mod tests {
         p.flags = IORING_SETUP_SQ_AFF;
         assert_eq!(
             sys_io_uring_setup(8, &mut p).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn do_setup_null_ptr_rejected() {
+        assert_eq!(do_io_uring_setup(8, 0).unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn do_setup_kernel_ptr_rejected() {
+        // A kernel-half address must be rejected by the range check before
+        // any dereference occurs.
+        let kernel_addr: u64 = 0xffff_8000_0000_0000u64;
+        assert_eq!(
+            do_io_uring_setup(8, kernel_addr).unwrap_err(),
             Error::InvalidArgument
         );
     }

@@ -560,19 +560,49 @@ impl RecvTimeout {
 ///
 /// # Arguments
 ///
-/// * `buf`         — raw ancillary buffer (kernel-side copy)
+/// * `buf`         — raw ancillary buffer (kernel-side copy, already bounds-checked
+///                   against [`CMSG_MAX_LEN`] by [`MsgHdr::from_raw`])
 /// * `cloexec_fds` — if `true`, mark received FDs close-on-exec
 ///
 /// # Returns
 ///
 /// An `AncDataVec` of parsed entries and any flags to OR into `msg_flags`.
+///
+/// # Security
+///
+/// Every arithmetic operation on attacker-controlled lengths uses checked or
+/// saturating variants; no unchecked addition is performed on `cmsg_len`.
+/// Specifically:
+///
+/// 1. `remaining = buf.len() - offset` (no overflow: offset is always <= buf.len()).
+/// 2. `cmsg_len < CMSG_HDR_SIZE || cmsg_len > remaining` — comparison only, no add.
+/// 3. `data_end = offset + cmsg_len` is safe because step 2 proved
+///    `cmsg_len <= remaining = buf.len() - offset`.
+/// 4. The CMSG_NXTHDR advance uses `checked_add` twice; `None` breaks the loop,
+///    preventing any infinite-loop or wrap-to-zero advance.
 pub fn parse_ancillary_data(buf: &[u8], _cloexec_fds: bool) -> (AncDataVec, i32) {
+    // Caller (MsgHdr::from_raw) already rejects controllen > CMSG_MAX_LEN.
+    // Belt-and-suspenders: if somehow a larger slice arrives, silently truncate
+    // so this function never processes more than CMSG_MAX_LEN bytes.
+    debug_assert!(
+        buf.len() <= CMSG_MAX_LEN,
+        "ancillary buf exceeds CMSG_MAX_LEN"
+    );
+    let buf = if buf.len() > CMSG_MAX_LEN {
+        &buf[..CMSG_MAX_LEN]
+    } else {
+        buf
+    };
+
     let mut out = AncDataVec::new();
     let mut extra_flags = 0i32;
     let mut offset = 0usize;
 
+    // Loop invariant: offset <= buf.len() (maintained by every exit path).
     while offset + CMSG_HDR_SIZE <= buf.len() {
-        // Read the header fields manually from the byte slice.
+        // --- 1. Read the fixed-size header from the kernel-local buffer. ---
+        // offset + CMSG_HDR_SIZE (16) <= buf.len() is guaranteed by the while
+        // condition, so all sub-slices are in bounds.
         let cmsg_len_bytes: [u8; 8] = buf[offset..offset + 8].try_into().unwrap_or([0u8; 8]);
         let cmsg_len = usize::from_ne_bytes(cmsg_len_bytes);
 
@@ -582,19 +612,27 @@ pub fn parse_ancillary_data(buf: &[u8], _cloexec_fds: bool) -> (AncDataVec, i32)
         let type_bytes: [u8; 4] = buf[offset + 12..offset + 16].try_into().unwrap_or([0u8; 4]);
         let cmsg_type = i32::from_ne_bytes(type_bytes);
 
+        // --- 2. Validate cmsg_len against remaining bytes (no addition). ---
+        // remaining = buf.len() - offset is exact because offset <= buf.len().
+        let remaining = buf.len() - offset;
+
+        if cmsg_len < CMSG_HDR_SIZE || cmsg_len > remaining {
+            // Malformed or truncated chain — stop.
+            extra_flags |= MSG_CTRUNC;
+            break;
+        }
+
+        // --- 3. Form payload slice. ---
+        // cmsg_len <= remaining = buf.len() - offset, so:
+        //   offset + cmsg_len <= buf.len()  (no overflow, both in-range).
+        let data_end = offset + cmsg_len; // safe: proven above
+        let data = &buf[offset + CMSG_HDR_SIZE..data_end];
+
         let hdr = CmsgHdr {
             cmsg_len,
             cmsg_level,
             cmsg_type,
         };
-
-        if !hdr.is_valid() || offset + hdr.cmsg_len > buf.len() {
-            // Malformed chain — stop.
-            extra_flags |= MSG_CTRUNC;
-            break;
-        }
-
-        let data = &buf[offset + CMSG_HDR_SIZE..offset + hdr.cmsg_len];
 
         match (cmsg_level, cmsg_type) {
             (l, SCM_RIGHTS) if l == SOL_SOCKET => {
@@ -632,9 +670,30 @@ pub fn parse_ancillary_data(buf: &[u8], _cloexec_fds: bool) -> (AncDataVec, i32)
             }
         }
 
-        // Advance to the next cmsg (CMSG_NXTHDR alignment: round up to pointer size).
-        let aligned = (hdr.cmsg_len + 7) & !7;
-        offset += aligned;
+        // --- 4. CMSG_NXTHDR: advance offset by aligned(cmsg_len). ---
+        // aligned = (cmsg_len + 7) & !7
+        // Use checked_add to detect any overflow (cmsg_len near usize::MAX).
+        // Additionally, aligned must be >= CMSG_HDR_SIZE to guarantee forward
+        // progress (cmsg_len >= CMSG_HDR_SIZE was already checked above, so
+        // this holds: (CMSG_HDR_SIZE + 7) & !7 == 16 == CMSG_HDR_SIZE).
+        let aligned = match cmsg_len.checked_add(7) {
+            Some(v) => v & !7usize,
+            None => {
+                // Overflow: cmsg_len > usize::MAX - 7; chain is malformed.
+                extra_flags |= MSG_CTRUNC;
+                break;
+            }
+        };
+        // aligned >= CMSG_HDR_SIZE (16) because cmsg_len >= CMSG_HDR_SIZE.
+        // This guarantees forward progress (offset strictly increases).
+        let next_offset = match offset.checked_add(aligned) {
+            Some(v) => v,
+            None => {
+                // offset + aligned overflows: done.
+                break;
+            }
+        };
+        offset = next_offset;
     }
 
     (out, extra_flags)
@@ -943,5 +1002,121 @@ mod tests {
         };
         assert_eq!(hdr.data_len(), 8);
         assert!(hdr.is_valid());
+    }
+
+    // -----------------------------------------------------------------
+    // Security regression tests — parse_ancillary_data overflow paths
+    // -----------------------------------------------------------------
+
+    /// A crafted cmsg_len of usize::MAX must not wrap the bounds guard,
+    /// must not panic, and must set MSG_CTRUNC.
+    #[test]
+    fn parse_ancillary_cmsg_len_usize_max_sets_ctrunc() {
+        // Build a minimal 16-byte buffer whose cmsg_len field is usize::MAX.
+        let mut buf = [0u8; CMSG_HDR_SIZE];
+        buf[0..8].copy_from_slice(&usize::MAX.to_ne_bytes());
+        // cmsg_level = SOL_SOCKET (1)
+        buf[8..12].copy_from_slice(&1i32.to_ne_bytes());
+        // cmsg_type = SCM_RIGHTS (1)
+        buf[12..16].copy_from_slice(&1i32.to_ne_bytes());
+
+        let (anc, flags) = parse_ancillary_data(&buf, false);
+        // Must not panic; must report truncation; must produce no parsed entries.
+        assert!(anc.is_empty(), "expected no parsed entries");
+        assert_ne!(flags & MSG_CTRUNC, 0, "expected MSG_CTRUNC");
+    }
+
+    /// A crafted cmsg_len that is exactly one byte beyond the buffer end
+    /// must set MSG_CTRUNC without panicking.
+    #[test]
+    fn parse_ancillary_cmsg_len_one_past_end_sets_ctrunc() {
+        // Buffer has 20 bytes; cmsg_len claims 21.
+        const BUF_LEN: usize = 20;
+        let mut buf = [0u8; BUF_LEN];
+        buf[0..8].copy_from_slice(&(BUF_LEN + 1).to_ne_bytes());
+        buf[8..12].copy_from_slice(&1i32.to_ne_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_ne_bytes());
+
+        let (anc, flags) = parse_ancillary_data(&buf, false);
+        assert!(anc.is_empty());
+        assert_ne!(flags & MSG_CTRUNC, 0);
+    }
+
+    /// A crafted second cmsg whose aligned advance would overflow must
+    /// terminate the loop cleanly (no panic, no infinite loop).
+    #[test]
+    fn parse_ancillary_aligned_advance_overflow_terminates() {
+        // First cmsg: valid CMSG_HDR_SIZE entry with 0 data bytes.
+        // cmsg_len = CMSG_HDR_SIZE (16); aligned = 16.
+        // Second cmsg: cmsg_len = usize::MAX - 6 so (usize::MAX-6+7)&!7 wraps.
+        let mut buf = [0u8; CMSG_HDR_SIZE * 2];
+        // First entry: cmsg_len = 16, level = SOL_SOCKET, type = SCM_TIMESTAMP
+        // (data_len = 0, so no timestamp is pushed — but the entry is valid).
+        buf[0..8].copy_from_slice(&CMSG_HDR_SIZE.to_ne_bytes());
+        buf[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        buf[12..16].copy_from_slice(&SCM_TIMESTAMP.to_ne_bytes());
+        // Second entry: cmsg_len = usize::MAX - 6; but remaining = 16,
+        // so the bounds check fires first and we set MSG_CTRUNC.
+        let huge: usize = usize::MAX - 6;
+        buf[16..24].copy_from_slice(&huge.to_ne_bytes());
+        buf[24..28].copy_from_slice(&1i32.to_ne_bytes());
+        buf[28..32].copy_from_slice(&1i32.to_ne_bytes());
+
+        let (anc, flags) = parse_ancillary_data(&buf, false);
+        // First entry produced an Unknown (SCM_TIMESTAMP with 0 data bytes,
+        // which doesn't satisfy data.len() >= 16, so falls through to Unknown).
+        // Second entry triggers MSG_CTRUNC. Either way, must not panic/loop.
+        assert_ne!(flags & MSG_CTRUNC, 0);
+        let _ = anc.len(); // just access it to show no panic
+    }
+
+    /// A valid SCM_RIGHTS cmsg followed by a cmsg_len = usize::MAX entry
+    /// must return the first entry and then set MSG_CTRUNC.
+    #[test]
+    fn parse_ancillary_valid_rights_then_overflow_in_second_cmsg() {
+        // Craft: cmsg_len = CMSG_HDR_SIZE + 4 (one fd), then a second header
+        // with cmsg_len = usize::MAX.
+        const FIRST_LEN: usize = CMSG_HDR_SIZE + 4; // 20 bytes
+        // Align first entry to 8: (20+7)&!7 = 24
+        const FIRST_ALIGNED: usize = 24;
+        let buf_len = FIRST_ALIGNED + CMSG_HDR_SIZE;
+        let mut buf = [0u8; FIRST_ALIGNED + CMSG_HDR_SIZE];
+
+        // First cmsg: SCM_RIGHTS with fd=5.
+        buf[0..8].copy_from_slice(&FIRST_LEN.to_ne_bytes());
+        buf[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        buf[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        buf[16..20].copy_from_slice(&5i32.to_ne_bytes()); // fd value
+
+        // Second cmsg header at offset 24: cmsg_len = usize::MAX.
+        buf[FIRST_ALIGNED..FIRST_ALIGNED + 8].copy_from_slice(&usize::MAX.to_ne_bytes());
+        buf[FIRST_ALIGNED + 8..FIRST_ALIGNED + 12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        buf[FIRST_ALIGNED + 12..FIRST_ALIGNED + 16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+
+        // Silence unused variable warning.
+        let _ = buf_len;
+
+        let (anc, flags) = parse_ancillary_data(&buf, false);
+        // First entry must be parsed.
+        assert_eq!(anc.len(), 1, "expected exactly one parsed entry");
+        // Second entry triggers MSG_CTRUNC.
+        assert_ne!(flags & MSG_CTRUNC, 0);
+        // Verify the first entry carries the correct fd.
+        match anc.get(0) {
+            Some(AncillaryData::Rights(r)) => {
+                assert_eq!(r.fds.as_slice(), &[5i32]);
+            }
+            other => panic!("unexpected first entry: {:?}", other),
+        }
+    }
+
+    /// A buffer larger than CMSG_MAX_LEN must be silently clamped;
+    /// this exercises the defensive truncation in parse_ancillary_data.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ancillary buf exceeds CMSG_MAX_LEN")]
+    fn parse_ancillary_oversized_buf_triggers_debug_assert() {
+        let big = [0u8; CMSG_MAX_LEN + 1];
+        let _ = parse_ancillary_data(&big, false);
     }
 }
