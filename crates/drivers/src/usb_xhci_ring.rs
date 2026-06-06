@@ -327,7 +327,12 @@ impl TransferRing {
         Ok(trb_addr)
     }
 
-    /// Advance the dequeue pointer (after controller notifies via event).
+    /// Advance the dequeue pointer after a Transfer Completion Event.
+    ///
+    /// The owning controller **must** call this once for each Transfer
+    /// Completion Event received from the hardware; failure to do so will
+    /// cause the ring-full guard to trigger prematurely and block further
+    /// enqueues even when slots have been retired by the controller.
     pub fn advance_dequeue(&mut self) {
         self.dequeue = (self.dequeue + 1) % (TRANSFER_RING_SIZE - 1);
     }
@@ -423,46 +428,111 @@ impl EventRing {
 
 // ── CommandRing ───────────────────────────────────────────────────────────────
 
-/// xHCI Command Ring (a specialized transfer ring for host commands).
+/// xHCI Command Ring (a fixed-size ring dedicated to host commands).
+///
+/// Uses [`COMMAND_RING_SIZE`] TRBs (including one Link TRB at index
+/// `COMMAND_RING_SIZE - 1`). All wrap and full-detection logic is
+/// expressed in terms of that constant, independent of
+/// [`TRANSFER_RING_SIZE`].
 pub struct CommandRing {
-    inner: TransferRing,
+    /// Command TRB buffer.
+    trbs: [Trb; COMMAND_RING_SIZE],
+    /// Current enqueue index (where software writes next TRB).
+    enqueue: usize,
+    /// Dequeue index (advanced on Command Completion Events).
+    dequeue: usize,
+    /// Current producer cycle state (flips when ring wraps).
+    cycle: bool,
+    /// Physical address of the ring buffer.
+    ring_addr: u64,
 }
 
 impl CommandRing {
     /// Create a new command ring at the given physical address.
     pub fn new(ring_addr: u64) -> Self {
-        let mut inner = TransferRing::new(ring_addr);
-        // Command ring uses a smaller buffer.
-        // Re-create with COMMAND_RING_SIZE semantics.
-        // For simplicity, reuse the full transfer ring struct but note
-        // only COMMAND_RING_SIZE - 1 entries are usable.
+        // Compile-time invariant: COMMAND_RING_SIZE must be at least 2.
+        // One slot is sacrificed to the Link TRB; the one-slot-sacrifice
+        // full-detection convention makes a size-1 ring permanently unwritable.
+        const { assert!(COMMAND_RING_SIZE >= 2, "COMMAND_RING_SIZE must be >= 2") }
+        let mut ring = Self {
+            trbs: [Trb::default(); COMMAND_RING_SIZE],
+            enqueue: 0,
+            dequeue: 0,
+            cycle: true,
+            ring_addr,
+        };
+        // Place the Link TRB at the last slot of the command ring.
         let last = COMMAND_RING_SIZE - 1;
-        inner.trbs[last] = Trb::link(ring_addr, true, inner.cycle);
-        Self { inner }
+        ring.trbs[last] = Trb::link(ring_addr, true, ring.cycle);
+        ring
     }
 
     /// Enqueue a command TRB.
     ///
+    /// Sets the Cycle bit to the current producer state before writing.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Busy`] if the command ring is full.
-    pub fn enqueue_cmd(&mut self, trb: Trb) -> Result<u64> {
-        self.inner.enqueue(trb)
+    pub fn enqueue_cmd(&mut self, mut trb: Trb) -> Result<u64> {
+        // Ring capacity is COMMAND_RING_SIZE - 1 usable slots (one Link TRB).
+        let usable = COMMAND_RING_SIZE - 1;
+        let next = (self.enqueue + 1) % usable;
+        if next == self.dequeue {
+            return Err(Error::Busy);
+        }
+
+        // Stamp cycle bit.
+        if self.cycle {
+            trb.control |= 1;
+        } else {
+            trb.control &= !1;
+        }
+
+        // SAFETY: enqueue is always < COMMAND_RING_SIZE - 1 (< usable),
+        // which is a valid index into self.trbs[0..COMMAND_RING_SIZE].
+        unsafe { core::ptr::write_volatile(&mut self.trbs[self.enqueue], trb) };
+
+        let trb_addr = self.ring_addr + (self.enqueue * core::mem::size_of::<Trb>()) as u64;
+
+        self.enqueue = next;
+        if self.enqueue == 0 {
+            // Wrapped — update Link TRB cycle bit and flip producer state.
+            let cycle = self.cycle;
+            // SAFETY: COMMAND_RING_SIZE - 1 is a valid index.
+            unsafe {
+                let link = &mut self.trbs[COMMAND_RING_SIZE - 1];
+                if cycle {
+                    link.control |= 1;
+                } else {
+                    link.control &= !1;
+                }
+                core::ptr::write_volatile(link, *link);
+            }
+            self.cycle = !self.cycle;
+        }
+
+        Ok(trb_addr)
     }
 
     /// Return the ring address for writing to CRCR.
     pub fn ring_addr(&self) -> u64 {
-        self.inner.ring_addr()
+        self.ring_addr
     }
 
     /// Return the current cycle bit for writing to CRCR.
     pub fn cycle(&self) -> bool {
-        self.inner.cycle()
+        self.cycle
     }
 
     /// Advance the dequeue pointer after a Command Completion Event.
+    ///
+    /// The owning controller **must** call this once for each Command
+    /// Completion Event received from the hardware; failure to do so will
+    /// cause the ring-full guard to trigger prematurely and block further
+    /// command enqueues even when slots have been retired by the controller.
     pub fn advance_dequeue(&mut self) {
-        self.inner.advance_dequeue();
+        self.dequeue = (self.dequeue + 1) % (COMMAND_RING_SIZE - 1);
     }
 }
 
