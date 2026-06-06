@@ -47,6 +47,21 @@ const MAX_REPORT_DATA: usize = 64;
 /// Maximum number of pending input events per device.
 const MAX_EVENTS: usize = 32;
 
+/// Maximum allowed bit size for a single HID field (HID spec: ≤32 bits per
+/// logical value in practice; caps attacker-controlled `bit_size` before any
+/// arithmetic on it).
+const HID_MAX_FIELD_BIT_SIZE: u32 = 32;
+
+/// Maximum allowed bit offset for a single HID field.  A report cannot exceed
+/// [`MAX_REPORT_DATA`] bytes = 512 bits; use 512 as the hard ceiling so that
+/// `bit_offset + bit_size` always fits in a u32 without overflow.
+const HID_MAX_FIELD_BIT_OFFSET: u32 = (MAX_REPORT_DATA as u32) * 8;
+
+/// Maximum total report size in bits derived from the caps above.
+/// Used in [`ReportDescriptor::report_size_bytes`] to ensure the +7 rounding
+/// never overflows even on a 32-bit sub-target.
+const HID_MAX_REPORT_BITS: u32 = HID_MAX_FIELD_BIT_OFFSET + HID_MAX_FIELD_BIT_SIZE;
+
 /// Maximum number of report IDs per device.
 const MAX_REPORT_IDS: usize = 16;
 
@@ -217,29 +232,55 @@ const EMPTY_FIELD: HidField = HidField {
 impl HidField {
     /// Extracts the field value from raw report data.
     ///
-    /// Returns the value as a signed integer, sign-extended from
-    /// the field's bit size.
+    /// Returns the value as a signed integer, sign-extended from the field's
+    /// bit size, or `0` if any field parameter is out of bounds.
+    ///
+    /// All arithmetic on device-supplied `bit_offset` and `bit_size` uses
+    /// checked or bounded operations so that an attacker-controlled HID
+    /// descriptor cannot trigger a ring-0 overflow panic (overflow-checks are
+    /// ON for dev/test) or silent corruption (release builds).
     pub fn extract_value(&self, data: &[u8]) -> i32 {
-        let byte_offset = (self.bit_offset / 8) as usize;
-        let bit_start = (self.bit_offset % 8) as usize;
-        let bits = self.bit_size as usize;
-
-        if bits == 0 || byte_offset >= data.len() {
+        // SECURITY: bit_size and bit_offset are from an untrusted USB HID
+        // descriptor.  Bound-check both before any arithmetic so neither an
+        // overflow panic (dev/test, overflow-checks=on) nor silent corruption
+        // (release) is possible regardless of which code path created the field.
+        if self.bit_size == 0 || self.bit_size > HID_MAX_FIELD_BIT_SIZE {
+            return 0;
+        }
+        if self.bit_offset > HID_MAX_FIELD_BIT_OFFSET {
             return 0;
         }
 
-        // Collect enough bytes to cover the field.
+        let byte_offset = (self.bit_offset / 8) as usize;
+        let bit_start = (self.bit_offset % 8) as usize; // 0..=7, fits usize
+        let bits = self.bit_size as usize; // 1..=32, fits usize
+
+        if byte_offset >= data.len() {
+            return 0;
+        }
+
+        // `bit_start` (≤7) + `bits` (≤32) + 7 = ≤46, well within usize range.
+        let bytes_needed = (bit_start + bits + 7) / 8; // 1..=5
+
+        // Collect enough bytes to cover the field (at most 5 bytes for a
+        // 32-bit field that straddles a byte boundary; cap at 4 for the u32
+        // accumulator, any fifth byte contributes no bits after the >>bit_start
+        // shift into the 32-bit window).
         let mut raw: u32 = 0;
-        let bytes_needed = (bit_start + bits + 7) / 8;
         for i in 0..bytes_needed.min(4) {
-            if byte_offset + i < data.len() {
-                raw |= (data[byte_offset + i] as u32) << (i * 8);
+            // SECURITY: byte_offset + i — both sides are bounded above:
+            // byte_offset ≤ HID_MAX_FIELD_BIT_OFFSET/8 = 64, i ≤ 3, so the
+            // sum fits in usize with no overflow risk.
+            let idx = byte_offset + i;
+            if idx < data.len() {
+                raw |= (data[idx] as u32) << (i * 8);
             }
         }
 
         // Extract the bits.
         raw >>= bit_start;
-        let mask = if bits >= 32 {
+        // bits ≤ 32; the `bits >= 32` branch avoids an undefined 1u32 << 32.
+        let mask: u32 = if bits >= 32 {
             u32::MAX
         } else {
             (1u32 << bits) - 1
@@ -307,17 +348,41 @@ impl ReportDescriptor {
 
     /// Adds a field to the descriptor.
     ///
+    /// Validates device-supplied `bit_offset` and `bit_size` before accepting
+    /// the field.  Both values arrive from an untrusted USB descriptor and must
+    /// be bounded before any arithmetic to prevent overflow panics (overflow-
+    /// checks are ON for dev/test builds) or silent corruption in release mode.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::OutOfMemory`] if the field array is full.
+    /// Returns [`Error::OutOfMemory`] if the field array is full, or
+    /// [`Error::InvalidArgument`] if `bit_size` exceeds
+    /// [`HID_MAX_FIELD_BIT_SIZE`], `bit_offset` exceeds
+    /// [`HID_MAX_FIELD_BIT_OFFSET`], or their sum overflows u32.
     pub fn add_field(&mut self, field: HidField) -> Result<()> {
         if self.field_count >= MAX_FIELDS {
             return Err(Error::OutOfMemory);
         }
+        // SECURITY: bit_size and bit_offset come from an untrusted USB HID
+        // descriptor.  Reject oversized values before any arithmetic so that
+        // ring-0 overflow panics (dev/test) and silent corruption (release)
+        // are both impossible.
+        if field.bit_size > HID_MAX_FIELD_BIT_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+        if field.bit_offset > HID_MAX_FIELD_BIT_OFFSET {
+            return Err(Error::InvalidArgument);
+        }
+        // checked_add guards the remaining edge case where both values are at
+        // their individual maxima and their sum would overflow u32.
+        let field_end = field
+            .bit_offset
+            .checked_add(field.bit_size)
+            .ok_or(Error::InvalidArgument)?;
+
         self.fields[self.field_count] = field;
         self.field_count += 1;
         // Update total report size.
-        let field_end = field.bit_offset + field.bit_size;
         if field_end > self.report_size_bits {
             self.report_size_bits = field_end;
         }
@@ -335,8 +400,19 @@ impl ReportDescriptor {
     }
 
     /// Returns the report size in bytes (rounded up from bits).
+    ///
+    /// `report_size_bits` is bounded by [`HID_MAX_REPORT_BITS`] through the
+    /// validation in [`add_field`], so the `+ 7` rounding never overflows even
+    /// on a 32-bit sub-target.  The saturating cast is a belt-and-suspenders
+    /// guard for any future caller path that skips `add_field`.
     pub fn report_size_bytes(&self) -> usize {
-        (self.report_size_bits as usize + 7) / 8
+        // SECURITY: saturating_add prevents overflow if report_size_bits is
+        // set by a path other than add_field (which enforces the HID caps).
+        // The byte result is clamped to MAX_REPORT_DATA so a caller that sizes
+        // a report buffer from it can never receive a value above the actual
+        // report-buffer cap (HID_MAX_REPORT_BITS rounds up to 68 > 64).
+        let bits = self.report_size_bits.min(HID_MAX_REPORT_BITS);
+        ((bits.saturating_add(7) as usize) / 8).min(MAX_REPORT_DATA)
     }
 
     /// Finds all fields matching a given usage page.
