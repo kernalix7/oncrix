@@ -266,8 +266,18 @@ impl MlockState {
     }
 
     /// Whether this process can lock `count` more pages.
+    ///
+    /// Uses `checked_add` so a `count` that would overflow
+    /// `locked_pages + count` is treated as over-limit and denied,
+    /// rather than wrapping to a small value that bypasses the limit.
     pub fn can_lock(&self, count: u64) -> bool {
-        self.privileged || self.locked_pages + count <= self.limit_pages
+        if self.privileged {
+            return true;
+        }
+        match self.locked_pages.checked_add(count) {
+            Some(total) => total <= self.limit_pages,
+            None => false,
+        }
     }
 
     /// Update the peak locked pages if current exceeds it.

@@ -565,20 +565,36 @@ impl MmapRegionTable {
         let start = if let Some(hint) = addr_hint {
             if flags.fixed {
                 // MAP_FIXED: use the exact address (unmap existing).
+                // Validate the aligned range before touching any VMA:
+                // a hint near u64::MAX would otherwise wrap and unmap
+                // an inverted / non-canonical range.
                 let aligned = align_down(hint, PAGE_SIZE);
+                let end = aligned.checked_add(size).ok_or(Error::InvalidArgument)?;
+                if aligned < MMAP_MIN_ADDR || end > USER_ADDR_LIMIT {
+                    return Err(Error::InvalidArgument);
+                }
                 // Remove any overlapping regions.
-                self.unmap_range(aligned, aligned + size)?;
+                self.unmap_range(aligned, end)?;
                 aligned
             } else {
-                // Try the hint; fall back to gap search.
-                let aligned = align_up(hint, DEFAULT_ALIGN);
-                if aligned + size <= USER_ADDR_LIMIT
-                    && self.find_overlap(aligned, aligned + size).is_none()
-                {
-                    aligned
-                } else {
-                    let gap = self.find_gap(size, DEFAULT_ALIGN)?;
-                    gap.aligned_start(DEFAULT_ALIGN)
+                // Try the hint; fall back to gap search. align_up and
+                // the end computation are both checked so a wrapped
+                // (aligned + size) can never falsely pass the bound.
+                let hinted = match align_up_checked(hint, DEFAULT_ALIGN) {
+                    Some(aligned) => aligned.checked_add(size).and_then(|end| {
+                        let ok = aligned >= MMAP_MIN_ADDR
+                            && end <= USER_ADDR_LIMIT
+                            && self.find_overlap(aligned, end).is_none();
+                        if ok { Some(aligned) } else { None }
+                    }),
+                    None => None,
+                };
+                match hinted {
+                    Some(aligned) => aligned,
+                    None => {
+                        let gap = self.find_gap(size, DEFAULT_ALIGN)?;
+                        gap.aligned_start(DEFAULT_ALIGN)
+                    }
                 }
             }
         } else {
@@ -586,9 +602,12 @@ impl MmapRegionTable {
             gap.aligned_start(DEFAULT_ALIGN)
         };
 
+        // `start` is gap-derived or bound-checked above; this cannot
+        // overflow, but stay panic-free regardless.
+        let end = start.checked_add(size).ok_or(Error::InvalidArgument)?;
         let region = MmapRegion {
             start,
-            end: start + size,
+            end,
             prot,
             flags,
             inode,
@@ -639,13 +658,22 @@ impl MmapRegionTable {
 
             if r.start < start && r.end > end {
                 // Region straddles the unmap range — split into two.
+                // Reserve the slot BEFORE truncating the original so a
+                // full table fails without dropping the tail mapping
+                // (all-or-nothing).
+                if self.count >= MAX_REGIONS {
+                    return Err(Error::OutOfMemory);
+                }
                 let orig_end = r.end;
-                self.regions[i].end = start;
-                // Create the upper part.
+                let orig_start = r.start;
+                // Create the upper part from the (still intact) region.
                 let mut upper = self.regions[i];
                 upper.start = end;
                 upper.end = orig_end;
-                upper.offset += end - self.regions[i].start;
+                upper.offset += end - orig_start;
+                // Now truncate the lower half and insert the tail; the
+                // capacity check above guarantees insertion succeeds.
+                self.regions[i].end = start;
                 self.insert_sorted(upper)?;
                 freed += end - start;
                 self.total_mapped = self.total_mapped.saturating_sub(end - start);
@@ -937,6 +965,19 @@ fn align_down(val: u64, align: u64) -> u64 {
 }
 
 /// Align `val` up to the nearest multiple of `align`.
+///
+/// Callers pass values already bounded below [`USER_ADDR_LIMIT`], so
+/// the `+ align - 1` cannot overflow in practice; the saturating add
+/// keeps this panic-free for any defaulted / out-of-range input.
 fn align_up(val: u64, align: u64) -> u64 {
-    (val + align - 1) & !(align - 1)
+    val.saturating_add(align - 1) & !(align - 1)
+}
+
+/// Align `val` up to the nearest multiple of `align`, returning
+/// `None` if the rounding would overflow `u64`.
+///
+/// Used on the user-controlled mmap hint path where a near-`u64::MAX`
+/// value must not wrap into a small (falsely in-range) address.
+fn align_up_checked(val: u64, align: u64) -> Option<u64> {
+    Some(val.checked_add(align - 1)? & !(align - 1))
 }

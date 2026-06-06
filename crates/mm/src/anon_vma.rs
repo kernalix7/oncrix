@@ -687,18 +687,38 @@ impl AnonVmaManager {
     }
 
     fn decrement_refcount(&mut self, av_id: u32, vma_id: u32) {
-        if let Some(idx) = self.find_av_by_id(av_id) {
-            self.anon_vmas[idx].refcount = self.anon_vmas[idx].refcount.saturating_sub(1);
-            // Remove VMA from the anon_vma's list.
-            let nr = self.anon_vmas[idx].nr_vmas;
-            for j in 0..nr {
-                if self.anon_vmas[idx].vma_ids[j] == vma_id {
-                    let last = nr - 1;
-                    self.anon_vmas[idx].vma_ids[j] = self.anon_vmas[idx].vma_ids[last];
-                    self.anon_vmas[idx].nr_vmas -= 1;
-                    break;
-                }
+        let idx = match self.find_av_by_id(av_id) {
+            Some(idx) => idx,
+            None => return,
+        };
+        self.anon_vmas[idx].refcount = self.anon_vmas[idx].refcount.saturating_sub(1);
+        // Remove VMA from the direct anon_vma's list (only the direct
+        // anon_vma tracks the VMA in `vma_ids`; ancestors do not).
+        let nr = self.anon_vmas[idx].nr_vmas;
+        for j in 0..nr {
+            if self.anon_vmas[idx].vma_ids[j] == vma_id {
+                let last = nr - 1;
+                self.anon_vmas[idx].vma_ids[j] = self.anon_vmas[idx].vma_ids[last];
+                self.anon_vmas[idx].nr_vmas -= 1;
+                break;
             }
+        }
+        // Mirror `register_vma`: it bumped each ancestor's refcount when
+        // chaining the VMA up to the root. Walk the same chain here and
+        // decrement each, bounded by `MAX_DEPTH` to avoid a cycle loop,
+        // otherwise the ancestor refcounts leak and the anon_vma tree
+        // can never be freed.
+        let mut current_av_id = self.anon_vmas[idx].parent_id;
+        let mut steps = 0;
+        while current_av_id != 0 && steps < MAX_DEPTH {
+            match self.find_av_by_id(current_av_id) {
+                Some(pidx) => {
+                    self.anon_vmas[pidx].refcount = self.anon_vmas[pidx].refcount.saturating_sub(1);
+                    current_av_id = self.anon_vmas[pidx].parent_id;
+                }
+                None => break,
+            }
+            steps += 1;
         }
     }
 

@@ -24,6 +24,12 @@ use oncrix_lib::{Error, Result};
 /// Page size.
 const PAGE_SIZE: u64 = 4096;
 
+/// User-space virtual address limit (canonical x86_64 lower half).
+///
+/// A munmap range end must never exceed this; a saturating end would
+/// silently widen the range and over-unmap the upper address space.
+const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
+
 /// Maximum VMAs tracked.
 const MAX_VMAS: usize = 256;
 
@@ -61,16 +67,28 @@ pub struct MunmapRange {
 
 impl MunmapRange {
     /// Creates a new unmap range.
+    ///
+    /// Rejects overflow of `start + length` and any range whose end
+    /// exceeds [`USER_ADDR_LIMIT`]. Never saturates the end (a
+    /// saturated end would silently widen the range and over-unmap).
     pub fn new(start: u64, length: u64) -> Result<Self> {
         if start % PAGE_SIZE != 0 || length % PAGE_SIZE != 0 || length == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let end = start.checked_add(length).ok_or(Error::InvalidArgument)?;
+        if end > USER_ADDR_LIMIT {
             return Err(Error::InvalidArgument);
         }
         Ok(Self { start, length })
     }
 
     /// Returns the end address (exclusive).
+    ///
+    /// [`MunmapRange::new`] guarantees `start + length` does not
+    /// overflow, so the fallback (an empty range at `start`) is only
+    /// reachable for a defaulted range and never over-unmaps.
     pub fn end(&self) -> u64 {
-        self.start.saturating_add(self.length)
+        self.start.checked_add(self.length).unwrap_or(self.start)
     }
 
     /// Returns the number of pages.
@@ -221,17 +239,21 @@ impl MmapMunmap {
                 self.vmas[i].end = start.max(self.vmas[i].start);
                 self.stats.splits += 1;
             } else {
-                // Split VMA in the middle.
-                let overlap = range_end - start;
-                total_unmapped += overlap / PAGE_SIZE;
-                let old_end = self.vmas[i].end;
-                self.vmas[i].end = start;
-                // Create new VMA for the tail.
-                if self.vma_count < MAX_VMAS {
-                    self.vmas[self.vma_count] =
-                        MunmapVma::new(range_end, old_end, self.vmas[i].flags);
-                    self.vma_count += 1;
+                // Split VMA in the middle. Reserve the tail slot
+                // BEFORE truncating the original: if the table is
+                // full, fail without mutating so the tail mapping is
+                // never silently dropped (all-or-nothing).
+                if self.vma_count >= MAX_VMAS {
+                    self.stats.failures += 1;
+                    return Err(Error::OutOfMemory);
                 }
+                let overlap = range_end - start;
+                let old_end = self.vmas[i].end;
+                let flags = self.vmas[i].flags;
+                self.vmas[i].end = start;
+                self.vmas[self.vma_count] = MunmapVma::new(range_end, old_end, flags);
+                self.vma_count += 1;
+                total_unmapped += overlap / PAGE_SIZE;
                 self.stats.splits += 1;
             }
         }
