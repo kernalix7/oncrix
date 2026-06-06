@@ -34,6 +34,44 @@
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
+// User-pointer safety
+// ---------------------------------------------------------------------------
+
+/// Inclusive upper bound of the canonical user-space lower half (x86_64).
+///
+/// Any pointer supplied by the caller must satisfy `ptr <= USER_PTR_MAX`.
+/// A pointer above this value is either a kernel-half address or a
+/// non-canonical VA; dereferencing it in ring 0 causes a kernel fault.
+///
+/// Mirrors `oncrix_mm::address_space::USER_SPACE_END`.
+const USER_PTR_MAX: u64 = 0x0000_7FFF_FFFF_FFFF;
+
+/// Validate that the half-open range `[ptr, ptr + len)` is entirely within
+/// the canonical user-space lower half.
+///
+/// Returns `Err(InvalidArgument)` (→ `EFAULT` at the syscall boundary) if:
+/// - `ptr` is zero (null pointer).
+/// - `ptr` is not a multiple of `align` (a `core::ptr::read` of an
+///   under-aligned pointer is undefined behaviour).
+/// - `ptr + len` wraps around (overflow).
+/// - any byte of the range exceeds `USER_PTR_MAX`.
+fn validate_user_ptr_range(ptr: u64, len: u64, align: u64) -> Result<()> {
+    if ptr == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    if align != 0 && ptr % align != 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let end = ptr.checked_add(len).ok_or(Error::InvalidArgument)?;
+    // `end` is the exclusive end; the last accessible byte is `end - 1`.
+    // Use `end - 1 <= USER_PTR_MAX`, i.e. `end <= USER_PTR_MAX + 1`.
+    if end > USER_PTR_MAX.saturating_add(1) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Flag constants
 // ---------------------------------------------------------------------------
 
@@ -120,9 +158,11 @@ impl IoUringEnterArgs {
     ///
     /// Returns `Err(InvalidArgument)` if:
     /// - Unknown flag bits are set.
+    /// - `IORING_ENTER_EXT_ARG` is set but `argp` is null or not in the
+    ///   canonical user-space range.
     /// - `IORING_ENTER_EXT_ARG` is set but `argsz` does not match
     ///   `size_of::<IoUringGeteventsArg>()`.
-    /// - `IORING_ENTER_EXT_ARG` is set but `argp` is null.
+    /// - The `pad` field of the extended arg is non-zero.
     pub fn from_raw(
         fd: u32,
         to_submit: u32,
@@ -136,15 +176,27 @@ impl IoUringEnterArgs {
         }
 
         let ext_arg = if flags & IORING_ENTER_EXT_ARG != 0 {
-            if argp == 0 {
-                return Err(Error::InvalidArgument);
-            }
+            // Validate size before touching the pointer so we never deref with
+            // a wrong stride.
             if argsz != core::mem::size_of::<IoUringGeteventsArg>() {
                 return Err(Error::InvalidArgument);
             }
-            // SAFETY: Caller has validated the pointer is non-null and the
-            // size matches.  In a real kernel we would use copy_from_user.
-            let arg = unsafe { *(argp as *const IoUringGeteventsArg) };
+            // SECURITY: validate the canonical user-space range before any
+            // dereference.  A kernel-half or non-canonical address would cause
+            // a ring-0 fault.  This check mirrors the crate-wide convention
+            // (see copy_file_range_ext_call, mseal) and must precede any read.
+            validate_user_ptr_range(
+                argp,
+                argsz as u64,
+                core::mem::align_of::<IoUringGeteventsArg>() as u64,
+            )?;
+            // SAFETY: `validate_user_ptr_range` has confirmed the range is
+            // within the canonical user lower-half, correctly aligned for
+            // `IoUringGeteventsArg`, and cannot overflow.
+            // `IoUringGeteventsArg` is `repr(C)` and fully initialized by the
+            // caller.  We copy by value into a kernel-local binding so that
+            // no subsequent code touches the user pointer directly.
+            let arg = unsafe { core::ptr::read(argp as *const IoUringGeteventsArg) };
             if arg.pad != 0 {
                 return Err(Error::InvalidArgument);
             }
@@ -278,15 +330,27 @@ mod tests {
 
     #[test]
     fn enter_ext_arg_null_ptr() {
+        // argp == 0, argsz == 0: size check fires first (0 != 16).
         let result = do_io_uring_enter(3, 1, 1, IORING_ENTER_EXT_ARG, 0, 0);
         assert_eq!(result.unwrap_err(), Error::InvalidArgument);
     }
 
     #[test]
     fn enter_ext_arg_wrong_size() {
-        let arg = IoUringGeteventsArg::new();
-        let ptr = &arg as *const _ as u64;
-        let result = do_io_uring_enter(3, 1, 1, IORING_ENTER_EXT_ARG, ptr, 4);
+        // Size mismatch is caught before the pointer range check — no deref occurs.
+        // Use a plausible user address so the test clearly exercises the size path.
+        let user_addr: u64 = 0x0000_4000_0000_0000;
+        let result = do_io_uring_enter(3, 1, 1, IORING_ENTER_EXT_ARG, user_addr, 4);
+        assert_eq!(result.unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn enter_ext_arg_kernel_addr_rejected() {
+        // A kernel-half address (above USER_PTR_MAX) must be rejected even
+        // when the size is correct.  No deref should ever occur.
+        let kernel_addr: u64 = 0xffff_8000_0000_0000u64;
+        let sz = core::mem::size_of::<IoUringGeteventsArg>();
+        let result = do_io_uring_enter(3, 1, 1, IORING_ENTER_EXT_ARG, kernel_addr, sz);
         assert_eq!(result.unwrap_err(), Error::InvalidArgument);
     }
 

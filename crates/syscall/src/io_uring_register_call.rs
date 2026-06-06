@@ -337,11 +337,18 @@ pub fn sys_io_uring_register(_fd: u32, opcode: u32, arg: u64, nr_args: u32) -> R
             Ok(0)
         }
         IORING_REGISTER_RESTRICTIONS => {
+            // SECURITY: returning Ok(0) here without actually applying the
+            // restriction table is a fail-open sandbox bypass — the caller
+            // believes the ring is now restricted but it is not.  Fail closed
+            // with NotImplemented until the restriction table is stored and
+            // enforced.  The full implementation must copy the restriction
+            // array from user space, validate each entry, and atomically
+            // commit the set to the ring context so that subsequent
+            // IORING_ENTER / IORING_REGISTER calls are gated against it.
             if arg == 0 {
                 return Err(Error::InvalidArgument);
             }
-            // TODO: apply restriction table to the ring.
-            Ok(0)
+            Err(Error::NotImplemented)
         }
         IORING_REGISTER_ENABLE_RINGS => {
             if arg != 0 || nr_args != 0 {
@@ -372,8 +379,22 @@ pub fn sys_io_uring_register(_fd: u32, opcode: u32, arg: u64, nr_args: u32) -> R
             Ok(nr_args as i64)
         }
         _ => {
-            // All remaining valid opcodes are accepted but not fully implemented.
-            Ok(0)
+            // SECURITY: fail closed on every opcode not explicitly handled
+            // above.  Returning Ok(0) here would cause callers to incorrectly
+            // assume that a privileged or state-mutating side-effect (e.g.
+            // IORING_REGISTER_IOWQ_AFF, IORING_REGISTER_PBUF_RING,
+            // IORING_REGISTER_RESIZE_RINGS, IORING_REGISTER_MEM_REGION) was
+            // successfully applied.  Opcodes in this range include ones that
+            // require CAP_SYS_ADMIN or ring-owner identity — none of which
+            // can be verified until per-task credentials are threaded through
+            // the dispatcher.  Until each opcode is individually implemented
+            // and capability-gated, they must be explicitly denied.
+            //
+            // // SECURITY: privilege gate placeholder — when per-task creds
+            // // are available, add: `if !caller_cred.has_cap(CAP_SYS_ADMIN)
+            // // { return Err(Error::PermissionDenied); }` here and for every
+            // // opcode that mutates ring or worker-pool state.
+            Err(Error::NotImplemented)
         }
     }
 }
@@ -427,5 +448,41 @@ mod tests {
         let r = sys_io_uring_register(3, IORING_REGISTER_PERSONALITY, 0, 0);
         assert!(r.is_ok());
         assert!(r.unwrap() > 0);
+    }
+
+    /// IORING_REGISTER_RESTRICTIONS must be denied (not silently accepted)
+    /// until the restriction table is actually stored and enforced.
+    /// Returning Ok(0) without storing the restriction is a fail-open bypass.
+    #[test]
+    fn register_restrictions_fails_closed() {
+        // Non-null arg — would previously return Ok(0) (fail-open).
+        let fake_user_addr: u64 = 0x0000_4000_0000_0000;
+        assert_eq!(
+            sys_io_uring_register(3, IORING_REGISTER_RESTRICTIONS, fake_user_addr, 1).unwrap_err(),
+            Error::NotImplemented
+        );
+    }
+
+    /// Unimplemented opcodes inside the valid range (e.g. IORING_REGISTER_IOWQ_AFF,
+    /// IORING_REGISTER_PBUF_RING, IORING_REGISTER_RESIZE_RINGS) must be denied,
+    /// not silently accepted.  Accepting them lets a caller assume a privileged
+    /// side-effect occurred when it did not.
+    #[test]
+    fn unimplemented_opcodes_fail_closed() {
+        for opcode in [
+            IORING_REGISTER_IOWQ_AFF,
+            IORING_UNREGISTER_IOWQ_AFF,
+            IORING_REGISTER_PBUF_RING,
+            IORING_UNREGISTER_PBUF_RING,
+            IORING_REGISTER_RESIZE_RINGS,
+            IORING_REGISTER_MEM_REGION,
+        ] {
+            let r = sys_io_uring_register(3, opcode, 0x0000_4000_0000_0000, 1);
+            assert_eq!(
+                r.unwrap_err(),
+                Error::NotImplemented,
+                "opcode {opcode} should return NotImplemented, not Ok"
+            );
+        }
     }
 }
