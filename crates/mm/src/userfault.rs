@@ -228,13 +228,17 @@ impl UffdRange {
     }
 
     /// End address (exclusive).
+    ///
+    /// Saturates so a range whose `[start, start+length)` would
+    /// overflow `u64` does not wrap into a small end value that would
+    /// corrupt the fault-routing membership window.
     pub const fn end(&self) -> u64 {
-        self.start + self.length
+        self.start.saturating_add(self.length)
     }
 
     /// Check if an address falls within this range.
     pub const fn contains(&self, addr: u64) -> bool {
-        addr >= self.start && addr < self.start + self.length
+        addr >= self.start && self.end() > addr
     }
 }
 
@@ -555,8 +559,10 @@ impl UffdManager {
         if desc.range_count >= MAX_RANGES_PER_FD {
             return Err(Error::OutOfMemory);
         }
+        // Reject a range that wraps the address space; a wrapping `end`
+        // would corrupt the overlap and membership checks.
+        let end = start.checked_add(length).ok_or(Error::InvalidArgument)?;
         // Check overlap with existing ranges.
-        let end = start + length;
         for r in &desc.ranges[..desc.range_count] {
             if r.active && start < r.end() && end > r.start {
                 return Err(Error::AlreadyExists);

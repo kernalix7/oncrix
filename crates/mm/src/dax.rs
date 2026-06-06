@@ -207,8 +207,12 @@ impl Default for DaxDevice {
 
 impl DaxDevice {
     /// Return the ending physical address (exclusive).
+    ///
+    /// Saturates instead of wrapping so a device whose range would
+    /// overflow `u64` reports the maximum address rather than a small
+    /// wrapped value that could corrupt containment checks.
     pub fn phys_end(&self) -> u64 {
-        self.phys_start + self.phys_len
+        self.phys_start.saturating_add(self.phys_len)
     }
 
     /// Check whether a physical address falls within this device.
@@ -221,7 +225,9 @@ impl DaxDevice {
         if offset >= self.phys_len {
             return Err(Error::InvalidArgument);
         }
-        Ok(self.phys_start + offset)
+        self.phys_start
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Convert a physical address to a PFN.
@@ -487,7 +493,11 @@ impl DaxManager {
         if self.device_count >= MAX_DAX_DEVICES {
             return Err(Error::OutOfMemory);
         }
-        let end = phys_start + phys_len;
+        // Reject a range that wraps; a wrapping `end` would defeat the
+        // overlap guard and let two devices alias the same PMEM.
+        let end = phys_start
+            .checked_add(phys_len)
+            .ok_or(Error::InvalidArgument)?;
         // Check for overlap with existing devices.
         for i in 0..self.device_count {
             let d = &self.devices[i];
@@ -560,7 +570,17 @@ impl DaxManager {
         if device_idx >= self.device_count || !self.devices[device_idx].alive {
             return Err(Error::InvalidArgument);
         }
-        if phys_offset + length > self.devices[device_idx].phys_len {
+        // Reject a phys range that wraps or exceeds the device. A
+        // wrapping sum would otherwise pass the bound check and install
+        // an out-of-device PFN (memory disclosure/corruption).
+        let phys_end = phys_offset
+            .checked_add(length)
+            .ok_or(Error::InvalidArgument)?;
+        if phys_end > self.devices[device_idx].phys_len {
+            return Err(Error::InvalidArgument);
+        }
+        // Reject a virtual range that wraps the address space.
+        if virt_start.checked_add(length).is_none() {
             return Err(Error::InvalidArgument);
         }
         if self.mapping_count >= MAX_DAX_MAPPINGS {
@@ -634,9 +654,18 @@ impl DaxManager {
         let mapping = self.mappings[mapping_idx];
         let dev_idx = mapping.device_idx;
 
-        // Compute the physical address.
-        let offset_in_mapping = virt_addr - mapping.virt_start;
-        let phys_addr = self.devices[dev_idx].phys_start + mapping.phys_offset + offset_in_mapping;
+        // Compute the physical address with checked arithmetic and
+        // re-verify it lands inside the device. A wrapping sum here
+        // would yield an out-of-device PFN.
+        let offset_in_mapping = virt_addr.saturating_sub(mapping.virt_start);
+        let phys_addr = self.devices[dev_idx]
+            .phys_start
+            .checked_add(mapping.phys_offset)
+            .and_then(|p| p.checked_add(offset_in_mapping))
+            .ok_or(Error::InvalidArgument)?;
+        if !self.devices[dev_idx].contains_phys(phys_addr) {
+            return Err(Error::InvalidArgument);
+        }
         let pfn = DaxDevice::phys_to_pfn(phys_addr);
 
         // Classify the fault.
@@ -869,7 +898,13 @@ impl DaxManager {
     fn find_mapping(&self, virt_addr: u64) -> Option<usize> {
         for i in 0..self.mapping_count {
             let m = &self.mappings[i];
-            if m.active && virt_addr >= m.virt_start && virt_addr < m.virt_start + m.length {
+            // Use checked_add for the end bound so a mapping whose
+            // [start, start+length) wraps does not falsely match.
+            let end = match m.virt_start.checked_add(m.length) {
+                Some(e) => e,
+                None => continue,
+            };
+            if m.active && virt_addr >= m.virt_start && virt_addr < end {
                 return Some(i);
             }
         }

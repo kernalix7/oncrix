@@ -663,7 +663,14 @@ impl MadviseManager {
             }
         };
 
+        // `len` is non-zero here, so a zero rounded length means the
+        // page round-up overflowed `u64`; reject rather than treating
+        // it as a zero-length advice.
         let aligned_len = page_align_up(len);
+        if aligned_len == 0 {
+            self.stats.invalid_args += 1;
+            return Err(Error::InvalidArgument);
+        }
         self.apply_advice(pid, addr, aligned_len, parsed, pid)
     }
 
@@ -747,7 +754,13 @@ impl MadviseManager {
                 self.stats.invalid_args += 1;
                 return Err(Error::InvalidArgument);
             }
+            // A zero rounded length for a non-zero `entry.len` means the
+            // page round-up overflowed `u64`; reject the request.
             let aligned_len = page_align_up(entry.len);
+            if aligned_len == 0 {
+                self.stats.invalid_args += 1;
+                return Err(Error::InvalidArgument);
+            }
             self.apply_advice(target_pid, entry.base, aligned_len, parsed, caller_pid)?;
         }
 
@@ -1015,6 +1028,14 @@ impl MadviseManager {
 // ── Helpers ───────────────────────────────────────────────────────
 
 /// Align a value up to the next page boundary.
+///
+/// Returns `0` for a `val` so large that rounding up would overflow
+/// `u64`; callers must reject a zero result for a non-zero input as
+/// [`Error::InvalidArgument`] rather than treating it as a valid
+/// zero-length operation.
 const fn page_align_up(val: u64) -> u64 {
-    (val + PAGE_SIZE - 1) & PAGE_MASK
+    match val.checked_add(PAGE_SIZE - 1) {
+        Some(v) => v & PAGE_MASK,
+        None => 0,
+    }
 }
