@@ -3,9 +3,19 @@
 
 //! Device-mapper crypt (dm-crypt) target driver.
 //!
-//! Implements an AES-XTS transparent block encryption layer over any
-//! underlying block device. The `DmCrypt` target intercepts block I/O,
-//! encrypts writes and decrypts reads using the configured cipher and key.
+//! Models an AES-XTS transparent block encryption layer over any underlying
+//! block device. The `DmCrypt` target intercepts block I/O and is intended to
+//! encrypt writes and decrypt reads using the configured cipher and key.
+//!
+//! # Security status
+//!
+//! No real AES-XTS / AES-CBC-ESSIV cipher is wired into the sector crypt path
+//! yet (the crypto crate exposes AES-128 block primitives but no XTS tweak
+//! construction). The driver therefore **fails closed**: [`DmCrypt::configure`]
+//! rejects every cipher mode (see [`cipher_is_implemented`]) and the sector
+//! crypt path returns an error instead of running a placeholder XOR that would
+//! provide zero confidentiality. A real, verified cipher MUST be connected
+//! before encrypted volumes are accepted.
 //!
 //! # Architecture
 //!
@@ -71,6 +81,26 @@ pub enum CipherMode {
 impl Default for CipherMode {
     fn default() -> Self {
         Self::Aes256Xts
+    }
+}
+
+/// Returns `true` only for cipher modes backed by a real, wired cipher.
+///
+/// # Security
+///
+/// dm-crypt must fail closed: until a verified AES-XTS (and AES-CBC-ESSIV)
+/// implementation is connected to the sector crypt path, no cipher mode is
+/// considered implemented, so [`DmCrypt::configure`] refuses activation and
+/// the sector crypt path returns an error. This prevents presenting a
+/// non-cipher (e.g. an XOR transform) as disk encryption.
+///
+/// When a real cipher is wired (the crypto crate exposes AES-128 block
+/// primitives; XTS still requires the tweak construction), flip the
+/// corresponding arm to `true`.
+pub const fn cipher_is_implemented(mode: CipherMode) -> bool {
+    match mode {
+        // SECURITY: no real AES-XTS / AES-CBC-ESSIV is wired yet.
+        CipherMode::Aes128Xts | CipherMode::Aes256Xts | CipherMode::Aes256CbcEssiv => false,
     }
 }
 
@@ -236,7 +266,11 @@ impl DmCrypt {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if key length doesn't match cipher_mode.
+    /// Returns [`Error::InvalidArgument`] if key length doesn't match
+    /// `cipher_mode`, or if `cipher_mode` selects a cipher whose real
+    /// implementation is not yet wired (see [`cipher_is_implemented`]).
+    /// dm-crypt fails closed rather than activating a mapping that would
+    /// provide no real confidentiality.
     pub fn configure(
         &mut self,
         cipher_mode: CipherMode,
@@ -246,6 +280,14 @@ impl DmCrypt {
         start_lba: u64,
         total_sectors: u64,
     ) -> Result<()> {
+        // SECURITY: Fail closed. The sector crypto path does not yet have a
+        // real AES-XTS / AES-CBC-ESSIV implementation wired (the crypto crate
+        // provides AES-128 block primitives but no XTS tweak construction).
+        // Refuse to activate any mapping until a real cipher is connected so
+        // that an encrypted volume is never silently backed by a non-cipher.
+        if !cipher_is_implemented(cipher_mode) {
+            return Err(Error::InvalidArgument);
+        }
         // Validate key length vs cipher mode.
         match cipher_mode {
             CipherMode::Aes128Xts => {
@@ -285,7 +327,7 @@ impl DmCrypt {
         compute_sector_iv(sector_num, self.iv_offset, self.iv_mode, &mut iv);
         // XTS encryption: process each AES block with tweaked IV.
         // (Actual AES implementation deferred to crypto layer; this models the structure.)
-        self.xts_crypt_sector(buf, &iv, true)
+        self.xts_crypt_sector(buf, &iv)
     }
 
     /// Decrypts a sector buffer in-place using the configured cipher.
@@ -299,7 +341,7 @@ impl DmCrypt {
         }
         let mut iv = [0u8; AES_BLOCK_SIZE];
         compute_sector_iv(sector_num, self.iv_offset, self.iv_mode, &mut iv);
-        self.xts_crypt_sector(buf, &iv, false)
+        self.xts_crypt_sector(buf, &iv)
     }
 
     /// Translates a target-relative LBA to the backing device LBA.
@@ -320,26 +362,30 @@ impl DmCrypt {
     }
 
     // -----------------------------------------------------------------------
-    // Private: XTS sector encryption stub
+    // Private: XTS sector encryption (fail-closed until real cipher wired)
     // -----------------------------------------------------------------------
 
-    fn xts_crypt_sector(
-        &self,
-        buf: &mut [u8],
-        iv: &[u8; AES_BLOCK_SIZE],
-        _encrypt: bool,
-    ) -> Result<()> {
-        // XTS mode processes SECTOR_SIZE / AES_BLOCK_SIZE blocks.
-        // Each block's tweak = AES_ECB(tweak_key, T xor i) where T = iv, i = block index.
-        // This stub XORs each block with the IV (illustrative only — real impl uses AES).
-        for block_idx in 0..(SECTOR_SIZE / AES_BLOCK_SIZE) {
-            let start = block_idx * AES_BLOCK_SIZE;
-            for j in 0..AES_BLOCK_SIZE {
-                // Mix in IV and block index (stub; real XTS uses full AES).
-                buf[start + j] ^= iv[j] ^ (block_idx as u8);
-            }
+    /// Transforms a sector buffer with the configured cipher.
+    ///
+    /// # Security
+    ///
+    /// This MUST be a real AES-XTS (or AES-CBC-ESSIV) transform before any
+    /// encrypted volume is accepted. No such cipher is wired yet, so this
+    /// fails closed with [`Error::InvalidArgument`] rather than running a
+    /// placeholder XOR that provides zero confidentiality. A prior
+    /// implementation here XOR-ed each block with the IV and block index and
+    /// presented it as AES-XTS; that is intentionally removed. `configure`
+    /// also rejects activation via [`cipher_is_implemented`], so this guard
+    /// is the second, defence-in-depth layer for any direct caller.
+    fn xts_crypt_sector(&self, _buf: &mut [u8], _iv: &[u8; AES_BLOCK_SIZE]) -> Result<()> {
+        // SECURITY: fail closed. Real AES-XTS (FIPS-197 AES block + tweak)
+        // must be wired before returning Ok and mutating the buffer.
+        if !cipher_is_implemented(self.cipher_mode) {
+            return Err(Error::InvalidArgument);
         }
-        Ok(())
+        // Unreachable until a real cipher arm in `cipher_is_implemented`
+        // returns true; the real XTS transform will be implemented here.
+        Err(Error::NotImplemented)
     }
 }
 
@@ -466,21 +512,40 @@ mod tests {
     }
 
     #[test]
-    fn encrypt_decrypt_round_trip() {
+    fn sector_crypt_fails_closed_without_real_cipher() {
+        // SECURITY: until a real AES-XTS cipher is wired, the sector crypt
+        // path must refuse to run (no placeholder XOR) and must leave the
+        // buffer untouched.
         let mut dev = DmCrypt::new(0);
         dev.total_sectors = 1000;
         dev.initialized = true;
 
         let mut sector = [0u8; SECTOR_SIZE];
-        // Fill with known pattern.
         for (i, b) in sector.iter_mut().enumerate() {
             *b = (i & 0xFF) as u8;
         }
         let original = sector;
-        dev.encrypt_sector(0, &mut sector).unwrap();
-        // After encryption, data should differ (XOR with IV != 0 changes it).
-        dev.decrypt_sector(0, &mut sector).unwrap();
-        // XOR with same IV twice = identity.
-        assert_eq!(sector, original);
+        assert!(dev.encrypt_sector(0, &mut sector).is_err());
+        assert_eq!(sector, original, "buffer must be untouched on fail-closed");
+        assert!(dev.decrypt_sector(0, &mut sector).is_err());
+        assert_eq!(sector, original, "buffer must be untouched on fail-closed");
+    }
+
+    #[test]
+    fn configure_rejects_unimplemented_cipher() {
+        // SECURITY: activation must fail closed for every cipher mode while
+        // no real cipher is wired.
+        let mut dev = DmCrypt::new(0);
+        let key = DmCryptKey::from_bytes(&[0u8; 64]).unwrap();
+        let res = dev.configure(CipherMode::Aes256Xts, IvGenerator::Plain64, key, 0, 0, 1000);
+        assert!(res.is_err());
+        assert!(!dev.is_initialized());
+    }
+
+    #[test]
+    fn no_cipher_is_implemented_yet() {
+        assert!(!cipher_is_implemented(CipherMode::Aes128Xts));
+        assert!(!cipher_is_implemented(CipherMode::Aes256Xts));
+        assert!(!cipher_is_implemented(CipherMode::Aes256CbcEssiv));
     }
 }

@@ -9,12 +9,23 @@
 //!
 //! # Simplifications
 //!
-//! - Uses a placeholder symmetric cipher (XOR-based) instead of
-//!   ChaCha20-Poly1305.  In a production kernel this would be
-//!   replaced by a constant-time AEAD implementation.
 //! - The Noise handshake is modelled as a state machine but does
 //!   not perform real Diffie-Hellman; key agreement is simulated.
-//! - Replay protection uses a simple sliding-window counter.
+//! - Replay protection uses a simple sliding-window counter that is
+//!   only advanced **after** authentication.
+//!
+//! # Security: transport data fails closed
+//!
+//! WireGuard transport data is protected by ChaCha20-Poly1305.  This
+//! kernel does **not** yet ship a Poly1305 (or any AEAD) bound to the
+//! tunnel, so [`WgDevice::encrypt`] / [`WgDevice::decrypt`] reject all
+//! transport traffic with [`Error::NotImplemented`] rather than run a
+//! placeholder cipher.  Earlier revisions XOR-ed the payload with the
+//! session key and shipped it with no authentication tag: that is an
+//! always-accept, full-plaintext-recovery break, never a cipher.  The
+//! gate [`AEAD_AVAILABLE`] stays `false` until a real, constant-time
+//! ChaCha20-Poly1305 (the `crypto` crate provides ChaCha20; Poly1305
+//! must be added) is wired in and a tag is verified in constant time.
 //!
 //! # Architecture
 //!
@@ -86,6 +97,19 @@ const MAX_PAYLOAD: usize = 1420;
 
 /// Replay window size (bits).
 const REPLAY_WINDOW: u64 = 64;
+
+/// AEAD authentication tag size in bytes (Poly1305 = 16).
+const AEAD_TAG_SIZE: usize = 16;
+
+/// Whether a real ChaCha20-Poly1305 AEAD is wired to the transport.
+///
+/// SECURITY: this MUST remain `false` until a constant-time
+/// ChaCha20-Poly1305 implementation (ChaCha20 lives in the `crypto`
+/// crate; Poly1305 still needs to be added) encrypts/decrypts and
+/// authenticates transport data.  While `false`, the data path fails
+/// closed: no plaintext is ever produced from an unauthenticated
+/// packet and no unauthenticated ciphertext is ever emitted.
+const AEAD_AVAILABLE: bool = false;
 
 // =========================================================================
 // Key types
@@ -235,10 +259,38 @@ impl SessionKeys {
         current_tick.saturating_sub(self.created_tick) > REKEY_AFTER_SECS
     }
 
-    /// Check a nonce against the replay window.
+    /// Read-only replay check.  Does **not** mutate any state.
     ///
-    /// Returns `true` if the nonce is acceptable (not replayed).
-    fn check_replay(&mut self, nonce: u64) -> bool {
+    /// Returns `true` if `nonce` is acceptable (ahead of the window,
+    /// or inside the window but not previously seen).  The window is
+    /// only advanced by [`Self::replay_advance`], which must be
+    /// called **after** the AEAD tag has been verified, so a spoofed
+    /// counter cannot wedge the session (TOCTOU hardening, mirrors
+    /// the audit-22 xfrm fix).
+    fn replay_check(&self, nonce: u64) -> bool {
+        if nonce > self.recv_counter {
+            // Future nonce relative to the highest seen: always OK.
+            true
+        } else {
+            // `nonce <= recv_counter`, so this subtraction cannot
+            // underflow.  Reject anything older than the window or an
+            // exact replay of an already-recorded bit.
+            let diff = self.recv_counter - nonce;
+            if diff >= REPLAY_WINDOW {
+                return false;
+            }
+            let bit = 1u64 << diff;
+            self.recv_bitmap & bit == 0
+        }
+    }
+
+    /// Advance the replay window to record an authenticated `nonce`.
+    ///
+    /// Must only be called once [`Self::replay_check`] has returned
+    /// `true` **and** the AEAD tag has verified.  Recording before
+    /// authentication would let a forged packet move the window and
+    /// drop legitimate traffic.
+    fn replay_advance(&mut self, nonce: u64) {
         if nonce > self.recv_counter {
             let shift = nonce - self.recv_counter;
             if shift < REPLAY_WINDOW {
@@ -248,18 +300,11 @@ impl SessionKeys {
             }
             self.recv_bitmap |= 1;
             self.recv_counter = nonce;
-            true
         } else {
             let diff = self.recv_counter - nonce;
-            if diff >= REPLAY_WINDOW {
-                return false;
+            if diff < REPLAY_WINDOW {
+                self.recv_bitmap |= 1u64 << diff;
             }
-            let bit = 1u64 << diff;
-            if self.recv_bitmap & bit != 0 {
-                return false;
-            }
-            self.recv_bitmap |= bit;
-            true
         }
     }
 }
@@ -659,15 +704,20 @@ impl WgDevice {
 
     /// Encrypt a cleartext packet for transmission to a peer.
     ///
-    /// In a real implementation this would use ChaCha20-Poly1305.
-    /// Here we use a simple XOR with the session send key for
-    /// demonstration.
+    /// WireGuard transport data is sealed with ChaCha20-Poly1305.
+    /// Until that AEAD is wired in (see [`AEAD_AVAILABLE`]) this
+    /// method fails closed and emits no packet, so an unauthenticated
+    /// XOR stream is never put on the wire.
+    ///
+    /// On success returns `(packet_len, peer_idx)`.
     ///
     /// # Errors
     ///
+    /// - [`Error::NotImplemented`] if no real AEAD is configured
+    ///   (current default — fail closed).
     /// - [`Error::NotFound`] if no peer routes the destination.
     /// - [`Error::InvalidArgument`] if the session is not
-    ///   established or the packet is too large.
+    ///   established or the packet is malformed / too large.
     pub fn encrypt(&mut self, cleartext: &[u8], out: &mut [u8]) -> Result<(usize, usize)> {
         if cleartext.len() < 20 || cleartext.len() > MAX_PAYLOAD {
             return Err(Error::InvalidArgument);
@@ -677,6 +727,9 @@ impl WgDevice {
         let dst = [cleartext[16], cleartext[17], cleartext[18], cleartext[19]];
 
         let peer_idx = self.route_by_dst(&dst).ok_or(Error::NotFound)?;
+        if peer_idx >= MAX_PEERS {
+            return Err(Error::InvalidArgument);
+        }
 
         let peer = self.peers[peer_idx].as_mut().ok_or(Error::NotFound)?;
 
@@ -687,8 +740,21 @@ impl WgDevice {
             return Err(Error::InvalidArgument);
         }
 
-        // Header: type(1) + reserved(3) + counter(8) = 12 bytes
-        let total = 12 + cleartext.len();
+        // SECURITY: fail closed.  Producing a ChaCha20-Poly1305 frame
+        // requires a real AEAD; the previous repeating-key XOR with no
+        // tag offered no confidentiality and no integrity.  Reject
+        // until ChaCha20-Poly1305 is bound (see `AEAD_AVAILABLE`).
+        if !AEAD_AVAILABLE {
+            return Err(Error::NotImplemented);
+        }
+
+        // Header: type(1) + reserved(3) + counter(8) = 12 bytes, plus
+        // the trailing Poly1305 tag.  `checked_add` keeps the length
+        // math panic-free even under overflow-checks.
+        let total = 12usize
+            .checked_add(cleartext.len())
+            .and_then(|n| n.checked_add(AEAD_TAG_SIZE))
+            .ok_or(Error::InvalidArgument)?;
         if out.len() < total {
             return Err(Error::InvalidArgument);
         }
@@ -702,12 +768,11 @@ impl WgDevice {
         let counter_bytes = counter.to_le_bytes();
         out[4..12].copy_from_slice(&counter_bytes);
 
-        // XOR encrypt
-        let key = &peer.session.send_key.bytes;
-        for (i, &b) in cleartext.iter().enumerate() {
-            out[12 + i] = b ^ key[i % KEY_SIZE];
-        }
-
+        // SECURITY: a real ChaCha20-Poly1305 seal over the cleartext
+        // (keyed by `send_key`, nonced by `counter`) and an appended
+        // Poly1305 tag must fill `out[12..total]` here.  This branch
+        // is currently unreachable because `AEAD_AVAILABLE` is false;
+        // the early return above guarantees no fake cipher executes.
         peer.session.send_counter = counter.saturating_add(1);
         peer.tx_bytes = peer.tx_bytes.saturating_add(cleartext.len() as u64);
         peer.last_send_tick = self.current_tick;
@@ -718,13 +783,37 @@ impl WgDevice {
 
     /// Decrypt a received WireGuard transport packet.
     ///
+    /// `peer_idx` is supplied by the caller (e.g. from a session-index
+    /// lookup) and is bounds-checked here before it indexes the peer
+    /// array, so an out-of-range value cannot read past the slice.
+    ///
+    /// The replay window is consulted read-only first and is only
+    /// advanced **after** the AEAD tag verifies, so a spoofed counter
+    /// can neither move the window nor wedge the session.  Because no
+    /// real AEAD is wired yet (see [`AEAD_AVAILABLE`]), this method
+    /// fails closed and returns no plaintext.
+    ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] if the packet is malformed.
-    /// - [`Error::NotFound`] if no peer matches the source.
-    /// - [`Error::PermissionDenied`] if replay check fails.
+    /// - [`Error::InvalidArgument`] if `peer_idx` is out of range or
+    ///   the packet is malformed.
+    /// - [`Error::NotImplemented`] if no real AEAD is configured
+    ///   (current default — fail closed, never accept unauthenticated
+    ///   data).
+    /// - [`Error::NotFound`] if the indexed peer slot is inactive.
+    /// - [`Error::PermissionDenied`] if the replay check rejects the
+    ///   counter.
     pub fn decrypt(&mut self, ciphertext: &[u8], out: &mut [u8], peer_idx: usize) -> Result<usize> {
-        if ciphertext.len() < 12 {
+        // Bound the caller-supplied index BEFORE indexing the array.
+        if peer_idx >= MAX_PEERS {
+            return Err(Error::InvalidArgument);
+        }
+        // A transport packet needs the 12-byte header plus a Poly1305
+        // tag; anything shorter cannot carry authenticated data.
+        let min_len = 12usize
+            .checked_add(AEAD_TAG_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        if ciphertext.len() < min_len {
             return Err(Error::InvalidArgument);
         }
         if ciphertext[0] != MSG_TRANSPORT {
@@ -742,27 +831,48 @@ impl WgDevice {
         counter_bytes.copy_from_slice(&ciphertext[4..12]);
         let counter = u64::from_le_bytes(counter_bytes);
 
-        // Replay check
-        if !peer.session.check_replay(counter) {
+        // Read-only replay check: reject replays/old counters WITHOUT
+        // touching the window.  The window is advanced only after the
+        // tag verifies (below), defeating the counter-spoof TOCTOU.
+        if !peer.session.replay_check(counter) {
             return Err(Error::PermissionDenied);
         }
 
-        let payload = &ciphertext[12..];
-        if out.len() < payload.len() {
+        // SECURITY: fail closed.  Authenticating and decrypting a
+        // ChaCha20-Poly1305 frame requires a real AEAD with a
+        // constant-time Poly1305 tag check.  The former repeating-key
+        // XOR had no tag, so every forged packet was "accepted" and
+        // the plaintext was trivially recoverable.  Until the AEAD is
+        // bound, never produce plaintext and never advance the replay
+        // window from unauthenticated input.
+        if !AEAD_AVAILABLE {
+            return Err(Error::NotImplemented);
+        }
+
+        // `ciphertext.len() >= min_len` proven above, so this cannot
+        // underflow: the payload excludes the 12-byte header and the
+        // trailing tag.
+        let payload_len = ciphertext.len() - min_len;
+        if out.len() < payload_len {
             return Err(Error::InvalidArgument);
         }
 
-        // XOR decrypt
-        let key = &peer.session.recv_key.bytes;
-        for (i, &b) in payload.iter().enumerate() {
-            out[i] = b ^ key[i % KEY_SIZE];
-        }
+        // SECURITY: a real ChaCha20-Poly1305 open (keyed by `recv_key`,
+        // nonced by `counter`) must (1) recompute the Poly1305 tag over
+        // the ciphertext, (2) compare it against the received tag with
+        // `crypto::constant_time_eq`, returning `Error::PermissionDenied`
+        // on mismatch, and only then (3) write the plaintext into
+        // `out[..payload_len]`.  This block is unreachable while
+        // `AEAD_AVAILABLE` is false; the early return above guarantees
+        // no unauthenticated plaintext is produced.
 
-        peer.rx_bytes = peer.rx_bytes.saturating_add(payload.len() as u64);
+        // Tag verified above: now it is safe to advance the window.
+        peer.session.replay_advance(counter);
+        peer.rx_bytes = peer.rx_bytes.saturating_add(payload_len as u64);
         peer.last_recv_tick = self.current_tick;
         self.rx_packets = self.rx_packets.saturating_add(1);
 
-        Ok(payload.len())
+        Ok(payload_len)
     }
 
     /// Advance the tick counter and check for needed rekeys.
@@ -957,7 +1067,9 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_decrypt() {
+    fn test_transport_data_fails_closed() {
+        // SECURITY: with no real AEAD wired, the transport data path
+        // must reject rather than run a placeholder cipher.
         let mut reg = WgRegistry::new();
         let idx = reg.create(b"wg0").unwrap();
         let dev = reg.device_mut(idx).unwrap();
@@ -982,31 +1094,82 @@ mod tests {
         cleartext[19] = 2;
 
         let mut cipher = [0u8; 128];
-        let (enc_len, _) = dev.encrypt(&cleartext, &mut cipher).unwrap();
-        assert!(enc_len > 12);
+        assert_eq!(
+            dev.encrypt(&cleartext, &mut cipher),
+            Err(Error::NotImplemented)
+        );
 
-        // Decrypt
+        // A crafted "transport" packet must not yield plaintext.
+        let mut frame = [0u8; 40];
+        frame[0] = MSG_TRANSPORT;
         let mut decrypted = [0u8; 128];
-        let dec_len = dev
-            .decrypt(&cipher[..enc_len], &mut decrypted, pidx)
-            .unwrap();
-        assert_eq!(dec_len, 40);
-        assert_eq!(&decrypted[..dec_len], &cleartext[..]);
+        assert_eq!(
+            dev.decrypt(&frame, &mut decrypted, pidx),
+            Err(Error::NotImplemented)
+        );
+        // Fail-closed must not leak plaintext into the output buffer.
+        assert!(decrypted.iter().all(|&b| b == 0));
     }
 
     #[test]
-    fn test_replay_protection() {
+    fn test_decrypt_rejects_oob_peer_index() {
+        // CRITICAL: an out-of-range peer index must be rejected before
+        // it can index the peer array (OOB read in ring 0).
+        let mut reg = WgRegistry::new();
+        let idx = reg.create(b"wg0").unwrap();
+        let dev = reg.device_mut(idx).unwrap();
+        let mut frame = [0u8; 40];
+        frame[0] = MSG_TRANSPORT;
+        let mut out = [0u8; 128];
+        assert_eq!(
+            dev.decrypt(&frame, &mut out, MAX_PEERS),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(
+            dev.decrypt(&frame, &mut out, usize::MAX),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn test_replay_check_is_read_only() {
+        // The read-only check must not mutate the window: a spoofed
+        // (unauthenticated) counter cannot advance it.
+        let keys = SessionKeys::from_handshake(test_key(0x11), test_key(0x22), 0);
+        // Inspecting a far-future counter many times stays accepting
+        // because nothing is recorded until `replay_advance`.
+        assert!(keys.replay_check(100));
+        assert!(keys.replay_check(100));
+        assert_eq!(keys.recv_counter, 0);
+        assert_eq!(keys.recv_bitmap, 0);
+    }
+
+    #[test]
+    fn test_replay_advance_after_auth() {
+        // Post-auth advance records counters and blocks replays.
         let mut keys = SessionKeys::from_handshake(test_key(0x11), test_key(0x22), 0);
-        assert!(keys.check_replay(0));
-        assert!(keys.check_replay(1));
-        // Replay of nonce 0
-        assert!(!keys.check_replay(0));
-        // Far future nonce
-        assert!(keys.check_replay(100));
-        // Nonce 50 is within window of 100
-        assert!(keys.check_replay(50));
-        // Replay of 50
-        assert!(!keys.check_replay(50));
+
+        assert!(keys.replay_check(0));
+        keys.replay_advance(0);
+        assert!(keys.replay_check(1));
+        keys.replay_advance(1);
+
+        // Replay of nonce 0 (already recorded).
+        assert!(!keys.replay_check(0));
+
+        // Far-future nonce, then advance.
+        assert!(keys.replay_check(100));
+        keys.replay_advance(100);
+
+        // Nonce 50 is within the window of 100 and unseen.
+        assert!(keys.replay_check(50));
+        keys.replay_advance(50);
+
+        // Replay of 50.
+        assert!(!keys.replay_check(50));
+
+        // A counter older than the window is rejected.
+        assert!(!keys.replay_check(0));
     }
 
     #[test]

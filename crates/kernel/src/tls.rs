@@ -366,6 +366,14 @@ impl TlsSession {
 
     /// Construct the per-record nonce by XORing the IV with the
     /// sequence number (RFC 8446 section 5.3).
+    ///
+    /// # Security
+    ///
+    /// The AEAD nonce is `iv XOR seq` where `seq` is the strictly
+    /// increasing per-record sequence number. A `(key, nonce)` pair must
+    /// never repeat, so callers MUST reject a sequence-number wrap (see
+    /// [`TlsSession::encrypt_record`] / [`TlsSession::decrypt_record`])
+    /// rather than letting `seq` roll over and reuse a nonce.
     fn build_nonce(iv: &[u8; AEAD_NONCE_SIZE], seq: u64) -> [u8; AEAD_NONCE_SIZE] {
         let seq_bytes = seq.to_be_bytes();
         let mut nonce = [0u8; AEAD_NONCE_SIZE];
@@ -491,11 +499,25 @@ impl TlsSession {
     /// complete record (header + encrypted payload + tag) to `out`
     /// and returns the total number of bytes written.
     ///
+    /// # Security
+    ///
+    /// The per-record nonce is `write_iv XOR write_seq` (RFC 8446 §5.3).
+    /// `write_seq` increments by exactly one per record and is checked for
+    /// overflow: when it would wrap past `u64::MAX` the session refuses to
+    /// encrypt (fail closed) so a `(key, nonce)` pair is never reused. Per
+    /// RFC 8446 the connection must be rekeyed (or torn down) before the
+    /// sequence space is exhausted.
+    ///
+    /// NOTE: the underlying transform is a placeholder AES-CTR + truncated
+    /// HMAC-SHA256 (see [`TlsSession::aead_encrypt`]), not the negotiated
+    /// AEAD (AES-GCM / ChaCha20-Poly1305). A real AEAD must be wired before
+    /// this is used on the wire.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if `plaintext` exceeds
-    /// [`TLS_MAX_PLAINTEXT`] or `out` is too small, or if the
-    /// session is not in the `Established` state.
+    /// [`TLS_MAX_PLAINTEXT`] or `out` is too small, if the session is not in
+    /// the `Established` state, or if the write sequence number would wrap.
     pub fn encrypt_record(
         &mut self,
         content_type: TlsContentType,
@@ -508,6 +530,13 @@ impl TlsSession {
         if plaintext.len() > TLS_MAX_PLAINTEXT {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: refuse to encrypt if advancing the sequence number would
+        // wrap, since that would reuse a (key, nonce) pair and break AEAD
+        // confidentiality/integrity. Compute the next value up front.
+        let next_seq = self
+            .write_seq
+            .checked_add(1)
+            .ok_or(Error::InvalidArgument)?;
 
         // Inner plaintext: original content type appended to
         // plaintext (RFC 8446 section 5.2).
@@ -558,7 +587,7 @@ impl TlsSession {
             &mut out[TLS_RECORD_HEADER_SIZE..],
         )?;
 
-        self.write_seq = self.write_seq.wrapping_add(1);
+        self.write_seq = next_seq;
 
         Ok(TLS_RECORD_HEADER_SIZE + written)
     }
@@ -569,19 +598,49 @@ impl TlsSession {
     /// in `ciphertext`, decrypts it, writes the plaintext to `out`,
     /// and returns the inner content type and plaintext length.
     ///
+    /// `expected_seq` is the record sequence number the receiver expects
+    /// next. It MUST equal the session's current read sequence: TLS records
+    /// arrive in order over a reliable transport (RFC 8446 §5.3), so any
+    /// mismatch indicates a dropped, reordered, or replayed record and is
+    /// rejected rather than silently desynchronizing the nonce.
+    ///
+    /// # Security
+    ///
+    /// The per-record nonce is `read_iv XOR read_seq`. Deriving the nonce
+    /// strictly from the expected (validated) sequence number, and refusing
+    /// to advance on a gap, prevents both (a) a single lost/reordered record
+    /// permanently desyncing every later record (DoS) and (b) a nonce being
+    /// reused under the same key. The read sequence is also checked for
+    /// overflow and fails closed on wrap.
+    ///
+    /// NOTE: the underlying transform is a placeholder AES-CTR + truncated
+    /// HMAC-SHA256 (see [`TlsSession::aead_decrypt`]), not the negotiated
+    /// AEAD. A real AEAD must be wired before this is used on the wire.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the record is
-    /// malformed, the MAC check fails, or the session is not in
-    /// the `Established` state.
+    /// Returns [`Error::InvalidArgument`] if the record is malformed, the MAC
+    /// check fails, the session is not in the `Established` state,
+    /// `expected_seq` does not match the session read sequence, or the read
+    /// sequence number would wrap.
     pub fn decrypt_record(
         &mut self,
+        expected_seq: u64,
         ciphertext: &[u8],
         out: &mut [u8],
     ) -> Result<(TlsContentType, usize)> {
         if self.state != TlsSessionState::Established {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: reject out-of-order / replayed records instead of
+        // silently desyncing the nonce. The caller must present records in
+        // sequence; a mismatch fails closed.
+        if expected_seq != self.read_seq {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: refuse to advance past the sequence space; a wrap would
+        // reuse a (key, nonce) pair. Compute the next value up front.
+        let next_seq = self.read_seq.checked_add(1).ok_or(Error::InvalidArgument)?;
         if ciphertext.len() < TLS_RECORD_HEADER_SIZE {
             return Err(Error::InvalidArgument);
         }
@@ -596,7 +655,7 @@ impl TlsSession {
             return Err(Error::InvalidArgument);
         }
 
-        // Construct per-record nonce.
+        // Construct per-record nonce from the validated read sequence.
         let nonce = Self::build_nonce(&self.read_iv, self.read_seq);
 
         // Decrypt inner plaintext.
@@ -632,7 +691,7 @@ impl TlsSession {
             i += 1;
         }
 
-        self.read_seq = self.read_seq.wrapping_add(1);
+        self.read_seq = next_seq;
 
         Ok((real_ct, plaintext_len))
     }
@@ -854,6 +913,10 @@ impl TlsRegistry {
 
     /// Decrypt a TLS record for the given session.
     ///
+    /// `expected_seq` is the next in-order record sequence number; it must
+    /// match the session's read sequence or the record is rejected as
+    /// out-of-order (see [`TlsSession::decrypt_record`]).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the session does not exist.
@@ -861,11 +924,12 @@ impl TlsRegistry {
     pub fn decrypt(
         &mut self,
         id: u64,
+        expected_seq: u64,
         data: &[u8],
         out: &mut [u8],
     ) -> Result<(TlsContentType, usize)> {
         let session = self.get_mut(id).ok_or(Error::NotFound)?;
-        session.decrypt_record(data, out)
+        session.decrypt_record(expected_seq, data, out)
     }
 
     /// Close and release a TLS session.
