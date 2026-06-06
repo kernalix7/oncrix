@@ -21,6 +21,13 @@
 //! of its field conditions are satisfied. An optional syscall bitmask
 //! restricts matching to specific syscall numbers.
 //!
+//! # Privilege
+//!
+//! All rule-mutation APIs (`load`, `unload`, `enable`, `disable`) require
+//! [`CAP_AUDIT_CONTROL`] in the caller's effective capability set.
+//! The registry is fail-closed: an empty / unprivileged [`ThreadCapState`]
+//! is always denied.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -35,6 +42,8 @@
 //! Reference: Linux `kernel/auditfilter.c`, `include/uapi/linux/audit.h`.
 
 use oncrix_lib::{Error, Result};
+
+use crate::capability::{CAP_AUDIT_CONTROL, ThreadCapState};
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -52,6 +61,17 @@ const SYSCALL_MASK_BITS: usize = 512;
 
 /// Number of `u64` words needed for the syscall bitmask.
 const SYSCALL_MASK_WORDS: usize = SYSCALL_MASK_BITS / 64;
+
+// Compile-time assertions: the length fields (u16) must be wide enough to hold
+// the maximum buffer sizes without truncation.
+const _: () = assert!(
+    STRING_VALUE_LEN <= u16::MAX as usize,
+    "STRING_VALUE_LEN exceeds u16::MAX — widen string_len field type"
+);
+const _: () = assert!(
+    STRING_VALUE_LEN <= u16::MAX as usize,
+    "STRING_VALUE_LEN exceeds u16::MAX — widen path_len field type"
+);
 
 // ── AuditField ────────────────────────────────────────────────────
 
@@ -114,8 +134,11 @@ pub struct AuditFieldMatch {
     pub value: u64,
     /// String comparison value (fixed-size buffer).
     string_value: [u8; STRING_VALUE_LEN],
-    /// Valid length of `string_value`.
-    string_len: u8,
+    /// Valid length of `string_value` in bytes.
+    ///
+    /// Stored as `u16` so it can represent any value up to
+    /// [`STRING_VALUE_LEN`] (128) without silent truncation.
+    string_len: u16,
     /// Whether this match slot is active.
     active: bool,
 }
@@ -128,7 +151,7 @@ impl AuditFieldMatch {
             operator: AuditOperator::Equal,
             value: 0,
             string_value: [0u8; STRING_VALUE_LEN],
-            string_len: 0,
+            string_len: 0u16,
             active: false,
         }
     }
@@ -140,7 +163,7 @@ impl AuditFieldMatch {
             operator,
             value,
             string_value: [0u8; STRING_VALUE_LEN],
-            string_len: 0,
+            string_len: 0u16,
             active: true,
         }
     }
@@ -159,13 +182,17 @@ impl AuditFieldMatch {
         m.field = field;
         m.operator = operator;
         m.string_value[..string_val.len()].copy_from_slice(string_val);
-        m.string_len = string_val.len() as u8;
+        // Safety: string_val.len() <= STRING_VALUE_LEN (128) <= u16::MAX,
+        // enforced by the compile-time assertion above.
+        m.string_len = string_val.len() as u16;
         m.active = true;
         Ok(m)
     }
 
     /// Return the string value as a byte slice.
     pub fn string_value(&self) -> &[u8] {
+        // string_len is always <= STRING_VALUE_LEN (128), guaranteed by
+        // `AuditFieldMatch::string` which rejects oversized inputs.
         &self.string_value[..self.string_len as usize]
     }
 
@@ -497,8 +524,11 @@ pub struct AuditContext {
     pub exit_code: u64,
     /// File path relevant to the event (fixed-size buffer).
     path: [u8; STRING_VALUE_LEN],
-    /// Valid length of `path`.
-    path_len: u8,
+    /// Valid length of `path` in bytes.
+    ///
+    /// Stored as `u16` so it can represent any value up to
+    /// [`STRING_VALUE_LEN`] (128) without silent truncation.
+    path_len: u16,
 }
 
 impl AuditContext {
@@ -521,7 +551,7 @@ impl AuditContext {
             success,
             exit_code,
             path: [0u8; STRING_VALUE_LEN],
-            path_len: 0,
+            path_len: 0u16,
         }
     }
 
@@ -536,12 +566,16 @@ impl AuditContext {
             return Err(Error::InvalidArgument);
         }
         self.path[..path.len()].copy_from_slice(path);
-        self.path_len = path.len() as u8;
+        // Safety: path.len() <= STRING_VALUE_LEN (128) <= u16::MAX,
+        // enforced by the bounds check above.
+        self.path_len = path.len() as u16;
         Ok(())
     }
 
     /// Return the path as a byte slice.
     pub fn path(&self) -> &[u8] {
+        // path_len is always <= STRING_VALUE_LEN (128), guaranteed by
+        // `set_path` which rejects oversized inputs.
         &self.path[..self.path_len as usize]
     }
 }
@@ -597,13 +631,41 @@ impl AuditRuleRegistry {
     }
 
     /// Enable the audit rule engine.
-    pub fn enable(&mut self) {
+    ///
+    /// Requires [`CAP_AUDIT_CONTROL`] in the caller's effective capability
+    /// set. Returns [`Error::PermissionDenied`] fail-closed when absent.
+    ///
+    /// # SECURITY
+    ///
+    /// The syscall dispatch site (arch/x86_64/syscall_entry.rs) MUST pass
+    /// the real per-thread [`ThreadCapState`] here. Passing
+    /// `ThreadCapState::new_unprivileged()` (the fail-closed default) blocks
+    /// the operation when credentials are unavailable.
+    pub fn enable(&mut self, caller_caps: &ThreadCapState) -> Result<()> {
+        if !caller_caps.capable(CAP_AUDIT_CONTROL) {
+            return Err(Error::PermissionDenied);
+        }
         self.enabled = true;
+        Ok(())
     }
 
     /// Disable the audit rule engine.
-    pub fn disable(&mut self) {
+    ///
+    /// Requires [`CAP_AUDIT_CONTROL`] in the caller's effective capability
+    /// set. Returns [`Error::PermissionDenied`] fail-closed when absent.
+    ///
+    /// # SECURITY
+    ///
+    /// The syscall dispatch site (arch/x86_64/syscall_entry.rs) MUST pass
+    /// the real per-thread [`ThreadCapState`] here. Passing
+    /// `ThreadCapState::new_unprivileged()` (the fail-closed default) blocks
+    /// the operation when credentials are unavailable.
+    pub fn disable(&mut self, caller_caps: &ThreadCapState) -> Result<()> {
+        if !caller_caps.capable(CAP_AUDIT_CONTROL) {
+            return Err(Error::PermissionDenied);
+        }
         self.enabled = false;
+        Ok(())
     }
 
     /// Return whether the engine is enabled.
@@ -622,6 +684,14 @@ impl AuditRuleRegistry {
     }
 
     /// Return a mutable reference to a rule set by type.
+    ///
+    /// # SECURITY
+    ///
+    /// This is an internal helper. All callers — including the syscall
+    /// dispatch site (arch/x86_64/syscall_entry.rs) — MUST verify
+    /// [`CAP_AUDIT_CONTROL`] before reaching this method. Prefer the
+    /// privileged wrappers [`Self::load`] and [`Self::unload`] which
+    /// enforce the check at the entry point.
     pub fn get_rule_set_mut(&mut self, set_type: RuleSetType) -> &mut AuditRuleSet {
         match set_type {
             RuleSetType::Entry => &mut self.entry,
@@ -633,19 +703,59 @@ impl AuditRuleRegistry {
 
     /// Load a rule into the specified rule set.
     ///
+    /// Requires [`CAP_AUDIT_CONTROL`] in the caller's effective capability
+    /// set. Returns [`Error::PermissionDenied`] fail-closed when absent.
+    ///
+    /// # SECURITY
+    ///
+    /// The syscall dispatch site (arch/x86_64/syscall_entry.rs) MUST pass
+    /// the real per-thread [`ThreadCapState`] here. Passing
+    /// `ThreadCapState::new_unprivileged()` (the fail-closed default) blocks
+    /// the operation when credentials are unavailable.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::OutOfMemory`] if the rule set is full.
-    pub fn load(&mut self, set_type: RuleSetType, rule: AuditRule) -> Result<usize> {
+    /// Returns [`Error::PermissionDenied`] if `caller_caps` lacks
+    /// [`CAP_AUDIT_CONTROL`], or [`Error::OutOfMemory`] if the rule set
+    /// is full.
+    pub fn load(
+        &mut self,
+        caller_caps: &ThreadCapState,
+        set_type: RuleSetType,
+        rule: AuditRule,
+    ) -> Result<usize> {
+        if !caller_caps.capable(CAP_AUDIT_CONTROL) {
+            return Err(Error::PermissionDenied);
+        }
         self.get_rule_set_mut(set_type).add_rule(rule)
     }
 
     /// Remove a rule from the specified rule set.
     ///
+    /// Requires [`CAP_AUDIT_CONTROL`] in the caller's effective capability
+    /// set. Returns [`Error::PermissionDenied`] fail-closed when absent.
+    ///
+    /// # SECURITY
+    ///
+    /// The syscall dispatch site (arch/x86_64/syscall_entry.rs) MUST pass
+    /// the real per-thread [`ThreadCapState`] here. Passing
+    /// `ThreadCapState::new_unprivileged()` (the fail-closed default) blocks
+    /// the operation when credentials are unavailable.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the index is invalid.
-    pub fn unload(&mut self, set_type: RuleSetType, index: usize) -> Result<()> {
+    /// Returns [`Error::PermissionDenied`] if `caller_caps` lacks
+    /// [`CAP_AUDIT_CONTROL`], or [`Error::InvalidArgument`] if the index
+    /// is invalid.
+    pub fn unload(
+        &mut self,
+        caller_caps: &ThreadCapState,
+        set_type: RuleSetType,
+        index: usize,
+    ) -> Result<()> {
+        if !caller_caps.capable(CAP_AUDIT_CONTROL) {
+            return Err(Error::PermissionDenied);
+        }
         self.get_rule_set_mut(set_type).remove_rule(index)
     }
 

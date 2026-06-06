@@ -53,6 +53,22 @@ const MAX_NICE: i32 = 19;
 /// Quota value meaning unlimited (no bandwidth cap).
 const QUOTA_UNLIMITED: i64 = -1;
 
+/// Minimum enforcement period in microseconds (1 ms).
+const MIN_PERIOD_US: u64 = 1_000;
+
+/// Maximum enforcement period in microseconds (1 s).
+const MAX_PERIOD_US: u64 = 1_000_000;
+
+/// Maximum accepted quota in microseconds.
+///
+/// Bounds attacker-controlled quota to a sane ceiling (~1 hour of CPU
+/// time per period) so downstream accounting cannot overflow.
+const MAX_QUOTA_US: i64 = 3_600_000_000;
+
+/// Maximum accepted burst allowance in microseconds (same ceiling as
+/// [`MAX_QUOTA_US`]).
+const MAX_BURST_US: u64 = 3_600_000_000;
+
 // ── CpuBandwidth ───────────────────────────────────────────────────
 
 /// CPU bandwidth parameters for throttling.
@@ -189,19 +205,42 @@ impl CpuCgroupController {
 
     /// Sets bandwidth throttling parameters.
     ///
-    /// `quota` must be `-1` (unlimited) or a positive value.
-    /// `period` must be greater than zero.
+    /// All three values are unprivileged, attacker-controlled inputs
+    /// and are validated against fixed bounds before being stored:
+    ///
+    /// - `quota` must be `-1` (unlimited) or in `1..=MAX_QUOTA_US`.
+    /// - `period` must be in `MIN_PERIOD_US..=MAX_PERIOD_US`
+    ///   (`[1_000, 1_000_000]`), so it is always non-zero.
+    /// - `burst` must not exceed `MAX_BURST_US`.
+    ///
+    /// The combined `quota + burst` ceiling is also checked so the
+    /// effective quota computed in [`Self::check_throttle`] cannot
+    /// overflow.
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidArgument` if `quota` is zero or a
-    /// negative value other than `-1`, or if `period` is zero.
+    /// Returns `Error::InvalidArgument` if any parameter is out of
+    /// range.
     pub fn set_bandwidth(&mut self, quota: i64, period: u64, burst: u64) -> Result<()> {
-        if quota != QUOTA_UNLIMITED && quota <= 0 {
+        // Quota: either unlimited or a bounded positive value.
+        if quota != QUOTA_UNLIMITED && !(1..=MAX_QUOTA_US).contains(&quota) {
             return Err(Error::InvalidArgument);
         }
-        if period == 0 {
+        // Period: bounded, hence guaranteed non-zero.
+        if !(MIN_PERIOD_US..=MAX_PERIOD_US).contains(&period) {
             return Err(Error::InvalidArgument);
+        }
+        // Burst: bounded ceiling.
+        if burst > MAX_BURST_US {
+            return Err(Error::InvalidArgument);
+        }
+        // Guard the effective-quota sum (quota + burst) against
+        // overflow with checked arithmetic.
+        if quota != QUOTA_UNLIMITED {
+            let quota_u = quota as u64;
+            if quota_u.checked_add(burst).is_none() {
+                return Err(Error::InvalidArgument);
+            }
         }
         self.bandwidth.quota_us = quota;
         self.bandwidth.period_us = period;

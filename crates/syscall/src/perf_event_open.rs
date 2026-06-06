@@ -67,6 +67,13 @@ pub const PERF_TYPE_BREAKPOINT: u32 = 5;
 /// Maximum valid built-in event type.
 const PERF_TYPE_MAX: u32 = 6;
 
+/// Minimum accepted `perf_event_attr.size` — the v0 ABI baseline.
+const PERF_ATTR_SIZE_MIN: u32 = 64;
+
+/// Maximum accepted `perf_event_attr.size`. Bounds an attacker-declared
+/// struct size so it cannot drive an oversized copy.
+const PERF_ATTR_SIZE_MAX: u32 = 4096;
+
 // ---------------------------------------------------------------------------
 // Constants — hardware event IDs
 // ---------------------------------------------------------------------------
@@ -304,6 +311,23 @@ impl PerfEventAttr {
     /// - Pinned and exclusive are mutually coherent.
     /// - Size field matches expected size.
     pub fn validate(&self) -> Result<()> {
+        // SECURITY TODO (needs per-thread credentials): a paranoia gate
+        // must require CAP_PERFMON for a kernel/cpu-wide/tracepoint event,
+        // force `exclude_kernel` (and strip kernel-address sample_type bits
+        // IP/ADDR/CALLCHAIN) for an unprivileged caller to prevent a
+        // kernel-address leak, and `validate_targeting` must enforce
+        // ptrace access when the target pid is not the caller. These need
+        // the caller's effective capability set + pid threaded from
+        // syscall_entry.rs, which currently carries no per-task creds
+        // (capget/capset are no-ops); the size/period/mmap bounds below
+        // are the credential-independent hardening applied now.
+        //
+        // The caller-declared ABI struct size must be sane: at least the
+        // v0 baseline (64 bytes) and not absurdly large. A zero/short size
+        // is a truncated attr; an enormous one is a malformed request.
+        if self.size < PERF_ATTR_SIZE_MIN || self.size > PERF_ATTR_SIZE_MAX {
+            return Err(Error::InvalidArgument);
+        }
         if self.event_type >= PERF_TYPE_MAX {
             return Err(Error::InvalidArgument);
         }

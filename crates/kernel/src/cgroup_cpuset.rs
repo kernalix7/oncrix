@@ -39,6 +39,13 @@ const MAX_GROUPS: usize = 64;
 /// Maximum name length in bytes.
 const MAX_NAME_LEN: usize = 64;
 
+/// Bitmask of all structurally valid memory-node bits (`0..MAX_MEMS`).
+const MEMS_VALID_MASK: u64 = if MAX_MEMS >= 64 {
+    u64::MAX
+} else {
+    (1u64 << MAX_MEMS) - 1
+};
+
 // ── CpusetMask ─────────────────────────────────────────────────────
 
 /// Bitmask for CPU or memory node selection.
@@ -76,8 +83,36 @@ impl CpusetMask {
     }
 
     /// Create a mask from a raw `u64` value.
+    ///
+    /// This is a low-level constructor that does not validate the bit
+    /// range. Untrusted, attacker-controlled masks must be checked
+    /// with [`CpusetMask::is_valid_cpus`] or
+    /// [`CpusetMask::is_valid_mems`] before use; the `set_cpus` /
+    /// `set_mems` entry points enforce this.
     pub const fn from_raw(bits: u64) -> Self {
         Self { bits }
+    }
+
+    /// Returns `true` if no bit at or above `MAX_CPUS` is set.
+    ///
+    /// Bits outside the supported CPU range make the mask invalid. When
+    /// `MAX_CPUS == 64` the whole `u64` is valid (there are no high bits
+    /// to reject); otherwise the valid low bits are shifted out and any
+    /// remaining (out-of-range) bit fails the check. The shift form
+    /// avoids a `bits & 0` mask that the `MAX_CPUS == 64` case would
+    /// otherwise produce.
+    pub const fn is_valid_cpus(&self) -> bool {
+        MAX_CPUS >= 64 || (self.bits >> MAX_CPUS) == 0
+    }
+
+    /// Returns `true` if no bit at or above `MAX_MEMS` is set.
+    ///
+    /// Rejects memory-node masks that reference NUMA nodes outside the
+    /// supported range. Tests the out-of-range (high) bits against
+    /// the inverse of the valid mask rather than using a trivially
+    /// constant `x & 0` form.
+    pub const fn is_valid_mems(&self) -> bool {
+        (self.bits & !MEMS_VALID_MASK) == 0
     }
 
     /// Return the raw bitmask value.
@@ -338,9 +373,10 @@ impl CpusetGroup {
 
     /// Set the CPU affinity mask for this group.
     ///
-    /// Returns `Error::InvalidArgument` if the mask is empty.
+    /// Returns `Error::InvalidArgument` if the mask is empty or
+    /// references a CPU index at or above `MAX_CPUS`.
     pub fn set_cpus(&mut self, mask: CpusetMask) -> Result<()> {
-        if mask.is_empty() {
+        if mask.is_empty() || !mask.is_valid_cpus() {
             return Err(Error::InvalidArgument);
         }
         self.controller.cpus = mask;
@@ -349,9 +385,10 @@ impl CpusetGroup {
 
     /// Set the memory node affinity mask for this group.
     ///
-    /// Returns `Error::InvalidArgument` if the mask is empty.
+    /// Returns `Error::InvalidArgument` if the mask is empty or
+    /// references a memory node at or above `MAX_MEMS`.
     pub fn set_mems(&mut self, mask: CpusetMask) -> Result<()> {
-        if mask.is_empty() {
+        if mask.is_empty() || !mask.is_valid_mems() {
             return Err(Error::InvalidArgument);
         }
         self.controller.mems = mask;
@@ -523,12 +560,24 @@ impl CpusetRegistry {
     /// Set the CPU affinity mask for a group and recompute effective
     /// masks for it and its children.
     ///
+    /// If the group has a parent, the requested mask must be a subset
+    /// of the parent's effective CPU mask; a child can never widen its
+    /// CPU set beyond what the parent effectively allows.
+    ///
     /// # Errors
     ///
     /// - `Error::NotFound` — group does not exist.
-    /// - `Error::InvalidArgument` — mask is empty.
+    /// - `Error::InvalidArgument` — mask is empty, out of range, or
+    ///   not a subset of the parent's effective CPU mask.
     pub fn set_cpus(&mut self, group_id: u64, mask: CpusetMask) -> Result<()> {
         let idx = self.index_of(group_id)?;
+        // Bound the requested mask to the parent's effective mask:
+        // mask.intersect(parent_effective) must equal mask.
+        if let Some(parent_eff) = self.parent_effective_cpus(idx) {
+            if mask.intersect(&parent_eff) != mask {
+                return Err(Error::InvalidArgument);
+            }
+        }
         self.groups[idx].set_cpus(mask)?;
         self.recompute_effective(group_id);
         Ok(())
@@ -537,12 +586,23 @@ impl CpusetRegistry {
     /// Set the memory node affinity mask for a group and recompute
     /// effective masks for it and its children.
     ///
+    /// If the group has a parent, the requested mask must be a subset
+    /// of the parent's effective memory mask; a child can never widen
+    /// its memory-node set beyond what the parent effectively allows.
+    ///
     /// # Errors
     ///
     /// - `Error::NotFound` — group does not exist.
-    /// - `Error::InvalidArgument` — mask is empty.
+    /// - `Error::InvalidArgument` — mask is empty, out of range, or
+    ///   not a subset of the parent's effective memory mask.
     pub fn set_mems(&mut self, group_id: u64, mask: CpusetMask) -> Result<()> {
         let idx = self.index_of(group_id)?;
+        // Bound the requested mask to the parent's effective mask.
+        if let Some(parent_eff) = self.parent_effective_mems(idx) {
+            if mask.intersect(&parent_eff) != mask {
+                return Err(Error::InvalidArgument);
+            }
+        }
         self.groups[idx].set_mems(mask)?;
         self.recompute_effective(group_id);
         Ok(())
@@ -556,6 +616,28 @@ impl CpusetRegistry {
             .iter()
             .position(|g| g.in_use && g.id == id)
             .ok_or(Error::NotFound)
+    }
+
+    /// Return the parent's effective CPU mask for the group at `idx`,
+    /// or `None` if the group is a root (no parent) or the parent is
+    /// missing.
+    fn parent_effective_cpus(&self, idx: usize) -> Option<CpusetMask> {
+        let parent_id = self.groups[idx].parent_id?;
+        self.groups
+            .iter()
+            .find(|g| g.in_use && g.id == parent_id)
+            .map(|p| p.controller.cpus_effective)
+    }
+
+    /// Return the parent's effective memory mask for the group at
+    /// `idx`, or `None` if the group is a root (no parent) or the
+    /// parent is missing.
+    fn parent_effective_mems(&self, idx: usize) -> Option<CpusetMask> {
+        let parent_id = self.groups[idx].parent_id?;
+        self.groups
+            .iter()
+            .find(|g| g.in_use && g.id == parent_id)
+            .map(|p| p.controller.mems_effective)
     }
 
     /// Recompute effective masks for a group and propagate to
