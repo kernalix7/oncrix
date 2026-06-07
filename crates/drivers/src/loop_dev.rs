@@ -102,6 +102,12 @@ impl LoopConfig {
 
     /// Return the capacity in blocks.
     pub const fn capacity_blocks(&self) -> u64 {
+        // SECURITY: block_size is a pub field, so a hand-built config (bypassing
+        // validate()) could be 0; guard the divide so this pub fn cannot panic
+        // with a ring-0 divide-by-zero.
+        if self.block_size == 0 {
+            return 0;
+        }
         self.data_size() / self.block_size as u64
     }
 
@@ -294,7 +300,10 @@ impl LoopDevice {
         if buf.len() != bs {
             return Err(Error::InvalidArgument);
         }
-        self.read(lba * bs as u64, buf)
+        // SECURITY: lba is attacker-controlled; checked_mul prevents wrapping
+        // overflow (overflow-checks=on would panic on debug builds otherwise).
+        let byte_offset = lba.checked_mul(bs as u64).ok_or(Error::InvalidArgument)?;
+        self.read(byte_offset, buf)
     }
 
     /// Write one block at LBA `lba`.
@@ -308,7 +317,10 @@ impl LoopDevice {
         if buf.len() != bs {
             return Err(Error::InvalidArgument);
         }
-        self.write(lba * bs as u64, buf)
+        // SECURITY: lba is attacker-controlled; checked_mul prevents wrapping
+        // overflow (overflow-checks=on would panic on debug builds otherwise).
+        let byte_offset = lba.checked_mul(bs as u64).ok_or(Error::InvalidArgument)?;
+        self.write(byte_offset, buf)
     }
 
     /// Flush — no-op for memory-backed loop device.

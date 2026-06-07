@@ -87,13 +87,28 @@ impl Pl011Uart {
         // Disable UART while configuring.
         self.write32(UARTCR, 0);
         // Compute divisor: IBRD = clk / (16 * baud), FBRD = frac * 64 + 0.5
-        let baud16 = self.config.baud.saturating_mul(16);
+        // SECURITY: use checked_mul so a zero or out-of-range baud value
+        // (attacker-supplied via config) is caught before the division.
+        let baud16 = self
+            .config
+            .baud
+            .checked_mul(16)
+            .ok_or(Error::InvalidArgument)?;
         if baud16 == 0 {
             return Err(Error::InvalidArgument);
         }
         let ibrd = self.config.clk_hz / baud16;
+        // SECURITY: reject ibrd == 0 (baud too high for clock) or ibrd > 0xFFFF
+        // (baud too low; register is 16 bits).  Writing an out-of-range value
+        // would silently program the wrong baud rate.
+        if ibrd == 0 || ibrd > 0xFFFF {
+            return Err(Error::InvalidArgument);
+        }
         let rem = self.config.clk_hz % baud16;
-        let fbrd = ((rem * 8 + baud16 / 2) / baud16) as u32;
+        // SECURITY: compute `rem * 8 + baud16 / 2` in u64 to prevent the
+        // intermediate product overflowing u32 when rem is large (up to
+        // baud16 - 1).  Clamp to 63 before narrowing — FBRD is a 6-bit field.
+        let fbrd = (((rem as u64 * 8 + baud16 as u64 / 2) / baud16 as u64).min(63)) as u32;
         self.write32(UARTIBRD, ibrd);
         self.write32(UARTFBRD, fbrd);
         // Set 8N1 + optional FIFO.
@@ -219,6 +234,9 @@ pub fn compute_divisors(clk_hz: u32, baud: u32) -> Option<(u32, u32)> {
         return None;
     }
     let rem = clk_hz % baud16;
-    let fbrd = ((rem * 8 + baud16 / 2) / baud16).min(63);
+    // SECURITY: widen to u64 before `rem * 8 + baud16 / 2` to prevent the
+    // intermediate product overflowing u32 (rem can be up to baud16 - 1).
+    // Clamp to 63 — FBRD is a 6-bit field.
+    let fbrd = (((rem as u64 * 8 + baud16 as u64 / 2) / baud16 as u64).min(63)) as u32;
     Some((ibrd, fbrd))
 }

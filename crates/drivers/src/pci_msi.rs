@@ -362,7 +362,10 @@ pub struct MsixCapability {
 impl MsixCapability {
     /// Parse from raw control, table, and PBA register values.
     pub fn parse(cap_offset: u8, control: u16, table_reg: u32, pba_reg: u32) -> Self {
-        let num_vectors = (control & MSIX_CTRL_SIZE_MASK) + 1;
+        // SECURITY: Device-reported table size is attacker-controlled (up to 2048).
+        // Clamp to MAX_MSIX_VECTORS so all downstream index and sizing operations
+        // are bounded by a kernel constant rather than a hardware value.
+        let num_vectors = ((control & MSIX_CTRL_SIZE_MASK) + 1).min(MAX_MSIX_VECTORS as u16);
         Self {
             cap_offset,
             control,
@@ -762,37 +765,65 @@ pub fn scan_msi_capabilities(
 /// Write a 32-bit value to an MSI-X table entry field via MMIO.
 ///
 /// `table_base` is the virtual address of the MSI-X table BAR region.
+/// `num_entries` is the validated table size (use `msix_cap.num_vectors`, already
+/// clamped to `MAX_MSIX_VECTORS` by [`MsixCapability::parse`]).
 /// `entry` is the zero-based entry index.
 /// `field_offset` is 0=addr_lo, 4=addr_hi, 8=data, 12=vector_ctrl.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `entry >= num_entries`.
 ///
 /// # Safety
 ///
 /// Caller must ensure `table_base` is a valid mapped MMIO region covering
-/// at least `(entry + 1) * MSIX_ENTRY_SIZE` bytes.
+/// at least `num_entries * MSIX_ENTRY_SIZE` bytes.
 pub unsafe fn msix_write_entry_field(
     table_base: *mut u32,
+    num_entries: usize,
     entry: usize,
     field_offset: usize,
     val: u32,
-) {
-    // SAFETY: Caller guarantees valid MMIO mapping.
+) -> Result<()> {
+    // SECURITY: entry is attacker-controlled (from device vector table index).
+    // Reject out-of-bounds indices before pointer arithmetic to prevent arbitrary
+    // MMIO writes outside the mapped BAR region.
+    if entry >= num_entries {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: Caller guarantees valid MMIO mapping; entry is bounds-checked above.
     let ptr = unsafe { table_base.add(entry * MSIX_ENTRY_SIZE / 4 + field_offset / 4) };
     unsafe { core::ptr::write_volatile(ptr, val) };
+    Ok(())
 }
 
 /// Read a 32-bit value from an MSI-X table entry field via MMIO.
+///
+/// `num_entries` is the validated table size (use `msix_cap.num_vectors`, already
+/// clamped to `MAX_MSIX_VECTORS` by [`MsixCapability::parse`]).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `entry >= num_entries`.
 ///
 /// # Safety
 ///
 /// Same requirements as [`msix_write_entry_field`].
 pub unsafe fn msix_read_entry_field(
     table_base: *const u32,
+    num_entries: usize,
     entry: usize,
     field_offset: usize,
-) -> u32 {
-    // SAFETY: Caller guarantees valid MMIO mapping.
+) -> Result<u32> {
+    // SECURITY: entry is attacker-controlled (from device vector table index).
+    // Reject out-of-bounds indices before pointer arithmetic to prevent arbitrary
+    // MMIO reads outside the mapped BAR region.
+    if entry >= num_entries {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: Caller guarantees valid MMIO mapping; entry is bounds-checked above.
     let ptr = unsafe { table_base.add(entry * MSIX_ENTRY_SIZE / 4 + field_offset / 4) };
-    unsafe { core::ptr::read_volatile(ptr) }
+    Ok(unsafe { core::ptr::read_volatile(ptr) })
 }
 
 // ---------------------------------------------------------------------------

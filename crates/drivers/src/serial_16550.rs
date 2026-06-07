@@ -584,12 +584,16 @@ impl Serial16550 {
 
     /// Read a UART register.
     fn read_reg(&self, offset: u16) -> u8 {
-        port_inb(self.base + offset)
+        // SECURITY: widen to u32 before adding so that a base near 0xFFFF
+        // cannot wrap the u16 sum; offsets are 0..=7 so the result is always
+        // a valid port for any real COM base address (<= 0x3F8 + 7).
+        port_inb((self.base as u32 + offset as u32) as u16)
     }
 
     /// Write a UART register.
     fn write_reg(&self, offset: u16, val: u8) {
-        port_outb(self.base + offset, val);
+        // SECURITY: same widening rationale as read_reg.
+        port_outb((self.base as u32 + offset as u32) as u16, val);
     }
 
     // -- Data transfer -----------------------------------------------------

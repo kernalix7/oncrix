@@ -407,9 +407,15 @@ impl IrqDomain {
         if self.mode == MsiMode::Msix && self.msix_table_addr != 0 {
             let entry = MsixTableEntry::from_vector(&self.vectors[idx]);
             // SAFETY: msix_table_addr is a valid MMIO BAR address provided by the
-            // PCI subsystem. The idx bounds-check above ensures we stay in range.
+            // PCI subsystem. table_size = self.num_vectors is already bounds-checked
+            // at the top of this function (idx < self.num_vectors).
             unsafe {
-                write_msix_entry(self.msix_table_addr as *mut u32, idx, &entry);
+                write_msix_entry(
+                    self.msix_table_addr as *mut u32,
+                    self.num_vectors,
+                    idx,
+                    &entry,
+                )?;
             }
         }
         Ok(())
@@ -427,9 +433,15 @@ impl IrqDomain {
         self.vectors[idx].masked = false;
         if self.mode == MsiMode::Msix && self.msix_table_addr != 0 {
             let entry = MsixTableEntry::from_vector(&self.vectors[idx]);
-            // SAFETY: Same as mask_vector — MMIO address and index are valid.
+            // SAFETY: Same as mask_vector — MMIO address is valid; table_size =
+            // self.num_vectors and idx < self.num_vectors (checked above).
             unsafe {
-                write_msix_entry(self.msix_table_addr as *mut u32, idx, &entry);
+                write_msix_entry(
+                    self.msix_table_addr as *mut u32,
+                    self.num_vectors,
+                    idx,
+                    &entry,
+                )?;
             }
         }
         Ok(())
@@ -609,16 +621,33 @@ pub fn build_msix_disable_ctrl(base_ctrl: u16) -> u16 {
 /// Writes one MSI-X table entry via MMIO volatile writes.
 ///
 /// `table_base` is the virtual address of the MSI-X table BAR region.
+/// `table_size` is the number of valid entries (use the clamped `num_vectors`
+/// from the capability, not the raw device-reported value).
 /// `entry_idx` is the zero-based entry index.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `entry_idx >= table_size`.
 ///
 /// # Safety
 ///
 /// `table_base` must be a valid, mapped MMIO region covering at least
-/// `(entry_idx + 1) * MSIX_ENTRY_SIZE_BYTES` bytes.
-pub unsafe fn write_msix_entry(table_base: *mut u32, entry_idx: usize, entry: &MsixTableEntry) {
+/// `table_size * MSIX_ENTRY_SIZE_BYTES` bytes.
+pub unsafe fn write_msix_entry(
+    table_base: *mut u32,
+    table_size: usize,
+    entry_idx: usize,
+    entry: &MsixTableEntry,
+) -> Result<()> {
+    // SECURITY: entry_idx is attacker-controlled (device MSI-X vector number).
+    // Reject out-of-bounds access before pointer arithmetic to prevent writes
+    // outside the mapped BAR region.
+    if entry_idx >= table_size {
+        return Err(Error::InvalidArgument);
+    }
     let words_per_entry = MSIX_ENTRY_SIZE_BYTES / 4;
-    // SAFETY: Caller guarantees table_base is valid and covers at least
-    // (entry_idx + 1) entries. pointer arithmetic is within the mapped region.
+    // SAFETY: Caller guarantees table_base is valid; entry_idx is bounds-checked
+    // above so pointer arithmetic stays within the mapped region.
     let base = unsafe { table_base.add(entry_idx * words_per_entry) };
     // SAFETY: Caller guarantees `table_base` is a valid MMIO mapping covering
     // the full entry range. Volatile writes ensure the device sees each field.
@@ -628,26 +657,44 @@ pub unsafe fn write_msix_entry(table_base: *mut u32, entry_idx: usize, entry: &M
         base.add(2).write_volatile(entry.data);
         base.add(3).write_volatile(entry.ctrl);
     }
+    Ok(())
 }
 
 /// Reads one MSI-X table entry via MMIO volatile reads.
 ///
+/// `table_size` is the number of valid entries (use the clamped `num_vectors`
+/// from the capability, not the raw device-reported value).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `entry_idx >= table_size`.
+///
 /// # Safety
 ///
 /// Same requirements as [`write_msix_entry`].
-pub unsafe fn read_msix_entry(table_base: *const u32, entry_idx: usize) -> MsixTableEntry {
+pub unsafe fn read_msix_entry(
+    table_base: *const u32,
+    table_size: usize,
+    entry_idx: usize,
+) -> Result<MsixTableEntry> {
+    // SECURITY: entry_idx is attacker-controlled (device MSI-X vector number).
+    // Reject out-of-bounds access before pointer arithmetic to prevent reads
+    // outside the mapped BAR region.
+    if entry_idx >= table_size {
+        return Err(Error::InvalidArgument);
+    }
     let words_per_entry = MSIX_ENTRY_SIZE_BYTES / 4;
-    // SAFETY: Caller guarantees table_base is valid and covers at least
-    // (entry_idx + 1) entries. Pointer arithmetic is within the mapped region.
+    // SAFETY: Caller guarantees table_base is valid; entry_idx is bounds-checked
+    // above so pointer arithmetic stays within the mapped region.
     let base = unsafe { table_base.add(entry_idx * words_per_entry) };
     // SAFETY: Caller guarantees valid MMIO mapping. Volatile reads ensure we get
     // the actual device-visible state, not a cached copy.
-    unsafe {
+    Ok(unsafe {
         MsixTableEntry {
             addr_lo: base.read_volatile(),
             addr_hi: base.add(1).read_volatile(),
             data: base.add(2).read_volatile(),
             ctrl: base.add(3).read_volatile(),
         }
-    }
+    })
 }

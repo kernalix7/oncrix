@@ -141,7 +141,10 @@ pub const fn baud_divisor(baud: u32) -> u16 {
     if baud == 0 {
         return 1;
     }
-    let d = UART_CLOCK_HZ / (16 * baud);
+    // SECURITY: split the divide so no `16 * baud` product is formed — for an
+    // attacker baud >= 2^28 that u32 multiply overflows and panics in ring 0.
+    // UART_CLOCK_HZ is an exact multiple of 16, so (A/16)/baud == A/(16*baud).
+    let d = UART_CLOCK_HZ / 16 / baud;
     if d == 0 {
         1
     } else if d > 0xFFFF {

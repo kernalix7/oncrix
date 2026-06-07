@@ -420,6 +420,18 @@ impl PciBridgeSubsystem {
         bridge.config.secondary_bus = bridge.config_read8(CFG_SECONDARY_BUS);
         bridge.config.subordinate_bus = bridge.config_read8(CFG_SUBORDINATE_BUS);
 
+        // SECURITY: These three fields are device-reported and attacker-controlled
+        // via malicious hardware or firmware. A secondary_bus <= primary_bus means
+        // the bridge loops back to an upstream segment (topology cycle / spoofing).
+        // A subordinate_bus < secondary_bus means the subordinate window is inverted.
+        // Both would corrupt bus routing tables; reject them at the boundary.
+        if bridge.config.secondary_bus <= bridge.config.primary_bus
+            || bridge.config.subordinate_bus < bridge.config.secondary_bus
+        {
+            bridge.valid = false;
+            return Err(Error::InvalidArgument);
+        }
+
         // Read window base/limit registers.
         bridge.config.io_base = bridge.config_read8(CFG_IO_BASE);
         bridge.config.io_limit = bridge.config_read8(CFG_IO_LIMIT);
@@ -471,14 +483,20 @@ impl PciBridgeSubsystem {
                 window_type: WindowType::Io,
                 enabled: aligned_size > 0,
             };
-            // Program I/O base/limit registers (upper nibble = address[11:8]).
-            let io_base_reg = ((base >> 8) & 0xF0) as u8;
-            let io_limit_reg = (((base + aligned_size - 1) >> 8) & 0xF0) as u8;
-            self.bridges[bridge_id].config.io_base = io_base_reg;
-            self.bridges[bridge_id].config.io_limit = io_limit_reg;
-            self.bridges[bridge_id].config_write8(CFG_IO_BASE, io_base_reg);
-            self.bridges[bridge_id].config_write8(CFG_IO_LIMIT, io_limit_reg);
-            self.stats.config_accesses += 2;
+            // SECURITY: aligned_size may be zero when the caller passes size=0.
+            // `base + aligned_size - 1` underflows (unsigned wrap + overflow-checks =
+            // ring-0 panic) when aligned_size==0. Skip register programming for a
+            // zero-size (disabled) window; the enabled=false flag disables forwarding.
+            if aligned_size > 0 {
+                // Program I/O base/limit registers (upper nibble = address[11:8]).
+                let io_base_reg = ((base >> 8) & 0xF0) as u8;
+                let io_limit_reg = (((base + aligned_size - 1) >> 8) & 0xF0) as u8;
+                self.bridges[bridge_id].config.io_base = io_base_reg;
+                self.bridges[bridge_id].config.io_limit = io_limit_reg;
+                self.bridges[bridge_id].config_write8(CFG_IO_BASE, io_base_reg);
+                self.bridges[bridge_id].config_write8(CFG_IO_LIMIT, io_limit_reg);
+                self.stats.config_accesses += 2;
+            }
         }
 
         if let Some((base, size)) = mem {
@@ -492,13 +510,17 @@ impl PciBridgeSubsystem {
                 window_type: WindowType::Mem,
                 enabled: aligned_size > 0,
             };
-            let mem_base_reg = ((base >> 16) & 0xFFF0) as u16;
-            let mem_limit_reg = (((base + aligned_size - 1) >> 16) & 0xFFF0) as u16;
-            self.bridges[bridge_id].config.mem_base = mem_base_reg;
-            self.bridges[bridge_id].config.mem_limit = mem_limit_reg;
-            self.bridges[bridge_id].config_write16(CFG_MEM_BASE, mem_base_reg);
-            self.bridges[bridge_id].config_write16(CFG_MEM_LIMIT, mem_limit_reg);
-            self.stats.config_accesses += 2;
+            // SECURITY: Same guard as the I/O window — skip register writes when
+            // aligned_size==0 to avoid the `base + 0 - 1` underflow panic.
+            if aligned_size > 0 {
+                let mem_base_reg = ((base >> 16) & 0xFFF0) as u16;
+                let mem_limit_reg = (((base + aligned_size - 1) >> 16) & 0xFFF0) as u16;
+                self.bridges[bridge_id].config.mem_base = mem_base_reg;
+                self.bridges[bridge_id].config.mem_limit = mem_limit_reg;
+                self.bridges[bridge_id].config_write16(CFG_MEM_BASE, mem_base_reg);
+                self.bridges[bridge_id].config_write16(CFG_MEM_LIMIT, mem_limit_reg);
+                self.stats.config_accesses += 2;
+            }
         }
 
         if let Some((base, size)) = prefetch {
@@ -512,13 +534,16 @@ impl PciBridgeSubsystem {
                 window_type: WindowType::PrefetchMem,
                 enabled: aligned_size > 0,
             };
-            let pfetch_base_reg = ((base >> 16) & 0xFFF0) as u16;
-            let pfetch_limit_reg = (((base + aligned_size - 1) >> 16) & 0xFFF0) as u16;
-            self.bridges[bridge_id].config.prefetch_base = pfetch_base_reg;
-            self.bridges[bridge_id].config.prefetch_limit = pfetch_limit_reg;
-            self.bridges[bridge_id].config_write16(CFG_PREFETCH_BASE, pfetch_base_reg);
-            self.bridges[bridge_id].config_write16(CFG_PREFETCH_LIMIT, pfetch_limit_reg);
-            self.stats.config_accesses += 2;
+            // SECURITY: Same guard as above — avoid underflow when aligned_size==0.
+            if aligned_size > 0 {
+                let pfetch_base_reg = ((base >> 16) & 0xFFF0) as u16;
+                let pfetch_limit_reg = (((base + aligned_size - 1) >> 16) & 0xFFF0) as u16;
+                self.bridges[bridge_id].config.prefetch_base = pfetch_base_reg;
+                self.bridges[bridge_id].config.prefetch_limit = pfetch_limit_reg;
+                self.bridges[bridge_id].config_write16(CFG_PREFETCH_BASE, pfetch_base_reg);
+                self.bridges[bridge_id].config_write16(CFG_PREFETCH_LIMIT, pfetch_limit_reg);
+                self.stats.config_accesses += 2;
+            }
         }
 
         Ok(())
@@ -637,7 +662,16 @@ impl Default for PciBridgeSubsystem {
 // ---------------------------------------------------------------------------
 
 /// Align `value` up to the next multiple of `align` (must be power of two).
+///
+/// Returns the aligned value, or `u64::MAX` rounded down to `align` if the
+/// addition would overflow (which would cause a ring-0 panic in debug/test).
 fn align_up(value: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
-    (value + align - 1) & !(align - 1)
+    // SECURITY: `value + align - 1` overflows when value is near u64::MAX and
+    // align > 1. Use checked_add to detect the overflow and saturate to the
+    // largest representable aligned value rather than panicking.
+    value
+        .checked_add(align - 1)
+        .map(|v| v & !(align - 1))
+        .unwrap_or_else(|| u64::MAX & !(align - 1))
 }
