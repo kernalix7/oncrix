@@ -30,6 +30,7 @@
 //! Reference: Linux `kernel/trace/ftrace.c`,
 //! `include/linux/ftrace.h`.
 
+use crate::capability::{CAP_SYS_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 /// Maximum number of functions in the global function table.
@@ -43,6 +44,21 @@ const FTRACE_BUFFER_SIZE: usize = 2048;
 
 /// Maximum length of a function symbol name in bytes.
 const MAX_SYMBOL_LEN: usize = 64;
+
+/// Lowest address of the x86_64 kernel-text mapping (pre-KASLR base).
+const KERNEL_TEXT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+
+/// Size of the kernel-text validation window above [`KERNEL_TEXT_BASE`]
+/// (kernel image plus maximum KASLR slide).
+const KERNEL_TEXT_WINDOW: u64 = 0x4000_0000;
+
+/// Returns `true` if `addr` lies within the kernel-text mapping.
+///
+/// A traced function address is matched against live call sites, so an
+/// attacker-supplied non-text address has no legitimate use. Fail-closed.
+const fn is_kernel_text_addr(addr: u64) -> bool {
+    addr >= KERNEL_TEXT_BASE && addr < KERNEL_TEXT_BASE.wrapping_add(KERNEL_TEXT_WINDOW)
+}
 
 // -------------------------------------------------------------------
 // FtraceFunc
@@ -520,8 +536,23 @@ impl FtraceRegistry {
     }
 
     /// Enable the function tracer globally.
-    pub fn enable(&mut self) {
+    ///
+    /// Function tracing exposes kernel control flow and call addresses, a
+    /// privileged operation, so the caller must hold `CAP_SYS_ADMIN`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if `caller_caps` lacks
+    ///   `CAP_SYS_ADMIN`.
+    pub fn enable(&mut self, caller_caps: CapSet) -> Result<()> {
+        // SECURITY: enabling the tracer turns on collection of kernel call
+        // addresses; gate on CAP_SYS_ADMIN and fail closed. Per-task creds
+        // are not yet threaded, so the dispatcher passes the CapSet.
+        if !caller_caps.has(CAP_SYS_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
         self.state.enabled = true;
+        Ok(())
     }
 
     /// Disable the function tracer globally.
@@ -546,16 +577,35 @@ impl FtraceRegistry {
 
     /// Register a function for tracing.
     ///
-    /// The function is enabled by default upon registration.
+    /// The function is enabled by default upon registration. Registering
+    /// a trace point is privileged, so the caller must hold
+    /// `CAP_SYS_ADMIN`, and `addr` must lie in the kernel-text mapping.
     ///
     /// # Errors
     ///
+    /// - [`Error::PermissionDenied`] if `caller_caps` lacks
+    ///   `CAP_SYS_ADMIN`.
+    /// - [`Error::InvalidArgument`] if `addr` is not a kernel-text
+    ///   address, or `symbol_name` exceeds [`MAX_SYMBOL_LEN`].
     /// - [`Error::OutOfMemory`] if the function table is full.
     /// - [`Error::AlreadyExists`] if a function at `addr` is
     ///   already registered.
-    /// - [`Error::InvalidArgument`] if `symbol_name` exceeds
-    ///   [`MAX_SYMBOL_LEN`].
-    pub fn register_func(&mut self, addr: u64, symbol_name: &[u8]) -> Result<()> {
+    pub fn register_func(
+        &mut self,
+        caller_caps: CapSet,
+        addr: u64,
+        symbol_name: &[u8],
+    ) -> Result<()> {
+        // SECURITY: registering a trace point is a privileged mutation;
+        // gate on CAP_SYS_ADMIN and fail closed before touching state.
+        if !caller_caps.has(CAP_SYS_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
+        // SECURITY: reject non-kernel-text addresses so a bogus address
+        // cannot be seeded into the trace table.
+        if !is_kernel_text_addr(addr) {
+            return Err(Error::InvalidArgument);
+        }
         if symbol_name.len() > MAX_SYMBOL_LEN {
             return Err(Error::InvalidArgument);
         }
@@ -649,5 +699,45 @@ impl FtraceRegistry {
     /// Return whether the tracer is globally enabled.
     pub fn is_enabled(&self) -> bool {
         self.state.is_enabled()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEXT_ADDR: u64 = KERNEL_TEXT_BASE + 0x2000;
+
+    fn admin() -> CapSet {
+        let mut c = CapSet::EMPTY;
+        c.set(CAP_SYS_ADMIN);
+        c
+    }
+
+    #[test]
+    fn enable_requires_cap_sys_admin() {
+        let mut reg = FtraceRegistry::new();
+        assert_eq!(reg.enable(CapSet::EMPTY), Err(Error::PermissionDenied));
+        assert!(!reg.is_enabled());
+        assert!(reg.enable(admin()).is_ok());
+        assert!(reg.is_enabled());
+    }
+
+    #[test]
+    fn register_func_requires_cap_and_kernel_text() {
+        let mut reg = FtraceRegistry::new();
+        // No capability: denied.
+        assert_eq!(
+            reg.register_func(CapSet::EMPTY, TEXT_ADDR, b"fn"),
+            Err(Error::PermissionDenied)
+        );
+        // Non-kernel-text address: rejected even with caps.
+        assert_eq!(
+            reg.register_func(admin(), 0x1000, b"fn"),
+            Err(Error::InvalidArgument)
+        );
+        // Valid: accepted.
+        assert!(reg.register_func(admin(), TEXT_ADDR, b"fn").is_ok());
+        assert_eq!(reg.func_count(), 1);
     }
 }

@@ -33,7 +33,34 @@
 //! Reference: Linux `kernel/kprobes.c`,
 //! `include/linux/kprobes.h`.
 
+use crate::capability::{CAP_SYS_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
+
+/// Lowest address of the x86_64 kernel-text mapping (pre-KASLR base).
+///
+/// Mirrors `kaslr::KERNEL_BASE`. Replicated as a private constant so the
+/// probe-address validator stays self-contained and usable in `const`
+/// contexts without holding a live [`crate::kaslr::KaslrState`].
+const KERNEL_TEXT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+
+/// Size of the kernel-text validation window above [`KERNEL_TEXT_BASE`].
+///
+/// Covers the kernel image plus the maximum KASLR slide (two times
+/// `kaslr::KASLR_RANGE`), so a probe site placed anywhere the kernel text
+/// may legitimately land is accepted while everything else is rejected.
+const KERNEL_TEXT_WINDOW: u64 = 0x4000_0000;
+
+/// Returns `true` if `addr` lies within the kernel-text mapping.
+///
+/// A kprobe rewrites the first byte at its target with INT3, so an
+/// unvalidated address is an arbitrary-kernel-write primitive. This
+/// fail-closed check rejects any non-text address before it can be stored
+/// or armed. The kernel uses variable-length x86 instructions, so no
+/// alignment is required (matching Linux kprobes); only a non-null,
+/// in-range constraint applies.
+const fn is_kernel_text_addr(addr: u64) -> bool {
+    addr >= KERNEL_TEXT_BASE && addr < KERNEL_TEXT_BASE.wrapping_add(KERNEL_TEXT_WINDOW)
+}
 
 /// Maximum number of kprobes that can be registered.
 const MAX_KPROBES: usize = 128;
@@ -316,20 +343,41 @@ impl KprobeRegistry {
     ///
     /// Returns the unique probe identifier on success.
     ///
+    /// Placing a kprobe patches kernel text with INT3, so this is a
+    /// privileged operation: the caller must hold `CAP_SYS_ADMIN` and
+    /// `addr` must lie inside the kernel-text mapping.
+    ///
     /// # Errors
     ///
+    /// - [`Error::PermissionDenied`] if `caller_caps` lacks
+    ///   `CAP_SYS_ADMIN`.
+    /// - [`Error::InvalidArgument`] if `addr` is not a kernel-text
+    ///   address, or `symbol` exceeds [`MAX_SYMBOL_LEN`].
     /// - [`Error::OutOfMemory`] if the registry is full.
     /// - [`Error::AlreadyExists`] if a probe already exists
     ///   at `addr`.
-    /// - [`Error::InvalidArgument`] if `symbol` exceeds
-    ///   [`MAX_SYMBOL_LEN`].
     pub fn register_kprobe(
         &mut self,
+        caller_caps: CapSet,
         addr: u64,
         symbol: &[u8],
         pre_handler: u32,
         post_handler: u32,
     ) -> Result<u32> {
+        // SECURITY: arming a kprobe writes an INT3 into kernel text, an
+        // arbitrary-code-patch primitive. Gate on CAP_SYS_ADMIN and fail
+        // closed before touching any state. Per-task creds are not yet
+        // threaded through the tracing layer, so the caller's CapSet is
+        // passed explicitly by the dispatcher.
+        if !caller_caps.has(CAP_SYS_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
+        // SECURITY: reject any target outside the kernel-text mapping so an
+        // attacker-supplied address cannot redirect the INT3 patch to
+        // arbitrary memory.
+        if !is_kernel_text_addr(addr) {
+            return Err(Error::InvalidArgument);
+        }
         if symbol.len() > MAX_SYMBOL_LEN {
             return Err(Error::InvalidArgument);
         }
@@ -392,12 +440,23 @@ impl KprobeRegistry {
     /// Returns the saved opcode that was at the probe address
     /// so the caller can write INT3 in its place.
     ///
+    /// Arming is the moment INT3 is written into kernel text, so the
+    /// caller must hold `CAP_SYS_ADMIN`.
+    ///
     /// # Errors
     ///
+    /// - [`Error::PermissionDenied`] if `caller_caps` lacks
+    ///   `CAP_SYS_ADMIN`.
     /// - [`Error::NotFound`] if no active probe has this `id`.
     /// - [`Error::InvalidArgument`] if the probe is not in
-    ///   the [`KprobeState::Disabled`] state.
-    pub fn arm_kprobe(&mut self, id: u32) -> Result<u8> {
+    ///   the [`KprobeState::Disabled`] state, or its stored address is
+    ///   no longer a kernel-text address.
+    pub fn arm_kprobe(&mut self, caller_caps: CapSet, id: u32) -> Result<u8> {
+        // SECURITY: writing the INT3 breakpoint is the privileged action;
+        // gate it on CAP_SYS_ADMIN and fail closed before any mutation.
+        if !caller_caps.has(CAP_SYS_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
         let kp = self
             .kprobes
             .iter_mut()
@@ -405,6 +464,12 @@ impl KprobeRegistry {
             .ok_or(Error::NotFound)?;
 
         if kp.state != KprobeState::Disabled {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: defence-in-depth — re-validate the target lies in
+        // kernel text before transitioning to Armed, even though
+        // registration already checked it.
+        if !is_kernel_text_addr(kp.addr) {
             return Err(Error::InvalidArgument);
         }
         kp.state = KprobeState::Armed;
@@ -468,20 +533,38 @@ impl KprobeRegistry {
     ///
     /// Returns the unique probe identifier on success.
     ///
+    /// A kretprobe installs an entry kprobe (INT3 patch) at the function,
+    /// so this is a privileged operation requiring `CAP_SYS_ADMIN`, and
+    /// `addr` must lie in the kernel-text mapping.
+    ///
     /// # Errors
     ///
+    /// - [`Error::PermissionDenied`] if `caller_caps` lacks
+    ///   `CAP_SYS_ADMIN`.
+    /// - [`Error::InvalidArgument`] if `addr` is not a kernel-text
+    ///   address, `symbol` exceeds [`MAX_SYMBOL_LEN`], or `max_active`
+    ///   is zero.
     /// - [`Error::OutOfMemory`] if the registry is full.
     /// - [`Error::AlreadyExists`] if a kretprobe already
     ///   exists at `addr`.
-    /// - [`Error::InvalidArgument`] if `symbol` exceeds
-    ///   [`MAX_SYMBOL_LEN`] or `max_active` is zero.
     pub fn register_kretprobe(
         &mut self,
+        caller_caps: CapSet,
         addr: u64,
         symbol: &[u8],
         handler: u32,
         max_active: usize,
     ) -> Result<u32> {
+        // SECURITY: a kretprobe patches kernel text at the function entry.
+        // Gate on CAP_SYS_ADMIN and fail closed before touching state.
+        if !caller_caps.has(CAP_SYS_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
+        // SECURITY: reject any entry address outside kernel text so the
+        // INT3 patch cannot be redirected to attacker-controlled memory.
+        if !is_kernel_text_addr(addr) {
+            return Err(Error::InvalidArgument);
+        }
         if symbol.len() > MAX_SYMBOL_LEN {
             return Err(Error::InvalidArgument);
         }
@@ -637,5 +720,67 @@ impl KprobeRegistry {
             miss_count: kp.miss_count,
             state: kp.state,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A valid in-range kernel-text probe address for tests.
+    const TEXT_ADDR: u64 = KERNEL_TEXT_BASE + 0x1000;
+
+    fn admin() -> CapSet {
+        let mut c = CapSet::EMPTY;
+        c.set(CAP_SYS_ADMIN);
+        c
+    }
+
+    #[test]
+    fn register_kprobe_requires_cap_sys_admin() {
+        let mut reg = KprobeRegistry::new();
+        let r = reg.register_kprobe(CapSet::EMPTY, TEXT_ADDR, b"sym", 0, 0);
+        assert_eq!(r, Err(Error::PermissionDenied));
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn register_kprobe_rejects_non_kernel_text_addr() {
+        let mut reg = KprobeRegistry::new();
+        // User-space address must be rejected even with full caps.
+        let r = reg.register_kprobe(admin(), 0x4000, b"sym", 0, 0);
+        assert_eq!(r, Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn register_kprobe_accepts_valid_text_addr_with_cap() {
+        let mut reg = KprobeRegistry::new();
+        let id = reg
+            .register_kprobe(admin(), TEXT_ADDR, b"sym", 1, 2)
+            .expect("valid registration");
+        assert_eq!(reg.len(), 1);
+        // Arming also requires the capability.
+        assert_eq!(
+            reg.arm_kprobe(CapSet::EMPTY, id),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(reg.arm_kprobe(admin(), id), Ok(0));
+    }
+
+    #[test]
+    fn register_kretprobe_is_gated_and_range_checked() {
+        let mut reg = KprobeRegistry::new();
+        assert_eq!(
+            reg.register_kretprobe(CapSet::EMPTY, TEXT_ADDR, b"f", 0, 4),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(
+            reg.register_kretprobe(admin(), 0x2000, b"f", 0, 4),
+            Err(Error::InvalidArgument)
+        );
+        assert!(
+            reg.register_kretprobe(admin(), TEXT_ADDR, b"f", 0, 4)
+                .is_ok()
+        );
     }
 }
