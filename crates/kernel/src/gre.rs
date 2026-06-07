@@ -306,6 +306,90 @@ pub fn parse_gre(data: &[u8]) -> Result<(GreHeader, usize)> {
     Ok((header, offset))
 }
 
+/// Byte offset of the optional GRE checksum field within the header.
+///
+/// The checksum occupies the two bytes immediately after the
+/// `flags_version`/`protocol_type` words (RFC 2784 section 2.1).
+const GRE_CHECKSUM_OFFSET: usize = GRE_HEADER_MIN_LEN;
+
+/// Verify the RFC 1071 one's-complement GRE checksum over a received
+/// packet when the Checksum-Present (C) flag is set.
+///
+/// Per RFC 2784 section 2.1 the checksum covers the *entire* GRE
+/// header (all optional fields included) plus the payload, with the
+/// checksum field itself treated as zero during computation.  This
+/// helper sums every 16-bit word across `[0, packet.len())` while
+/// skipping the on-wire checksum field (equivalent to zeroing it),
+/// folds the accumulator, and compares the one's-complement result
+/// against the wire value.
+///
+/// `payload_offset` is the start of the encapsulated payload as
+/// returned by [`parse_gre`]; it is used only to bound the sanity
+/// checks — the checksum still spans through `packet.len()`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if the packet is too short to
+/// hold the checksum field, or if the computed checksum does not match
+/// the value carried on the wire (the packet is forged or corrupt and
+/// must be dropped before its payload is trusted).
+//
+// SECURITY: every inbound GRE frame is attacker-controlled.  A forged
+// packet that sets the C flag but carries a bogus checksum must be
+// dropped here, before `decapsulate_depth` hands the inner payload to
+// the re-injection path.  All slice indices below are bounded against
+// the *received* `packet` length (never an MTU-derived value) so a
+// truncated or oversized frame cannot trigger an out-of-bounds panic
+// in ring 0.
+fn verify_gre_checksum(packet: &[u8], payload_offset: usize, wire_checksum: u16) -> Result<()> {
+    // SECURITY: the checksum field must be fully present and must lie
+    // within the parsed header (before the payload).  `parse_gre`
+    // already guaranteed the header fits, but re-check here so this
+    // helper is sound in isolation and cannot index past `packet`.
+    if packet.len() < GRE_CHECKSUM_OFFSET + 2
+        || payload_offset > packet.len()
+        || GRE_CHECKSUM_OFFSET + 2 > payload_offset
+    {
+        return Err(Error::InvalidArgument);
+    }
+
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    // SECURITY: bound the word loop strictly against the received
+    // length so the final pair never reads past the slice end.
+    while i + 1 < packet.len() {
+        // Skip the on-wire checksum field, treating it as zero per
+        // RFC 2784 (it is a 16-bit word aligned at GRE_CHECKSUM_OFFSET).
+        if i == GRE_CHECKSUM_OFFSET {
+            i += 2;
+            continue;
+        }
+        let word = u16::from_be_bytes([packet[i], packet[i + 1]]);
+        sum = sum.wrapping_add(word as u32);
+        i += 2;
+    }
+
+    // Odd trailing byte is padded with zero on the right (RFC 1071).
+    if i < packet.len() {
+        sum = sum.wrapping_add((packet[i] as u32) << 8);
+    }
+
+    // Fold the 32-bit accumulator down to 16 bits.
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    let computed = !(sum as u16);
+
+    // SECURITY: drop on mismatch — never return / re-inject the inner
+    // payload of a packet whose checksum does not verify.
+    if computed != wire_checksum {
+        return Err(Error::InvalidArgument);
+    }
+
+    Ok(())
+}
+
 /// Serialise a GRE header into `buf`.
 ///
 /// Returns the number of bytes written (the header length).
@@ -539,6 +623,16 @@ impl GreTunnel {
         }
 
         let (header, payload_offset) = parse_gre(outer_packet)?;
+
+        // SECURITY: when the Checksum-Present (C) flag is set, verify the
+        // RFC 1071 one's-complement checksum over the full GRE header +
+        // payload *before* trusting any of the packet.  A forged frame
+        // with C set and a bogus checksum is dropped here, so its inner
+        // payload is never returned for re-injection into the stack.
+        // The C-clear path skips this entirely and is unaffected.
+        if header.flags().checksum_present() {
+            verify_gre_checksum(outer_packet, payload_offset, header.checksum)?;
+        }
 
         // Validate key if configured.
         if let Some(expected_key) = self.key
