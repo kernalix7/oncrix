@@ -160,7 +160,12 @@ impl Extent {
 
     /// Return `true` if `logical` falls within this extent.
     pub fn contains(&self, logical: u32) -> bool {
-        logical >= self.ee_block && logical < self.ee_block + self.length() as u32
+        // SECURITY: `self.ee_block + self.length() as u32` overflows when
+        // `ee_block` is near u32::MAX and `length()` is non-zero (both values
+        // come from untrusted on-disk data).  Rewrite using a subtraction that
+        // is guaranteed safe: after the `logical >= self.ee_block` guard,
+        // `logical - self.ee_block` cannot underflow.
+        logical >= self.ee_block && (logical - self.ee_block) < self.length() as u32
     }
 }
 
@@ -256,12 +261,25 @@ impl ExtentTree {
         // Check for overlap with the entry just before `pos`.
         if pos > 0 {
             let prev = &self.extents[pos - 1];
-            if prev.ee_block + prev.length() as u32 > ext.ee_block {
+            // SECURITY: `prev.ee_block + prev.length() as u32` overflows when
+            // ee_block is near u32::MAX; both fields are from untrusted disk data.
+            // Use checked_add: if it would wrap the extent is degenerate and we
+            // conservatively treat it as overlapping (reject).
+            let prev_end = prev
+                .ee_block
+                .checked_add(prev.length() as u32)
+                .ok_or(Error::InvalidArgument)?;
+            if prev_end > ext.ee_block {
                 return Err(Error::AlreadyExists);
             }
         }
         // Check for overlap with the entry at `pos`.
-        if pos < self.count && self.extents[pos].ee_block < ext.ee_block + ext.length() as u32 {
+        // SECURITY: same checked_add guard for the new extent's end block.
+        let ext_end = ext
+            .ee_block
+            .checked_add(ext.length() as u32)
+            .ok_or(Error::InvalidArgument)?;
+        if pos < self.count && self.extents[pos].ee_block < ext_end {
             return Err(Error::AlreadyExists);
         }
         // Shift entries right to make room.
@@ -396,7 +414,14 @@ pub fn ext4_ext_validate(tree: &ExtentTree) -> Result<()> {
     for i in 1..tree.count {
         let prev = &tree.extents[i - 1];
         let curr = &tree.extents[i];
-        if prev.ee_block + prev.length() as u32 > curr.ee_block {
+        // SECURITY: `prev.ee_block + prev.length() as u32` overflows near
+        // u32::MAX; both fields come from untrusted on-disk data.  Treat an
+        // overflowing end address as a structural violation.
+        let prev_end = prev
+            .ee_block
+            .checked_add(prev.length() as u32)
+            .ok_or(Error::InvalidArgument)?;
+        if prev_end > curr.ee_block {
             return Err(Error::InvalidArgument);
         }
     }

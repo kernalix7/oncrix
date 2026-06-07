@@ -48,8 +48,18 @@ const DX_ROOT_MAX_ENTRIES: usize = 508;
 /// Maximum dx_entry slots in an interior node.
 const DX_NODE_MAX_ENTRIES: usize = 510;
 
-/// Maximum supported indirect levels (0 = root points directly to leaves).
+/// Maximum supported indirect levels (0 = root points directly to leaves,
+/// 1 = root → interior node → leaves).
+///
+/// SECURITY: ext4 supports only 0 or 1.  A value of 2 would allow a third
+/// tree level that ext4 never writes and the kernel never handles; accepting
+/// it opens up unbounded traversal on attacker-controlled on-disk data.
+// Maximum htree NODE-PATH depth: the root plus up to one interior level
+// (ext4 supports indirect_levels 0 or 1, i.e. root->leaf or root->node->leaf),
+// so the traversal path holds at most 2 node entries.
 const MAX_HTREE_LEVELS: u8 = 2;
+/// Maximum on-disk `indirect_levels` value ext4 permits (0 or 1).
+const MAX_INDIRECT_LEVELS: u8 = 1;
 
 /// Maximum filename length handled by the hash functions.
 const MAX_NAME_LEN: usize = 255;
@@ -309,7 +319,11 @@ impl DxRoot {
     ///
     /// Returns the index of the last entry whose hash ≤ `hash`.
     pub fn search(&self, hash: u32) -> usize {
-        let live = &self.entries[..self.count];
+        // SECURITY: self.count may be set from an on-disk value (attacker-
+        // controlled).  Clamp to the real array length before slicing to
+        // prevent an OOB panic when overflow-checks are enabled.
+        let safe_count = self.count.min(DX_ROOT_MAX_ENTRIES);
+        let live = &self.entries[..safe_count];
         match live.binary_search_by_key(&hash, |e| e.hash) {
             Ok(pos) => pos,
             Err(pos) => pos.saturating_sub(1),
@@ -323,16 +337,22 @@ impl DxRoot {
     /// - `OutOfMemory` if the node is full.
     /// - `AlreadyExists` if an entry with the same hash exists.
     pub fn insert(&mut self, entry: DxEntry) -> Result<()> {
-        if self.count >= self.limit {
+        // SECURITY: self.count and self.limit may originate from an on-disk
+        // value (attacker-controlled).  Clamp both to DX_ROOT_MAX_ENTRIES
+        // before using them as slice/copy bounds.  Without this clamp a
+        // large on-disk count causes an OOB slice or copy_within panic when
+        // overflow-checks are enabled (ring-0 panic = machine halt).
+        let cap = self.count.min(self.limit).min(DX_ROOT_MAX_ENTRIES);
+        if cap >= DX_ROOT_MAX_ENTRIES {
             return Err(Error::OutOfMemory);
         }
-        let live = &self.entries[..self.count];
+        let live = &self.entries[..cap];
         match live.binary_search_by_key(&entry.hash, |e| e.hash) {
             Ok(_) => Err(Error::AlreadyExists),
             Err(pos) => {
-                self.entries.copy_within(pos..self.count, pos + 1);
+                self.entries.copy_within(pos..cap, pos + 1);
                 self.entries[pos] = entry;
-                self.count += 1;
+                self.count = cap + 1;
                 Ok(())
             }
         }
@@ -340,7 +360,10 @@ impl DxRoot {
 
     /// Whether the root node is full.
     pub fn is_full(&self) -> bool {
-        self.count >= self.limit
+        // SECURITY: clamp self.count against the real array bound before
+        // comparing; an on-disk count > DX_ROOT_MAX_ENTRIES must be treated
+        // as "full", not as a reason to index past the array end.
+        self.count.min(DX_ROOT_MAX_ENTRIES) >= self.limit.min(DX_ROOT_MAX_ENTRIES)
     }
 }
 
@@ -371,7 +394,11 @@ impl DxNode {
 
     /// Find the child entry for `hash`.
     pub fn search(&self, hash: u32) -> usize {
-        let live = &self.entries[..self.count];
+        // SECURITY: self.count may be set from an on-disk value (attacker-
+        // controlled).  Clamp to the real array length before slicing to
+        // prevent an OOB panic when overflow-checks are enabled.
+        let safe_count = self.count.min(DX_NODE_MAX_ENTRIES);
+        let live = &self.entries[..safe_count];
         match live.binary_search_by_key(&hash, |e| e.hash) {
             Ok(pos) => pos,
             Err(pos) => pos.saturating_sub(1),
@@ -385,16 +412,22 @@ impl DxNode {
     /// - `OutOfMemory` if the node is full.
     /// - `AlreadyExists` on hash collision.
     pub fn insert(&mut self, entry: DxEntry) -> Result<()> {
-        if self.count >= self.limit {
+        // SECURITY: self.count and self.limit may originate from an on-disk
+        // value (attacker-controlled).  Clamp both to DX_NODE_MAX_ENTRIES
+        // before using them as slice/copy bounds.  Without this clamp a
+        // large on-disk count causes an OOB slice or copy_within panic when
+        // overflow-checks are enabled (ring-0 panic = machine halt).
+        let cap = self.count.min(self.limit).min(DX_NODE_MAX_ENTRIES);
+        if cap >= DX_NODE_MAX_ENTRIES {
             return Err(Error::OutOfMemory);
         }
-        let live = &self.entries[..self.count];
+        let live = &self.entries[..cap];
         match live.binary_search_by_key(&entry.hash, |e| e.hash) {
             Ok(_) => Err(Error::AlreadyExists),
             Err(pos) => {
-                self.entries.copy_within(pos..self.count, pos + 1);
+                self.entries.copy_within(pos..cap, pos + 1);
                 self.entries[pos] = entry;
-                self.count += 1;
+                self.count = cap + 1;
                 Ok(())
             }
         }
@@ -463,9 +496,12 @@ impl DirHashTree {
     /// # Errors
     ///
     /// - `InvalidArgument` if `version` byte is unrecognised or
-    ///   `indirect_levels` exceeds [`MAX_HTREE_LEVELS`].
+    ///   `indirect_levels` exceeds [`MAX_INDIRECT_LEVELS`] (i.e. > 1).
     pub fn new(dir_ino: u64, version: HashVersion, seed: u32, indirect_levels: u8) -> Result<Self> {
-        if indirect_levels > MAX_HTREE_LEVELS {
+        // SECURITY: indirect_levels comes from the on-disk dx_root_info and is
+        // attacker-controlled.  ext4 supports only 0 (root→leaves) or 1
+        // (root→interior→leaves), so reject anything above MAX_INDIRECT_LEVELS=1.
+        if indirect_levels > MAX_INDIRECT_LEVELS {
             return Err(Error::InvalidArgument);
         }
         let info = DxRootInfo::new(version, indirect_levels, seed);

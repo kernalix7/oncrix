@@ -261,8 +261,17 @@ pub fn ext4_add_entry(
             let used = Ext4DirEntry::min_rec_len(existing.name_len as usize);
             let spare = existing.rec_len.saturating_sub(used);
             if spare >= needed {
-                let leftover_rec_len = existing.rec_len - needed;
-                existing.rec_len = used + leftover_rec_len;
+                // SECURITY: leftover_rec_len is derived from on-disk rec_len
+                // (attacker-controlled).  `used + leftover_rec_len` can
+                // overflow u16 even though spare >= needed, because
+                // leftover_rec_len = rec_len - needed and rec_len may be close
+                // to u16::MAX.  Use checked_add and reject the block as corrupt
+                // on overflow; do not panic or silently wrap into an invalid
+                // rec_len that would corrupt the directory in memory.
+                let leftover_rec_len = existing.rec_len - needed; // safe: spare >= needed >= 0
+                let new_existing_rec_len =
+                    used.checked_add(leftover_rec_len).ok_or(Error::IoError)?;
+                existing.rec_len = new_existing_rec_len;
                 // Insert new entry after by shifting is complex in fixed
                 // arrays; instead append at count position with adjusted
                 // rec_len.

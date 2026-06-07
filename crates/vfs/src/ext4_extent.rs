@@ -58,9 +58,18 @@ impl Ext4ExtentHeader {
         }
     }
 
-    /// Validate the header magic.
+    /// Validate the header magic, entry counts, and tree depth.
+    ///
+    /// Checks beyond magic are required because an attacker-controlled image
+    /// can set `entries > max_entries` or `depth > EXT4_EXTENT_MAX_DEPTH` to
+    /// produce OOB accesses or infinite recursion in tree traversal.
     pub fn is_valid(&self) -> bool {
+        // SECURITY: reject any header whose magic is wrong, whose entries
+        // field exceeds the declared max, or whose depth exceeds the protocol
+        // maximum.  All three fields come from untrusted on-disk data.
         self.magic == EXT4_EXT_MAGIC
+            && self.entries <= self.max_entries
+            && (self.depth as usize) <= EXT4_EXTENT_MAX_DEPTH
     }
 }
 
@@ -106,8 +115,21 @@ impl Ext4Extent {
     }
 
     /// Last logical block covered by this extent (inclusive).
+    ///
+    /// Returns `self.block` when `block_count()` is zero to avoid underflow;
+    /// zero-length extents are invalid on disk but must not panic.
     pub fn last_block(&self) -> u32 {
-        self.block + self.block_count() as u32 - 1
+        // SECURITY: block_count() comes from the on-disk `len` field.  A zero
+        // value would cause `block + 0 - 1` to underflow (unsigned wrap = OOB).
+        // Return `self.block` as a safe sentinel; callers that care about
+        // validity should reject zero-length extents before calling contains().
+        let bc = self.block_count();
+        if bc == 0 {
+            return self.block;
+        }
+        // `bc` is at most 0x7fff (15-bit field); `block` is u32 — their sum
+        // can still overflow u32 near u32::MAX, so use saturating arithmetic.
+        self.block.saturating_add(bc as u32 - 1)
     }
 
     /// Whether the given logical block falls within this extent.
@@ -237,19 +259,51 @@ impl ExtentNode {
     ///
     /// Returns the number of merges performed.
     pub fn try_merge_adjacent(&mut self) -> usize {
+        // SECURITY: reject a corrupted or attacker-crafted header before doing
+        // any work, mirroring the same guard in lookup().  An invalid header
+        // (wrong magic, entries > max_entries, or depth out of range) must not
+        // be acted upon; silently returning 0 is correct — the caller will
+        // surface the corruption when it next calls lookup().
+        if !self.header.is_valid() {
+            return 0;
+        }
+
         let mut merges = 0;
         let mut i = 0;
-        let mut count = self.header.entries as usize;
+        // SECURITY: `header.entries` is an on-disk u16 value that an attacker
+        // can set to any value up to 65535, far beyond the EXT4_EXTENTS_PER_BLOCK
+        // array bound.  Cap it before using it as a loop bound, mirroring the
+        // same guard used in lookup().
+        let mut count = (self.header.entries as usize).min(EXT4_EXTENTS_PER_BLOCK);
         while i + 1 < count {
             let a = self.extents[i];
             let b = self.extents[i + 1];
             let a_phys_end = a.phys_block() + a.block_count() as u64;
-            let adjacent_logical = b.block == a.block + a.block_count() as u32;
+            // SECURITY: `a.block` and `a.block_count()` are both on-disk values.
+            // Their sum can overflow u32 near u32::MAX.  Use checked_add; if it
+            // wraps the extent is corrupt so treat it as non-adjacent (skip merge).
+            let adjacent_logical = a
+                .block
+                .checked_add(a.block_count() as u32)
+                .map_or(false, |end| b.block == end);
             let adjacent_phys = b.phys_block() == a_phys_end;
             let combined_len = a.block_count() as u32 + b.block_count() as u32;
-            if adjacent_logical && adjacent_phys && combined_len <= 0x7fff {
-                // Merge b into a.
-                self.extents[i].len = combined_len as u16;
+            // SECURITY: only merge extents that share the same initialized/unwritten
+            // state (bit 15 of ee_len).  Merging an initialized extent with an
+            // unwritten (pre-allocated) one would either expose uninitialized disk
+            // blocks as live file data, or silently mark written data as unwritten —
+            // both are data-exposure / data-corruption bugs on attacker-controlled
+            // images.  Require `a.is_initialized() == b.is_initialized()` so the
+            // merge is only allowed between two extents of the same type.
+            let same_init = a.is_initialized() == b.is_initialized();
+            if adjacent_logical && adjacent_phys && combined_len <= 0x7fff && same_init {
+                // Merge b into a, preserving the unwritten flag (bit 15) from `a`
+                // (which equals `b`'s flag because same_init was required above).
+                // If both extents are unwritten, bit 15 must remain set in the
+                // merged len; masking with `a.len & 0x8000` achieves this without
+                // an explicit branch.
+                let unwritten_flag = a.len & 0x8000;
+                self.extents[i].len = (combined_len as u16) | unwritten_flag;
                 self.extents.copy_within(i + 2..count, i + 1);
                 self.extents[count - 1] = Ext4Extent {
                     block: 0,
