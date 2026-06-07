@@ -579,6 +579,12 @@ impl UsbSerial {
     ///
     /// Returns [`Error::InvalidArgument`] if the baud rate is zero.
     pub fn set_baud_rate(&mut self, baud: BaudRate) -> Result<()> {
+        // SECURITY: reject a zero baud rate so it cannot reach a later
+        // base/baud divisor computation as a divide-by-zero (matches the doc
+        // contract above and the guard in set_config).
+        if baud.value() == 0 {
+            return Err(Error::InvalidArgument);
+        }
         self.config.baud_rate = baud.value();
         Ok(())
     }
@@ -593,9 +599,15 @@ impl UsbSerial {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if data_bits is not in
-    /// the range 5-8.
+    /// the range 5-8, or if baud_rate is zero.
     pub fn set_config(&mut self, config: SerialConfig) -> Result<()> {
         if config.data_bits < 5 || config.data_bits > 8 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: baud_rate is attacker-supplied (USB CDC line-coding field).
+        // A zero value would cause a divide-by-zero in any downstream divisor
+        // calculation (e.g. clock / baud_rate). Reject it at the boundary.
+        if config.baud_rate == 0 {
             return Err(Error::InvalidArgument);
         }
         self.config = config;

@@ -248,6 +248,19 @@ impl Sb16 {
             return Err(Error::NotFound);
         }
 
+        // SECURITY: dma8/dma16 come from device config and are attacker-
+        // influenced. Validate against the SB16 hardware spec before use:
+        //   dma8  valid set: {0, 1, 3}  (8-bit ISA DMA channels)
+        //   dma16 valid set: {5, 6, 7}  (16-bit ISA DMA channels)
+        // Without this check, `1u8 << self.dma8` panics on shift >= 8, and
+        // `self.dma16 - 4` panics with unsigned underflow when dma16 < 4.
+        if !(self.dma8 == 0 || self.dma8 == 1 || self.dma8 == 3) {
+            return Err(Error::InvalidArgument);
+        }
+        if !(self.dma16 == 5 || self.dma16 == 6 || self.dma16 == 7) {
+            return Err(Error::InvalidArgument);
+        }
+
         // Configure mixer: set IRQ and DMA.
         let irq_bit = match self.irq {
             2 => 0x01,
@@ -258,6 +271,8 @@ impl Sb16 {
         };
         self.mixer_write(mixer_reg::IRQ_SEL, irq_bit);
 
+        // Safe: dma8 in {0,1,3} so shift < 8; dma16 in {5,6,7} so subtraction
+        // is 1/2/3 (no underflow) and the resulting shift is also < 8.
         let dma8_bit = 1u8 << self.dma8;
         let dma16_bit = 1u8 << (self.dma16 - 4); // 16-bit channels 5-7
         self.mixer_write(mixer_reg::DMA_SEL, dma8_bit | (dma16_bit << 4));

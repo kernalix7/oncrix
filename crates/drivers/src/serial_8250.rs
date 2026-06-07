@@ -78,7 +78,10 @@ pub fn baud_divisor(baud: u32) -> Result<u16> {
     if baud == 0 {
         return Err(Error::InvalidArgument);
     }
-    let divisor = UART_CLOCK_HZ / (16 * baud);
+    // SECURITY: split the multiply to avoid `16 * baud` overflowing u32 when
+    // baud >= 0x1000_0000 (attacker-supplied baud value).  Dividing in two
+    // steps is arithmetically identical: (A / 16) / baud == A / (16 * baud).
+    let divisor = UART_CLOCK_HZ / 16 / baud;
     if divisor == 0 || divisor > 0xFFFF {
         return Err(Error::InvalidArgument);
     }
@@ -300,12 +303,15 @@ impl Serial8250 {
         #[cfg(target_arch = "x86_64")]
         {
             let val: u8;
+            // SECURITY: widen to u32 before adding so that a base_port near
+            // 0xFFFF cannot wrap the u16 sum; offsets are 0..=7 so the result
+            // fits in u16 for any valid base (real COM bases are <= 0x3F8 + 7).
             // SAFETY: base_port is a valid 8250 UART I/O port range; offset
             // is at most 7, keeping us within the standard 8-register UART window.
             unsafe {
                 core::arch::asm!(
                     "in al, dx",
-                    in("dx") self.base_port + offset,
+                    in("dx") (self.base_port as u32 + offset as u32) as u16,
                     out("al") val,
                     options(nomem, nostack)
                 );
@@ -318,11 +324,12 @@ impl Serial8250 {
 
     fn write_reg(&mut self, offset: u16, val: u8) {
         #[cfg(target_arch = "x86_64")]
+        // SECURITY: widen to u32 before adding (same rationale as read_reg).
         // SAFETY: Same port range as read_reg; volatile PIO write to hardware register.
         unsafe {
             core::arch::asm!(
                 "out dx, al",
-                in("dx") self.base_port + offset,
+                in("dx") (self.base_port as u32 + offset as u32) as u16,
                 in("al") val,
                 options(nomem, nostack)
             );
