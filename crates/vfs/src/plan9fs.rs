@@ -37,6 +37,12 @@ use oncrix_lib::{Error, Result};
 /// Maximum message size negotiated during Tversion (8 KiB).
 const MAX_MESSAGE_SIZE: u32 = 8192;
 
+/// Minimum acceptable msize from the server (must fit at least one 9P header
+/// plus a small payload).  Servers that advertise anything smaller are broken;
+/// reject them immediately rather than proceeding with a zero- or tiny-sized
+/// message buffer that would cause later divide-by-zero / OOB indexing.
+const MIN_MSIZE: u32 = 256;
+
 /// Maximum number of FIDs tracked per session.
 const MAX_FIDS: usize = 256;
 
@@ -494,10 +500,13 @@ impl FidTable {
         }
         let idx = slot.ok_or(Error::OutOfMemory)?;
         let fid_num = self.next_fid;
-        self.next_fid = self.next_fid.wrapping_add(1);
-        if self.next_fid == NOFID {
-            self.next_fid = 1;
-        }
+        // Advance next_fid with checked arithmetic; skip the reserved NOFID
+        // sentinel and wrap back to 1 on exhaustion so the counter never
+        // produces an invalid FID number.
+        self.next_fid = match self.next_fid.checked_add(1) {
+            Some(n) if n != NOFID => n,
+            _ => 1,
+        };
         self.fids[idx].fid = fid_num;
         self.fids[idx].state = FidState::Allocated;
         self.fids[idx].offset = 0;
@@ -669,12 +678,23 @@ impl Plan9Message {
 
     /// Parse the header from a received message.
     ///
+    /// Validates that the `size[4]` field encoded in the wire header equals
+    /// the actual buffer length provided by the transport layer.  A mismatch
+    /// indicates a truncated or over-padded frame and is rejected immediately,
+    /// preventing later out-of-bounds reads driven by the field value.
+    ///
     /// Returns (message_type, tag, payload_start_offset).
     pub fn parse_header(buf: &[u8]) -> Result<(P9MessageType, u16, usize)> {
         if buf.len() < HEADER_SIZE {
             return Err(Error::InvalidArgument);
         }
-        let _size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let wire_size = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        // The 9P spec says size[4] includes itself, so it must equal buf.len().
+        // Reject any frame where the claimed size does not match the received
+        // byte count to catch truncated or over-padded frames early.
+        if wire_size != buf.len() {
+            return Err(Error::InvalidArgument);
+        }
         let msg_type = P9MessageType::from_u8(buf[4]).ok_or(Error::InvalidArgument)?;
         let tag = u16::from_le_bytes([buf[5], buf[6]]);
         Ok((msg_type, tag, HEADER_SIZE))
@@ -824,7 +844,14 @@ impl Plan9Session {
 
     /// Handle an Rversion reply from the server.
     ///
-    /// Updates the negotiated message size and transitions to Versioned state.
+    /// Updates the negotiated maximum message size and transitions to the
+    /// Versioned state.  Rejects replies where:
+    ///
+    /// - The server-advertised `msize` is below `MIN_MSIZE` (guards against
+    ///   zero-size / degenerate buffer use and downstream divide-by-zero).
+    /// - The version string does not exactly match "9P2000.L" (the comparison
+    ///   is bounded by `min(received_len, VERSION_STR_LEN)` so a crafted
+    ///   short string cannot cause an out-of-bounds index).
     pub fn handle_rversion(&mut self, reply: &[u8]) -> Result<()> {
         let (msg_type, _tag, offset) = Plan9Message::parse_header(reply)?;
         if msg_type != P9MessageType::Rversion {
@@ -832,29 +859,53 @@ impl Plan9Session {
             return Err(Error::IoError);
         }
         let (server_msize, offset) = Plan9Message::read_u32(reply, offset)?;
-        let (version_str, _offset) = Plan9Message::read_string(reply, offset)?;
-        // Verify version string matches.
-        if version_str.len() != VERSION_STR_LEN {
+
+        // Reject degenerate msize values that would make the message buffer
+        // zero-sized or too small to hold a single 9P header.
+        if server_msize < MIN_MSIZE {
             self.state = SessionState::Error;
             return Err(Error::InvalidArgument);
         }
-        let mut matches = true;
+
+        let (version_str, _offset) = Plan9Message::read_string(reply, offset)?;
+
+        // Compare only up to min(received_len, VERSION_STR_LEN) bytes so a
+        // server that sends a shorter string can never make the index walk
+        // past the received slice.
+        let cmp_len = if version_str.len() < VERSION_STR_LEN {
+            version_str.len()
+        } else {
+            VERSION_STR_LEN
+        };
+        // The lengths must also be equal for the strings to match.
+        let len_ok = version_str.len() == VERSION_STR_LEN;
+        let mut bytes_ok = true;
         let mut i = 0;
-        while i < VERSION_STR_LEN {
+        while i < cmp_len {
             if version_str[i] != P9_VERSION[i] {
-                matches = false;
+                bytes_ok = false;
                 break;
             }
             i += 1;
         }
-        if !matches {
+        if !len_ok || !bytes_ok {
             self.state = SessionState::Error;
             return Err(Error::InvalidArgument);
         }
-        // Use the smaller of client/server msize.
-        if server_msize < self.msize {
-            self.msize = server_msize;
-        }
+
+        // Accept the smaller of the two advertised sizes and clamp to the
+        // local maximum so we never allocate beyond our own buffer.
+        let negotiated = if server_msize < self.msize {
+            server_msize
+        } else {
+            self.msize
+        };
+        self.msize = if negotiated > MAX_MESSAGE_SIZE {
+            MAX_MESSAGE_SIZE
+        } else {
+            negotiated
+        };
+
         self.state = SessionState::Versioned;
         Ok(())
     }
@@ -957,7 +1008,29 @@ impl Plan9Session {
         }
         let nwqid = u16::from_le_bytes([reply[offset], reply[offset + 1]]) as usize;
         offset += 2;
+        // nwqid must not exceed the protocol maximum (16 elements).
         if nwqid > MAX_WALK_ELEMS {
+            let _ = self.fid_table.release(dst_fid);
+            return Err(Error::InvalidArgument);
+        }
+        // Validate upfront that the buffer holds all nwqid QIDs before
+        // entering the loop.  Use checked arithmetic to prevent overflow
+        // when computing the required byte span.
+        let qid_bytes = match nwqid.checked_mul(P9Qid::WIRE_SIZE) {
+            Some(n) => n,
+            None => {
+                let _ = self.fid_table.release(dst_fid);
+                return Err(Error::InvalidArgument);
+            }
+        };
+        let required_end = match offset.checked_add(qid_bytes) {
+            Some(n) => n,
+            None => {
+                let _ = self.fid_table.release(dst_fid);
+                return Err(Error::InvalidArgument);
+            }
+        };
+        if required_end > reply.len() {
             let _ = self.fid_table.release(dst_fid);
             return Err(Error::InvalidArgument);
         }
@@ -995,6 +1068,13 @@ impl Plan9Session {
     /// Handle an Ropen reply.
     ///
     /// Returns the QID and iounit (maximum I/O size for this open file).
+    ///
+    /// The parse offset is advanced as an explicit absolute position after
+    /// each field so that the `consumed` byte count returned by
+    /// `P9Qid::from_bytes` is never mistakenly used as an absolute offset
+    /// (which would double-count the header offset and produce an OOB read
+    /// on a crafted reply that is just long enough to pass the header check
+    /// but shorter than `2 * HEADER_SIZE + QID_SIZE + 4`).
     pub fn handle_ropen(
         &mut self,
         reply: &[u8],
@@ -1008,8 +1088,26 @@ impl Plan9Session {
         if msg_type != P9MessageType::Ropen {
             return Err(Error::InvalidArgument);
         }
-        let (qid, qid_end) = P9Qid::from_bytes(reply, offset)?;
-        let (iounit, _) = Plan9Message::read_u32(reply, offset + qid_end)?;
+        // Validate that the buffer holds the QID and iounit fields before
+        // reading them, using the absolute end position of each field.
+        let qid_end = match offset.checked_add(P9Qid::WIRE_SIZE) {
+            Some(n) => n,
+            None => return Err(Error::InvalidArgument),
+        };
+        let iounit_end = match qid_end.checked_add(4) {
+            Some(n) => n,
+            None => return Err(Error::InvalidArgument),
+        };
+        if iounit_end > reply.len() {
+            return Err(Error::InvalidArgument);
+        }
+        // `from_bytes` performs its own length check; the upfront guard above
+        // ensures it will succeed without an allocation-driven panic.
+        let (qid, _consumed) = P9Qid::from_bytes(reply, offset)?;
+        // Pass the absolute offset of the iounit field, not `offset + consumed`
+        // (which would be correct here only by coincidence and would fail if the
+        // header offset were ever non-zero relative to the QID start).
+        let (iounit, _) = Plan9Message::read_u32(reply, qid_end)?;
         let slot = self.fid_table.lookup(fid)?;
         let fid_entry = self.fid_table.get_mut(slot)?;
         fid_entry.state = FidState::Open;
