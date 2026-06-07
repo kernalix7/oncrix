@@ -265,7 +265,8 @@ impl SpiFlashDevice {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] if misaligned or data too large.
+    /// - [`Error::InvalidArgument`] if misaligned, data too large, device size
+    ///   is unknown, or the write range exceeds device capacity.
     pub fn write_page(&self, spi: &mut dyn SpiBusOps, addr: u32, data: &[u8]) -> Result<()> {
         if addr % self.page_size != 0 {
             return Err(Error::InvalidArgument);
@@ -273,6 +274,11 @@ impl SpiFlashDevice {
         if data.len() > self.page_size as usize {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: Validate the page-program address range against the known flash
+        // capacity before issuing the write-enable + PP command sequence.  Without
+        // this check, an attacker-controlled addr could program flash outside the
+        // device's declared address space (or any address on a size-0 device).
+        self.check_bounds(addr, data.len())?;
         self.write_enable(spi)?;
         let mut cmd = Vec::new();
         cmd.push(CMD_PP);
@@ -301,6 +307,11 @@ impl SpiFlashDevice {
         if addr % self.sector_size != 0 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: bound the erase range against flash capacity, matching read()
+        // and write_page().  Rejects size==0 (unknown JEDEC capacity) and any
+        // sector-aligned address beyond the device so erase cannot target
+        // unmeasured/out-of-range addresses on the bus.
+        self.check_bounds(addr, self.sector_size as usize)?;
         self.write_enable(spi)?;
         let tx = [CMD_SE, (addr >> 16) as u8, (addr >> 8) as u8, addr as u8];
         let mut rx = [0u8; 4];
@@ -321,6 +332,8 @@ impl SpiFlashDevice {
         if addr % self.block_size != 0 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: bound the erase range against flash capacity (see erase_sector).
+        self.check_bounds(addr, self.block_size as usize)?;
         self.write_enable(spi)?;
         let tx = [CMD_BE, (addr >> 16) as u8, (addr >> 8) as u8, addr as u8];
         let mut rx = [0u8; 4];
@@ -355,10 +368,20 @@ impl SpiFlashDevice {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the range exceeds device size.
+    /// Returns [`Error::InvalidArgument`] if the device size is unknown
+    /// (size == 0, unrecognised JEDEC capacity code) or if the range
+    /// exceeds the known device size.
     fn check_bounds(&self, addr: u32, len: usize) -> Result<()> {
+        // SECURITY: A size of 0 means the JEDEC capacity code was not recognised
+        // and the true capacity is unknown.  Accepting any addr/len in that state
+        // would bypass all bounds enforcement, allowing arbitrary flash addresses
+        // to be read or programmed.  Reject immediately so callers cannot proceed
+        // against an unmeasured device.
+        if self.size == 0 {
+            return Err(Error::InvalidArgument);
+        }
         let end = addr as u64 + len as u64;
-        if self.size > 0 && end > self.size {
+        if end > self.size {
             return Err(Error::InvalidArgument);
         }
         Ok(())
