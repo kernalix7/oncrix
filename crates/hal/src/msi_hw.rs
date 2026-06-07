@@ -79,6 +79,11 @@ pub const MSIX_CTRL_ENABLE: u16 = 1 << 15;
 /// MSI-X table entry size in bytes (16 bytes: addr_lo, addr_hi, data, ctrl).
 pub const MSIX_ENTRY_SIZE: usize = 16;
 
+/// Architectural maximum number of MSI-X table entries (table-size field is
+/// 11 bits, encoding N-1, so the largest table is 2048 entries). Used as a
+/// defense-in-depth ceiling on the entry index in the table MMIO accessors.
+pub const MSIX_MAX_VECTORS: usize = 2048;
+
 /// MSI-X vector control: Mask bit (bit 0).
 pub const MSIX_VEC_CTRL_MASKED: u32 = 1 << 0;
 
@@ -290,8 +295,15 @@ impl MsixConfig {
 /// `entry` must be < `num_vectors`. `field_offset` must be 0, 4, 8, or 12.
 #[inline]
 pub unsafe fn msix_read_entry_field(table_base: u64, entry: usize, field_offset: usize) -> u32 {
+    // SECURITY: defense-in-depth — even though the caller contract requires
+    // entry < num_vectors, cap the index at the MSI-X architectural maximum and
+    // bound the field so a contract violation (e.g. an attacker-influenced vector
+    // index) cannot synthesize an arbitrary out-of-table MMIO address.
+    if entry >= MSIX_MAX_VECTORS || field_offset > MSIX_ENTRY_SIZE - 4 {
+        return 0;
+    }
     let addr = table_base + (entry * MSIX_ENTRY_SIZE + field_offset) as u64;
-    // SAFETY: Caller guarantees valid MMIO table mapping and bounds.
+    // SAFETY: Caller guarantees valid MMIO table mapping; index bounded above.
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
@@ -302,8 +314,14 @@ pub unsafe fn msix_read_entry_field(table_base: u64, entry: usize, field_offset:
 /// Same as [`msix_read_entry_field`].
 #[inline]
 pub unsafe fn msix_write_entry_field(table_base: u64, entry: usize, field_offset: usize, val: u32) {
+    // SECURITY: defense-in-depth bound (see msix_read_entry_field) — an
+    // out-of-range entry/field is dropped rather than writing an arbitrary MMIO
+    // address, which would otherwise be a device-index-driven write primitive.
+    if entry >= MSIX_MAX_VECTORS || field_offset > MSIX_ENTRY_SIZE - 4 {
+        return;
+    }
     let addr = table_base + (entry * MSIX_ENTRY_SIZE + field_offset) as u64;
-    // SAFETY: Caller guarantees valid MMIO table mapping and bounds.
+    // SAFETY: Caller guarantees valid MMIO table mapping; index bounded above.
     unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
 }
 
