@@ -213,7 +213,12 @@ impl ReadCapacity10 {
 
     /// Return the total capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
-        (self.last_lba() as u64 + 1) * self.block_len() as u64
+        // SECURITY: last_lba() is a device-supplied u32; adding 1 in u32 wraps at
+        // 0xFFFF_FFFF. Widen to u64 first, then cap at the 48-bit LBA limit so a
+        // malicious device cannot present an absurd (multi-exabyte) capacity.
+        // Both operands are u64 before the multiply, preventing any overflow.
+        let sectors = (u64::from(self.last_lba()).saturating_add(1)).min(0x0001_0000_0000_0000);
+        sectors.saturating_mul(u64::from(self.block_len()))
     }
 }
 
@@ -305,8 +310,19 @@ impl AtapiDevice {
 
     /// Update capacity from READ CAPACITY response.
     pub fn update_capacity(&mut self, cap: &ReadCapacity10) {
-        self.capacity_sectors = cap.last_lba() + 1;
-        self.sector_size = cap.block_len();
+        // SECURITY: block_len comes from an untrusted device response. A value of
+        // zero would cause a divide-by-zero panic in ring-0 when callers compute
+        // bytes / self.sector_size; a value above 65536 is not a sane sector size.
+        // The bound 0 < bl <= 65536 fully closes the div-by-zero risk. We do NOT
+        // require a power of two: legitimate optical media use non-power-of-two
+        // raw-mode sizes (e.g. 2352-byte CD audio frames, 2048-byte data sectors).
+        let bl = cap.block_len();
+        if bl == 0 || bl > 65536 {
+            self.state = AtapiState::Error;
+            return;
+        }
+        self.capacity_sectors = cap.last_lba().saturating_add(1);
+        self.sector_size = bl;
         self.state = AtapiState::Ready;
     }
 
