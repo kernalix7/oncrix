@@ -45,6 +45,18 @@ const MAX_SUBDEVS: usize = 8;
 /// Maximum supported formats per device.
 const MAX_FORMATS: usize = 16;
 
+/// Maximum per-buffer allocation size (64 MiB, page-aligned).
+///
+/// Userspace-supplied `length` values above this are rejected before any
+/// offset arithmetic to prevent u32 overflow in `request_buffers`.
+const MAX_BUFFER_SIZE: u32 = 64 * 1024 * 1024;
+
+/// Maximum frame dimension in either axis (16 384 pixels).
+///
+/// Enforced in `V4l2PixFormat::new` before width*bpp and bytesperline*height
+/// multiplications to prevent u32 overflow on attacker-controlled values.
+const MAX_FRAME_DIM: u32 = 16_384;
+
 // ---------------------------------------------------------------------------
 // Pixel format FourCC codes
 // ---------------------------------------------------------------------------
@@ -150,16 +162,37 @@ const EMPTY_FMT: V4l2PixFormat = V4l2PixFormat {
 
 impl V4l2PixFormat {
     /// Creates a new pixel format.
-    pub fn new(width: u32, height: u32, pixelformat: u32) -> Self {
-        let bpp = match pixelformat {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `width` or `height` exceeds
+    /// [`MAX_FRAME_DIM`], or if the resulting stride / image-size overflows u32.
+    pub fn new(width: u32, height: u32, pixelformat: u32) -> Result<Self> {
+        // SECURITY: reject attacker-supplied dimensions before any multiply to
+        // prevent u32 overflow panic (overflow-checks = on in dev/test).
+        if width == 0 || height == 0 || width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
+            return Err(Error::InvalidArgument);
+        }
+        let bpp: u32 = match pixelformat {
             V4L2_PIX_FMT_RGB24 => 3,
             V4L2_PIX_FMT_YUYV => 2,
             V4L2_PIX_FMT_NV12 => 1, // per-pixel average for planar
             _ => 2,                 // default assumption
         };
-        let bytesperline = width * bpp;
-        let sizeimage = bytesperline * height;
-        Self {
+        // SECURITY: checked multiply so no silent wrap or panic on large dims.
+        let bytesperline = width.checked_mul(bpp).ok_or(Error::InvalidArgument)?;
+        let luma = bytesperline
+            .checked_mul(height)
+            .ok_or(Error::InvalidArgument)?;
+        // SECURITY: sizeimage bounds the frame buffer the device fills. Planar
+        // formats need their chroma plane(s) added or the buffer is undersized
+        // (a device writing a full frame would overrun it). NV12 (4:2:0 semi-
+        // planar) = luma + luma/2; packed formats are luma only.
+        let sizeimage = match pixelformat {
+            V4L2_PIX_FMT_NV12 => luma.checked_add(luma / 2).ok_or(Error::InvalidArgument)?,
+            _ => luma,
+        };
+        Ok(Self {
             width,
             height,
             pixelformat,
@@ -167,7 +200,7 @@ impl V4l2PixFormat {
             bytesperline,
             sizeimage,
             colorspace: 0,
-        }
+        })
     }
 }
 
@@ -274,20 +307,31 @@ impl V4l2BufferQueue {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `count` exceeds [`MAX_BUFFERS`]
-    /// or is zero.
+    /// Returns [`Error::InvalidArgument`] if `count` exceeds [`MAX_BUFFERS`],
+    /// is zero, `length` exceeds [`MAX_BUFFER_SIZE`], or the per-buffer offset
+    /// arithmetic would overflow u32.
     pub fn request_buffers(&mut self, count: usize, length: u32) -> Result<usize> {
         if count == 0 || count > MAX_BUFFERS {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: cap attacker-supplied length before the index*length offset
+        // multiply below; without this a large length overflows u32 and panics.
+        if length > MAX_BUFFER_SIZE {
+            return Err(Error::InvalidArgument);
+        }
         self.count = count;
         for i in 0..count {
+            // SECURITY: checked multiply prevents u32 overflow on the MMAP
+            // offset field when both i and length are attacker-controlled.
+            let offset = (i as u32)
+                .checked_mul(length)
+                .ok_or(Error::InvalidArgument)?;
             self.buffers[i] = V4l2Buffer {
                 index: i as u32,
                 buf_type: self.buf_type,
                 memory: self.memory,
                 state: V4l2BufferState::Dequeued,
-                offset: (i as u32) * length,
+                offset,
                 userptr: 0,
                 dmabuf_fd: -1,
                 bytesused: 0,
@@ -484,15 +528,28 @@ impl V4l2Control {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the value is out of range.
+    /// Returns [`Error::InvalidArgument`] if the value is out of range or if
+    /// the step-snap arithmetic would overflow i64.
     pub fn set_value(&mut self, val: i64) -> Result<()> {
         if val < self.minimum || val > self.maximum {
             return Err(Error::InvalidArgument);
         }
         // Snap to step
         if self.step > 0 {
-            let offset = val - self.minimum;
-            let snapped = self.minimum + (offset / self.step) * self.step;
+            // SECURITY: val and minimum are both i64 extremes from device
+            // firmware; subtraction, division, and addition can all overflow
+            // without checked arithmetic.
+            let offset = val
+                .checked_sub(self.minimum)
+                .ok_or(Error::InvalidArgument)?;
+            let steps = offset
+                .checked_div(self.step)
+                .ok_or(Error::InvalidArgument)?;
+            let snapped_offset = steps.checked_mul(self.step).ok_or(Error::InvalidArgument)?;
+            let snapped = self
+                .minimum
+                .checked_add(snapped_offset)
+                .ok_or(Error::InvalidArgument)?;
             self.value = snapped;
         } else {
             self.value = val;
@@ -707,22 +764,45 @@ impl V4l2Device {
     /// Sets the current format (VIDIOC_S_FMT equivalent).
     ///
     /// The format must match a supported format's pixel format code.
+    /// `bytesperline` and `sizeimage` from the caller are **ignored**; they are
+    /// recomputed from `width`, `height`, and `pixelformat` so that no
+    /// attacker-controlled stride/size value reaches the rest of the kernel.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the pixel format is not
-    /// supported, or [`Error::Busy`] if streaming is active.
+    /// Returns [`Error::InvalidArgument`] if dimensions are zero or out of
+    /// range, [`Error::NotFound`] if no formats have been registered, or the
+    /// pixel format code is not in the supported list, or
+    /// [`Error::Busy`] if streaming is active.
     pub fn set_format(&mut self, fmt: V4l2PixFormat) -> Result<()> {
         if self.queue.is_streaming() {
             return Err(Error::Busy);
         }
+        // SECURITY: a device with zero registered formats must not silently
+        // accept any pixelformat — that bypasses all validation entirely.
+        if self.format_count == 0 {
+            return Err(Error::NotFound);
+        }
+        // SECURITY: reject zero dimensions before any arithmetic.
+        if fmt.width == 0 || fmt.height == 0 {
+            return Err(Error::InvalidArgument);
+        }
         let supported = self.supported_formats[..self.format_count]
             .iter()
             .any(|f| f.pixelformat == fmt.pixelformat);
-        if !supported && self.format_count > 0 {
+        if !supported {
             return Err(Error::InvalidArgument);
         }
-        self.format = fmt;
+        // SECURITY: recompute bytesperline and sizeimage from trusted inputs
+        // rather than storing the caller-supplied values verbatim; this
+        // prevents attacker-controlled strides from propagating into DMA setup.
+        let canonical = V4l2PixFormat::new(fmt.width, fmt.height, fmt.pixelformat)?;
+        // Preserve caller-supplied field and colorspace (display hints only).
+        self.format = V4l2PixFormat {
+            field: fmt.field,
+            colorspace: fmt.colorspace,
+            ..canonical
+        };
         Ok(())
     }
 

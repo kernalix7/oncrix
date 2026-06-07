@@ -409,9 +409,14 @@ impl UsbMscDevice {
         let (data_len, flags) = match &data {
             Some((buf, dir_in)) => {
                 let f = if *dir_in { CBW_FLAGS_IN } else { CBW_FLAGS_OUT };
-                (buf.len() as u32, f)
+                // SECURITY: buf.len() can exceed u32::MAX on 64-bit hosts;
+                // a silent `as u32` truncation would make the CBW declare a
+                // shorter transfer than the host DMA actually moves, corrupting
+                // protocol framing.  Reject oversized buffers at the boundary.
+                let dtl = u32::try_from(buf.len()).map_err(|_| Error::InvalidArgument)?;
+                (dtl, f)
             }
-            None => (0, CBW_FLAGS_OUT),
+            None => (0u32, CBW_FLAGS_OUT),
         };
 
         let tag = self.alloc_tag();
@@ -459,6 +464,14 @@ impl UsbMscDevice {
         }
 
         if !csw.is_valid(tag) {
+            return Err(Error::IoError);
+        }
+
+        // SECURITY: data_residue is device-supplied and must not exceed the
+        // declared transfer length.  A rogue device returning a larger residue
+        // would violate BOT §5.2 and could be used to confuse upper layers
+        // about how many bytes were actually transferred.
+        if csw.data_residue > data_len {
             return Err(Error::IoError);
         }
 
@@ -613,6 +626,18 @@ impl UsbMscDevice {
         }
         let last_lba = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let block_size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        // SECURITY: block_size is firmware-supplied and attacker-controlled.
+        // block_size==0 makes checked_mul(0) return Some(0), bypassing every
+        // buffer-size guard and causing divide-by-zero in ring-0 where
+        // overflow-checks is ON.  Values above 65536 or non-power-of-two are
+        // never valid for USB storage and indicate a malformed or hostile
+        // response.  Reject all three cases before the value is stored or
+        // used in arithmetic.
+        if block_size == 0 || block_size > 65536 || !block_size.is_power_of_two() {
+            return Err(Error::InvalidArgument);
+        }
+
         let block_count = u64::from(last_lba) + 1;
         Ok((block_count, block_size))
     }
