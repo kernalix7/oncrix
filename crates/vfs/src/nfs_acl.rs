@@ -180,9 +180,14 @@ impl Default for NfsAcl {
 pub const NFSACL_ENTRY_XDR_SIZE: usize = 12;
 
 /// Compute the XDR buffer size needed for an ACL with `n` entries.
-pub fn nfsacl_xdr_size(n: usize) -> usize {
-    // 4-byte count + n * entry_size
-    4 + n * NFSACL_ENTRY_XDR_SIZE
+///
+/// Returns `None` if the arithmetic would overflow `usize`.  Callers that
+/// accept a wire-supplied `n` MUST propagate the `None` as a protocol error
+/// rather than proceeding with an unchecked calculation.
+pub fn nfsacl_xdr_size(n: usize) -> Option<usize> {
+    // 4-byte count field + n * entry_size; both additions may overflow on
+    // adversarial input, so use checked arithmetic throughout.
+    n.checked_mul(NFSACL_ENTRY_XDR_SIZE)?.checked_add(4)
 }
 
 /// Encode an `NfsAcl` into an XDR byte buffer.
@@ -190,7 +195,7 @@ pub fn nfsacl_xdr_size(n: usize) -> usize {
 /// Returns the number of bytes written, or `Err(InvalidArgument)` if the
 /// buffer is too small.
 pub fn encode_nfsacl(acl: &NfsAcl, buf: &mut [u8]) -> Result<usize> {
-    let needed = nfsacl_xdr_size(acl.count);
+    let needed = nfsacl_xdr_size(acl.count).ok_or(Error::InvalidArgument)?;
     if buf.len() < needed {
         return Err(Error::InvalidArgument);
     }
@@ -218,7 +223,8 @@ pub fn decode_nfsacl(buf: &[u8]) -> Result<NfsAcl> {
     if count > NFSACL_MAX_ENTRIES {
         return Err(Error::InvalidArgument);
     }
-    if buf.len() < nfsacl_xdr_size(count) {
+    let needed = nfsacl_xdr_size(count).ok_or(Error::InvalidArgument)?;
+    if buf.len() < needed {
         return Err(Error::InvalidArgument);
     }
     let mut acl = NfsAcl::new();
@@ -232,4 +238,52 @@ pub fn decode_nfsacl(buf: &[u8]) -> Result<NfsAcl> {
         off += NFSACL_ENTRY_XDR_SIZE;
     }
     Ok(acl)
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xdr_size_normal() {
+        // 0 entries: just the 4-byte count field.
+        assert_eq!(nfsacl_xdr_size(0), Some(4));
+        // 1 entry: 4 + 12 = 16.
+        assert_eq!(nfsacl_xdr_size(1), Some(4 + NFSACL_ENTRY_XDR_SIZE));
+        // Max legal entries must not overflow.
+        assert!(nfsacl_xdr_size(NFSACL_MAX_ENTRIES).is_some());
+    }
+
+    #[test]
+    fn xdr_size_overflow_returns_none() {
+        // usize::MAX / NFSACL_ENTRY_XDR_SIZE + 1 will overflow the mul.
+        let huge = usize::MAX / NFSACL_ENTRY_XDR_SIZE + 1;
+        assert_eq!(nfsacl_xdr_size(huge), None);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let mut acl = NfsAcl::new();
+        acl.add(NfsAclEntry::new(
+            AclTag::UserObj,
+            0,
+            AclPerms::READ | AclPerms::EXEC,
+        ))
+        .unwrap();
+        acl.add(NfsAclEntry::new(AclTag::Other, 0, 0)).unwrap();
+        let mut buf = [0u8; 256];
+        let written = encode_nfsacl(&acl, &mut buf).unwrap();
+        let decoded = decode_nfsacl(&buf[..written]).unwrap();
+        assert_eq!(decoded.count, acl.count);
+    }
+
+    #[test]
+    fn decode_truncated_buf_is_error() {
+        // A buffer that advertises 2 entries but contains only 4 bytes must fail.
+        let mut buf = [0u8; 4];
+        buf[3] = 2; // count = 2
+        assert!(decode_nfsacl(&buf).is_err());
+    }
 }

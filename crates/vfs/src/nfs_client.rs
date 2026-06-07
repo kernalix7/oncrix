@@ -441,6 +441,11 @@ impl NfsClientSubsystem {
     ///
     /// Called by the RPC layer when a reply arrives.
     ///
+    /// The `bytes` value is a server-supplied wire count.  It is clamped to
+    /// [`NFS_DATA_BUF`] before being stored so that callers slicing
+    /// `req.data[..req.bytes_transferred as usize]` can never index out of
+    /// bounds regardless of what the server sends.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidArgument`] — `slot` out of range.
@@ -453,7 +458,9 @@ impl NfsClientSubsystem {
         if req.state != NfsRequestState::InFlight && req.state != NfsRequestState::Pending {
             return Err(Error::NotFound);
         }
-        req.bytes_transferred = bytes;
+        // Clamp to the fixed data buffer size so a malicious/buggy server
+        // cannot cause an out-of-bounds slice later.
+        req.bytes_transferred = bytes.min(NFS_DATA_BUF as u32);
         req.result = result;
         if result == 0 {
             req.state = NfsRequestState::Complete;
@@ -573,6 +580,24 @@ mod tests {
         sub.complete_request(slot, 0, 512).unwrap();
         assert_eq!(sub.stats().bytes_read, 512);
         sub.release_slot(slot).unwrap();
+    }
+
+    #[test]
+    fn complete_request_clamps_bytes_to_buf_size() {
+        let mut sub = NfsClientSubsystem::new();
+        let m = sub.mount(0xC0A80001, dummy_fh(), NfsVersion::V4).unwrap();
+        let slot = sub
+            .submit_request(m as u8, NfsOp::Read, dummy_fh(), 0, NFS_DATA_BUF as u32)
+            .unwrap();
+        sub.poll();
+        // Server claims it transferred more bytes than the buffer can hold.
+        let oversized: u32 = NFS_DATA_BUF as u32 + 1;
+        sub.complete_request(slot, 0, oversized).unwrap();
+        // Must be clamped — never exceed NFS_DATA_BUF.
+        assert_eq!(
+            sub.client.pending_ops[slot].bytes_transferred, NFS_DATA_BUF as u32,
+            "bytes_transferred must be clamped to NFS_DATA_BUF"
+        );
     }
 
     #[test]
