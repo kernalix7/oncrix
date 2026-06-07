@@ -70,6 +70,29 @@ const VQ_RING_DEPTH: usize = 64;
 /// Maximum pending fence IDs.
 const MAX_FENCES: usize = 64;
 
+/// Maximum resource table entries (simultaneously live resources).
+const MAX_RESOURCES: usize = 64;
+
+/// Maximum allowed width or height for a 2-D resource (pixels).
+///
+/// 16 384 px is the cap from the virtio-gpu spec (virtio-v1.2 §5.7.6.8).
+/// Values beyond this indicate a malicious or buggy host.
+pub const MAX_RESOURCE_DIM: u32 = 16_384;
+
+/// Maximum number of pixels in a 2-D resource (width * height).
+///
+/// Caps the total allocation at 256 M pixels (~1 GiB at 4 bpp), preventing
+/// overflow in size arithmetic regardless of format.
+pub const MAX_RESOURCE_PIXELS: u64 = 256 * 1024 * 1024;
+
+/// Bytes per pixel for all supported formats (all are 32-bit / 4 bytes).
+const BYTES_PER_PIXEL: u64 = 4;
+
+/// Maximum backing-store size accepted for a single resource (bytes).
+///
+/// Derived from `MAX_RESOURCE_PIXELS * BYTES_PER_PIXEL`.
+pub const MAX_RESOURCE_BYTES: u64 = MAX_RESOURCE_PIXELS * BYTES_PER_PIXEL;
+
 // ---------------------------------------------------------------------------
 // Common header
 // ---------------------------------------------------------------------------
@@ -130,6 +153,24 @@ pub struct GpuRect {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+}
+
+impl GpuRect {
+    /// Returns `true` if the rectangle lies entirely within `(res_w, res_h)`.
+    ///
+    /// All arithmetic is checked to avoid overflow on untrusted wire values.
+    pub fn fits_within(&self, res_w: u32, res_h: u32) -> bool {
+        // checked_add catches x+width or y+height overflowing u32.
+        let x_end = match self.x.checked_add(self.width) {
+            Some(v) => v,
+            None => return false,
+        };
+        let y_end = match self.y.checked_add(self.height) {
+            Some(v) => v,
+            None => return false,
+        };
+        x_end <= res_w && y_end <= res_h
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +343,27 @@ pub struct GpuMemEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Resource metadata (local tracking)
+// ---------------------------------------------------------------------------
+
+/// Kernel-side metadata for a live 2-D resource.
+///
+/// Populated when `dispatch_resource_create_2d` accepts a command so that
+/// subsequent transfer/flush operations can validate their rect/offset
+/// arguments without trusting the caller.
+#[derive(Debug, Clone, Copy)]
+struct ResourceMeta {
+    /// Resource ID (non-zero).
+    resource_id: u32,
+    /// Width in pixels (validated, <= MAX_RESOURCE_DIM).
+    width: u32,
+    /// Height in pixels (validated, <= MAX_RESOURCE_DIM).
+    height: u32,
+    /// Total backing store size in bytes (width * height * BYTES_PER_PIXEL).
+    backing_bytes: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Fence tracking
 // ---------------------------------------------------------------------------
 
@@ -337,9 +399,9 @@ struct VqDesc {
 pub struct GpuCmdQueue {
     /// Descriptor ring.
     descs: [VqDesc; VQ_RING_DEPTH],
-    /// Available ring head index.
+    /// Available ring head index (modulo VQ_RING_DEPTH).
     avail_idx: u16,
-    /// Used ring head index (tracks device consumption).
+    /// Used ring head index (tracks device consumption, modulo VQ_RING_DEPTH).
     used_idx: u16,
     /// Pending fences.
     fences: [Option<FenceEntry>; MAX_FENCES],
@@ -347,12 +409,15 @@ pub struct GpuCmdQueue {
     next_fence_id: u64,
     /// Total commands submitted.
     pub submit_count: u64,
+    /// Live resource metadata table.
+    resources: [Option<ResourceMeta>; MAX_RESOURCES],
 }
 
 impl GpuCmdQueue {
     /// Create an empty GPU command queue.
     pub const fn new() -> Self {
-        const NONE: Option<FenceEntry> = None;
+        const NONE_FENCE: Option<FenceEntry> = None;
+        const NONE_RES: Option<ResourceMeta> = None;
         Self {
             descs: [const {
                 VqDesc {
@@ -364,9 +429,10 @@ impl GpuCmdQueue {
             }; VQ_RING_DEPTH],
             avail_idx: 0,
             used_idx: 0,
-            fences: [NONE; MAX_FENCES],
+            fences: [NONE_FENCE; MAX_FENCES],
             next_fence_id: 1,
             submit_count: 0,
+            resources: [NONE_RES; MAX_RESOURCES],
         }
     }
 
@@ -440,7 +506,10 @@ impl GpuCmdQueue {
     ///
     /// Returns [`Error::Busy`] if the ring is full.
     pub fn submit(&mut self, phys_addr: u64, len: u32) -> Result<u16> {
-        let next_avail = (self.avail_idx + 1) % VQ_RING_DEPTH as u16;
+        // SAFETY (arithmetic): avail_idx is always kept < VQ_RING_DEPTH.
+        // wrapping_add(1) prevents overflow under overflow-checks=on; the
+        // subsequent modulo brings it back into ring range.
+        let next_avail = self.avail_idx.wrapping_add(1) % VQ_RING_DEPTH as u16;
         if next_avail == self.used_idx {
             return Err(Error::Busy);
         }
@@ -457,9 +526,90 @@ impl GpuCmdQueue {
         Ok(idx)
     }
 
-    /// Acknowledge that the device has consumed up to `used_idx`.
-    pub fn advance_used(&mut self, used_idx: u16) {
-        self.used_idx = used_idx % VQ_RING_DEPTH as u16;
+    /// Acknowledge that the device has consumed descriptors up to `used_idx`.
+    ///
+    /// The value comes from the device-visible used ring and is therefore
+    /// untrusted.  We validate it against the number of descriptors that were
+    /// actually submitted (tracked by `avail_idx`):
+    ///
+    /// * The advance (number of newly consumed slots) must not exceed the
+    ///   number of outstanding submitted-but-unacknowledged descriptors.
+    ///   A device that claims to have consumed more than was submitted is
+    ///   malicious or buggy.
+    ///
+    /// The ring indices are kept as ring-modulo values (`0..VQ_RING_DEPTH`).
+    /// All arithmetic is done with wrapping operations to stay correct across
+    /// the ring boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `used_idx` reflects more
+    /// consumed slots than were ever submitted.  The caller should treat the
+    /// queue as wedged and reset the device.
+    pub fn advance_used(&mut self, used_idx: u16) -> Result<()> {
+        let ring = VQ_RING_DEPTH as u16;
+        let new_pos = used_idx % ring;
+
+        // How many slots the device claims to have consumed since last ack.
+        // wrapping_sub handles the modular ring boundary correctly.
+        let advance = new_pos.wrapping_sub(self.used_idx) % ring;
+
+        // How many slots were submitted but not yet acknowledged.
+        // avail_idx is always kept in [0, ring) so this is also correct.
+        let outstanding = self.avail_idx.wrapping_sub(self.used_idx) % ring;
+
+        // If the device consumed more than was submitted it is lying.
+        if advance > outstanding {
+            return Err(Error::InvalidArgument);
+        }
+
+        self.used_idx = new_pos;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource metadata helpers (private)
+    // -----------------------------------------------------------------------
+
+    /// Register metadata for a newly created resource.
+    ///
+    /// Replaces an existing entry for the same `resource_id` if present
+    /// (re-create after unref).
+    fn register_resource(&mut self, meta: ResourceMeta) -> Result<()> {
+        // Replace an existing entry for the same ID first.
+        for slot in self.resources.iter_mut() {
+            if slot.map_or(false, |m| m.resource_id == meta.resource_id) {
+                *slot = Some(meta);
+                return Ok(());
+            }
+        }
+        // Find an empty slot.
+        let slot = self
+            .resources
+            .iter_mut()
+            .find(|s| s.is_none())
+            .ok_or(Error::OutOfMemory)?;
+        *slot = Some(meta);
+        Ok(())
+    }
+
+    /// Look up resource metadata by ID.
+    fn resource_meta(&self, resource_id: u32) -> Option<ResourceMeta> {
+        self.resources
+            .iter()
+            .flatten()
+            .find(|m| m.resource_id == resource_id)
+            .copied()
+    }
+
+    /// Remove resource metadata (called on RESOURCE_UNREF).
+    pub fn unregister_resource(&mut self, resource_id: u32) {
+        for slot in self.resources.iter_mut() {
+            if slot.map_or(false, |m| m.resource_id == resource_id) {
+                *slot = None;
+                return;
+            }
+        }
     }
 }
 
@@ -496,6 +646,16 @@ pub fn dispatch_get_display_info(
 }
 
 /// Dispatch a RESOURCE_CREATE_2D command.
+///
+/// `width` and `height` must each be in `1..=MAX_RESOURCE_DIM`, and
+/// `width * height * 4` must not overflow `u64`. Both constraints guard
+/// against overflow in DMA-size arithmetic when overflow-checks are enabled
+/// in dev/test builds.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if any argument is out of range or if
+/// the total pixel count overflows the permitted maximum.
 pub fn dispatch_resource_create_2d(
     queue: &mut GpuCmdQueue,
     phys_addr: u64,
@@ -504,19 +664,56 @@ pub fn dispatch_resource_create_2d(
     width: u32,
     height: u32,
 ) -> Result<DispatchResult> {
-    if resource_id == 0 || width == 0 || height == 0 {
+    if resource_id == 0 {
         return Err(Error::InvalidArgument);
     }
+    // Clamp / reject out-of-range dimensions supplied by the host/caller.
+    if width == 0 || width > MAX_RESOURCE_DIM {
+        return Err(Error::InvalidArgument);
+    }
+    if height == 0 || height > MAX_RESOURCE_DIM {
+        return Err(Error::InvalidArgument);
+    }
+    // Checked multiplication prevents width*height*bpp from overflowing.
+    let pixels = (width as u64)
+        .checked_mul(height as u64)
+        .ok_or(Error::InvalidArgument)?;
+    // `>=` so the exact maximum (16384*16384 == MAX_RESOURCE_PIXELS, a 1 GiB
+    // backing) is also rejected; a single resource that large is excessive.
+    if pixels >= MAX_RESOURCE_PIXELS {
+        return Err(Error::InvalidArgument);
+    }
+    let backing_bytes = pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or(Error::InvalidArgument)?;
+
+    // Record metadata so later transfer/flush calls can validate their rects.
+    queue.register_resource(ResourceMeta {
+        resource_id,
+        width,
+        height,
+        backing_bytes,
+    })?;
+
     let fence_id = queue.alloc_fence()?;
     let len = core::mem::size_of::<GpuCmdResourceCreate2d>() as u32;
-    // In a real driver the struct would be written to the DMA buffer at phys_addr.
-    // Here we validate args and submit the descriptor.
-    let _ = (resource_id, format, width, height);
+    // In a real driver the struct would be written to the DMA buffer at
+    // phys_addr.  Here we validate args and submit the descriptor.
+    let _ = (format,);
     queue.submit(phys_addr, len)?;
     Ok(DispatchResult::Submitted { fence_id })
 }
 
 /// Dispatch a RESOURCE_FLUSH command.
+///
+/// `rect` is validated against the resource dimensions stored when the
+/// resource was created. An unknown `resource_id` or an out-of-bounds rect
+/// both return [`Error::InvalidArgument`].
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `resource_id` is zero, unknown, or
+/// if `rect` extends beyond the resource boundary.
 pub fn dispatch_resource_flush(
     queue: &mut GpuCmdQueue,
     phys_addr: u64,
@@ -526,14 +723,33 @@ pub fn dispatch_resource_flush(
     if resource_id == 0 {
         return Err(Error::InvalidArgument);
     }
+    let meta = queue
+        .resource_meta(resource_id)
+        .ok_or(Error::InvalidArgument)?;
+
+    // Validate the flush rect lies entirely within the resource boundary.
+    if !rect.fits_within(meta.width, meta.height) {
+        return Err(Error::InvalidArgument);
+    }
+
     let fence_id = queue.alloc_fence()?;
     let len = core::mem::size_of::<GpuCmdResourceFlush>() as u32;
-    let _ = rect;
     queue.submit(phys_addr, len)?;
     Ok(DispatchResult::Submitted { fence_id })
 }
 
 /// Dispatch a TRANSFER_TO_HOST_2D command.
+///
+/// Validates that:
+/// * `rect` lies within the resource dimensions, and
+/// * `offset + transfer_len` does not exceed the resource backing size,
+///   where `transfer_len = rect.width * rect.height * 4` (checked multiply).
+///
+/// All arithmetic is checked to avoid overflow on untrusted wire values.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if any argument fails validation.
 pub fn dispatch_transfer_to_host(
     queue: &mut GpuCmdQueue,
     phys_addr: u64,
@@ -544,9 +760,33 @@ pub fn dispatch_transfer_to_host(
     if resource_id == 0 {
         return Err(Error::InvalidArgument);
     }
+    let meta = queue
+        .resource_meta(resource_id)
+        .ok_or(Error::InvalidArgument)?;
+
+    // Validate rect bounds against the resource dimensions.
+    if !rect.fits_within(meta.width, meta.height) {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Compute the byte length of the transfer (checked to avoid overflow).
+    let pixels = (rect.width as u64)
+        .checked_mul(rect.height as u64)
+        .ok_or(Error::InvalidArgument)?;
+    let transfer_len = pixels
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or(Error::InvalidArgument)?;
+
+    // Validate offset + transfer_len does not exceed the backing store.
+    let end = offset
+        .checked_add(transfer_len)
+        .ok_or(Error::InvalidArgument)?;
+    if end > meta.backing_bytes {
+        return Err(Error::InvalidArgument);
+    }
+
     let fence_id = queue.alloc_fence()?;
     let len = core::mem::size_of::<GpuCmdTransferToHost2d>() as u32;
-    let _ = (rect, offset);
     queue.submit(phys_addr, len)?;
     Ok(DispatchResult::Submitted { fence_id })
 }
@@ -567,4 +807,341 @@ pub fn dispatch_set_scanout(
     let _ = (resource_id, rect);
     queue.submit(phys_addr, len)?;
     Ok(DispatchResult::Submitted { fence_id })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: create a queue with one registered resource (64x64, id=1).
+    fn queue_with_resource() -> GpuCmdQueue {
+        let mut q = GpuCmdQueue::new();
+        q.register_resource(ResourceMeta {
+            resource_id: 1,
+            width: 64,
+            height: 64,
+            backing_bytes: 64 * 64 * 4,
+        })
+        .unwrap();
+        q
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 1 — submit ring-index wrapping
+    // -----------------------------------------------------------------------
+
+    /// submit must not panic when avail_idx is at u16 boundary values.
+    #[test]
+    fn submit_no_overflow_at_ring_boundary() {
+        let mut q = GpuCmdQueue::new();
+        // Drive avail_idx to VQ_RING_DEPTH - 1 by submitting then acking.
+        for _ in 0..(VQ_RING_DEPTH - 1) {
+            q.submit(0x1000, 64).unwrap();
+        }
+        // Ack all consumed so the ring is empty again.
+        q.advance_used(q.avail_idx).unwrap();
+        // This submit must wrap cleanly without panic.
+        let r = q.submit(0x2000, 64);
+        assert!(r.is_ok(), "submit at ring boundary must succeed: {r:?}");
+    }
+
+    /// A full ring returns Busy.
+    #[test]
+    fn submit_full_ring_returns_busy() {
+        let mut q = GpuCmdQueue::new();
+        // Fill ring to capacity (ring_depth - 1 usable slots).
+        for _ in 0..(VQ_RING_DEPTH - 1) {
+            q.submit(0x1000, 64).unwrap();
+        }
+        assert_eq!(q.submit(0x2000, 64), Err(Error::Busy));
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 2 — dispatch_resource_create_2d overflow checks
+    // -----------------------------------------------------------------------
+
+    /// width/height of 0 is rejected.
+    #[test]
+    fn create_2d_zero_dimensions_rejected() {
+        let mut q = GpuCmdQueue::new();
+        assert_eq!(
+            dispatch_resource_create_2d(&mut q, 0, 1, GpuFormat::Bgra8888, 0, 64),
+            Err(Error::InvalidArgument),
+        );
+        assert_eq!(
+            dispatch_resource_create_2d(&mut q, 0, 1, GpuFormat::Bgra8888, 64, 0),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// Dimensions above MAX_RESOURCE_DIM are rejected.
+    #[test]
+    fn create_2d_excess_dimensions_rejected() {
+        let mut q = GpuCmdQueue::new();
+        assert_eq!(
+            dispatch_resource_create_2d(
+                &mut q,
+                0,
+                1,
+                GpuFormat::Bgra8888,
+                MAX_RESOURCE_DIM + 1,
+                64,
+            ),
+            Err(Error::InvalidArgument),
+        );
+        assert_eq!(
+            dispatch_resource_create_2d(
+                &mut q,
+                0,
+                1,
+                GpuFormat::Bgra8888,
+                64,
+                MAX_RESOURCE_DIM + 1,
+            ),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// Pixel count above MAX_RESOURCE_PIXELS is rejected even if each dim
+    /// is individually within MAX_RESOURCE_DIM.
+    #[test]
+    fn create_2d_pixel_overflow_rejected() {
+        let mut q = GpuCmdQueue::new();
+        // 16384 * 16384 = 268 435 456 == MAX_RESOURCE_PIXELS (256 M);
+        // rejected by the `>=` cap (a 1 GiB single resource is excessive).
+        assert_eq!(
+            dispatch_resource_create_2d(
+                &mut q,
+                0,
+                1,
+                GpuFormat::Bgra8888,
+                MAX_RESOURCE_DIM,
+                MAX_RESOURCE_DIM,
+            ),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// A valid small resource is accepted.
+    #[test]
+    fn create_2d_valid_accepted() {
+        let mut q = GpuCmdQueue::new();
+        let r = dispatch_resource_create_2d(&mut q, 0x1000, 1, GpuFormat::Bgra8888, 64, 64);
+        assert!(matches!(r, Ok(DispatchResult::Submitted { .. })));
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 3 — advance_used monotonicity / over-consumption guard
+    // -----------------------------------------------------------------------
+
+    /// A device that claims to have consumed more slots than were submitted is
+    /// rejected.  Here: 0 descriptors submitted, device claims 1 consumed.
+    #[test]
+    fn advance_used_excess_over_submitted_rejected() {
+        let mut q = GpuCmdQueue::new();
+        // avail_idx = 0, used_idx = 0 → outstanding = 0.
+        // Device claims new used_idx = 1 → advance = 1 > 0 = outstanding.
+        assert_eq!(q.advance_used(1), Err(Error::InvalidArgument));
+    }
+
+    /// A device that acknowledges more than it was given is rejected even at
+    /// the ring boundary (advance > outstanding after modular arithmetic).
+    #[test]
+    fn advance_used_more_than_submitted_rejected() {
+        let mut q = GpuCmdQueue::new();
+        // Submit 2 descriptors (avail_idx = 2, used_idx = 0 → outstanding = 2).
+        q.submit(0x1000, 64).unwrap();
+        q.submit(0x2000, 64).unwrap();
+        // Device claims 3 consumed — one more than was submitted.
+        assert_eq!(q.advance_used(3), Err(Error::InvalidArgument));
+    }
+
+    /// A simple valid advance succeeds and updates used_idx.
+    #[test]
+    fn advance_used_valid() {
+        let mut q = GpuCmdQueue::new();
+        q.submit(0x1000, 64).unwrap();
+        q.submit(0x2000, 64).unwrap();
+        // Device consumed 2 descriptors (exactly outstanding).
+        assert!(q.advance_used(2).is_ok());
+        assert_eq!(q.used_idx, 2);
+    }
+
+    /// Idempotent advance (same value twice) is always OK (advance = 0).
+    #[test]
+    fn advance_used_idempotent() {
+        let mut q = GpuCmdQueue::new();
+        q.submit(0x1000, 64).unwrap();
+        q.advance_used(1).unwrap();
+        // Sending the same used_idx again: advance = 0 ≤ 0 = outstanding.
+        assert!(q.advance_used(1).is_ok());
+    }
+
+    /// Partial advance (consuming fewer than submitted) is always OK.
+    #[test]
+    fn advance_used_partial() {
+        let mut q = GpuCmdQueue::new();
+        q.submit(0x1000, 64).unwrap();
+        q.submit(0x2000, 64).unwrap();
+        q.submit(0x3000, 64).unwrap();
+        // Device consumed only 2 of 3 submitted.
+        assert!(q.advance_used(2).is_ok());
+        assert_eq!(q.used_idx, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 4 — dispatch_transfer_to_host validation
+    // -----------------------------------------------------------------------
+
+    /// A rect that fits within the resource is accepted.
+    #[test]
+    fn transfer_valid_rect_accepted() {
+        let mut q = queue_with_resource();
+        let rect = GpuRect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 32,
+        };
+        let offset = 0u64;
+        let r = dispatch_transfer_to_host(&mut q, 0x1000, 1, rect, offset);
+        assert!(matches!(r, Ok(DispatchResult::Submitted { .. })));
+    }
+
+    /// A rect that exceeds the resource width is rejected.
+    #[test]
+    fn transfer_out_of_bounds_rect_rejected() {
+        let mut q = queue_with_resource();
+        // x=32, width=64 → x_end=96 > 64
+        let rect = GpuRect {
+            x: 32,
+            y: 0,
+            width: 64,
+            height: 32,
+        };
+        assert_eq!(
+            dispatch_transfer_to_host(&mut q, 0x1000, 1, rect, 0),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// An offset that pushes the transfer past the backing size is rejected.
+    #[test]
+    fn transfer_offset_overflow_rejected() {
+        let mut q = queue_with_resource();
+        let rect = GpuRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        // backing = 64*64*4 = 16384; offset=16384 + 1 rect-pixel = 16384+4 > 16384
+        let offset = 64 * 64 * 4; // exactly at the end → +4 bytes will exceed
+        assert_eq!(
+            dispatch_transfer_to_host(&mut q, 0x1000, 1, rect, offset),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// rect with overflow (x + width wraps u32) is rejected.
+    #[test]
+    fn transfer_rect_coordinate_overflow_rejected() {
+        let mut q = queue_with_resource();
+        let rect = GpuRect {
+            x: u32::MAX,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            dispatch_transfer_to_host(&mut q, 0x1000, 1, rect, 0),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// Unknown resource ID is rejected.
+    #[test]
+    fn transfer_unknown_resource_rejected() {
+        let mut q = GpuCmdQueue::new();
+        let rect = GpuRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            dispatch_transfer_to_host(&mut q, 0x1000, 99, rect, 0),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 5 — dispatch_resource_flush validation
+    // -----------------------------------------------------------------------
+
+    /// A flush rect within the resource is accepted.
+    #[test]
+    fn flush_valid_rect_accepted() {
+        let mut q = queue_with_resource();
+        let rect = GpuRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        let r = dispatch_resource_flush(&mut q, 0x1000, 1, rect);
+        assert!(matches!(r, Ok(DispatchResult::Submitted { .. })));
+    }
+
+    /// A flush rect that is partially out of bounds is rejected.
+    #[test]
+    fn flush_out_of_bounds_rect_rejected() {
+        let mut q = queue_with_resource();
+        let rect = GpuRect {
+            x: 1,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        assert_eq!(
+            dispatch_resource_flush(&mut q, 0x1000, 1, rect),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// Unknown resource ID is rejected.
+    #[test]
+    fn flush_unknown_resource_rejected() {
+        let mut q = GpuCmdQueue::new();
+        let rect = GpuRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            dispatch_resource_flush(&mut q, 0x1000, 99, rect),
+            Err(Error::InvalidArgument),
+        );
+    }
+
+    /// rect with wrapping coordinate (y + height overflows) is rejected.
+    #[test]
+    fn flush_rect_y_overflow_rejected() {
+        let mut q = queue_with_resource();
+        let rect = GpuRect {
+            x: 0,
+            y: u32::MAX,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            dispatch_resource_flush(&mut q, 0x1000, 1, rect),
+            Err(Error::InvalidArgument),
+        );
+    }
 }
