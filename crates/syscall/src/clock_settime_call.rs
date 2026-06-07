@@ -38,6 +38,43 @@ pub const CLOCK_PROCESS_CPUTIME_ID: u32 = 2;
 pub const CLOCK_THREAD_CPUTIME_ID: u32 = 3;
 
 // ---------------------------------------------------------------------------
+// Capability
+// ---------------------------------------------------------------------------
+
+/// Capability bit required to set a system clock.
+///
+/// Mirrors `oncrix-kernel`'s canonical `crate::capability::CAP_SYS_TIME`
+/// (value `25`). It is re-declared here because the `syscall` crate does not
+/// depend on `oncrix-kernel`; the dispatcher passes the caller's capability
+/// set so this layer can enforce the check. Do **not** change the value
+/// independently of the kernel definition.
+pub const CAP_SYS_TIME: u8 = 25;
+
+/// The caller's effective capability set, threaded from the dispatcher.
+///
+/// `bits` is a bitmask indexed by capability number (bit `n` set ⇒ the
+/// caller holds capability `n`). A default-constructed value holds **no**
+/// capabilities, so callers that have not yet wired real credentials
+/// fail closed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapabilitySet {
+    /// Bitmask of held capabilities (bit `n` ⇒ capability `n`).
+    pub bits: u64,
+}
+
+impl CapabilitySet {
+    /// Construct from a raw capability bitmask.
+    pub const fn from_bits(bits: u64) -> Self {
+        Self { bits }
+    }
+
+    /// Returns `true` if capability `cap` is held.
+    pub const fn has(&self, cap: u8) -> bool {
+        (self.bits & (1u64 << cap)) != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Timespec
 // ---------------------------------------------------------------------------
 
@@ -74,13 +111,25 @@ pub fn is_settable_clock(clockid: u32) -> bool {
 
 /// Handle `clock_settime(2)`.
 ///
+/// Setting any system clock is a privileged operation: the caller must hold
+/// `CAP_SYS_TIME`. The capability set is threaded from the dispatcher via
+/// `caps`; a caller with no credentials wired yet (default `CapabilitySet`)
+/// is denied, so the operation fails closed.
+///
 /// # Errors
 ///
+/// - [`Error::PermissionDenied`] — caller lacks `CAP_SYS_TIME`.
 /// - [`Error::InvalidArgument`] — unknown or non-settable `clockid`, null
 ///   `tp_ptr`, or `tv_nsec` out of range.
-/// - [`Error::PermissionDenied`] — caller lacks `CAP_SYS_TIME`.
 /// - [`Error::NotImplemented`] — stub.
-pub fn sys_clock_settime(clockid: u32, tp_ptr: u64) -> Result<i64> {
+pub fn sys_clock_settime(clockid: u32, tp_ptr: u64, caps: CapabilitySet) -> Result<i64> {
+    // SECURITY: fail closed. Setting a clock requires CAP_SYS_TIME; deny
+    // before touching any argument so an unprivileged caller cannot set the
+    // wall clock. The check is first so a missing capability is reported as
+    // PermissionDenied regardless of argument validity.
+    if !caps.has(CAP_SYS_TIME) {
+        return Err(Error::PermissionDenied);
+    }
     if !is_settable_clock(clockid) {
         return Err(Error::InvalidArgument);
     }
@@ -97,8 +146,12 @@ pub fn sys_clock_settime(clockid: u32, tp_ptr: u64) -> Result<i64> {
 }
 
 /// Entry point called from the syscall dispatcher.
-pub fn do_clock_settime_call(clockid: u32, tp_ptr: u64) -> Result<i64> {
-    sys_clock_settime(clockid, tp_ptr)
+///
+/// `caps` carries the calling task's effective capability set; the
+/// dispatcher is responsible for populating it from the current task's
+/// credentials before calling.
+pub fn do_clock_settime_call(clockid: u32, tp_ptr: u64, caps: CapabilitySet) -> Result<i64> {
+    sys_clock_settime(clockid, tp_ptr, caps)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,10 +162,15 @@ pub fn do_clock_settime_call(clockid: u32, tp_ptr: u64) -> Result<i64> {
 mod tests {
     use super::*;
 
+    /// A capability set holding only CAP_SYS_TIME.
+    fn caps_with_time() -> CapabilitySet {
+        CapabilitySet::from_bits(1u64 << CAP_SYS_TIME)
+    }
+
     #[test]
     fn monotonic_clock_not_settable() {
         assert_eq!(
-            sys_clock_settime(CLOCK_MONOTONIC, 0x1000).unwrap_err(),
+            sys_clock_settime(CLOCK_MONOTONIC, 0x1000, caps_with_time()).unwrap_err(),
             Error::InvalidArgument
         );
     }
@@ -120,9 +178,30 @@ mod tests {
     #[test]
     fn null_tp_rejected() {
         assert_eq!(
-            sys_clock_settime(CLOCK_REALTIME, 0).unwrap_err(),
+            sys_clock_settime(CLOCK_REALTIME, 0, caps_with_time()).unwrap_err(),
             Error::InvalidArgument
         );
+    }
+
+    #[test]
+    fn no_cap_sys_time_denied() {
+        // Fail closed: an empty capability set is rejected, and the denial
+        // takes priority over argument validity (settable clock + null ptr).
+        assert_eq!(
+            sys_clock_settime(CLOCK_REALTIME, 0, CapabilitySet::default()).unwrap_err(),
+            Error::PermissionDenied
+        );
+        assert_eq!(
+            sys_clock_settime(CLOCK_REALTIME, 0x1000, CapabilitySet::default()).unwrap_err(),
+            Error::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn cap_set_has_bit() {
+        let caps = caps_with_time();
+        assert!(caps.has(CAP_SYS_TIME));
+        assert!(!CapabilitySet::default().has(CAP_SYS_TIME));
     }
 
     #[test]

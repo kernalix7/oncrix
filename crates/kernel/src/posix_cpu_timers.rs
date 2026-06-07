@@ -518,9 +518,14 @@ impl PosixCpuTimerSubsystem {
     ) -> Result<()> {
         let idx = self.find_task(tid).ok_or(Error::NotFound)?;
         let task = &mut self.tasks[idx];
-        task.utime_ns += utime_delta_ns;
-        task.stime_ns += stime_delta_ns;
-        task.sum_exec_ns += utime_delta_ns + stime_delta_ns;
+        // CPU-time deltas accumulate without an upper bound; a raw `+=` would
+        // overflow-panic in ring 0 over a long-lived task. Saturate the
+        // accumulators (a saturated CPU clock simply pins at u64::MAX).
+        task.utime_ns = task.utime_ns.saturating_add(utime_delta_ns);
+        task.stime_ns = task.stime_ns.saturating_add(stime_delta_ns);
+        task.sum_exec_ns = task
+            .sum_exec_ns
+            .saturating_add(utime_delta_ns.saturating_add(stime_delta_ns));
         task.last_update_ns = self.now_ns;
 
         // Update process aggregate.
@@ -900,18 +905,21 @@ impl PosixCpuTimerSubsystem {
         let mut stime = 0u64;
         let mut count = 0u32;
 
+        // Sum per-thread CPU times into the process aggregate. With many
+        // threads each near-saturated, a raw `+=` could overflow-panic in
+        // ring 0; saturate every accumulation instead.
         for task in &self.tasks {
             if matches!(task.state, TaskCpuClockState::Active) && task.pid == pid {
-                utime += task.utime_ns;
-                stime += task.stime_ns;
-                count += 1;
+                utime = utime.saturating_add(task.utime_ns);
+                stime = stime.saturating_add(task.stime_ns);
+                count = count.saturating_add(1);
             }
         }
 
         let proc_info = &mut self.processes[proc_idx];
         proc_info.utime_ns = utime;
         proc_info.stime_ns = stime;
-        proc_info.sum_exec_ns = utime + stime;
+        proc_info.sum_exec_ns = utime.saturating_add(stime);
         proc_info.thread_count = count;
     }
 

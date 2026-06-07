@@ -54,6 +54,16 @@ const USECS_PER_SEC: u64 = 1_000_000;
 /// Nanoseconds per second.
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
+/// Upper bound (in seconds) for an itimer `tv_sec` field.
+///
+/// `setitimer` otherwise accepts any non-negative timeval, so a hostile
+/// caller could pass a `tv_sec` near `i64::MAX` whose `tv_sec * 1e9` would
+/// overflow the nanosecond conversion. Linux caps itimers at roughly
+/// `KTIME_SEC_MAX`; we bound `tv_sec` so the worst-case nanosecond product
+/// stays comfortably inside `i64` (≈292 years). Values above this are
+/// rejected with `InvalidArgument`.
+const MAX_ITIMER_SEC: i64 = 100_000_000_000;
+
 // ── itimer which constants ──────────────────────────────────
 
 /// ITIMER_REAL — wall-clock timer, delivers SIGALRM.
@@ -170,6 +180,21 @@ impl Itimerval {
     pub fn validate(&self) -> Result<()> {
         self.it_interval.validate()?;
         self.it_value.validate()
+    }
+
+    /// Validate both fields and clamp them to the supported upper bound.
+    ///
+    /// Used on the `setitimer` (arming) path. In addition to the range
+    /// checks in [`validate`](Self::validate), this rejects any `tv_sec`
+    /// above [`MAX_ITIMER_SEC`] so the later `tv_sec * NANOS_PER_SEC`
+    /// conversion cannot overflow `i64` (which would panic in ring 0 under
+    /// overflow checks).
+    pub fn validate_bounded(&self) -> Result<()> {
+        self.validate()?;
+        if self.it_interval.tv_sec > MAX_ITIMER_SEC || self.it_value.tv_sec > MAX_ITIMER_SEC {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
     }
 }
 
@@ -416,7 +441,11 @@ impl ItimerManager {
         new_value: &Itimerval,
         now_ns: i64,
     ) -> Result<Itimerval> {
-        new_value.validate()?;
+        // Bound-check on the arming path: an unbounded `it_interval` /
+        // `it_value` would let `to_nanos()` feed the saturating tick re-arm
+        // pathological inputs and (without the cap) overflow the nanosecond
+        // conversion. Reject out-of-range timevals up front.
+        new_value.validate_bounded()?;
         self.stats.set_count += 1;
 
         let pos = self.ensure_slot(pid)?;
@@ -522,11 +551,19 @@ impl ItimerManager {
                 count += 1;
             }
 
-            // Re-arm or disarm.
+            // Re-arm or disarm. `expiry_ns` and `interval_ns` derive from an
+            // attacker-controlled `it_interval` (setitimer accepts any in-range
+            // timeval), so a raw `-`/`/`/`+`/`*` here would overflow-panic in
+            // ring 0 (kernel halt) on a periodic tick. Use saturating math
+            // throughout, mirroring `posix_timer.rs::tick`. `interval_ns > 0`
+            // is guaranteed by the branch guard, so the divide is safe.
             if proc_state.real.interval_ns > 0 {
-                let elapsed = now_ns - proc_state.real.expiry_ns;
-                let periods = (elapsed / proc_state.real.interval_ns) + 1;
-                proc_state.real.expiry_ns += periods * proc_state.real.interval_ns;
+                let elapsed = now_ns.saturating_sub(proc_state.real.expiry_ns);
+                let periods = (elapsed / proc_state.real.interval_ns).saturating_add(1);
+                proc_state.real.expiry_ns = proc_state
+                    .real
+                    .expiry_ns
+                    .saturating_add(periods.saturating_mul(proc_state.real.interval_ns));
             } else {
                 proc_state.real.armed = false;
             }
@@ -575,11 +612,18 @@ impl ItimerManager {
                     count += 1;
                 }
 
+                // Saturating re-arm: `interval_ns` comes from an
+                // attacker-controlled `it_interval`, so raw i64 math would
+                // overflow-panic in ring 0 on a periodic tick. Divide is safe
+                // under the `interval_ns > 0` branch guard.
                 if proc_state.virtual_timer.interval_ns > 0 {
-                    let elapsed = now - proc_state.virtual_timer.expiry_ns;
-                    let periods = (elapsed / proc_state.virtual_timer.interval_ns) + 1;
-                    proc_state.virtual_timer.expiry_ns +=
-                        periods * proc_state.virtual_timer.interval_ns;
+                    let interval = proc_state.virtual_timer.interval_ns;
+                    let elapsed = now.saturating_sub(proc_state.virtual_timer.expiry_ns);
+                    let periods = (elapsed / interval).saturating_add(1);
+                    proc_state.virtual_timer.expiry_ns = proc_state
+                        .virtual_timer
+                        .expiry_ns
+                        .saturating_add(periods.saturating_mul(interval));
                 } else {
                     proc_state.virtual_timer.armed = false;
                 }
@@ -602,10 +646,18 @@ impl ItimerManager {
                     count += 1;
                 }
 
+                // Saturating re-arm: `interval_ns` comes from an
+                // attacker-controlled `it_interval`, so raw i64 math would
+                // overflow-panic in ring 0 on a periodic tick. Divide is safe
+                // under the `interval_ns > 0` branch guard.
                 if proc_state.prof.interval_ns > 0 {
-                    let elapsed = now - proc_state.prof.expiry_ns;
-                    let periods = (elapsed / proc_state.prof.interval_ns) + 1;
-                    proc_state.prof.expiry_ns += periods * proc_state.prof.interval_ns;
+                    let interval = proc_state.prof.interval_ns;
+                    let elapsed = now.saturating_sub(proc_state.prof.expiry_ns);
+                    let periods = (elapsed / interval).saturating_add(1);
+                    proc_state.prof.expiry_ns = proc_state
+                        .prof
+                        .expiry_ns
+                        .saturating_add(periods.saturating_mul(interval));
                 } else {
                     proc_state.prof.armed = false;
                 }
