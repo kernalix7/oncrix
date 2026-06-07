@@ -10,6 +10,40 @@
 
 use oncrix_lib::{Error, Result};
 
+// ── Block size ───────────────────────────────────────────────────────────────
+
+/// F2FS block size in bytes (always 4096).
+pub const BLOCK_SIZE: usize = 4096;
+
+// ── CRC32 (zlib / ISO 3309, reflected poly 0xEDB88320) ──────────────────────
+
+/// Software CRC32 using the zlib / ISO 3309 polynomial (reflected bit order).
+///
+/// F2FS uses standard zlib CRC32 (same poly as cramfs) to protect checkpoint
+/// blocks.  The reflected polynomial 0xEDB8_8320 matches the Linux F2FS
+/// implementation (`f2fs_crc32`).
+///
+/// # SECURITY
+///
+/// Do NOT substitute crc32c (Castagnoli) or any weaker hash — the checkpoint
+/// integrity check would become forgeable by an attacker supplying a crafted
+/// filesystem image.
+fn crc32_zlib(data: &[u8]) -> u32 {
+    const POLY: u32 = 0xEDB8_8320;
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 /// F2FS magic number in the super block.
 pub const F2FS_MAGIC: u32 = 0xF2F5_2010;
 
@@ -366,6 +400,119 @@ impl Default for RecoveryContext {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Verify the integrity of a raw F2FS checkpoint block before parsing.
+///
+/// This function MUST be called on the raw on-disk bytes of a checkpoint block
+/// before the block is trusted.  It performs three security checks:
+///
+/// 1. **checksum_offset bounds** — the 4-byte CRC stored at `checksum_offset`
+///    must fit within the block.
+/// 2. **CRC32 verification** — the CRC32 (zlib) over the first `checksum_offset`
+///    bytes must equal the stored 4-byte CRC.
+/// 3. **bitmap bytesize** — `sit_ver_bitmap_bytesize` and
+///    `nat_ver_bitmap_bytesize` must not exceed the total bytes available in
+///    the checkpoint pack (`cp_pack_total_block_count * BLOCK_SIZE`).
+///
+/// # SECURITY
+///
+/// A mounted filesystem image is fully attacker-controlled.  Accepting a
+/// checkpoint without CRC verification means a forged checkpoint is fully
+/// trusted, allowing arbitrary file-system state to be injected at mount time.
+/// An oversized bitmap bytesize can cause an out-of-bounds slice index.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if the block is shorter than
+/// `BLOCK_SIZE`, `checksum_offset` is out of range, the CRC does not match,
+/// or either bitmap size exceeds the pack capacity.
+pub fn verify_raw_checkpoint(block: &[u8]) -> Result<()> {
+    // The checkpoint block must be exactly one F2FS block.
+    if block.len() < BLOCK_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Parse the on-disk fields we need.  All fields are little-endian u32 at
+    // fixed offsets derived from the RawCheckpoint layout:
+    //
+    //   offset   field
+    //   ──────   ──────────────────────────────
+    //    0.. 7   checkpoint_ver (u64)
+    //    8..15   user_block_count (u64)
+    //   16..23   valid_block_count (u64)
+    //   24..27   rsvd_segment_count (u32)
+    //   28..31   overprov_segment_count (u32)
+    //   32..35   free_segment_count (u32)
+    //   36..67   cur_data_segno [8×u32]
+    //   68..83   cur_data_blkoff [8×u16]
+    //   84..115  cur_node_segno [8×u32]
+    //  116..131  cur_node_blkoff [8×u16]
+    //  132..135  nat_upd_block_count (u32)
+    //  136..139  nat_bits_version (u32)
+    //  140..143  sit_nat_journaling (u32)
+    //  144..147  cp_pack_total_block_count (u32)
+    //  148..151  cp_pack_start_sum (u32)
+    //  152..155  valid_node_count (u32)
+    //  156..159  valid_inode_count (u32)
+    //  160..163  next_free_nid (u32)
+    //  164..167  sit_ver_bitmap_bytesize (u32)
+    //  168..171  nat_ver_bitmap_bytesize (u32)
+    //  172..175  checksum_offset (u32)
+    //  176..183  elapsed_time (u64)
+    //  184..187  ckpt_flags (u32)
+    //  188..191  cp_pack_bitmap (u32)
+    //  192..199  reserved [8]
+
+    /// Read a little-endian u32 from `buf` at `off`.
+    #[inline(always)]
+    fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    }
+
+    // SECURITY [Fix 3 — OOB]: bound-check checksum_offset before any use.
+    // The stored value is a byte offset; the 4-byte CRC must fit in the block.
+    let checksum_offset = read_u32_le(block, 172) as usize;
+    if checksum_offset
+        .checked_add(4)
+        .ok_or(Error::InvalidArgument)?
+        > BLOCK_SIZE
+    {
+        // SECURITY: reject — checksum_offset points outside the block.
+        return Err(Error::InvalidArgument);
+    }
+
+    // SECURITY [Fix 2 — CRC]: compute CRC32 over block[0..checksum_offset]
+    // and compare to the stored 4-byte value at block[checksum_offset..+4].
+    let computed_crc = crc32_zlib(&block[..checksum_offset]);
+    let stored_crc = read_u32_le(block, checksum_offset);
+    if computed_crc != stored_crc {
+        // SECURITY: reject — checkpoint CRC mismatch; block is corrupt or forged.
+        return Err(Error::InvalidArgument);
+    }
+
+    // SECURITY [Fix 4 — bitmap sizes]: validate sit/nat bitmap bytesizes.
+    // Both values are attacker-controlled on-disk counts.  They must not
+    // exceed the total bytes in the checkpoint pack.
+    let cp_pack_total = read_u32_le(block, 144);
+    // SECURITY: use checked_mul to guard against overflow on the total capacity.
+    let max_bitmap_bytes = (cp_pack_total as usize)
+        .checked_mul(BLOCK_SIZE)
+        .ok_or(Error::InvalidArgument)?;
+
+    let sit_bitmap_bytes = read_u32_le(block, 164) as usize;
+    let nat_bitmap_bytes = read_u32_le(block, 168) as usize;
+
+    if sit_bitmap_bytes > max_bitmap_bytes {
+        // SECURITY: reject — sit_ver_bitmap_bytesize exceeds pack capacity.
+        return Err(Error::InvalidArgument);
+    }
+    if nat_bitmap_bytes > max_bitmap_bytes {
+        // SECURITY: reject — nat_ver_bitmap_bytesize exceeds pack capacity.
+        return Err(Error::InvalidArgument);
+    }
+
+    Ok(())
 }
 
 /// Select the more recent valid checkpoint from two candidates.

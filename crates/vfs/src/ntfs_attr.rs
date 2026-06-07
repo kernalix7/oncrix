@@ -246,6 +246,13 @@ pub struct DataRun {
     pub start_lcn: i64,
 }
 
+/// Maximum number of run-list segments accepted from a single on-disk attribute.
+///
+/// Caps heap growth and prevents DoS from a crafted run list with millions of entries.
+// SECURITY: attacker-controlled buf can encode arbitrarily many run headers; bound
+// the Vec before every push so a malicious image cannot exhaust kernel heap.
+const MAX_RUN_SEGMENTS: usize = 4096;
+
 /// Decode the NTFS run-list encoding from `buf` into a `Vec<DataRun>`.
 ///
 /// NTFS encodes runs as: `[nibble: len_of_len | nibble: len_of_offset] [length bytes] [offset bytes]`
@@ -262,34 +269,75 @@ pub fn decode_run_list(buf: &[u8]) -> Result<Vec<DataRun>> {
         }
         let len_size = (byte & 0x0F) as usize;
         let off_size = ((byte >> 4) & 0x0F) as usize;
-        if len_size == 0 || pos + len_size + off_size > buf.len() {
+
+        // SECURITY: each nibble is 0-15 but shifting by n*8 bits into a 64-bit
+        // integer is only defined for n in [0, 7].  Reject len_size == 0 (a real
+        // run must encode at least one length byte) and anything > 8 for either
+        // field to prevent an undefined shift of >= 64 bits — which with
+        // overflow-checks ON panics in ring 0 (machine halt).  Mirror ntfs.rs ~477.
+        if len_size == 0 || len_size > 8 || off_size > 8 {
             return Err(Error::InvalidArgument);
         }
+
+        // Guard bounds before any indexing — checked_add prevents wrap on huge values.
+        let total = len_size
+            .checked_add(off_size)
+            .ok_or(Error::InvalidArgument)?;
+        if pos.checked_add(total).ok_or(Error::InvalidArgument)? > buf.len() {
+            return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: cap run count before pushing to bound heap growth; a crafted
+        // image could otherwise encode 2^32 run headers and exhaust kernel memory.
+        if runs.len() >= MAX_RUN_SEGMENTS {
+            return Err(Error::InvalidArgument);
+        }
+
         // Read cluster count (unsigned, little-endian).
+        // i < len_size <= 8, so i*8 <= 56: shift is always in range.
         let mut cluster_count: u64 = 0;
         for i in 0..len_size {
             cluster_count |= (buf[pos + i] as u64) << (i * 8);
         }
         pos += len_size;
+
         // Read LCN delta (signed, little-endian).
+        // i < off_size <= 8, so i*8 <= 56: shift is always in range.
         let mut delta: i64 = 0;
         if off_size > 0 {
             let mut raw: i64 = 0;
             for i in 0..off_size {
                 raw |= (buf[pos + i] as i64) << (i * 8);
             }
-            // Sign-extend.
-            let sign_bit = (off_size * 8) - 1;
-            if raw & (1i64 << sign_bit) != 0 {
+            // Sign-extend: when off_size < 8 propagate the sign bit of the
+            // most-significant byte into the upper bits of raw.  When off_size == 8
+            // all 64 bits are occupied; the shift 8*8 == 64 would be out-of-range,
+            // so skip the extension (the value is already fully represented).
+            if off_size < 8 && (buf[pos + off_size - 1] & 0x80) != 0 {
+                // off_size in [1,7] => 8*off_size in [8,56]: shift is in range.
                 raw |= !((1i64 << (off_size * 8)) - 1);
             }
             delta = raw;
         }
         pos += off_size;
-        prev_lcn = prev_lcn.wrapping_add(delta);
+
+        // SECURITY: use checked_add so an attacker cannot craft a delta that wraps
+        // prev_lcn to an arbitrary LCN and bypasses later bounds checks.
+        // off_size == 0 means a sparse run; its LCN is conventionally 0 (no delta).
+        let start_lcn = if off_size == 0 {
+            0i64 // sparse run — no on-disk LCN
+        } else {
+            prev_lcn = prev_lcn.checked_add(delta).ok_or(Error::InvalidArgument)?;
+            // SECURITY: a negative absolute LCN is never valid on a real volume.
+            if prev_lcn < 0 {
+                return Err(Error::InvalidArgument);
+            }
+            prev_lcn
+        };
+
         runs.push(DataRun {
             cluster_count,
-            start_lcn: prev_lcn,
+            start_lcn,
         });
     }
     Ok(runs)

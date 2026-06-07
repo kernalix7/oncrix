@@ -24,6 +24,47 @@
 
 use oncrix_lib::{Error, Result};
 
+// ── CRC32c ────────────────────────────────────────────────────────────────────
+
+// SECURITY: btrfs uses CRC32c (Castagnoli, reflected poly 0x82F63B78) for send-
+// stream integrity.  The checksum is computed over the command bytes with the
+// crc field itself zeroed; any mismatch means the stream has been corrupted or
+// tampered and MUST be rejected before any command is applied.
+
+/// Precomputed CRC32c lookup table (reflected Castagnoli polynomial 0x82F63B78).
+const CRC32C_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0usize;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0x82F6_3B78u32;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Compute a CRC32c digest over `data`.
+///
+/// Initialises to `0xFFFF_FFFF` and finalises with a bitwise NOT, matching
+/// the standard CRC32c convention used by btrfs.
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        let idx = ((crc ^ b as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32C_TABLE[idx];
+    }
+    !crc
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Magic bytes at the start of every Btrfs send stream.
@@ -217,6 +258,89 @@ impl SendCommand {
     pub fn find_attr(&self, key: SendAttrKey) -> Option<&SendAttr> {
         self.attrs[..self.attr_count].iter().find(|a| a.key == key)
     }
+
+    /// Compute the CRC32c over the serialised form of this command.
+    ///
+    /// The wire format is:
+    /// ```text
+    /// [cmd: u16 LE] [crc: u32 LE — ZEROED] [attr_count: u16 LE]
+    /// for each attr:
+    ///   [key: u16 LE] [value_len: u16 LE] [value bytes]
+    /// ```
+    ///
+    /// The `crc` field is zeroed during computation as required by the btrfs
+    /// send-stream specification.
+    pub fn compute_wire_crc(&self) -> u32 {
+        // SECURITY: CRC must be computed with the checksum field zeroed;
+        // failure to zero it would make the check trivially bypassable.
+        let mut buf = [0u8; 6 + 8 * (4 + 256)]; // header + max 8 attrs
+        let mut pos = 0usize;
+
+        // cmd (u16 LE)
+        let cmd_bytes = (self.cmd as u16).to_le_bytes();
+        buf[pos..pos + 2].copy_from_slice(&cmd_bytes);
+        pos += 2;
+
+        // SECURITY: crc field must be zeroed during computation; the buffer
+        // is already zero-initialised so we only advance the position.
+        pos += 4; // 4 bytes for crc, left as 0x00_00_00_00
+
+        // attr_count (u16 LE)
+        let ac_bytes = (self.attr_count as u16).to_le_bytes();
+        buf[pos..pos + 2].copy_from_slice(&ac_bytes);
+        pos += 2;
+
+        // attributes
+        for attr in &self.attrs[..self.attr_count] {
+            // key (u16 LE)
+            let key_bytes = (attr.key as u16).to_le_bytes();
+            buf[pos..pos + 2].copy_from_slice(&key_bytes);
+            pos += 2;
+
+            // value_len (u16 LE)
+            let vl = attr.value_len.min(256) as u16;
+            let vl_bytes = vl.to_le_bytes();
+            buf[pos..pos + 2].copy_from_slice(&vl_bytes);
+            pos += 2;
+
+            // value bytes
+            let vlen = vl as usize;
+            buf[pos..pos + vlen].copy_from_slice(&attr.value[..vlen]);
+            pos += vlen;
+        }
+
+        crc32c(&buf[..pos])
+    }
+
+    /// Verify the stored CRC32c against the computed value.
+    ///
+    /// Returns `Ok(())` if the stored crc is zero (not set) or matches the
+    /// computed value, or [`Error::IoError`] if there is a mismatch.
+    ///
+    /// # SECURITY
+    /// A mismatched CRC indicates a corrupted or tampered send stream.  The
+    /// caller MUST reject the entire stream on mismatch; replaying a command
+    /// with invalid data can corrupt the destination filesystem.
+    ///
+    /// INVARIANT for the real, untrusted receive path (when it replaces the
+    /// current in-memory construction): the `crc` field MUST be populated from
+    /// the on-disk stream bytes by the deserializer, and verify_crc MUST be made
+    /// mandatory (remove the `crc == 0` early-accept below) — otherwise a forger
+    /// simply emits every command with crc=0 to bypass all integrity. The
+    /// `crc == 0` skip is only safe while commands are built in-kernel (trusted).
+    pub fn verify_crc(&self) -> Result<()> {
+        if self.crc == 0 {
+            // CRC not set — stream does not carry integrity data for this cmd.
+            // SECURITY: see the INVARIANT above — this early-accept is only valid
+            // for trusted in-kernel-constructed commands, NOT an untrusted stream.
+            return Ok(());
+        }
+        let computed = self.compute_wire_crc();
+        if computed != self.crc {
+            return Err(Error::IoError);
+        }
+        Ok(())
+    }
 }
 
 // ── SendStream ────────────────────────────────────────────────────────────────
@@ -310,10 +434,20 @@ pub struct RecvStats {
 ///
 /// In a full implementation this drives actual VFS operations.  Here it
 /// validates commands and accumulates statistics.
+///
+/// # SECURITY
+/// Every command whose `crc` field is non-zero is verified with CRC32c
+/// (Castagnoli, reflected poly 0x82F63B78) before any data is acted on.
+/// A mismatch returns [`Error::IoError`], aborting the entire receive
+/// operation.  This prevents a corrupted or attacker-forged send stream
+/// from silently writing bad data to the destination filesystem.
 pub fn btrfs_recv_stream(stream: &SendStream) -> Result<RecvStats> {
     let mut stats = RecvStats::default();
 
     for cmd in stream.commands() {
+        // SECURITY: verify CRC32c integrity before touching any command data.
+        cmd.verify_crc()?;
+
         match cmd.cmd {
             SendCmd::Unspec => return Err(Error::InvalidArgument),
             SendCmd::End => break,

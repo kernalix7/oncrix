@@ -73,6 +73,8 @@ pub struct Fat32BootSector {
     pub root_cluster: u32,
     /// Total sectors in the volume.
     pub total_sectors: u32,
+    /// Total data clusters on the volume (used to bound chain traversal).
+    pub total_clusters: u32,
 }
 
 impl Fat32BootSector {
@@ -89,22 +91,45 @@ impl Fat32BootSector {
     }
 
     /// Returns the byte size of one cluster.
-    pub fn cluster_size_bytes(&self) -> u64 {
-        (self.sectors_per_cluster as u64) * (self.bytes_per_sector as u64)
+    ///
+    /// Returns `Err(InvalidArgument)` if either field is zero; a zero cluster
+    /// size would silently produce wrong offsets and would be used as a divisor
+    /// in `cluster_for_offset`, causing a ring-0 divide-by-zero panic.
+    // SECURITY: reject attacker-supplied zero fields before any arithmetic.
+    pub fn cluster_size_bytes(&self) -> Result<u64> {
+        if self.bytes_per_sector == 0 || self.sectors_per_cluster == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((self.sectors_per_cluster as u64) * (self.bytes_per_sector as u64))
     }
 
     /// Returns the byte offset of cluster `clus` in the volume.
+    // SECURITY: reject zero divisors before arithmetic; validate cluster range.
     pub fn cluster_to_byte(&self, clus: u32) -> Result<u64> {
+        // SECURITY: bytes_per_sector==0 or sectors_per_cluster==0 => div0 / wrong offset.
+        if self.bytes_per_sector == 0 || self.sectors_per_cluster == 0 {
+            return Err(Error::InvalidArgument);
+        }
         if !fat32_is_next(clus) {
             return Err(Error::InvalidArgument);
         }
-        let rel = (clus as u64 - 2) * self.cluster_size_bytes();
+        let cluster_size = self.cluster_size_bytes()?;
+        let rel = (clus as u64 - 2)
+            .checked_mul(cluster_size)
+            .ok_or(Error::InvalidArgument)?;
         Ok(self.data_start_byte() + rel)
     }
 
     /// Returns the byte offset of the FAT entry for `clus`.
-    pub fn fat_entry_byte(&self, clus: u32) -> u64 {
-        self.fat_start_byte() + (clus as u64) * 4
+    ///
+    /// Returns `Err(InvalidArgument)` if `clus` is not a valid data cluster
+    /// pointer; out-of-range values could produce unbounded FAT offsets.
+    // SECURITY: validate cluster before computing FAT byte offset.
+    pub fn fat_entry_byte(&self, clus: u32) -> Result<u64> {
+        if !fat32_is_next(clus) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(self.fat_start_byte() + (clus as u64) * 4)
     }
 }
 
@@ -162,6 +187,7 @@ impl Fat32Chain {
     /// Returns the cluster for the logical byte offset `byte_off`.
     ///
     /// `cluster_size` is the number of bytes per cluster.
+    // SECURITY: guard zero-divisor; cluster_size must be validated by caller.
     pub fn cluster_for_offset(&self, byte_off: u64, cluster_size: u64) -> Option<u32> {
         if cluster_size == 0 {
             return None;
@@ -189,18 +215,33 @@ impl Fat32Chain {
 /// Reads a FAT32 cluster chain from a raw FAT buffer.
 ///
 /// `fat_data` is the entire FAT region. `start_cluster` is the first cluster.
+/// `total_clusters` is the on-disk cluster count; the traversal is bounded to
+/// at most `total_clusters` steps so that a cyclic FAT chain cannot loop
+/// forever or overflow the fixed-size [`Fat32Chain`] buffer.
+///
 /// Returns the chain, stopping at EOC or bad-cluster.
-pub fn read_chain(fat_data: &[u8], start_cluster: u32) -> Result<Fat32Chain> {
+// SECURITY: `total_clusters` bounds traversal against cyclic FAT chains that
+// would otherwise loop forever or overflow the fixed chain buffer.
+pub fn read_chain(fat_data: &[u8], start_cluster: u32, total_clusters: u32) -> Result<Fat32Chain> {
     let mut chain = Fat32Chain::new();
     let mut current = start_cluster;
+    // SECURITY: bound iterations to total_clusters; any legitimate chain is
+    // shorter than the total number of clusters on the volume.
+    let max_steps = total_clusters.max(1) as usize;
 
-    loop {
+    let mut terminated = false;
+    for _ in 0..max_steps {
         if !fat32_is_next(current) {
             return Err(Error::InvalidArgument);
         }
         chain.push(current)?;
 
-        let off = (current as usize) * 4;
+        // SECURITY: use checked_mul to prevent (current as usize)*4 overflow
+        // on attacker-supplied large cluster values (e.g. 0x3FFF_FFFF * 4
+        // wraps to 0xFFFF_FFFC on 32-bit and silently reads wrong bytes).
+        let off = (current as usize)
+            .checked_mul(4)
+            .ok_or(Error::InvalidArgument)?;
         if off + 4 > fat_data.len() {
             return Err(Error::IoError);
         }
@@ -212,12 +253,19 @@ pub fn read_chain(fat_data: &[u8], start_cluster: u32) -> Result<Fat32Chain> {
         ]) & FAT32_ENTRY_MASK;
 
         if fat32_is_eoc(next_raw) {
+            terminated = true;
             break;
         }
         if !fat32_is_next(next_raw) {
             return Err(Error::IoError);
         }
         current = next_raw;
+    }
+    // SECURITY: if the loop exhausted max_steps without hitting EOC the chain is
+    // cyclic (or corrupt) — return an error rather than a partial/looped chain so
+    // a caller does not assemble file data from repeated clusters.
+    if !terminated {
+        return Err(Error::IoError);
     }
     Ok(chain)
 }

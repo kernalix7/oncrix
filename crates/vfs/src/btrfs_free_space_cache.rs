@@ -57,9 +57,26 @@ pub struct FreeSpaceExtent {
 }
 
 impl FreeSpaceExtent {
+    /// Returns the exclusive end of the extent, or `None` on overflow.
+    ///
+    /// # SECURITY
+    /// On-disk `start` and `len` are attacker-controlled; bare `start + len`
+    /// would panic with overflow-checks ON.  Always use this method or
+    /// `checked_end()` when deriving an upper bound from on-disk values.
+    pub fn checked_end(&self) -> Option<u64> {
+        self.start.checked_add(self.len)
+    }
+
     /// Returns the exclusive end of the extent.
-    pub const fn end(&self) -> u64 {
-        self.start + self.len
+    ///
+    /// Only valid when both `start` and `len` are known-safe (i.e. already
+    /// validated at parse time).  Internal callers that originate from
+    /// trusted in-memory state may use this; paths that touch on-disk values
+    /// must use [`checked_end`](Self::checked_end) instead.
+    pub fn end(&self) -> u64 {
+        // SECURITY: saturate rather than panic; callers that receive
+        // u64::MAX as an end will simply fail the subsequent range checks.
+        self.start.saturating_add(self.len)
     }
 }
 
@@ -158,9 +175,13 @@ pub struct FreeSpaceCluster {
 
 impl FreeSpaceCluster {
     /// Returns the number of blocks remaining in the cluster.
-    pub const fn remaining(&self) -> u64 {
-        if self.cursor < self.start + self.len {
-            self.start + self.len - self.cursor
+    pub fn remaining(&self) -> u64 {
+        // SECURITY: `start + len` could overflow on attacker-supplied values;
+        // use saturating_add so the result is u64::MAX (> any cursor) rather
+        // than wrapping to a small value that would falsely show free space.
+        let end = self.start.saturating_add(self.len);
+        if self.cursor < end {
+            end - self.cursor
         } else {
             0
         }
@@ -175,7 +196,12 @@ impl FreeSpaceCluster {
             return Err(Error::WouldBlock);
         }
         let start = self.cursor;
-        self.cursor += count;
+        // SECURITY: cursor += count could overflow; checked_add guards the
+        // monotone advance so we do not wrap back to a lower address.
+        self.cursor = self
+            .cursor
+            .checked_add(count)
+            .ok_or(Error::InvalidArgument)?;
         Ok(start)
     }
 }
@@ -262,6 +288,10 @@ impl BlockGroupFreeSpace {
         if len == 0 {
             return Ok(());
         }
+        // SECURITY: validate that [start, start+len) does not wrap around the
+        // u64 address space before touching any on-disk-derived arithmetic.
+        let new_end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
+
         // Try to merge with an existing extent.
         for i in 0..self.extent_count {
             let e = &mut self.extents[i];
@@ -269,15 +299,18 @@ impl BlockGroupFreeSpace {
                 continue;
             }
             if e.end() == start {
-                e.len += len;
-                self.free_total += len;
+                // SECURITY: e.len += len could overflow; use checked_add.
+                e.len = e.len.checked_add(len).ok_or(Error::InvalidArgument)?;
+                self.free_total = self.free_total.saturating_add(len);
                 self.generation += 1;
                 return Ok(());
             }
-            if start + len == e.start {
+            // SECURITY: `start + len` was already validated as `new_end` above.
+            if new_end == e.start {
                 e.start = start;
-                e.len += len;
-                self.free_total += len;
+                // SECURITY: e.len += len could overflow; use checked_add.
+                e.len = e.len.checked_add(len).ok_or(Error::InvalidArgument)?;
+                self.free_total = self.free_total.saturating_add(len);
                 self.generation += 1;
                 return Ok(());
             }
@@ -292,7 +325,7 @@ impl BlockGroupFreeSpace {
             active: true,
         };
         self.extent_count += 1;
-        self.free_total += len;
+        self.free_total = self.free_total.saturating_add(len);
         self.generation += 1;
         self.sort_extents();
         Ok(())
@@ -306,7 +339,9 @@ impl BlockGroupFreeSpace {
         if len == 0 {
             return Ok(());
         }
-        let end = start + len;
+        // SECURITY: validate removal range does not wrap the address space.
+        let end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
+
         let pos = self.extents[..self.extent_count]
             .iter()
             .position(|e| e.active && e.start <= start && e.end() >= end)
@@ -314,11 +349,15 @@ impl BlockGroupFreeSpace {
 
         let e_start = self.extents[pos].start;
         let e_len = self.extents[pos].len;
-        let e_end = e_start + e_len;
+        // SECURITY: e_end uses saturating_add; because this extent was found
+        // by the position() predicate above (e.end() >= end), e_end >= end is
+        // already guaranteed; saturation cannot produce a false equality.
+        let e_end = e_start.saturating_add(e_len);
 
-        self.free_total = self.free_total.saturating_sub(len);
-        self.generation += 1;
-
+        // SECURITY: the free_total / generation update is deferred to AFTER the
+        // branch logic so the split-path OutOfMemory early-return below cannot
+        // leave the cache in an inconsistent state (free_total decremented while
+        // the extent was not actually removed).
         if e_start == start && e_end == end {
             // Exact match — remove entry.
             self.extents[pos] = self.extents[self.extent_count - 1];
@@ -326,19 +365,25 @@ impl BlockGroupFreeSpace {
             self.extent_count -= 1;
         } else if e_start == start {
             // Trim from left.
-            self.extents[pos].start += len;
-            self.extents[pos].len -= len;
+            // SECURITY: start + len == end was checked above; len <= e_len
+            // because the extent covers [start, end); so this sub is safe.
+            self.extents[pos].start = end;
+            self.extents[pos].len = e_len.saturating_sub(len);
         } else if e_end == end {
             // Trim from right.
-            self.extents[pos].len -= len;
+            // SECURITY: start > e_start (else the first branch would fire);
+            // len <= e_len because the extent covers the removal range.
+            self.extents[pos].len = e_len.saturating_sub(len);
         } else {
             // Split.
             if self.extent_count >= MAX_EXTENT_ENTRIES {
                 return Err(Error::OutOfMemory);
             }
             let right_start = end;
-            let right_len = e_end - end;
-            self.extents[pos].len = start - e_start;
+            // SECURITY: e_end >= end (proven by find predicate); subtraction safe.
+            let right_len = e_end.saturating_sub(end);
+            // SECURITY: start >= e_start (proven by find predicate); safe.
+            self.extents[pos].len = start.saturating_sub(e_start);
             self.extents[self.extent_count] = FreeSpaceExtent {
                 start: right_start,
                 len: right_len,
@@ -346,6 +391,9 @@ impl BlockGroupFreeSpace {
             };
             self.extent_count += 1;
         }
+        // Apply the accounting update only after a branch succeeded.
+        self.free_total = self.free_total.saturating_sub(len);
+        self.generation = self.generation.saturating_add(1);
         Ok(())
     }
 
@@ -353,13 +401,36 @@ impl BlockGroupFreeSpace {
 
     /// Adds free space in the bitmap layer for the range `[start, start+len)`.
     pub fn add_free_bitmap(&mut self, start: u64, len: u64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        // SECURITY: validate the range does not wrap the address space.
+        let _end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
+
         let bm_start = start & !(BITMAP_BITS as u64 - 1);
         let bm_idx = self.find_or_create_bitmap(bm_start)?;
-        let offset = (start - self.bitmaps[bm_idx].start) as usize;
-        for i in 0..(len as usize).min(BITMAP_BITS - offset) {
+
+        // SECURITY: `start - bm_start` could underflow if bm_start > start
+        // (which should not happen given the alignment mask above, but
+        // attacker-controlled `start` could set high bits that make bm_start
+        // equal to start while len positions bm_start after start via some
+        // arithmetic quirk).  Use checked_sub to be safe.
+        let offset = start
+            .checked_sub(self.bitmaps[bm_idx].start)
+            .ok_or(Error::InvalidArgument)? as usize;
+
+        // SECURITY: bound offset against the actual bitmap size so an
+        // attacker cannot drive `BITMAP_BITS - offset` to wrap below zero.
+        if offset >= BITMAP_BITS {
+            return Err(Error::InvalidArgument);
+        }
+        let mark_count = (len as usize).min(BITMAP_BITS - offset);
+        for i in 0..mark_count {
             self.bitmaps[bm_idx].mark_free(offset + i);
         }
-        self.free_total += len;
+        // SECURITY: use saturating_add; free_total is a monotone counter and
+        // saturation at u64::MAX is safe (allocation will simply fail).
+        self.free_total = self.free_total.saturating_add(len);
         self.generation += 1;
         Ok(())
     }
@@ -374,7 +445,13 @@ impl BlockGroupFreeSpace {
                 continue;
             }
             if let Some(offset) = self.bitmaps[i].find_run(count) {
-                let start = self.bitmaps[i].start + offset as u64;
+                // SECURITY: bitmap.start + offset could overflow for a
+                // crafted on-disk start value; checked_add prevents a silent
+                // wrap that would return a block address aliasing offset 0.
+                let start = self.bitmaps[i]
+                    .start
+                    .checked_add(offset as u64)
+                    .ok_or(Error::InvalidArgument)?;
                 for j in 0..count {
                     self.bitmaps[i].mark_alloc(offset + j);
                 }

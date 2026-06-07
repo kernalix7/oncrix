@@ -278,7 +278,14 @@ impl FatTable {
     }
 
     /// Count the number of free clusters.
+    // SECURITY: if total_clusters < FAT_FIRST_DATA_CLUSTER (2), the slice
+    // start > end which panics (inverted-slice, ring-0 halt).  Guard before
+    // indexing — an attacker image with total_sectors < data_start yields
+    // cluster_count == 0, so total_clusters could be 0 or 1 here.
     pub fn free_cluster_count(&self) -> u32 {
+        if self.total_clusters <= FAT_FIRST_DATA_CLUSTER {
+            return 0;
+        }
         self.entries[FAT_FIRST_DATA_CLUSTER as usize..self.total_clusters as usize]
             .iter()
             .filter(|&&e| e & FAT32_MASK == FAT32_FREE)
