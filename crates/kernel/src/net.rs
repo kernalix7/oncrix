@@ -129,6 +129,12 @@ const ARP_HTYPE_ETHERNET: u16 = 1;
 /// Protocol type for IPv4 in ARP.
 const ARP_PTYPE_IPV4: u16 = 0x0800;
 
+/// Hardware address length for Ethernet in ARP (6 bytes).
+const ARP_HLEN_ETHERNET: u8 = 6;
+
+/// Protocol address length for IPv4 in ARP (4 bytes).
+const ARP_PLEN_IPV4: u8 = 4;
+
 /// ARP packet for IPv4-over-Ethernet.
 ///
 /// Fields are stored in host byte order after parsing; serialisation
@@ -694,9 +700,9 @@ impl NetworkStack {
 
     /// Handle an incoming ARP packet.
     ///
-    /// For ARP requests targeting our IP, sends a reply.  For ARP
-    /// replies, updates the ARP table.  Returns the reply frame
-    /// length, or 0 if no reply is needed.
+    /// For ARP requests targeting our IP, sends a reply.  Cache
+    /// learning follows the RFC 826 merge-flag rule (see below).
+    /// Returns the reply frame length, or 0 if no reply is needed.
     fn handle_arp(
         &mut self,
         eth: &EtherHeader,
@@ -705,8 +711,39 @@ impl NetworkStack {
     ) -> Result<usize> {
         let arp = parse_arp(payload)?;
 
-        // Learn the sender's MAC regardless of operation.
-        self.arp_table.insert(arp.spa, arp.sha);
+        // SECURITY (F3): reject anything that is not IPv4-over-Ethernet
+        // before trusting the fixed 28-byte layout. A frame with a
+        // different htype/ptype/hlen/plen is not addressed by this
+        // handler's address model and must be dropped, not parsed as if
+        // the 4-byte `spa`/`tpa` and 6-byte `sha`/`tha` offsets applied.
+        if arp.htype != ARP_HTYPE_ETHERNET
+            || arp.ptype != ARP_PTYPE_IPV4
+            || arp.hlen != ARP_HLEN_ETHERNET
+            || arp.plen != ARP_PLEN_IPV4
+        {
+            return Ok(0);
+        }
+
+        // SECURITY (F1): ARP cache poisoning prevention per RFC 826
+        // merge-flag semantics. An unsolicited ARP from any on-link host
+        // must NOT be allowed to create or hijack a mapping (e.g. the
+        // gateway), which would enable MITM. The rule is:
+        //   - If we already have an entry for `arp.spa`, refresh its MAC
+        //     (this is the legitimate "merge" update; `insert` updates
+        //     in place when the IP is already present).
+        //   - Otherwise, only create a NEW entry when the packet is
+        //     addressed to us (`arp.tpa == self.local_ip`), i.e. it is a
+        //     solicited/targeted ARP that we asked for or that targets us.
+        //   - Otherwise do not learn anything from this packet.
+        let targeted = arp.tpa == self.local_ip;
+        if self.arp_table.lookup(&arp.spa).is_some() {
+            // Existing entry: refresh the MAC (merge flag = true).
+            self.arp_table.insert(arp.spa, arp.sha);
+        } else if targeted {
+            // New entry only when the ARP is addressed to us.
+            self.arp_table.insert(arp.spa, arp.sha);
+        }
+        // Else: unsolicited, non-targeted, unknown sender -> do NOT learn.
 
         match arp.oper {
             ARP_REQUEST => {
@@ -739,7 +776,8 @@ impl NetworkStack {
                 Ok(offset)
             }
             ARP_REPLY => {
-                // Already inserted above.
+                // Cache learning (if any) was handled above under the
+                // RFC 826 merge-flag rule; nothing to reply to.
                 Ok(0)
             }
             _ => Ok(0),
@@ -758,6 +796,24 @@ impl NetworkStack {
         reply_buf: &mut [u8],
     ) -> Result<usize> {
         let (ip_hdr, ip_payload) = parse_ipv4(payload)?;
+
+        // SECURITY (F2): verify the IPv4 header checksum BEFORE acting on
+        // the packet (RFC 1071 / RFC 791). A correct header folds to
+        // 0xFFFF including its own checksum field, so `ipv4_checksum`
+        // returns 0; any other value means the header is corrupt or
+        // forged and the datagram must be dropped before dispatch.
+        //
+        // `header_len()` is `ihl * 4`; `parse_ipv4` already guaranteed
+        // `payload.len() >= header_len` and `header_len >=
+        // IPV4_HEADER_MIN_LEN`, but we re-check the bounds here so the
+        // slice can never panic on an attacker-controlled frame.
+        let hdr_len = ip_hdr.header_len();
+        if hdr_len < IPV4_HEADER_MIN_LEN
+            || payload.len() < hdr_len
+            || ipv4_checksum(&payload[..hdr_len]) != 0
+        {
+            return Ok(0);
+        }
 
         // Only process packets addressed to us.
         if ip_hdr.dst_addr != self.local_ip {

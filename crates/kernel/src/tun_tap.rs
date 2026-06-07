@@ -392,6 +392,20 @@ impl TunTapInterface {
         if data.is_empty() {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: Hard-cap against the REAL backing buffer capacity
+        // (`PacketBuf::data` is `[u8; MAX_PACKET_SIZE]`) BEFORE any
+        // MTU-based check.  The TX copy site (`write`) does
+        // `buf.data[..data.len()].copy_from_slice(data)`; an attacker-
+        // controlled `data.len()` exceeding the array length would
+        // trigger an out-of-bounds slice and panic in ring 0 (remote
+        // DoS).  The previous cap was `mtu + ETHER_HEADER_LEN`, which —
+        // with `set_mtu` allowing `mtu == MAX_PACKET_SIZE` — yields
+        // `MAX_PACKET_SIZE + 14 > MAX_PACKET_SIZE`, overflowing the
+        // fixed buffer.  No Ethernet-header slack is added: the cap is
+        // exactly the array length used by the copy.
+        if data.len() > MAX_PACKET_SIZE {
+            return Err(Error::InvalidArgument);
+        }
         if data.len() > self.mtu as usize + ETHER_HEADER_LEN {
             return Err(Error::InvalidArgument);
         }
