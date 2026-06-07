@@ -28,6 +28,11 @@ use oncrix_lib::{Error, Result};
 /// Maximum PDU data size.
 const MAX_PDU_DATA_SIZE: usize = 4096;
 
+/// Maximum wire-supplied data length for a single H2C/C2H transfer
+/// (16 MiB).  Values above this are rejected at the boundary so that
+/// checked arithmetic on PDU length fields can never overflow u32.
+const MAX_TRANSFER_LEN: u32 = 16 * 1024 * 1024;
+
 /// Maximum number of queue pairs per controller.
 const MAX_QUEUE_PAIRS: usize = 8;
 
@@ -347,18 +352,33 @@ impl NvmeTcpCapsuleCmd {
     }
 
     /// Creates a capsule command with inline data.
-    pub fn with_data_len(data_len: usize) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `data_len` exceeds
+    /// [`MAX_TRANSFER_LEN`] (as a `usize`), or if converting
+    /// `data_len` to `u32` or the subsequent addition with the
+    /// fixed header size would overflow.
+    pub fn with_data_len(data_len: usize) -> Result<Self> {
+        // Reject data_len values that are representable as usize but
+        // not as u32, and values exceeding the protocol maximum.
+        let data_u32 = u32::try_from(data_len).map_err(|_| Error::InvalidArgument)?;
+        if data_u32 > MAX_TRANSFER_LEN {
+            return Err(Error::InvalidArgument);
+        }
         let hlen = (8 + NVME_CMD_SIZE) as u8;
-        let plen = hlen as u32 + data_len as u32;
+        let plen = (hlen as u32)
+            .checked_add(data_u32)
+            .ok_or(Error::InvalidArgument)?;
         let flags = if data_len > 0 {
             PduFlags::DATA_PRESENT
         } else {
             PduFlags::NONE
         };
-        Self {
+        Ok(Self {
             header: NvmeTcpPduHeader::new(PduType::CapsuleCmd, flags, hlen, plen),
             sqe: [0u8; NVME_CMD_SIZE],
-        }
+        })
     }
 
     /// Sets the opcode in the SQE (byte 0).
@@ -442,17 +462,32 @@ pub struct H2CDataPdu {
 
 impl H2CDataPdu {
     /// Creates an H2CData PDU header.
-    pub fn new(cccid: u16, ttag: u16, data_offset: u32, data_length: u32) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `data_length` exceeds
+    /// [`MAX_TRANSFER_LEN`] or if the resulting PDU length would
+    /// overflow a `u32`.  Both conditions indicate a malformed or
+    /// malicious wire value.
+    pub fn new(cccid: u16, ttag: u16, data_offset: u32, data_length: u32) -> Result<Self> {
+        // Guard against wire-supplied data_length causing an overflow
+        // in the plen field (hlen + data_length).  hlen is a constant
+        // 24 bytes; the addition would panic with overflow-checks on.
+        if data_length > MAX_TRANSFER_LEN {
+            return Err(Error::InvalidArgument);
+        }
         let hlen = 24u8; // common header (8) + specific fields (16)
-        let plen = hlen as u32 + data_length;
-        Self {
+        let plen = (hlen as u32)
+            .checked_add(data_length)
+            .ok_or(Error::InvalidArgument)?;
+        Ok(Self {
             header: NvmeTcpPduHeader::new(PduType::H2CData, PduFlags::LAST_PDU, hlen, plen),
             cccid,
             ttag,
             data_offset,
             data_length,
             _reserved: 0,
-        }
+        })
     }
 }
 
@@ -658,7 +693,7 @@ impl NvmeTcpQueuePair {
     ) -> Result<NvmeTcpCapsuleCmd> {
         let cid = self.alloc_cid()?;
         let data_len = (block_count as usize) * 512;
-        let mut capsule = NvmeTcpCapsuleCmd::with_data_len(data_len);
+        let mut capsule = NvmeTcpCapsuleCmd::with_data_len(data_len)?;
         capsule.set_opcode(0x02); // NVM Read
         capsule.set_cid(cid);
         capsule.set_nsid(nsid);
@@ -676,11 +711,11 @@ impl NvmeTcpQueuePair {
         capsule.sqe[48] = nlb as u8;
         capsule.sqe[49] = (nlb >> 8) as u8;
 
-        // Track data length
+        // Track data length.  data_len = (u16) * 512 ≤ ~32 MiB, safe to cast.
         for slot in self.commands.iter_mut() {
             if slot.active && slot.cid == cid {
                 slot.opcode = 0x02;
-                slot.data_len = data_len as u32;
+                slot.data_len = u32::from(block_count) * 512;
                 break;
             }
         }
@@ -697,7 +732,7 @@ impl NvmeTcpQueuePair {
     ) -> Result<NvmeTcpCapsuleCmd> {
         let cid = self.alloc_cid()?;
         let data_len = (block_count as usize) * 512;
-        let mut capsule = NvmeTcpCapsuleCmd::with_data_len(data_len);
+        let mut capsule = NvmeTcpCapsuleCmd::with_data_len(data_len)?;
         capsule.set_opcode(0x01); // NVM Write
         capsule.set_cid(cid);
         capsule.set_nsid(nsid);
@@ -713,10 +748,11 @@ impl NvmeTcpQueuePair {
         capsule.sqe[48] = nlb as u8;
         capsule.sqe[49] = (nlb >> 8) as u8;
 
+        // Track data length.  data_len = (u16) * 512 ≤ ~32 MiB, safe to cast.
         for slot in self.commands.iter_mut() {
             if slot.active && slot.cid == cid {
                 slot.opcode = 0x01;
-                slot.data_len = data_len as u32;
+                slot.data_len = u32::from(block_count) * 512;
                 break;
             }
         }
@@ -813,13 +849,21 @@ impl NvmeTcpConnection {
     }
 
     /// Processes an ICResp PDU, updating negotiated parameters.
+    ///
+    /// The controller-supplied `maxdata` field is clamped to
+    /// [`MAX_TRANSFER_LEN`] before being stored so that no
+    /// downstream size computation can be driven to an arbitrarily
+    /// large value by a malicious or buggy target.
     pub fn process_ic_resp(&mut self, resp: &IcRespPdu) -> Result<()> {
         if resp.header.pdu_type != PduType::IcResp.to_byte() {
             return Err(Error::InvalidArgument);
         }
         self.hdgst = resp.hdgst_enabled();
         self.ddgst = resp.ddgst_enabled();
-        self.max_data_size = resp.maxdata;
+        // Clamp the controller-supplied maxdata to our local upper
+        // bound so that a malicious ICResp cannot drive subsequent
+        // transfer-size computations above MAX_TRANSFER_LEN.
+        self.max_data_size = resp.maxdata.min(MAX_TRANSFER_LEN);
         self.pfv = resp.pfv;
         self.state = ConnectionState::Connected;
         Ok(())

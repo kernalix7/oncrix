@@ -28,6 +28,16 @@
 //! (polls) until a completion entry appears with a matching command
 //! ID.
 //!
+//! # Privilege Requirements
+//!
+//! Passthrough issues **arbitrary** NVMe admin commands (Format NVM,
+//! firmware download, sanitize, vendor-specific, etc.).  Every call
+//! to [`NvmePassthrough::submit_admin_cmd`] or
+//! [`NvmePassthrough::submit_io_cmd`] therefore requires the caller
+//! to pass a [`Capabilities`] token that carries `CAP_SYS_ADMIN`.
+//! The dispatcher must obtain this token from the process capability
+//! set before calling into this module.
+//!
 //! Reference: NVM Express Base Specification 2.0, Section 5 (Admin
 //! Command Set).
 
@@ -52,6 +62,11 @@ const ADMIN_QUEUE_ID: u16 = 0;
 
 /// Page size used for PRP entries.
 const PAGE_SIZE: usize = 4096;
+
+/// Minimum allowed queue depth (must be ≥ 2 so that the modulo in
+/// the submission path can never divide by zero, and so at least one
+/// command slot is always available).
+const MIN_QUEUE_DEPTH: u16 = 2;
 
 // ── NVMe Admin Opcodes ──────────────────────────────────────────
 
@@ -142,6 +157,31 @@ pub const SC_INTERNAL_ERROR: u8 = 0x06;
 
 /// Generic status: Namespace Not Ready.
 pub const SC_NS_NOT_READY: u8 = 0x82;
+
+// ── Capability Token ────────────────────────────────────────────
+
+/// Capability bitmask presented by the dispatcher.
+///
+/// The dispatcher constructs this from the calling process's
+/// capability set.  Bit 0 corresponds to `CAP_SYS_ADMIN`.
+/// Additional bits may be defined as needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities(u32);
+
+impl Capabilities {
+    /// `CAP_SYS_ADMIN` — required for NVMe passthrough.
+    pub const CAP_SYS_ADMIN: u32 = 1 << 0;
+
+    /// Creates a [`Capabilities`] token with the given bitmask.
+    pub const fn new(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Returns `true` if `CAP_SYS_ADMIN` is set in this token.
+    pub fn has_sys_admin(self) -> bool {
+        self.0 & Self::CAP_SYS_ADMIN != 0
+    }
+}
 
 // ── Passthrough Command ─────────────────────────────────────────
 
@@ -493,7 +533,7 @@ struct ControllerHandle {
     cq_head: u16,
     /// Current expected phase.
     cq_phase: bool,
-    /// Queue depth.
+    /// Queue depth (always ≥ MIN_QUEUE_DEPTH after registration).
     queue_depth: u16,
     /// Next command ID to allocate.
     next_cid: u16,
@@ -529,6 +569,10 @@ impl ControllerHandle {
 /// Manages passthrough command submission and completion for
 /// management utilities. Each instance can handle multiple
 /// NVMe controllers.
+///
+/// All submission entry points require a [`Capabilities`] token
+/// carrying [`Capabilities::CAP_SYS_ADMIN`]; if the token is absent
+/// the call is rejected with [`Error::PermissionDenied`].
 pub struct NvmePassthrough {
     /// Controller handles.
     controllers: [ControllerHandle; MAX_CONTROLLERS],
@@ -558,7 +602,11 @@ impl NvmePassthrough {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `mmio_base` is zero.
+    /// Returns [`Error::InvalidArgument`] if `mmio_base` is zero,
+    /// any queue physical address is zero, or `queue_depth` is less
+    /// than [`MIN_QUEUE_DEPTH`] (2). A queue depth of zero or one
+    /// would cause a division-by-zero or an infinite spin in the
+    /// submission path.
     /// Returns [`Error::OutOfMemory`] if the maximum number of
     /// controllers has been reached.
     pub fn register_controller(
@@ -569,6 +617,13 @@ impl NvmePassthrough {
         queue_depth: u16,
     ) -> Result<u8> {
         if mmio_base == 0 || admin_sq_phys == 0 || admin_cq_phys == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: queue_depth == 0 causes a divide-by-zero in the
+        // SQ-tail wrap computation; queue_depth == 1 is degenerate.
+        // Reject both at the boundary so no downstream path can ever
+        // divide by zero or overflow.
+        if queue_depth < MIN_QUEUE_DEPTH {
             return Err(Error::InvalidArgument);
         }
         if self.controller_count >= MAX_CONTROLLERS {
@@ -607,13 +662,38 @@ impl NvmePassthrough {
     /// Copies the command into the admin submission queue and
     /// rings the doorbell. Returns the assigned command ID.
     ///
+    /// # Privilege
+    ///
+    /// The caller **must** supply a [`Capabilities`] token with
+    /// `CAP_SYS_ADMIN` set. NVMe admin passthrough can issue
+    /// destructive commands (Format NVM, Firmware Download, Sanitize,
+    /// vendor-specific). Failing to provide the token returns
+    /// [`Error::PermissionDenied`] immediately (fail-closed).
+    ///
     /// # Errors
     ///
+    /// Returns [`Error::PermissionDenied`] if `caps` does not carry
+    /// `CAP_SYS_ADMIN`.
     /// Returns [`Error::InvalidArgument`] if the controller ID is
     /// invalid or data size exceeds the maximum.
     /// Returns [`Error::OutOfMemory`] if the pending command table
     /// is full.
-    pub fn submit_admin_cmd(&mut self, controller_id: u8, cmd: &mut PassthroughCmd) -> Result<u16> {
+    pub fn submit_admin_cmd(
+        &mut self,
+        controller_id: u8,
+        cmd: &mut PassthroughCmd,
+        caps: Capabilities,
+    ) -> Result<u16> {
+        // SECURITY: NVMe admin passthrough grants the caller direct
+        // access to arbitrary device commands, including Format NVM,
+        // Firmware Download, Sanitize, and vendor-specific opcodes.
+        // These can permanently destroy data or compromise firmware
+        // integrity. Deny unconditionally unless CAP_SYS_ADMIN is
+        // present in the caller's capability set.
+        if !caps.has_sys_admin() {
+            return Err(Error::PermissionDenied);
+        }
+
         let ctrl = self.get_controller_mut(controller_id)?;
 
         if cmd.data_size > MAX_DATA_SIZE {
@@ -642,7 +722,8 @@ impl NvmePassthrough {
             core::ptr::write_volatile(dst, cmd.cmd);
         }
 
-        // Advance the tail.
+        // Advance the tail.  queue_depth >= MIN_QUEUE_DEPTH (2) is
+        // guaranteed by register_controller, so this modulo is safe.
         ctrl.sq_tail = (ctrl.sq_tail + 1) % ctrl.queue_depth;
 
         // Ring the SQ doorbell.
@@ -660,16 +741,28 @@ impl NvmePassthrough {
 
     /// Submit an I/O command passthrough.
     ///
+    /// # Privilege
+    ///
+    /// Requires `CAP_SYS_ADMIN` in `caps` for the same reasons as
+    /// [`submit_admin_cmd`].
+    ///
     /// # Errors
     ///
+    /// Returns [`Error::PermissionDenied`] if `caps` does not carry
+    /// `CAP_SYS_ADMIN`.
     /// Returns [`Error::InvalidArgument`] if the controller ID or
     /// queue ID is invalid.
-    pub fn submit_io_cmd(&mut self, controller_id: u8, cmd: &mut PassthroughCmd) -> Result<u16> {
+    pub fn submit_io_cmd(
+        &mut self,
+        controller_id: u8,
+        cmd: &mut PassthroughCmd,
+        caps: Capabilities,
+    ) -> Result<u16> {
         cmd.is_admin = false;
         // For simplicity, route through the admin queue with the
         // is_admin flag cleared. A full implementation would use
         // the specified I/O queue.
-        self.submit_admin_cmd(controller_id, cmd)
+        self.submit_admin_cmd(controller_id, cmd, caps)
     }
 
     /// Poll for completion of a specific command.
@@ -708,7 +801,8 @@ impl NvmePassthrough {
                 // We have a valid completion.
                 let completed_cid = entry.command_id();
 
-                // Advance CQ head.
+                // Advance CQ head.  queue_depth >= MIN_QUEUE_DEPTH (2)
+                // is guaranteed by register_controller.
                 let qd = self.controllers[ci].queue_depth;
                 self.controllers[ci].cq_head = (self.controllers[ci].cq_head + 1) % qd;
                 if self.controllers[ci].cq_head == 0 {
@@ -751,6 +845,10 @@ impl NvmePassthrough {
     /// Issues an Identify Controller admin command and waits for
     /// completion.
     ///
+    /// # Privilege
+    ///
+    /// Requires `CAP_SYS_ADMIN` in `caps`.
+    ///
     /// # Errors
     ///
     /// Returns errors from command submission or completion.
@@ -758,6 +856,7 @@ impl NvmePassthrough {
         &mut self,
         controller_id: u8,
         data_phys: u64,
+        caps: Capabilities,
     ) -> Result<PassthroughResult> {
         let mut cmd = PassthroughCmd {
             cmd: AdminCommand::identify_controller(data_phys),
@@ -769,7 +868,7 @@ impl NvmePassthrough {
             io_queue_id: ADMIN_QUEUE_ID,
         };
 
-        let cid = self.submit_admin_cmd(controller_id, &mut cmd)?;
+        let cid = self.submit_admin_cmd(controller_id, &mut cmd, caps)?;
         self.wait_completion(controller_id, cid)
     }
 
