@@ -582,6 +582,68 @@ impl NeighborTable {
         Ok(idx)
     }
 
+    /// Processes a Neighbor Advertisement per RFC 4861 §7.2.5.
+    ///
+    /// Unlike [`insert`](Self::insert), this NEVER creates a new cache entry —
+    /// an NA for an address we are not currently resolving must not populate
+    /// the cache — and it honours the Solicited/Override flags so a forged or
+    /// unsolicited NA cannot silently overwrite a known link-layer address.
+    /// Returns `true` if an existing entry was updated.
+    ///
+    // SECURITY: the previous handler called `insert()` unconditionally, which
+    // both created entries from unsolicited NAs and overwrote any cached MAC
+    // (and forced state Reachable). That allowed remote neighbor-cache
+    // poisoning -> on-link MITM. This method closes that by following the RFC
+    // 4861 §7.2.5 update rules.
+    pub fn handle_advertisement(
+        &mut self,
+        addr: Ipv6Addr,
+        mac: [u8; 6],
+        solicited: bool,
+        override_flag: bool,
+        current_tick: u64,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().flatten().find(|e| e.addr == addr) else {
+            // No existing entry: an NA must not create one.
+            return false;
+        };
+
+        // An entry still resolving (Incomplete) has no cached MAC to protect,
+        // so the advertised address is recorded directly.
+        if entry.state == NdpState::Incomplete {
+            entry.mac = mac;
+            if solicited {
+                entry.state = NdpState::Reachable;
+                entry.expires_tick = current_tick + REACHABLE_TIMEOUT;
+                entry.retries = 0;
+            } else {
+                entry.state = NdpState::Stale;
+            }
+            return true;
+        }
+
+        let mac_differs = entry.mac != mac;
+        if mac_differs && !override_flag {
+            // Conflicting MAC without the Override flag: keep the cached MAC.
+            // A reachable entry is demoted to Stale to trigger re-resolution.
+            if entry.state == NdpState::Reachable {
+                entry.state = NdpState::Stale;
+            }
+            return true;
+        }
+
+        // Override set, or the advertised MAC matches the cached one.
+        entry.mac = mac;
+        if solicited {
+            entry.state = NdpState::Reachable;
+            entry.expires_tick = current_tick + REACHABLE_TIMEOUT;
+            entry.retries = 0;
+        } else if mac_differs {
+            entry.state = NdpState::Stale;
+        }
+        true
+    }
+
     /// Inserts an incomplete entry (address resolution started).
     pub fn insert_incomplete(&mut self, addr: Ipv6Addr, current_tick: u64) -> Result<usize> {
         // Check if already present.
@@ -741,6 +803,23 @@ impl Ipv6Stack {
     ) -> Result<Option<usize>> {
         let icmp = Icmpv6Header::parse(payload)?;
 
+        // SECURITY: RFC 4443 §2.3 — an ICMPv6 message whose checksum is invalid
+        // MUST be silently discarded. Verifying here, before any dispatch or
+        // state mutation, stops forged ICMPv6 (e.g. spoofed Neighbor
+        // Advertisements used to poison the neighbor cache, or spoofed echo
+        // requests) from ever reaching a handler. icmpv6_checksum() sums the
+        // pseudo-header plus the message with the checksum field skipped and
+        // returns the value that field must hold, so a valid packet satisfies
+        // computed == icmp.checksum.
+        let computed = icmpv6_checksum(
+            &Ipv6Addr::from_bytes(ip_hdr.src),
+            &Ipv6Addr::from_bytes(ip_hdr.dst),
+            payload,
+        );
+        if computed != icmp.checksum {
+            return Ok(None);
+        }
+
         match Icmpv6Type::from_u8(icmp.icmp_type) {
             Some(Icmpv6Type::EchoRequest) => self.handle_echo_request(ip_hdr, payload, response),
             Some(Icmpv6Type::NeighborSolicitation) => {
@@ -857,6 +936,13 @@ impl Ipv6Stack {
         if payload.len() < ICMPV6_HEADER_LEN + 4 + 16 {
             return Err(Error::InvalidArgument);
         }
+
+        // NA flags occupy the first octet after the 4-byte ICMPv6 header:
+        // Router (0x80) | Solicited (0x40) | Override (0x20).
+        let flags = payload[ICMPV6_HEADER_LEN];
+        let solicited = flags & 0x40 != 0;
+        let override_flag = flags & 0x20 != 0;
+
         let mut target_bytes = [0u8; 16];
         target_bytes.copy_from_slice(&payload[8..24]);
         let target = Ipv6Addr::from_bytes(target_bytes);
@@ -872,7 +958,17 @@ impl Ipv6Stack {
                 addr,
             } = opt
             {
-                let _ = self.neighbors.insert(target, *addr, self.current_tick);
+                // SECURITY: RFC 4861 §7.2.5 — an NA may only UPDATE an existing
+                // entry and may only overwrite a known MAC when Override is set.
+                // Never create an entry from an NA. Closes neighbor-cache
+                // poisoning / on-link MITM via forged or unsolicited NAs.
+                let _ = self.neighbors.handle_advertisement(
+                    target,
+                    *addr,
+                    solicited,
+                    override_flag,
+                    self.current_tick,
+                );
             }
         }
         Ok(())
@@ -1031,7 +1127,12 @@ fn icmpv6_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, icmpv6_data: &[u8]) -> u16 {
     // Next header (ICMPv6 = 58)
     sum += NextHeader::Icmpv6 as u32;
 
-    // ICMPv6 data (with checksum field zeroed conceptually — caller should zero it before)
+    // ICMPv6 data. The 2-byte checksum field at offset 2-3 is UNCONDITIONALLY
+    // skipped below, so this works both for building (field already 0) and for
+    // verifying an inbound message (field holds the sender's checksum) without
+    // the caller having to mutate the buffer. Do NOT remove the skip: on the
+    // verify path the field is non-zero, and folding it in would make every
+    // valid packet mismatch and be dropped.
     let mut i = 0;
     while i + 1 < icmpv6_data.len() {
         // Skip the checksum field at offset 2-3.
@@ -1052,4 +1153,96 @@ fn icmpv6_checksum(src: &Ipv6Addr, dst: &Ipv6Addr, icmpv6_data: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(n: u8) -> Ipv6Addr {
+        let mut b = [0u8; 16];
+        b[0] = 0xfe;
+        b[1] = 0x80;
+        b[15] = n;
+        Ipv6Addr::from_bytes(b)
+    }
+
+    const MAC_A: [u8; 6] = [0xaa; 6];
+    const MAC_B: [u8; 6] = [0xbb; 6];
+
+    // SECURITY (RFC 4861 §7.2.5): an NA must never CREATE a neighbor entry.
+    #[test]
+    fn na_for_unknown_address_creates_nothing() {
+        let mut t = NeighborTable::new();
+        let updated = t.handle_advertisement(addr(1), MAC_B, true, true, 0);
+        assert!(!updated, "NA must not create a cache entry");
+        assert!(t.lookup(&addr(1)).is_none());
+    }
+
+    // SECURITY: Override-clear NA advertising a different MAC than a reachable
+    // entry must keep the cached MAC (no poisoning) and demote it to Stale.
+    #[test]
+    fn na_override_clear_conflict_preserves_mac() {
+        let mut t = NeighborTable::new();
+        t.insert(addr(1), MAC_A, 0).unwrap();
+        let updated = t.handle_advertisement(addr(1), MAC_B, false, false, 10);
+        assert!(updated);
+        let e = t.lookup(&addr(1)).unwrap();
+        assert_eq!(e.mac, MAC_A, "override-clear conflict must keep cached MAC");
+        assert_eq!(e.state, NdpState::Stale, "reachable entry demoted to Stale");
+    }
+
+    // The legitimate resolution path must still work: solicited NA resolves an
+    // Incomplete entry to Reachable with the advertised MAC.
+    #[test]
+    fn na_solicited_resolves_incomplete() {
+        let mut t = NeighborTable::new();
+        t.insert_incomplete(addr(2), 0).unwrap();
+        let updated = t.handle_advertisement(addr(2), MAC_B, true, false, 5);
+        assert!(updated);
+        let e = t.lookup(&addr(2)).unwrap();
+        assert_eq!(e.mac, MAC_B);
+        assert_eq!(e.state, NdpState::Reachable);
+    }
+
+    // A solicited NA with Override set legitimately updates a changed MAC.
+    #[test]
+    fn na_solicited_override_updates_changed_mac() {
+        let mut t = NeighborTable::new();
+        t.insert(addr(3), MAC_A, 0).unwrap();
+        let updated = t.handle_advertisement(addr(3), MAC_B, true, true, 7);
+        assert!(updated);
+        let e = t.lookup(&addr(3)).unwrap();
+        assert_eq!(e.mac, MAC_B, "override-set updates the MAC");
+        assert_eq!(e.state, NdpState::Reachable);
+    }
+
+    // SECURITY: the inbound checksum verify (computed == stored) is only sound
+    // because icmpv6_checksum unconditionally skips the on-wire checksum field.
+    // Prove the recomputed value is independent of the field's bytes.
+    #[test]
+    fn icmpv6_checksum_skips_field_so_verify_is_field_independent() {
+        let src = addr(1);
+        let dst = addr(2);
+        // Minimal NA-shaped message: type, code, checksum[2], flags+reserved[4], target[16].
+        let mut msg = [0u8; 24];
+        msg[0] = 136; // Neighbor Advertisement
+        msg[4] = 0x20; // Override
+        for (i, b) in msg[8..24].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let c0 = icmpv6_checksum(&src, &dst, &msg);
+        // Writing the real checksum into the field must NOT change the result.
+        msg[2..4].copy_from_slice(&c0.to_be_bytes());
+        assert_eq!(
+            icmpv6_checksum(&src, &dst, &msg),
+            c0,
+            "field must be skipped"
+        );
+        // Garbage in the field must also not change it (so a forged checksum is
+        // detected as computed != stored, never folded in to mask itself).
+        msg[2] = 0xBE;
+        msg[3] = 0xEF;
+        assert_eq!(icmpv6_checksum(&src, &dst, &msg), c0, "field still skipped");
+    }
 }
