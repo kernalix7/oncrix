@@ -438,7 +438,8 @@ pub fn do_fspick(mount_registry: &MountRegistry, mount_id: u32, flags: u32) -> R
 /// # Errors
 ///
 /// * [`Error::PermissionDenied`] — Caller is not root (uid != 0).
-/// * [`Error::InvalidArgument`]  — Mount not found or mapping overlaps.
+/// * [`Error::InvalidArgument`]  — Mount not found, an empty (`count == 0`)
+///   mapping, or a mapping whose source or destination range wraps `u32`.
 pub fn do_mount_idmap(
     mount_registry: &mut MountRegistry,
     mount_id: u32,
@@ -805,5 +806,41 @@ mod tests {
             do_mount_idmap(&mut reg, 9999, &idmap, 0),
             Err(Error::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn mount_idmap_wrapping_dest_rejected() {
+        let (mut reg, id) = make_registry_with_mount();
+        let mut idmap = IdMap::default();
+        // first_out + count wraps u32 -> must be rejected at ingest so it can
+        // never reach translate() and overflow in ring 0.
+        idmap
+            .add_uid_mapping(IdMapping {
+                first_in: 0,
+                first_out: 0xFFFF_FFFF,
+                count: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            do_mount_idmap(&mut reg, id, &idmap, 0),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn mount_idmap_realistic_map_accepted_and_translates() {
+        let (mut reg, id) = make_registry_with_mount();
+        let mut idmap = IdMap::default();
+        idmap
+            .add_uid_mapping(IdMapping {
+                first_in: 0,
+                first_out: 100_000,
+                count: 65_536,
+            })
+            .unwrap();
+        // A realistic (non-wrapping) map is accepted and translates correctly.
+        assert!(do_mount_idmap(&mut reg, id, &idmap, 0).is_ok());
+        assert_eq!(idmap.translate_uid(5), Some(100_005));
+        assert_eq!(idmap.translate_uid(65_536), None);
     }
 }
