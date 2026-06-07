@@ -21,6 +21,305 @@
 use oncrix_lib::{Error, Result};
 
 // -------------------------------------------------------------------
+// SHA-256 (FIPS 180-4) — private, self-contained implementation
+//
+// oncrix-hal has no dependency on oncrix-kernel (which would be a
+// cycle), so we carry a correct FIPS 180-4 SHA-256 here.  This is
+// the only hash used for TPM PCR extend; no stubs or XOR allowed.
+// -------------------------------------------------------------------
+
+/// SHA-256 block size in bytes.
+const SHA256_BLOCK: usize = 64;
+
+/// SHA-256 digest size in bytes.
+const SHA256_DIGEST: usize = 32;
+
+/// SHA-256 round constants (first 32 bits of the fractional parts
+/// of the cube roots of the first 64 primes).
+const SHA256_K: [u32; 64] = [
+    0x428a_2f98,
+    0x7137_4491,
+    0xb5c0_fbcf,
+    0xe9b5_dba5,
+    0x3956_c25b,
+    0x59f1_11f1,
+    0x923f_82a4,
+    0xab1c_5ed5,
+    0xd807_aa98,
+    0x1283_5b01,
+    0x2431_85be,
+    0x550c_7dc3,
+    0x72be_5d74,
+    0x80de_b1fe,
+    0x9bdc_06a7,
+    0xc19b_f174,
+    0xe49b_69c1,
+    0xefbe_4786,
+    0x0fc1_9dc6,
+    0x240c_a1cc,
+    0x2de9_2c6f,
+    0x4a74_84aa,
+    0x5cb0_a9dc,
+    0x76f9_88da,
+    0x983e_5152,
+    0xa831_c66d,
+    0xb003_27c8,
+    0xbf59_7fc7,
+    0xc6e0_0bf3,
+    0xd5a7_9147,
+    0x06ca_6351,
+    0x1429_2967,
+    0x27b7_0a85,
+    0x2e1b_2138,
+    0x4d2c_6dfc,
+    0x5338_0d13,
+    0x650a_7354,
+    0x766a_0abb,
+    0x81c2_c92e,
+    0x9272_2c85,
+    0xa2bf_e8a1,
+    0xa81a_664b,
+    0xc24b_8b70,
+    0xc76c_51a3,
+    0xd192_e819,
+    0xd699_0624,
+    0xf40e_3585,
+    0x106a_a070,
+    0x19a4_c116,
+    0x1e37_6c08,
+    0x2748_774c,
+    0x34b0_bcb5,
+    0x391c_0cb3,
+    0x4ed8_aa4a,
+    0x5b9c_ca4f,
+    0x682e_6ff3,
+    0x748f_82ee,
+    0x78a5_636f,
+    0x84c8_7814,
+    0x8cc7_0208,
+    0x90be_fffa,
+    0xa450_6ceb,
+    0xbef9_a3f7,
+    0xc671_78f2,
+];
+
+/// SHA-256 initial hash values (first 32 bits of the fractional parts
+/// of the square roots of the first 8 primes).
+const SHA256_H0: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+/// SHA-256 Ch: `(x & y) ^ (!x & z)`.
+const fn sha256_ch(x: u32, y: u32, z: u32) -> u32 {
+    (x & y) ^ (!x & z)
+}
+
+/// SHA-256 Maj: `(x & y) ^ (x & z) ^ (y & z)`.
+const fn sha256_maj(x: u32, y: u32, z: u32) -> u32 {
+    (x & y) ^ (x & z) ^ (y & z)
+}
+
+/// SHA-256 big sigma 0: `ROTR(2) ^ ROTR(13) ^ ROTR(22)`.
+const fn sha256_bs0(x: u32) -> u32 {
+    x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)
+}
+
+/// SHA-256 big sigma 1: `ROTR(6) ^ ROTR(11) ^ ROTR(25)`.
+const fn sha256_bs1(x: u32) -> u32 {
+    x.rotate_right(6) ^ x.rotate_right(11) ^ x.rotate_right(25)
+}
+
+/// SHA-256 small sigma 0: `ROTR(7) ^ ROTR(18) ^ SHR(3)`.
+const fn sha256_ss0(x: u32) -> u32 {
+    x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+}
+
+/// SHA-256 small sigma 1: `ROTR(17) ^ ROTR(19) ^ SHR(10)`.
+const fn sha256_ss1(x: u32) -> u32 {
+    x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+}
+
+/// FIPS 180-4 SHA-256 hasher.
+///
+/// This is a private, self-contained implementation used exclusively
+/// for TPM PCR extend.  It is validated against the NIST test vectors
+/// in the `#[cfg(test)]` section below.
+struct Sha256Hasher {
+    /// Intermediate hash state (8 × u32).
+    h: [u32; 8],
+    /// Partial-block buffer.
+    buf: [u8; SHA256_BLOCK],
+    /// Valid bytes in `buf`.
+    buf_len: usize,
+    /// Total bytes fed so far.
+    total: u64,
+}
+
+impl Sha256Hasher {
+    /// Creates a new hasher with the standard initial values.
+    const fn new() -> Self {
+        Self {
+            h: SHA256_H0,
+            buf: [0u8; SHA256_BLOCK],
+            buf_len: 0,
+            total: 0,
+        }
+    }
+
+    /// Compresses one 64-byte block.
+    fn compress(h: &mut [u32; 8], block: &[u8; SHA256_BLOCK]) {
+        let mut w = [0u32; 64];
+        let mut t = 0usize;
+        while t < 16 {
+            let b = t.wrapping_mul(4);
+            w[t] = u32::from_be_bytes([
+                block[b],
+                block[b.wrapping_add(1)],
+                block[b.wrapping_add(2)],
+                block[b.wrapping_add(3)],
+            ]);
+            t = t.wrapping_add(1);
+        }
+        while t < 64 {
+            w[t] = sha256_ss1(w[t.wrapping_sub(2)])
+                .wrapping_add(w[t.wrapping_sub(7)])
+                .wrapping_add(sha256_ss0(w[t.wrapping_sub(15)]))
+                .wrapping_add(w[t.wrapping_sub(16)]);
+            t = t.wrapping_add(1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+
+        let mut i = 0usize;
+        while i < 64 {
+            let t1 = hh
+                .wrapping_add(sha256_bs1(e))
+                .wrapping_add(sha256_ch(e, f, g))
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let t2 = sha256_bs0(a).wrapping_add(sha256_maj(a, b, c));
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+            i = i.wrapping_add(1);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    /// Feeds data into the hasher.
+    fn update(&mut self, data: &[u8]) {
+        let mut offset = 0usize;
+
+        if self.buf_len > 0 {
+            let space = SHA256_BLOCK.wrapping_sub(self.buf_len);
+            let fill = if data.len() < space {
+                data.len()
+            } else {
+                space
+            };
+            let mut i = 0usize;
+            while i < fill {
+                self.buf[self.buf_len.wrapping_add(i)] = data[i];
+                i = i.wrapping_add(1);
+            }
+            self.buf_len = self.buf_len.wrapping_add(fill);
+            offset = fill;
+            if self.buf_len == SHA256_BLOCK {
+                let blk = self.buf;
+                Self::compress(&mut self.h, &blk);
+                self.buf_len = 0;
+            }
+        }
+
+        while offset.wrapping_add(SHA256_BLOCK) <= data.len() {
+            let mut blk = [0u8; SHA256_BLOCK];
+            let mut i = 0usize;
+            while i < SHA256_BLOCK {
+                blk[i] = data[offset.wrapping_add(i)];
+                i = i.wrapping_add(1);
+            }
+            Self::compress(&mut self.h, &blk);
+            offset = offset.wrapping_add(SHA256_BLOCK);
+        }
+
+        let rem = data.len().wrapping_sub(offset);
+        let mut i = 0usize;
+        while i < rem {
+            self.buf[i] = data[offset.wrapping_add(i)];
+            i = i.wrapping_add(1);
+        }
+        if rem > 0 {
+            self.buf_len = rem;
+        }
+
+        self.total = self.total.wrapping_add(data.len() as u64);
+    }
+
+    /// Finalizes and returns the 32-byte digest.
+    fn finalize(mut self) -> [u8; SHA256_DIGEST] {
+        let bit_len = self.total.wrapping_mul(8);
+
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len = self.buf_len.wrapping_add(1);
+
+        let mut i = self.buf_len;
+        while i < SHA256_BLOCK {
+            self.buf[i] = 0;
+            i = i.wrapping_add(1);
+        }
+
+        if self.buf_len > 56 {
+            let blk = self.buf;
+            Self::compress(&mut self.h, &blk);
+            self.buf = [0u8; SHA256_BLOCK];
+        }
+
+        let lb = bit_len.to_be_bytes();
+        let mut j = 0usize;
+        while j < 8 {
+            self.buf[56usize.wrapping_add(j)] = lb[j];
+            j = j.wrapping_add(1);
+        }
+
+        let blk = self.buf;
+        Self::compress(&mut self.h, &blk);
+
+        let mut digest = [0u8; SHA256_DIGEST];
+        let mut w = 0usize;
+        while w < 8 {
+            let bytes = self.h[w].to_be_bytes();
+            let base = w.wrapping_mul(4);
+            digest[base] = bytes[0];
+            digest[base.wrapping_add(1)] = bytes[1];
+            digest[base.wrapping_add(2)] = bytes[2];
+            digest[base.wrapping_add(3)] = bytes[3];
+            w = w.wrapping_add(1);
+        }
+        digest
+    }
+}
+
+// -------------------------------------------------------------------
 // Constants
 // -------------------------------------------------------------------
 
@@ -328,20 +627,39 @@ impl TpmPcr {
         }
     }
 
-    /// Extends this PCR with a new measurement.
+    /// Extends this PCR with a new measurement digest.
     ///
-    /// The extend operation is: PCR_new = Hash(PCR_old || data).
-    /// Since we do not have a real hash implementation here, we
-    /// simulate by XOR-mixing the data into the digest.
+    /// Implements the TPM 2.0 PCR_Extend semantics per the TCG
+    /// specification: `PCR_new = SHA-256(PCR_old || data)`.
+    ///
+    /// Per TPM2 spec, `data` must already be a digest of the bank's
+    /// hash size.  For a SHA-256 bank that is exactly 32 bytes.
+    /// Passing a slice of any other length returns `InvalidArgument`
+    /// so that callers cannot forge a measurement by truncating or
+    /// padding a raw value.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] — `data.len() != self.digest_len`.
     pub fn extend(&mut self, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
+        if data.len() != self.digest_len {
             return Err(Error::InvalidArgument);
         }
-        // Simulate extend: XOR each byte of data into digest
-        for (i, &byte) in data.iter().enumerate() {
-            let idx = i % self.digest_len;
-            self.digest[idx] ^= byte;
-        }
+
+        // TPM PCR extend: PCR_new = SHA-256(PCR_old || data).
+        // This is one-way and order-dependent, preserving the
+        // append-only property that measured boot, sealing, and
+        // remote attestation rely on.  XOR is commutative and
+        // self-inverse, so any XOR-based mix would be forgeable.
+        let mut h = Sha256Hasher::new();
+        h.update(&self.digest[..self.digest_len]);
+        h.update(data);
+        let new_digest = h.finalize();
+
+        // Copy the 32-byte result into the digest buffer.
+        let copy_len = SHA256_DIGEST.min(self.digest_len);
+        self.digest[..copy_len].copy_from_slice(&new_digest[..copy_len]);
+
         self.extend_count = self.extend_count.saturating_add(1);
         Ok(())
     }
@@ -1014,29 +1332,40 @@ impl TpmDevice {
         Ok(())
     }
 
-    /// Extends a PCR with the given data via TPM2_PCR_Extend.
+    /// Extends a PCR with a pre-hashed digest via TPM2_PCR_Extend.
+    ///
+    /// Per the TPM 2.0 specification, `data` must already be a digest
+    /// of the bank's hash size.  For a SHA-256 bank that is exactly
+    /// 32 bytes.  Callers must hash raw measurements before calling
+    /// this function.  Passing a slice of any other length returns
+    /// `InvalidArgument` immediately — no silent truncation or padding.
+    ///
+    /// The local PCR shadow is updated with the real extend:
+    /// `PCR_new = SHA-256(PCR_old || data)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] — `pcr_index >= 24` or
+    ///   `data.len() != hash_algorithm.digest_size()`.
+    /// - [`Error::IoError`] — TPM device returned a non-success code.
     pub fn pcr_extend(&mut self, pcr_index: usize, data: &[u8]) -> Result<()> {
         if pcr_index >= PCR_COUNT {
+            return Err(Error::InvalidArgument);
+        }
+        let digest_len = self.hash_algorithm.digest_size();
+        // Reject wrong-sized digests: silent truncation/padding would
+        // allow forging a measurement by supplying a partial value.
+        if data.len() != digest_len {
             return Err(Error::InvalidArgument);
         }
 
         self.cmd_buf = TpmCommand::new();
         self.cmd_buf.init(0x8002, TPM2_CC_PCR_EXTEND); // TPM_ST_SESSIONS
         self.cmd_buf.append_u32(pcr_index as u32)?;
-        // Simplified: append digest count (1) + algorithm + digest
+        // Digest list: count=1, algorithm ID, then the exact digest.
         self.cmd_buf.append_u32(1)?; // count
         self.cmd_buf.append_u16(self.hash_algorithm.alg_id())?;
-        let digest_len = self.hash_algorithm.digest_size();
-        let write_len = if data.len() > digest_len {
-            digest_len
-        } else {
-            data.len()
-        };
-        self.cmd_buf.append_bytes(&data[..write_len])?;
-        // Pad remaining digest bytes with zeros
-        for _ in write_len..digest_len {
-            self.cmd_buf.append_u8(0)?;
-        }
+        self.cmd_buf.append_bytes(data)?;
         self.cmd_buf.finalize();
 
         self.transmit()?;
@@ -1045,7 +1374,7 @@ impl TpmDevice {
             return Err(Error::IoError);
         }
 
-        // Update local PCR state
+        // Update local PCR shadow: SHA-256(PCR_old || data).
         self.pcrs[pcr_index].extend(data)?;
         Ok(())
     }
@@ -1221,5 +1550,109 @@ impl TpmDeviceRegistry {
     /// Returns `true` if no devices are registered.
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+}
+
+// -------------------------------------------------------------------
+// Tests — NIST FIPS 180-4 SHA-256 vectors + PCR extend semantics
+// -------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NIST FIPS 180-4 vector 1: empty message.
+    /// Expected: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    #[test]
+    fn sha256_nist_empty() {
+        let got = Sha256Hasher::new().finalize();
+        let expected: [u8; 32] = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
+        assert_eq!(got, expected, "SHA-256(empty) NIST vector failed");
+    }
+
+    /// NIST FIPS 180-4 vector 2: message "abc".
+    ///
+    /// NIST SHA-256("abc") =
+    ///   ba7816bf 8f01cfea 414140de 5dae2223 b00361a3 96177a9c b410ff61 f20015ad
+    #[test]
+    fn sha256_nist_abc() {
+        let mut h = Sha256Hasher::new();
+        h.update(b"abc");
+        let got = h.finalize();
+        let expected: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(got, expected, "SHA-256(\"abc\") NIST vector failed");
+    }
+
+    /// Verifies that two sequential extend operations produce a
+    /// deterministic, non-reversible PCR value, and that a different
+    /// order produces a different PCR value (order-dependency).
+    #[test]
+    fn pcr_extend_order_dependent() {
+        let digest_a = [0x11u8; 32];
+        let digest_b = [0x22u8; 32];
+
+        let mut pcr1 = TpmPcr::with_index(0, HashAlgorithm::Sha256);
+        pcr1.extend(&digest_a).unwrap();
+        pcr1.extend(&digest_b).unwrap();
+
+        let mut pcr2 = TpmPcr::with_index(0, HashAlgorithm::Sha256);
+        pcr2.extend(&digest_b).unwrap();
+        pcr2.extend(&digest_a).unwrap();
+
+        // Different extend order must yield different PCR values.
+        assert_ne!(
+            pcr1.digest[..32],
+            pcr2.digest[..32],
+            "PCR extend must be order-dependent (XOR would be commutative)"
+        );
+    }
+
+    /// Verifies that extending with a self-inverse value changes the
+    /// PCR (XOR extend would restore the original value, SHA-256 does not).
+    #[test]
+    fn pcr_extend_not_self_inverse() {
+        let digest = [0xaau8; 32];
+
+        let mut pcr = TpmPcr::with_index(0, HashAlgorithm::Sha256);
+        let mut initial = [0u8; 32];
+        initial.copy_from_slice(&pcr.digest[..32]);
+
+        pcr.extend(&digest).unwrap();
+        let mut after_first = [0u8; 32];
+        after_first.copy_from_slice(&pcr.digest[..32]);
+
+        // First extend must change the PCR.
+        assert_ne!(initial, after_first, "extend must change PCR value");
+
+        pcr.extend(&digest).unwrap();
+        let mut after_second = [0u8; 32];
+        after_second.copy_from_slice(&pcr.digest[..32]);
+
+        // Second extend with the same value must NOT restore the original.
+        // (XOR would restore it; SHA-256 must not.)
+        assert_ne!(
+            initial, after_second,
+            "extend must not be self-inverse (XOR regression)"
+        );
+    }
+
+    /// Verifies that a wrong-length digest is rejected.
+    #[test]
+    fn pcr_extend_rejects_wrong_length() {
+        let mut pcr = TpmPcr::with_index(0, HashAlgorithm::Sha256);
+        // 31 bytes — one short of SHA-256 digest size.
+        let bad = [0u8; 31];
+        assert!(
+            pcr.extend(&bad).is_err(),
+            "extend must reject data.len() != digest_len"
+        );
     }
 }
