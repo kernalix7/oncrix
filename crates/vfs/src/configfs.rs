@@ -700,7 +700,10 @@ impl ConfigFs {
 
         let mut count = 0;
         for item in &group.items {
-            if item.active && count < names.len() {
+            // SECURITY: guard both output slices with the same bound so that
+            // a caller supplying name_lens shorter than names cannot cause an
+            // OOB index panic (ring-0 panic = machine halt).
+            if item.active && count < names.len() && count < name_lens.len() {
                 names[count] = item.name;
                 name_lens[count] = item.name_len;
                 count += 1;

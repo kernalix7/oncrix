@@ -375,7 +375,10 @@ pub fn fuse_mount(table: &mut FuseConnTable, daemon_init: &FuseInitIn) -> Result
     }
 
     let id = table.next_id;
-    table.next_id += 1;
+    // SECURITY: wrapping_add prevents a panic when next_id reaches u32::MAX
+    // (overflow-checks = on in this crate).  Connection IDs simply wrap;
+    // callers must not assume monotonicity beyond the live-connection table.
+    table.next_id = table.next_id.wrapping_add(1);
 
     let mut conn = FuseConnection::new(id);
 

@@ -26,6 +26,32 @@
 
 use oncrix_lib::{Error, Result};
 
+// ── CRC32C ────────────────────────────────────────────────────────────────────
+
+// SECURITY: btrfs_disk_io::crc32c is private to that module; replicate here so
+// verify_block_csum can compute a real digest from the raw block bytes rather
+// than relying on the caller to supply a pre-computed value (which would allow
+// an attacker to pass a matching fake checksum alongside corrupted data).
+/// Software CRC32C (Castagnoli polynomial, reversed bit order).
+///
+/// Same algorithm as `btrfs_disk_io::crc32c` — Castagnoli CRC used by btrfs
+/// for all data and metadata block checksums (`BTRFS_CSUM_TYPE_CRC32`).
+fn crc32c(data: &[u8]) -> u32 {
+    const POLY: u32 = 0x82F6_3B78;
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 /// Maximum number of devices tracked in one scrub session.
 pub const MAX_SCRUB_DEVICES: usize = 16;
 
@@ -244,14 +270,36 @@ impl Default for ScrubController {
     }
 }
 
-/// Verify a block checksum.
+/// Verify a block checksum against the raw block bytes.
 ///
-/// `stored_csum` is read from the on-disk block header.
-/// `computed_csum` is computed from the block data by the caller.
+/// `stored_csum` is the CRC32C value read from the on-disk block header
+/// (first 4 bytes of the `csum` field in `btrfs_header` / `btrfs_item`).
+/// `block_data` is the full raw block content that was read from disk;
+/// the checksum covers the entire block (btrfs checksums the whole node/leaf
+/// including the header, with the `csum` field itself zeroed out during
+/// verification — callers must zero those bytes before passing the slice).
+///
+/// # SECURITY
+///
+/// The previous stub accepted a caller-supplied `computed_csum` and simply
+/// compared the two u32 values.  A FUSE daemon or userspace scrub agent
+/// could supply any `computed_csum` it liked, making the check trivially
+/// bypassable.  This version computes the CRC itself from the raw bytes so
+/// the comparison is always against a kernel-derived digest.
 ///
 /// Returns the appropriate [`BlockVerifyResult`].
-pub fn verify_block_csum(stored_csum: u32, computed_csum: u32) -> BlockVerifyResult {
-    if stored_csum == computed_csum {
+//
+// SECURITY INVARIANT (for the future scrub driver): this kernel-side CRC verify
+// is correct but is not yet wired to a block-layer read path — when the scrub
+// driver lands it MUST, for every extent, read the raw block from disk, zero the
+// on-disk csum bytes, call verify_block_csum, and act on the result. Until then
+// the scrub state machine performs no actual integrity check (latent gap: no
+// untrusted block is verified because none is read).
+pub fn verify_block_csum(stored_csum: u32, block_data: &[u8]) -> BlockVerifyResult {
+    // SECURITY: compute digest inside the kernel from the raw block bytes;
+    // never trust a daemon-supplied checksum value.
+    let computed = crc32c(block_data);
+    if stored_csum == computed {
         BlockVerifyResult::Ok
     } else {
         BlockVerifyResult::Corrupt

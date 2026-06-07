@@ -158,19 +158,25 @@ impl FuseArgBuf {
 
     /// Reads a `u32` at byte offset `off` (little-endian).
     pub fn read_u32_le(&self, off: usize) -> Option<u32> {
-        if off + 4 > self.len {
+        // SECURITY: `off + 4` overflows to 0 when off is near usize::MAX,
+        // making the guard `0 > self.len` false and allowing an OOB slice.
+        // Use checked_add so overflow is treated as out-of-bounds.
+        let end = off.checked_add(4)?;
+        if end > self.len {
             return None;
         }
-        let b = &self.data[off..off + 4];
+        let b = &self.data[off..end];
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// Reads a `u64` at byte offset `off` (little-endian).
     pub fn read_u64_le(&self, off: usize) -> Option<u64> {
-        if off + 8 > self.len {
+        // SECURITY: same overflow hazard as read_u32_le — use checked_add.
+        let end = off.checked_add(8)?;
+        if end > self.len {
             return None;
         }
-        let b = &self.data[off..off + 8];
+        let b = &self.data[off..end];
         Some(u64::from_le_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
@@ -539,7 +545,13 @@ pub fn build_read_args(fh: u64, offset: u64, size: u32, out: &mut [u8]) -> usize
 /// followed by data bytes.
 pub fn build_write_args(fh: u64, offset: u64, data: &[u8], out: &mut [u8]) -> usize {
     let hdr = 32usize;
-    if out.len() < hdr + data.len() {
+    // SECURITY: `hdr + data.len()` overflows when data.len() > usize::MAX - 32,
+    // causing the guard to pass and an OOB write to follow. Subtract first so the
+    // comparison is always correct without overflow. The explicit `out.len() < hdr`
+    // term restores the implicit >=32 floor the old `hdr + data.len()` guard gave:
+    // without it a sub-header out buffer would pass and the fixed out[24..32]
+    // writes below would panic (ring-0) on a slice shorter than the header.
+    if out.len() < hdr || data.len() > out.len() - hdr {
         return 0;
     }
     out[0..8].copy_from_slice(&fh.to_le_bytes());
@@ -625,7 +637,10 @@ impl FuseMount {
         reply.to_result()?;
         // Extract minor version from reply data[4..8].
         if let Some(minor) = reply.data.read_u32_le(4) {
-            self.queue.set_minor_version(minor);
+            // SECURITY: clamp the daemon-supplied minor version to the maximum
+            // this kernel supports; a rogue daemon advertising a future minor
+            // must not enable protocol paths we have not implemented.
+            self.queue.set_minor_version(minor.min(FUSE_MINOR));
         }
         self.initialized = true;
         Ok(())

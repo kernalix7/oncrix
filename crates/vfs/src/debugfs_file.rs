@@ -192,6 +192,15 @@ pub fn debugfs_create_file(
     if name.is_empty() || name.len() > MAX_ENTRY_NAME {
         return Err(Error::InvalidArgument);
     }
+    // SECURITY: reject a daemon-supplied Blob whose declared length exceeds
+    // the fixed backing array.  Without this check a caller can store an
+    // out-of-bounds `len` which later causes an OOB index panic in
+    // debugfs_read_blob (ring-0 panic = machine halt).
+    if let DebugfsData::Blob(_, blen) = &data {
+        if *blen > MAX_BLOB_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+    }
     if table.find(parent_ino, name).is_some() {
         return Err(Error::AlreadyExists);
     }

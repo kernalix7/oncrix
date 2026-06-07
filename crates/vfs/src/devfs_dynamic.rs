@@ -248,8 +248,15 @@ impl DevfsTable {
 pub fn devfs_make_devpath(class: &[u8], name: &[u8], buf: &mut [u8]) -> Result<usize> {
     let _ = class; // class not used in path but retained for API clarity
     let prefix = b"/dev/";
-    let total = prefix.len() + name.len();
-    if buf.len() < total {
+    // SECURITY: use checked_add to prevent wrapping when name.len() is
+    // attacker-controlled; a wrap could produce a small `total` that passes
+    // the buf.len() guard while the subsequent copies access out-of-bounds.
+    let total = prefix
+        .len()
+        .checked_add(name.len())
+        .ok_or(Error::InvalidArgument)?;
+    // Also reject any path longer than the output buffer regardless of size.
+    if total > buf.len() {
         return Err(Error::InvalidArgument);
     }
     buf[..prefix.len()].copy_from_slice(prefix);
