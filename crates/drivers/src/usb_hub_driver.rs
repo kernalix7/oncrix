@@ -377,13 +377,21 @@ impl UsbHubDriver {
         G: Fn(u8) -> Result<u32>,
     {
         let mut changed_ports = 0u16;
-        for port in 1..=self.num_ports {
+        // Clamp the device-reported `num_ports` to the backing array and to the
+        // bitmap width (u16 has 16 bits; port 0 is unused so valid ports are
+        // 1..=15, keeping the shift ≤ 15 which is always safe for u16).
+        let bitmap_bits: u8 = u16::BITS as u8; // 16
+        let safe_max = (self.num_ports as usize)
+            .min(self.ports.len())
+            .min((bitmap_bits - 1) as usize) as u8;
+        for port in 1..=safe_max {
             let idx = (port - 1) as usize;
             if let Ok(status) = get_port_status(port) {
                 if status != self.ports[idx].status {
                     self.ports[idx].status = status;
                     if status & (PS_C_CONNECTION | PS_C_ENABLE | PS_C_RESET) != 0 {
-                        changed_ports |= 1 << port;
+                        // port is 1..=15; 1u16 << 15 = 0x8000 — never overflows.
+                        changed_ports |= 1u16 << port;
                     }
                     // Update state based on status.
                     if status & PS_CONNECTION == 0 {
