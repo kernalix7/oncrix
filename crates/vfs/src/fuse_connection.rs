@@ -16,6 +16,12 @@ pub const FUSE_MAX_INFLIGHT: usize = 64;
 pub const FUSE_KERNEL_VERSION: u32 = 7;
 pub const FUSE_KERNEL_MINOR_VERSION: u32 = 39;
 
+/// Hard upper bound on the `max_write` value advertised by a FUSE daemon (1 MiB).
+///
+/// A daemon that sets this larger is untrusted; we clamp to prevent oversized
+/// kernel allocations or arithmetic overflows in write-path sizing.
+pub const FUSE_MAX_REQUEST_SIZE: u32 = 1_048_576;
+
 /// Unique request identifier, monotonically increasing per connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FuseRequestId(pub u64);
@@ -208,7 +214,10 @@ impl FuseConnection {
         }
         let _ = daemon_minor; // minor is informational
         self.flags = FuseConnFlags(daemon_flags);
-        self.max_write = max_write.max(4096);
+        // SECURITY: max_write comes from the untrusted daemon; clamp it to
+        // [4096, FUSE_MAX_REQUEST_SIZE] so oversized values cannot drive
+        // unbounded allocations in the write path.
+        self.max_write = max_write.clamp(4096, FUSE_MAX_REQUEST_SIZE);
         self.state = FuseConnState::Connected;
         Ok(())
     }

@@ -356,18 +356,33 @@ impl ChunkTree {
 // Stripe layout helpers
 // ---------------------------------------------------------------------------
 
+/// Maximum legal stripe count for any btrfs chunk (RAID-6 needs at least 4
+/// data+parity stripes; btrfs caps the on-disk value at 64 in practice).
+const MAX_STRIPES_SANE: u16 = 64;
+
 /// Compute the total usable size for a chunk with `num_stripes` and `stripe_len`.
 ///
 /// For RAID-5, one stripe is parity; for RAID-6, two stripes are parity.
+///
+/// # Overflow safety
+///
+/// `length` and `num_stripes` come from on-disk metadata and are therefore
+/// untrusted.  All multiplications use `checked_mul`; if the intermediate
+/// product would overflow `u64` the function returns 0 (safe / conservative).
+/// `num_stripes` is also clamped to [`MAX_STRIPES_SANE`] before use; values
+/// beyond that cap are almost certainly corrupt on-disk data.
 pub fn chunk_usable_size(length: u64, chunk_type: u64, num_stripes: u16) -> u64 {
-    if num_stripes == 0 {
+    if num_stripes == 0 || num_stripes > MAX_STRIPES_SANE {
         return 0;
     }
+    let n = num_stripes as u64;
     if chunk_type & CHUNK_PROFILE_RAID5 != 0 && num_stripes > 1 {
-        return length * (num_stripes as u64 - 1) / num_stripes as u64;
+        // (n - 1) is safe: num_stripes > 1 is checked above.
+        return length.checked_mul(n - 1).unwrap_or(0) / n;
     }
     if chunk_type & CHUNK_PROFILE_RAID6 != 0 && num_stripes > 2 {
-        return length * (num_stripes as u64 - 2) / num_stripes as u64;
+        // (n - 2) is safe: num_stripes > 2 is checked above.
+        return length.checked_mul(n - 2).unwrap_or(0) / n;
     }
     // DUP, RAID1, RAID10, single: all stripes hold identical data.
     if chunk_type & (CHUNK_PROFILE_DUP | CHUNK_PROFILE_RAID1 | CHUNK_PROFILE_RAID10) != 0 {

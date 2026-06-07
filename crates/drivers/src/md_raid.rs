@@ -183,6 +183,7 @@ impl MdArray {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if no members are present.
+    /// Returns [`Error::InvalidArgument`] if RAID-0 has zero members or zero chunk size.
     /// Returns [`Error::InvalidArgument`] if RAID-1 has fewer than 2 members.
     pub fn assemble(&mut self) -> Result<()> {
         if self.member_count == 0 {
@@ -200,6 +201,16 @@ impl MdArray {
                 self.total_sectors = total;
             }
             RaidLevel::Raid0 => {
+                // Finding 2: reject zero member_count for RAID-0 (belt-and-suspenders;
+                // the outer check already catches it, but the translate path divides by n).
+                if self.member_count == 0 {
+                    return Err(Error::InvalidArgument);
+                }
+                // Finding 1: chunk_sectors == 0 causes divide-by-zero in translate_raid0_read.
+                // Reject at assembly time so translate never sees a zero divisor.
+                if self.chunk_sectors == 0 {
+                    return Err(Error::InvalidArgument);
+                }
                 // Stripe size = min(member) × count.
                 let min_sectors = self.members[..self.member_count]
                     .iter()
@@ -341,8 +352,16 @@ impl MdArray {
         ios: &mut [MemberIo; MAX_MD_MEMBERS],
     ) -> Result<usize> {
         // Simplified: only handles single-chunk reads for now.
+
+        // Finding 1: guard chunk_sectors == 0 (comes from on-disk superblock and is pub).
+        // Finding 2: guard member_count == 0 so n is never a zero divisor.
+        // assemble() rejects both, but translate may be called after mutation.
         let chunk = self.chunk_sectors;
         let n = self.member_count as u64;
+        if chunk == 0 || n == 0 {
+            return Err(Error::InvalidArgument);
+        }
+
         let chunk_idx = lba / chunk;
         let chunk_off = lba % chunk;
         let member_idx = (chunk_idx % n) as usize;

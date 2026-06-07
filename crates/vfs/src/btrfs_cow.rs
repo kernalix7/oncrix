@@ -583,11 +583,17 @@ impl NodePool {
 
     /// Free a pool slot.
     ///
-    /// Does nothing if the slot is already free.
+    /// Does nothing if the slot is already free or the index is out of range.
+    /// Both `allocated` and `live` are decremented so that subsequent calls
+    /// to `alloc_node` can reuse the released slot.  Without decrementing
+    /// `allocated`, the `allocated >= MAX_POOL_NODES` guard in `alloc_node`
+    /// would permanently reject new allocations once the counter saturated,
+    /// even though free slots were available (write-exhaustion DoS).
     pub fn free(&mut self, idx: u32) {
         let i = idx as usize;
         if i < MAX_POOL_NODES && self.nodes[i].in_use {
             self.nodes[i].in_use = false;
+            self.allocated = self.allocated.saturating_sub(1);
             self.live = self.live.saturating_sub(1);
         }
     }

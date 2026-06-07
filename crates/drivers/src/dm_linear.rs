@@ -140,16 +140,27 @@ pub struct DmLinear<D: BlockDevice> {
 
 impl<D: BlockDevice> DmLinear<D> {
     /// Create an empty `DmLinear` device.
-    pub fn new(block_size: u32) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `block_size` is zero (would cause
+    /// divide-by-zero on the first I/O). Mirror the same guard as
+    /// [`MemBlockDevice::new`].
+    ///
+    /// Finding 4: block_size == 0 is rejected here so read/write never divide by zero.
+    pub fn new(block_size: u32) -> Result<Self> {
+        if block_size == 0 {
+            return Err(Error::InvalidArgument);
+        }
         const NONE_SEG: Option<LinearSegment> = None;
-        Self {
+        Ok(Self {
             segments: [NONE_SEG; DM_LINEAR_MAX_SEGMENTS],
             segment_count: 0,
             devices: core::array::from_fn(|_| None),
             block_size,
             online: false,
             stats: DmLinearStats::default(),
-        }
+        })
     }
 
     /// Add a segment and its corresponding backing device.
@@ -157,10 +168,28 @@ impl<D: BlockDevice> DmLinear<D> {
     /// # Errors
     ///
     /// Returns [`Error::OutOfMemory`] if the segment table is full.
+    /// Returns [`Error::InvalidArgument`] if the segment has zero length (would
+    /// produce `available == 0` in I/O paths, causing an infinite loop).
     /// Returns [`Error::InvalidArgument`] if the segment overlaps an existing one.
     pub fn add_segment(&mut self, segment: LinearSegment, device: D) -> Result<()> {
         if self.segment_count >= DM_LINEAR_MAX_SEGMENTS {
             return Err(Error::OutOfMemory);
+        }
+        // Finding 6: zero-length segment makes available == 0 → chunk == 0 →
+        // the while-remaining loop never advances (infinite loop).
+        if segment.length == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // The physical mapping must not wrap: `physical_start` is
+        // attacker-controlled on-disk metadata, and `translate()` computes
+        // `physical_start + (lba - virtual_start)` where the delta is bounded
+        // by `length - 1`. Reject a segment whose `physical_start + length`
+        // overflows so every in-segment translate is overflow-safe (a raw add
+        // there would otherwise panic in ring 0 under overflow-checks).
+        if segment.physical_start.checked_add(segment.length).is_none()
+            || segment.virtual_start.checked_add(segment.length).is_none()
+        {
+            return Err(Error::InvalidArgument);
         }
         // Check for overlap with existing segments.
         for s in self.segments.iter().flatten() {
@@ -215,6 +244,8 @@ impl<D: BlockDevice> DmLinear<D> {
     ///
     /// Returns [`Error::IoError`] if not online.
     /// Returns [`Error::NotFound`] if the block range is not mapped.
+    /// Returns [`Error::InvalidArgument`] on arithmetic overflow in segment
+    /// boundary or physical-offset calculation.
     pub fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
         if !self.online {
             return Err(Error::IoError);
@@ -231,12 +262,37 @@ impl<D: BlockDevice> DmLinear<D> {
                 Error::NotFound
             })?;
             let seg = self.segments[seg_idx].unwrap();
-            // How many bytes are left in this segment?
-            let seg_end_byte = (seg.virtual_end() + 1) * bs;
-            let available = (seg_end_byte - current_offset) as usize;
+
+            // Finding 3: virtual_end() saturates to u64::MAX when the segment
+            // length overflows; the subsequent +1 would then wrap.  Use checked
+            // arithmetic and propagate as InvalidArgument.
+            let seg_end_byte = seg
+                .virtual_end()
+                .checked_add(1)
+                .and_then(|e| e.checked_mul(bs))
+                .ok_or(Error::InvalidArgument)?;
+
+            // Guard against current_offset being past the segment end (should
+            // not happen if contains() is correct, but be defensive).
+            let available = seg_end_byte
+                .checked_sub(current_offset)
+                .ok_or(Error::InvalidArgument)? as usize;
+
+            // Finding 6: available == 0 means the loop would spin forever.
+            if available == 0 {
+                return Err(Error::InvalidArgument);
+            }
             let chunk = remaining.min(available);
 
-            let phys_offset = seg.translate(lba) * bs + (current_offset % bs);
+            // Finding 5: physical_start is attacker-controlled (from on-disk
+            // metadata); guard the multiplication and addition against overflow.
+            let intra_block = current_offset % bs;
+            let phys_offset = seg
+                .translate(lba)
+                .checked_mul(bs)
+                .and_then(|p| p.checked_add(intra_block))
+                .ok_or(Error::InvalidArgument)?;
+
             let dev = self.devices[seg_idx].as_mut().ok_or(Error::IoError)?;
             dev.read(phys_offset, &mut buf[buf_offset..buf_offset + chunk])?;
 
@@ -255,6 +311,8 @@ impl<D: BlockDevice> DmLinear<D> {
     ///
     /// Returns [`Error::IoError`] if not online.
     /// Returns [`Error::NotFound`] if the block range is not mapped.
+    /// Returns [`Error::InvalidArgument`] on arithmetic overflow in segment
+    /// boundary or physical-offset calculation.
     pub fn write(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
         if !self.online {
             return Err(Error::IoError);
@@ -271,11 +329,32 @@ impl<D: BlockDevice> DmLinear<D> {
                 Error::NotFound
             })?;
             let seg = self.segments[seg_idx].unwrap();
-            let seg_end_byte = (seg.virtual_end() + 1) * bs;
-            let available = (seg_end_byte - current_offset) as usize;
+
+            // Finding 3: same overflow path as read — use checked arithmetic.
+            let seg_end_byte = seg
+                .virtual_end()
+                .checked_add(1)
+                .and_then(|e| e.checked_mul(bs))
+                .ok_or(Error::InvalidArgument)?;
+
+            let available = seg_end_byte
+                .checked_sub(current_offset)
+                .ok_or(Error::InvalidArgument)? as usize;
+
+            // Finding 6: available == 0 would spin the loop forever.
+            if available == 0 {
+                return Err(Error::InvalidArgument);
+            }
             let chunk = remaining.min(available);
 
-            let phys_offset = seg.translate(lba) * bs + (current_offset % bs);
+            // Finding 5: guard attacker-controlled physical_start multiplication.
+            let intra_block = current_offset % bs;
+            let phys_offset = seg
+                .translate(lba)
+                .checked_mul(bs)
+                .and_then(|p| p.checked_add(intra_block))
+                .ok_or(Error::InvalidArgument)?;
+
             let dev = self.devices[seg_idx].as_mut().ok_or(Error::IoError)?;
             dev.write(phys_offset, &buf[buf_offset..buf_offset + chunk])?;
 

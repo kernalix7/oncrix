@@ -26,6 +26,7 @@
 //!
 //! Linux `kernel/trace/trace_kprobe.c`, `include/linux/trace_events.h`.
 
+use crate::capability::{CAP_SYS_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ======================================================================
@@ -34,6 +35,25 @@ use oncrix_lib::{Error, Result};
 
 /// Maximum number of registered kprobe events.
 const MAX_KPROBE_EVENTS: usize = 256;
+
+/// Number of addressable x86_64 general-purpose registers a fetch may
+/// reference (RAX..R15, RIP, RFLAGS as captured in `ProbeRegisters`).
+const NR_GP_REGISTERS: u8 = 18;
+
+/// Lowest address of the x86_64 kernel-text mapping (pre-KASLR base).
+const KERNEL_TEXT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+
+/// Size of the kernel-text validation window above [`KERNEL_TEXT_BASE`]
+/// (kernel image plus maximum KASLR slide).
+const KERNEL_TEXT_WINDOW: u64 = 0x4000_0000;
+
+/// Returns `true` if `addr` lies within the kernel-text mapping.
+///
+/// Used to reject attacker-supplied [`FetchType::Memory`] addresses
+/// before they are recorded as a probe argument source. Fail-closed.
+const fn is_kernel_text_addr(addr: u64) -> bool {
+    addr >= KERNEL_TEXT_BASE && addr < KERNEL_TEXT_BASE.wrapping_add(KERNEL_TEXT_WINDOW)
+}
 
 /// Maximum length of a symbol name.
 const MAX_SYMBOL_LEN: usize = 128;
@@ -60,6 +80,12 @@ const TRACE_RING_SIZE: usize = 1024;
 // Probe argument fetch types
 // ======================================================================
 
+/// Largest stack byte offset a [`FetchType::Stack`] fetch may reference.
+///
+/// Bounds the read to a single kernel stack so an attacker-supplied
+/// offset cannot read arbitrary memory past the current frame.
+const MAX_STACK_FETCH_OFFSET: u32 = 0x4000;
+
 /// Describes how to fetch a single argument when a kprobe fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchType {
@@ -75,6 +101,33 @@ pub enum FetchType {
     InstructionPointer,
     /// Immediate constant value.
     Immediate(u64),
+}
+
+impl FetchType {
+    /// Validates that this fetch source is in bounds and safe to record.
+    ///
+    /// Rejected at definition time so an out-of-range register index, an
+    /// over-large stack offset, or a non-kernel memory address can never
+    /// be stored and later dereferenced when the probe fires.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if a `Register` index is `>=`
+    ///   [`NR_GP_REGISTERS`], a `Stack` offset exceeds
+    ///   [`MAX_STACK_FETCH_OFFSET`], or a `Memory` address is outside
+    ///   the kernel-text mapping.
+    pub fn validate(&self) -> Result<()> {
+        match *self {
+            // SECURITY: bound the register index to the GP-register file
+            // so a fetch cannot index past `ProbeRegisters`.
+            FetchType::Register(idx) if idx >= NR_GP_REGISTERS => Err(Error::InvalidArgument),
+            // SECURITY: bound the stack offset to a single kernel stack.
+            FetchType::Stack(off) if off > MAX_STACK_FETCH_OFFSET => Err(Error::InvalidArgument),
+            // SECURITY: only allow fixed-memory fetches from kernel text.
+            FetchType::Memory(addr) if !is_kernel_text_addr(addr) => Err(Error::InvalidArgument),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Describes one argument definition attached to a kprobe event.
@@ -105,6 +158,12 @@ impl ProbeArgDef {
     }
 
     /// Creates an argument definition with the given fetch type and size.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if `name_bytes` is empty or longer
+    ///   than 16 bytes, `size` is not one of 1/2/4/8, or `fetch` fails
+    ///   [`FetchType::validate`].
     pub fn with_fetch(name_bytes: &[u8], fetch: FetchType, size: u8, signed: bool) -> Result<Self> {
         if name_bytes.is_empty() || name_bytes.len() > 16 {
             return Err(Error::InvalidArgument);
@@ -112,6 +171,9 @@ impl ProbeArgDef {
         if !matches!(size, 1 | 2 | 4 | 8) {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: validate the fetch source before storing it so an
+        // out-of-range register/stack/memory source can never be recorded.
+        fetch.validate()?;
         let mut arg = Self::new();
         arg.name[..name_bytes.len()].copy_from_slice(name_bytes);
         arg.name_len = name_bytes.len();
@@ -404,6 +466,30 @@ impl KprobeEvent {
         self.offset
     }
 
+    /// Resolves the absolute probe address from a symbol base.
+    ///
+    /// Combines the caller-resolved `symbol_base` with this event's
+    /// validated `offset` using checked arithmetic, then confirms the
+    /// result lies in kernel text. This is the safe sink for the bound
+    /// established at [`register`](KprobeEventManager::register).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if `symbol_base + offset` overflows
+    ///   or does not land in the kernel-text mapping.
+    pub fn resolve_addr(&self, symbol_base: u64) -> Result<u64> {
+        // SECURITY: checked_add rejects wrapping (overflow-checks are on in
+        // dev/test, so a wrapping add would panic in ring 0); the range
+        // check rejects a base+offset that escapes kernel text.
+        let addr = symbol_base
+            .checked_add(self.offset)
+            .ok_or(Error::InvalidArgument)?;
+        if !is_kernel_text_addr(addr) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(addr)
+    }
+
     /// Returns whether this is a return probe.
     pub fn is_return(&self) -> bool {
         self.is_return
@@ -448,8 +534,20 @@ impl KprobeEvent {
     }
 
     /// Sets the filter expression.
-    pub fn set_filter(&mut self, filter: FilterExpr) {
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if an active filter references a
+    ///   `field_index` that is `>=` the number of defined format fields.
+    pub fn set_filter(&mut self, filter: FilterExpr) -> Result<()> {
+        // SECURITY: an active filter indexes the format-field table when it
+        // evaluates; reject an out-of-range field index at set time so it
+        // can never drive an out-of-bounds read on a probe hit.
+        if filter.active && filter.field_index >= self.nr_format_fields {
+            return Err(Error::InvalidArgument);
+        }
         self.filter = filter;
+        Ok(())
     }
 
     /// Clears the filter expression.
@@ -640,17 +738,47 @@ impl KprobeEventManager {
     }
 
     /// Registers a new kprobe event.
+    ///
+    /// Registering a kprobe event installs an underlying kprobe (kernel
+    /// text patch), so the caller must hold `CAP_SYS_ADMIN`. `offset` is
+    /// the byte offset from the resolved symbol base and must be strictly
+    /// less than `symbol_size`, preventing a probe placed past the end of
+    /// the symbol's instructions.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if `caller_caps` lacks
+    ///   `CAP_SYS_ADMIN`.
+    /// - [`Error::InvalidArgument`] if `name`/`symbol` are empty or
+    ///   over-long, `symbol_size` is zero, or `offset >= symbol_size`.
+    /// - [`Error::OutOfMemory`] if the event table is full.
+    /// - [`Error::AlreadyExists`] if an event with `name` exists.
     pub fn register(
         &mut self,
+        caller_caps: CapSet,
         name: &[u8],
         symbol: &[u8],
+        symbol_size: u64,
         offset: u64,
         is_return: bool,
     ) -> Result<u32> {
+        // SECURITY: installing a kprobe event patches kernel text; require
+        // CAP_SYS_ADMIN and fail closed before any state mutation. Per-task
+        // creds are not yet threaded here, so the dispatcher passes the
+        // caller's CapSet explicitly.
+        if !caller_caps.has(CAP_SYS_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
         if name.is_empty() || name.len() > MAX_EVENT_NAME_LEN {
             return Err(Error::InvalidArgument);
         }
         if symbol.is_empty() || symbol.len() > MAX_SYMBOL_LEN {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: bound the offset to the symbol's resolved size so an
+        // attacker-supplied offset cannot place the probe (base + offset)
+        // outside the symbol's instruction range.
+        if symbol_size == 0 || offset >= symbol_size {
             return Err(Error::InvalidArgument);
         }
         // Check for duplicate name.
@@ -695,7 +823,22 @@ impl KprobeEventManager {
     }
 
     /// Enables an event by ID.
-    pub fn enable(&mut self, event_id: u32) -> Result<()> {
+    ///
+    /// Enabling a kprobe event arms its kernel-text patch, so the caller
+    /// must hold `CAP_SYS_ADMIN`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if `caller_caps` lacks
+    ///   `CAP_SYS_ADMIN`.
+    /// - [`Error::NotFound`] if no event has `event_id`.
+    /// - [`Error::Busy`] if the event is being removed.
+    pub fn enable(&mut self, caller_caps: CapSet, event_id: u32) -> Result<()> {
+        // SECURITY: enabling arms the probe (kernel-text mutation); gate on
+        // CAP_SYS_ADMIN and fail closed before locating the event.
+        if !caller_caps.has(CAP_SYS_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
         let slot = self.find_by_id(event_id)?;
         self.events[slot].enable()
     }
@@ -707,10 +850,15 @@ impl KprobeEventManager {
     }
 
     /// Sets a filter on an event.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`] if no event has `event_id`.
+    /// - [`Error::InvalidArgument`] if the filter references an
+    ///   out-of-range format field (see [`KprobeEvent::set_filter`]).
     pub fn set_filter(&mut self, event_id: u32, filter: FilterExpr) -> Result<()> {
         let slot = self.find_by_id(event_id)?;
-        self.events[slot].set_filter(filter);
-        Ok(())
+        self.events[slot].set_filter(filter)
     }
 
     /// Processes a probe hit on the given event ID.
@@ -843,4 +991,94 @@ fn write_hex_u64(buf: &mut [u8], pos: usize, val: u64) -> usize {
         }
     }
     written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admin() -> CapSet {
+        let mut c = CapSet::EMPTY;
+        c.set(CAP_SYS_ADMIN);
+        c
+    }
+
+    #[test]
+    fn register_requires_cap_and_bounds_offset() {
+        let mut mgr = KprobeEventManager::new();
+        // No capability: denied before any state change.
+        assert_eq!(
+            mgr.register(CapSet::EMPTY, b"evt", b"do_open", 0x100, 0x10, false),
+            Err(Error::PermissionDenied)
+        );
+        // offset >= symbol_size is rejected.
+        assert_eq!(
+            mgr.register(admin(), b"evt", b"do_open", 0x100, 0x100, false),
+            Err(Error::InvalidArgument)
+        );
+        // Valid offset within the symbol succeeds.
+        assert!(
+            mgr.register(admin(), b"evt", b"do_open", 0x100, 0x10, false)
+                .is_ok()
+        );
+        assert_eq!(mgr.count(), 1);
+    }
+
+    #[test]
+    fn enable_requires_cap_sys_admin() {
+        let mut mgr = KprobeEventManager::new();
+        let id = mgr
+            .register(admin(), b"evt", b"sym", 0x100, 0, false)
+            .expect("register");
+        assert_eq!(mgr.enable(CapSet::EMPTY, id), Err(Error::PermissionDenied));
+        assert!(mgr.enable(admin(), id).is_ok());
+    }
+
+    #[test]
+    fn fetch_type_validation_rejects_out_of_range() {
+        // Register index past the GP-register file.
+        assert!(FetchType::Register(NR_GP_REGISTERS).validate().is_err());
+        assert!(FetchType::Register(0).validate().is_ok());
+        // Stack offset past one kernel stack.
+        assert!(
+            FetchType::Stack(MAX_STACK_FETCH_OFFSET + 1)
+                .validate()
+                .is_err()
+        );
+        // Non-kernel memory fetch.
+        assert!(FetchType::Memory(0x1000).validate().is_err());
+        assert!(FetchType::Memory(KERNEL_TEXT_BASE).validate().is_ok());
+        // with_fetch surfaces the same rejection.
+        assert!(ProbeArgDef::with_fetch(b"a", FetchType::Register(99), 8, false).is_err());
+    }
+
+    #[test]
+    fn set_filter_rejects_out_of_range_field_index() {
+        let mut mgr = KprobeEventManager::new();
+        let id = mgr
+            .register(admin(), b"evt", b"sym", 0x100, 0, false)
+            .expect("register");
+        // No format fields defined yet, so any active field index is invalid.
+        let bad = FilterExpr::with_condition(0, FilterOp::Eq, 1);
+        assert_eq!(mgr.set_filter(id, bad), Err(Error::InvalidArgument));
+        // An inactive filter is always accepted.
+        assert!(mgr.set_filter(id, FilterExpr::new()).is_ok());
+    }
+
+    #[test]
+    fn resolve_addr_uses_checked_math_and_range() {
+        let mut mgr = KprobeEventManager::new();
+        let id = mgr
+            .register(admin(), b"evt", b"sym", 0x100, 0x20, false)
+            .expect("register");
+        let slot = mgr.find_by_id(id).expect("slot");
+        let ev = &mgr.events[slot];
+        // Overflowing base + offset is rejected, not wrapped.
+        assert_eq!(ev.resolve_addr(u64::MAX), Err(Error::InvalidArgument));
+        // Valid kernel-text base resolves to base + offset.
+        assert_eq!(
+            ev.resolve_addr(KERNEL_TEXT_BASE),
+            Ok(KERNEL_TEXT_BASE + 0x20)
+        );
+    }
 }
