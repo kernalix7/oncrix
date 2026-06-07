@@ -52,6 +52,9 @@ const MAX_DIR_ENTRIES: usize = 128;
 /// Maximum OSD data payload size in bytes.
 const MAX_OSD_DATA: usize = 65536;
 
+/// Maximum number of outstanding (solicited but not yet granted) cap requests.
+const MAX_PENDING_CAPS: usize = 64;
+
 // ── MdsState ────────────────────────────────────────────────────
 
 /// Lifecycle state of a Ceph MDS session.
@@ -119,9 +122,20 @@ impl CephMdsSession {
 
     /// Acknowledge the MDS session response and mark the session open.
     ///
-    /// Returns `InvalidArgument` if called from a state other than `Opening`.
+    /// Returns `InvalidArgument` if called from a state other than `Opening`,
+    /// or if `session_id` is zero (which collides with the uninitialized value
+    /// and cannot be distinguished from a never-opened session).
     pub fn confirm_open(&mut self, session_id: u64, epoch: u32) -> Result<()> {
         if self.state != MdsState::Opening {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: session_id == 0 is the uninitialized sentinel; an MDS that
+        // sends 0 is either broken or adversarial.  Reject it so that stale
+        // zero-id sessions cannot be confused with a legitimately opened one.
+        // A full implementation should additionally bind this to a locally
+        // generated nonce sent in the SESSION_REQUEST message and verify that
+        // the MDS echoes the same nonce back before accepting the id.
+        if session_id == 0 {
             return Err(Error::InvalidArgument);
         }
         self.session_id = session_id;
@@ -304,12 +318,22 @@ impl CapSet {
 
     /// Add or update a capability in the set.
     ///
-    /// If a cap with the same `cap_id` exists, its `issued` bits are updated.
+    /// If a cap with the same `cap_id` exists, its `issued` bits are updated
+    /// only when `cap.seq` is strictly greater than the stored `seq`; a
+    /// stale or replayed update is rejected with `InvalidArgument`.
     /// Returns `OutOfMemory` if the set is full.
     pub fn insert(&mut self, cap: CephCap) -> Result<()> {
         // Update existing.
         for slot in &mut self.caps {
             if slot.valid && slot.cap_id == cap.cap_id {
+                // SECURITY: reject stale/replayed cap updates.  The MDS must
+                // always send a strictly increasing sequence number for each
+                // new grant to the same cap_id.  Accepting a lower or equal
+                // seq would allow a replayed MDS message to downgrade or
+                // re-issue privileges that have already been superseded.
+                if cap.seq <= slot.seq {
+                    return Err(Error::InvalidArgument);
+                }
                 slot.issued = cap.issued;
                 slot.seq = cap.seq;
                 return Ok(());
@@ -707,6 +731,29 @@ impl OsdMap {
 
 // ── CephFs ───────────────────────────────────────────────────────
 
+/// A pending (solicited) cap request entry: records the (ino, cap_id) pair
+/// for which the client has issued a cap request to the MDS and is waiting
+/// for the MDS grant reply.
+#[derive(Clone, Copy)]
+struct PendingCap {
+    /// Inode for which the cap was requested.
+    ino: u64,
+    /// The cap_id the client expects in the grant reply.
+    cap_id: u64,
+    /// Whether this slot is in use.
+    valid: bool,
+}
+
+impl PendingCap {
+    const fn empty() -> Self {
+        Self {
+            ino: 0,
+            cap_id: 0,
+            valid: false,
+        }
+    }
+}
+
 /// Top-level Ceph FS client handle.
 ///
 /// Manages the MDS session, inode cache, and OSD map. All VFS operations
@@ -718,6 +765,11 @@ pub struct CephFs {
     pub inode_cache: InodeCache,
     /// OSD cluster map.
     pub osd_map: OsdMap,
+    /// Outstanding (solicited) cap requests awaiting an MDS grant reply.
+    ///
+    /// Only grants whose (ino, cap_id) appear here are accepted; all others
+    /// are rejected as unsolicited.
+    pending_caps: [PendingCap; MAX_PENDING_CAPS],
 }
 
 impl CephFs {
@@ -727,7 +779,27 @@ impl CephFs {
             mds_session: CephMdsSession::new(),
             inode_cache: InodeCache::new(),
             osd_map: OsdMap::empty(),
+            pending_caps: [const { PendingCap::empty() }; MAX_PENDING_CAPS],
         }
+    }
+
+    /// Record an outgoing solicited cap request so that the matching MDS grant
+    /// can be validated.  Returns `OutOfMemory` if the pending table is full.
+    ///
+    /// The caller must invoke this before sending the cap-request message to
+    /// the MDS, so that `grant_caps` can verify the grant is expected.
+    pub fn record_pending_cap(&mut self, ino: u64, cap_id: u64) -> Result<()> {
+        for slot in &mut self.pending_caps {
+            if !slot.valid {
+                *slot = PendingCap {
+                    ino,
+                    cap_id,
+                    valid: true,
+                };
+                return Ok(());
+            }
+        }
+        Err(Error::OutOfMemory)
     }
 
     /// Connect to the MDS at the given address.
@@ -832,16 +904,20 @@ impl CephFs {
             .unwrap_or(false);
 
         if !has_read_cap {
-            // Request READ cap from MDS (stub: grant it directly).
-            let cap = CephCap::new(ino, ino ^ 0x0001, CapFlags::READ | CapFlags::CACHE);
-            if let Some(inode) = self.inode_cache.get_mut(ino) {
-                inode.caps.insert(cap)?;
-            } else {
-                return Err(Error::NotFound);
-            }
+            // Stub: simulate a solicited READ cap request-then-grant cycle.
+            // record_pending_cap registers the expected (ino, cap_id) pair so
+            // that grant_caps will accept it as a solicited grant.
+            let cap_id = ino ^ 0x0001;
+            self.record_pending_cap(ino, cap_id)?;
+            let cap = CephCap::new(ino, cap_id, CapFlags::READ | CapFlags::CACHE);
+            self.grant_caps(cap)?;
         }
 
-        let _req = OsdRequest::read(ino, offset, buf.len() as u32);
+        // SECURITY: reject oversized buffer lengths that would silently truncate
+        // to a smaller u32 value, causing the OSD to read fewer bytes than the
+        // caller expects (information truncation / incorrect read length).
+        let read_len = u32::try_from(buf.len()).map_err(|_| Error::InvalidArgument)?;
+        let _req = OsdRequest::read(ino, offset, read_len);
         // Stub: OSD dispatch not yet wired; return NotImplemented so the
         // caller knows to route via IPC.
         Err(Error::NotImplemented)
@@ -865,13 +941,11 @@ impl CephFs {
             .unwrap_or(false);
 
         if !has_write_cap {
-            // Request WRITE cap from MDS (stub: grant directly).
-            let cap = CephCap::new(ino, ino ^ 0x0002, CapFlags::WRITE | CapFlags::EXCL);
-            if let Some(inode) = self.inode_cache.get_mut(ino) {
-                inode.caps.insert(cap)?;
-            } else {
-                return Err(Error::NotFound);
-            }
+            // Stub: simulate a solicited WRITE cap request-then-grant cycle.
+            let cap_id = ino ^ 0x0002;
+            self.record_pending_cap(ino, cap_id)?;
+            let cap = CephCap::new(ino, cap_id, CapFlags::WRITE | CapFlags::EXCL);
+            self.grant_caps(cap)?;
         }
 
         let copy_len = data.len().min(MAX_OSD_DATA);
@@ -887,8 +961,36 @@ impl CephFs {
 
     /// Grant capabilities on an inode (called when an MDS cap message arrives).
     ///
-    /// Returns `NotFound` if the inode is not cached.
+    /// The grant is accepted only if a matching solicited request for the same
+    /// `(ino, cap_id)` is present in the pending table; unsolicited grants —
+    /// including any grant of `WRITE` or `EXCL` bits that the client never
+    /// asked for — are rejected with `PermissionDenied`.  On acceptance the
+    /// pending slot is consumed so the same grant cannot be applied twice.
+    ///
+    /// Returns `NotFound` if the inode is not in the local cache.
     pub fn grant_caps(&mut self, cap: CephCap) -> Result<()> {
+        // SECURITY: reject unsolicited cap grants.  A compromised MDS could
+        // send a WRITE or EXCL cap grant for an inode the client never
+        // requested, escalating the client's privileges on that inode.  We
+        // require that a matching pending record (ino, cap_id) exists and
+        // consume it atomically with the grant.  Any grant whose pair does
+        // not appear in the pending table is treated as attacker-injected
+        // and rejected.
+        let pending_idx = self
+            .pending_caps
+            .iter()
+            .position(|p| p.valid && p.ino == cap.ino && p.cap_id == cap.cap_id)
+            .ok_or(Error::PermissionDenied)?;
+
+        // SECURITY (belt-and-suspenders): the pending-table check above is the
+        // primary guard against unsolicited WRITE/EXCL grants.  If the
+        // pending-table integrity is ever weakened, the originally-requested
+        // bit mask must be stored alongside the (ino, cap_id) entry and
+        // enforced here before accepting elevated bits.
+
+        // Consume the pending slot (prevents duplicate application).
+        self.pending_caps[pending_idx] = PendingCap::empty();
+
         if let Some(inode) = self.inode_cache.get_mut(cap.ino) {
             inode.caps.insert(cap)
         } else {

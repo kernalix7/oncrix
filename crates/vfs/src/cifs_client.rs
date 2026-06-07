@@ -88,6 +88,20 @@ impl Default for CifsMountOptions {
     }
 }
 
+/// A generation-stamped token returned by [`CifsMount::alloc_handle`].
+///
+/// Callers must supply this token to [`CifsMount::free_handle`] and
+/// [`CifsMount::get_handle`].  The generation counter ensures that a stale
+/// index produced by a previous swap-remove cannot alias a newly allocated
+/// handle in the same slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandleToken {
+    /// Slot index inside [`CifsMount::handles`].
+    pub index: usize,
+    /// Generation stamp of the slot at allocation time.
+    pub generation: u32,
+}
+
 /// A cached open file handle on the server.
 #[derive(Debug, Clone, Copy)]
 pub struct CifsFileHandle {
@@ -101,10 +115,15 @@ pub struct CifsFileHandle {
     pub has_lock: bool,
     /// Whether a lease has been granted for this handle.
     pub leased: bool,
+    /// Generation stamp: incremented each time this slot is reused.
+    /// A `HandleToken` whose generation does not match this field is stale.
+    pub generation: u32,
+    /// `true` while this slot holds a live handle.
+    pub occupied: bool,
 }
 
 impl CifsFileHandle {
-    /// Construct a new file handle descriptor.
+    /// Construct a new (unoccupied) file handle descriptor.
     pub const fn new(persistent_id: u64, volatile_id: u64, access_mask: u32) -> Self {
         Self {
             persistent_id,
@@ -112,6 +131,8 @@ impl CifsFileHandle {
             access_mask,
             has_lock: false,
             leased: false,
+            generation: 0,
+            occupied: false,
         }
     }
 
@@ -169,26 +190,110 @@ impl CifsMount {
         }
     }
 
-    /// Allocate a handle slot, returning its index or `OutOfMemory`.
-    pub fn alloc_handle(&mut self, handle: CifsFileHandle) -> Result<usize> {
-        if self.handle_count >= CIFS_MAX_FILE_HANDLES {
-            return Err(Error::OutOfMemory);
-        }
-        let idx = self.handle_count;
+    /// Allocate a handle slot, returning a [`HandleToken`] that encodes both
+    /// the slot index and the current generation stamp.
+    ///
+    /// The token must be passed to [`free_handle`] and [`get_handle`];
+    /// a stale token whose generation no longer matches the slot is rejected,
+    /// preventing a post-swap-remove aliasing attack.
+    pub fn alloc_handle(&mut self, mut handle: CifsFileHandle) -> Result<HandleToken> {
+        // Search for any unoccupied slot (not just the tail) so that freed
+        // interior slots are reused instead of always growing the high-water mark.
+        let idx = self.handles[..CIFS_MAX_FILE_HANDLES]
+            .iter()
+            .position(|h| !h.occupied)
+            .ok_or(Error::OutOfMemory)?;
+        // Bump the generation so that any HandleToken that was issued for this
+        // slot before the previous free_handle is now detectably stale.
+        let next_gen = self.handles[idx].generation.wrapping_add(1);
+        handle.generation = next_gen;
+        handle.occupied = true;
         self.handles[idx] = handle;
-        self.handle_count += 1;
-        Ok(idx)
+        // Update high-water mark for handle_count (used only as a hint).
+        if idx >= self.handle_count {
+            self.handle_count = idx + 1;
+        }
+        Ok(HandleToken {
+            index: idx,
+            generation: next_gen,
+        })
     }
 
-    /// Release a handle by index.
-    pub fn free_handle(&mut self, idx: usize) -> Result<()> {
-        if idx >= self.handle_count {
+    /// Release a handle identified by its [`HandleToken`].
+    ///
+    /// Returns `InvalidArgument` if `token.index` is out of range, `NotFound`
+    /// if the slot is not occupied, or `PermissionDenied` if the generation
+    /// stamp does not match (stale token — possible use-after-free attempt).
+    pub fn free_handle(&mut self, token: HandleToken) -> Result<()> {
+        let idx = token.index;
+        if idx >= CIFS_MAX_FILE_HANDLES {
             return Err(Error::InvalidArgument);
         }
-        // Swap-remove to keep handles packed.
-        self.handle_count -= 1;
-        self.handles[idx] = self.handles[self.handle_count];
-        self.handles[self.handle_count] = CifsFileHandle::new(0, 0, 0);
+        let slot = &mut self.handles[idx];
+        if !slot.occupied {
+            return Err(Error::NotFound);
+        }
+        // SECURITY: generation mismatch means the caller holds a stale token
+        // from before a previous free; reject to prevent double-free /
+        // use-after-reallocation aliasing.
+        if slot.generation != token.generation {
+            return Err(Error::PermissionDenied);
+        }
+        // Preserve the generation so the next alloc_handle will bump it.
+        let saved_gen = slot.generation;
+        *slot = CifsFileHandle::new(0, 0, 0);
+        slot.generation = saved_gen;
+        // Recompute handle_count high-water mark.
+        while self.handle_count > 0 && !self.handles[self.handle_count - 1].occupied {
+            self.handle_count -= 1;
+        }
+        Ok(())
+    }
+
+    /// Look up a handle by its [`HandleToken`].
+    ///
+    /// Returns `PermissionDenied` for a stale token, `NotFound` for an
+    /// unoccupied slot, `InvalidArgument` for an out-of-range index.
+    pub fn get_handle(&self, token: HandleToken) -> Result<&CifsFileHandle> {
+        let idx = token.index;
+        if idx >= CIFS_MAX_FILE_HANDLES {
+            return Err(Error::InvalidArgument);
+        }
+        let slot = &self.handles[idx];
+        if !slot.occupied {
+            return Err(Error::NotFound);
+        }
+        // SECURITY: generation mismatch — stale token, could alias a
+        // subsequently allocated handle in the same slot.  Reject.
+        if slot.generation != token.generation {
+            return Err(Error::PermissionDenied);
+        }
+        Ok(slot)
+    }
+
+    /// Enforce the session signing policy on an inbound SMB2 response.
+    ///
+    /// Must be called after [`cifs_smb2::decode_header`] succeeds.  When
+    /// `self.security.signing_required` is set and the response flags indicate
+    /// `SMB2_FLAGS_SIGNED`, this function **rejects the message** because
+    /// HMAC-SHA256/AES-CMAC verification is not available at this layer.
+    ///
+    /// # Security
+    ///
+    /// // SECURITY: when `signing_required` is true we fail closed rather than
+    /// // accepting an unverified signature.  Real HMAC-SHA256 (SMB ≤ 3.0) or
+    /// // AES-CMAC (SMB 3.x) verification over the full message with the 16-byte
+    /// // signature field zeroed must be wired here before this guard is relaxed.
+    /// // The session signing key is available after SESSION_SETUP completes.
+    pub fn validate_response_signing(&self, response_flags: u32) -> Result<()> {
+        // SMB2_FLAGS_SIGNED = 0x0000_0008 (defined in cifs_smb2)
+        const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
+        if self.security.signing_required && (response_flags & SMB2_FLAGS_SIGNED != 0) {
+            // SECURITY: wiring point — replace this Err with actual
+            // HMAC-SHA256/AES-CMAC verification when the session key is
+            // available.  Never accept an unverified signed message.
+            return Err(Error::PermissionDenied);
+        }
         Ok(())
     }
 }

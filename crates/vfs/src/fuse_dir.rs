@@ -127,6 +127,10 @@ pub struct FuseReaddirState {
     pub entry_count: usize,
     /// Whether all entries have been read.
     pub done: bool,
+    // SECURITY: track the unique ID of the in-flight READDIR/READDIRPLUS
+    // request so that readdir_fill can reject unsolicited or mismatched
+    // daemon replies.  None means no request is in-flight.
+    pending_unique: Option<u64>,
 }
 
 impl FuseReaddirState {
@@ -138,7 +142,18 @@ impl FuseReaddirState {
             entries: core::array::from_fn(|_| None),
             entry_count: 0,
             done: false,
+            pending_unique: None,
         }
+    }
+
+    /// Record the unique ID of the READDIR/READDIRPLUS request just submitted.
+    ///
+    /// Must be called after the request is submitted to the connection queue.
+    /// The matching [`readdir_fill`] call must supply the same `unique`; any
+    /// other value is rejected as an unsolicited or replayed reply.
+    pub fn set_pending_unique(&mut self, unique: u64) {
+        // SECURITY: store the in-flight unique so replies can be correlated.
+        self.pending_unique = Some(unique);
     }
 
     /// Reset state to re-read from the beginning.
@@ -146,6 +161,7 @@ impl FuseReaddirState {
         self.offset = 0;
         self.entry_count = 0;
         self.done = false;
+        self.pending_unique = None;
         for e in self.entries.iter_mut() {
             *e = None;
         }
@@ -330,13 +346,32 @@ pub fn fuse_readdirplus(state: &FuseReaddirState) -> FuseDirRequest {
 
 /// Fill `state` with entries received from the FUSE daemon reply.
 ///
+/// `reply_unique` must match the unique ID recorded by [`FuseReaddirState::set_pending_unique`]
+/// (i.e. the unique from the READDIR/READDIRPLUS request this reply corresponds to).
+/// An unsolicited reply (no request in-flight), a duplicate reply (pending already
+/// cleared), or a reply whose unique does not match the in-flight unique are all
+/// rejected with `Err(InvalidArgument)`.
+///
 /// `entries` should be the parsed reply entries. Returns `Err(OutOfMemory)`
 /// if more entries than `MAX_READDIR_ENTRIES` are provided.
 pub fn readdir_fill(
     state: &mut FuseReaddirState,
+    reply_unique: u64,
     entries: &[(u64, u64, u8, &[u8])], // (ino, off, dtype, name)
     done: bool,
 ) -> Result<()> {
+    // SECURITY: reject unsolicited replies (no request in-flight) and replies
+    // whose unique does not match the outstanding request.  This prevents a
+    // malicious FUSE daemon from injecting directory entries for arbitrary
+    // directories or replaying a previous readdir reply.
+    match state.pending_unique {
+        None => return Err(Error::InvalidArgument),
+        Some(expected) if expected != reply_unique => return Err(Error::InvalidArgument),
+        Some(_) => {}
+    }
+    // Consume the pending slot — duplicates are now also rejected above.
+    state.pending_unique = None;
+
     state.entry_count = 0;
     for &(ino, off, dtype, name) in entries {
         let entry = FuseDirEntry::new(ino, off, dtype, name)?;

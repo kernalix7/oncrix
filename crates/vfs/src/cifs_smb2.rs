@@ -56,6 +56,13 @@ pub const SMB2_FLAGS_RELATED_OPERATIONS: u32 = 0x0000_0004;
 pub const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
 pub const SMB2_FLAGS_DFS_OPERATIONS: u32 = 0x1000_0000;
 
+/// Maximum number of in-flight SMB2 requests tracked for reply correlation.
+///
+/// A response whose MessageId is not found in this table is rejected.  This
+/// prevents a rogue server from injecting unsolicited replies and from replaying
+/// an already-completed response (use-after-free / double-dispatch confusion).
+pub const SMB2_MAX_PENDING: usize = 64;
+
 /// Maximum number of dialect values in a negotiate request.
 pub const MAX_DIALECTS: usize = 8;
 
@@ -82,6 +89,107 @@ pub const SMB300_DIALECT: u16 = 0x0300;
 pub const SMB210_DIALECT: u16 = 0x0210;
 /// SMB2.0.2 dialect value.
 pub const SMB202_DIALECT: u16 = 0x0202;
+
+// ── Pending-Request Correlation Table ────────────────────────────────────────
+
+/// One slot in the in-flight request table.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingRequest {
+    /// The MessageId that was sent.  0 means this slot is empty.
+    pub message_id: u64,
+    /// The command that was sent; a response with a different command is rejected
+    /// (cross-type confusion attack).
+    pub command: u16,
+}
+
+impl PendingRequest {
+    const EMPTY: Self = Self {
+        message_id: 0,
+        command: 0,
+    };
+}
+
+/// Fixed-size table of in-flight SMB2 requests keyed by MessageId.
+///
+/// Before sending a request the caller must call [`PendingRequestTable::register`].
+/// When a response arrives the caller must call [`PendingRequestTable::consume`],
+/// which atomically verifies that the MessageId is pending, that it has not
+/// already been completed (duplicate rejection), and that the response command
+/// matches the stored request command (cross-type confusion rejection).
+pub struct PendingRequestTable {
+    slots: [PendingRequest; SMB2_MAX_PENDING],
+}
+
+impl PendingRequestTable {
+    /// Create an empty table.
+    pub const fn new() -> Self {
+        Self {
+            slots: [PendingRequest::EMPTY; SMB2_MAX_PENDING],
+        }
+    }
+
+    /// Register an outgoing request.  Returns `Busy` if the table is full or
+    /// `AlreadyExists` if `message_id == 0` (reserved as "empty" sentinel).
+    pub fn register(&mut self, message_id: u64, command: u16) -> Result<()> {
+        if message_id == 0 {
+            // SECURITY: MessageId 0 is the empty-slot sentinel; a server that
+            // echoes it back would match every free slot.  Reject at send time.
+            return Err(Error::InvalidArgument);
+        }
+        for slot in self.slots.iter_mut() {
+            if slot.message_id == 0 {
+                *slot = PendingRequest {
+                    message_id,
+                    command,
+                };
+                return Ok(());
+            }
+        }
+        Err(Error::Busy)
+    }
+
+    /// Consume a pending request on receipt of a response.
+    ///
+    /// Verifies:
+    /// 1. `message_id` is currently pending (reject unknown/stale).
+    /// 2. `response_command` matches the stored request command (reject
+    ///    cross-type confusion).
+    /// 3. Marks the slot empty so a replayed response is rejected (duplicate
+    ///    rejection).
+    ///
+    /// Returns `NotFound` when the id is unknown/stale, `InvalidArgument` when
+    /// the command does not match.
+    pub fn consume(&mut self, message_id: u64, response_command: u16) -> Result<()> {
+        // SECURITY: message_id 0 is the EMPTY-slot sentinel (PendingRequest::EMPTY
+        // is { message_id: 0, command: 0 == Negotiate }); a response carrying
+        // message_id==0 would otherwise spuriously match an unused slot. A real
+        // request id is never 0 (register() rejects 0), so reject it here too.
+        if message_id == 0 {
+            return Err(Error::NotFound);
+        }
+        for slot in self.slots.iter_mut() {
+            if slot.message_id == message_id {
+                if slot.command != response_command {
+                    // SECURITY: response command does not match the stored
+                    // request command — possible cross-type confusion; reject.
+                    return Err(Error::InvalidArgument);
+                }
+                // Mark consumed — any future reply with the same id is stale.
+                *slot = PendingRequest::EMPTY;
+                return Ok(());
+            }
+        }
+        // SECURITY: no pending slot for this MessageId; the response is either
+        // unsolicited, replayed, or belongs to a different session.  Reject.
+        Err(Error::NotFound)
+    }
+}
+
+impl Default for PendingRequestTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── Command Codes ─────────────────────────────────────────────────────────────
 
@@ -207,8 +315,36 @@ pub fn encode_header(hdr: &Smb2Header, dst: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Decode a [`Smb2Header`] from `src[0..SMB2_HEADER_SIZE]`.
-pub fn decode_header(src: &[u8]) -> Result<Smb2Header> {
+/// Decode and validate a [`Smb2Header`] from `src[0..SMB2_HEADER_SIZE]`.
+///
+/// # Parameters
+///
+/// - `src` — raw received bytes; must be at least [`SMB2_HEADER_SIZE`] long.
+/// - `signing_required` — `true` when the session requires message signing
+///   (negotiated or forced by mount options).  When `true` and the server sets
+///   `SMB2_FLAGS_SIGNED`, this function **rejects the message** because
+///   HMAC-SHA256/AES-CMAC verification is not available at this layer.
+///
+/// # Security
+///
+/// **Signing fail-closed**: if `signing_required` is set and the inbound
+/// message carries `SMB2_FLAGS_SIGNED`, we return `Err(PermissionDenied)`.
+/// This is intentionally strict: accepting an unverified signature would allow
+/// a MitM or rogue server to forge arbitrary SMB2 responses.
+///
+/// // SECURITY: Real HMAC-SHA256 (SMB ≤ 3.0) or AES-CMAC (SMB 3.x) verification
+/// // must be wired here before this guard is relaxed.  The key exchange happens
+/// // during SESSION_SETUP; the session signing key must be passed in alongside
+/// // `signing_required`.  Until that plumbing exists, this function rejects every
+/// // signed message when `signing_required` is true, which is the correct
+/// // fail-closed posture for an attacker-controlled server.
+///
+/// # Pending-request correlation
+///
+/// This function does NOT validate the MessageId against an in-flight table;
+/// that responsibility belongs to the caller via
+/// [`PendingRequestTable::consume`] after a successful decode.
+pub fn decode_header(src: &[u8], signing_required: bool) -> Result<Smb2Header> {
     if src.len() < SMB2_HEADER_SIZE {
         return Err(Error::InvalidArgument);
     }
@@ -216,10 +352,22 @@ pub fn decode_header(src: &[u8]) -> Result<Smb2Header> {
     if magic != SMB2_MAGIC {
         return Err(Error::InvalidArgument);
     }
+    let flags = u32::from_le_bytes(src[16..20].try_into().map_err(|_| Error::InvalidArgument)?);
+
+    // SECURITY: if the session requires signing and the SIGNED flag is present,
+    // we must verify HMAC-SHA256 or AES-CMAC over the full message with the
+    // signature field zeroed.  That primitive is not available at this layer, so
+    // we fail closed: reject the message.  An attacker-controlled server that
+    // sets SMB2_FLAGS_SIGNED but provides a forged signature must not pass.
+    if signing_required && (flags & SMB2_FLAGS_SIGNED != 0) {
+        // SECURITY: wiring point — replace this Err with actual
+        // HMAC-SHA256/AES-CMAC verification when the session key is available.
+        return Err(Error::PermissionDenied);
+    }
+
     let status = u32::from_le_bytes(src[8..12].try_into().map_err(|_| Error::InvalidArgument)?);
     let command = u16::from_le_bytes(src[12..14].try_into().map_err(|_| Error::InvalidArgument)?);
     let credits = u16::from_le_bytes(src[14..16].try_into().map_err(|_| Error::InvalidArgument)?);
-    let flags = u32::from_le_bytes(src[16..20].try_into().map_err(|_| Error::InvalidArgument)?);
     let next_command =
         u32::from_le_bytes(src[20..24].try_into().map_err(|_| Error::InvalidArgument)?);
     let message_id =
@@ -528,9 +676,13 @@ impl Smb2MessageBuilder {
     }
 
     /// Increment and return the next message ID.
+    ///
+    /// MS-SMB2 §3.2.4.1: MessageId is a u64 counter; the protocol permits it to wrap.
+    /// Use wrapping_add so that overflow-checks=on does not panic in ring-0 when the
+    /// counter rolls over after 2^64 messages.
     pub fn next_id(&mut self) -> u64 {
         let id = self.message_id;
-        self.message_id += 1;
+        self.message_id = self.message_id.wrapping_add(1);
         id
     }
 }

@@ -144,6 +144,13 @@ impl MdsSession {
         if self.state != MdsSessionState::Opening && self.state != MdsSessionState::Reconnecting {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: reject a zero session_id (the uninitialized sentinel) so a
+        // forged SESSION_OPEN reply cannot collide with the unopened state
+        // (mirrors ceph.rs confirm_open). A real implementation must additionally
+        // bind session_id to a locally-generated nonce echoed by the MDS.
+        if session_id == 0 {
+            return Err(Error::InvalidArgument);
+        }
         self.session_id = session_id;
         self.epoch = epoch;
         self.state = MdsSessionState::Open;
@@ -311,6 +318,12 @@ impl CapTable {
         // Update existing cap with same cap_id.
         for slot in &mut self.caps {
             if slot.valid && slot.cap_id == cap.cap_id {
+                // SECURITY: require strictly increasing seq so a replayed/stale
+                // MDS cap cannot downgrade or re-issue privileges (mirrors the
+                // CapSet::insert guard in ceph.rs).
+                if cap.seq <= slot.seq {
+                    return Err(Error::InvalidArgument);
+                }
                 slot.issued = cap.issued;
                 slot.seq = cap.seq;
                 return Ok(());
@@ -483,7 +496,11 @@ pub fn map_striped_range(
 ) -> [StripedExtent; MAX_STRIPE_OBJECTS] {
     let mut extents = [StripedExtent::empty(); MAX_STRIPE_OBJECTS];
 
-    if layout.stripe_unit == 0 || layout.object_size == 0 || length == 0 {
+    // SECURITY: All three layout fields come from an attacker-controlled MDS reply.
+    // A zero divisor in any field causes a div-by-zero panic (= ring-0 machine halt
+    // with overflow-checks=on). Reject the entire mapping if any field is zero.
+    if layout.stripe_unit == 0 || layout.object_size == 0 || layout.stripe_count == 0 || length == 0
+    {
         return extents;
     }
 
@@ -497,19 +514,48 @@ pub fn map_striped_range(
 
     while remaining > 0 && idx < MAX_STRIPE_OBJECTS {
         // Which stripe unit does `pos` fall in?
+        // `su` is non-zero (guarded above), so division is safe.
         let stripe_no = pos / su;
         // Which object in the stripe set?
+        // `sc` is non-zero (guarded above), so both `%` and `/` are safe.
         let obj_in_set = stripe_no % sc;
         // Which stripe period (set of stripe_count objects)?
         let period = stripe_no / sc;
-        // Object number.
-        let object_no = obj_in_set + period * sc;
-        // Offset within the stripe unit.
+
+        // SECURITY: `period * sc` and the subsequent addition with `obj_in_set`
+        // are performed on attacker-influenced wire values; use checked arithmetic
+        // so a crafted (huge) offset cannot cause a panic via wrapping overflow.
+        let period_sc = match period.checked_mul(sc) {
+            Some(v) => v,
+            None => return extents, // overflow — return empty, never panic
+        };
+        let object_no = match obj_in_set.checked_add(period_sc) {
+            Some(v) => v,
+            None => return extents, // overflow — return empty, never panic
+        };
+
+        // Offset within the stripe unit (safe: pos % su < su).
         let offset_in_su = pos % su;
-        // Offset within the object.
-        let su_in_object = (period * su) % obj_size;
-        let object_offset = su_in_object + offset_in_su;
+
+        // SECURITY: `period * su` can overflow for attacker-supplied `period`
+        // (large file offset). Use checked_mul; the subsequent `% obj_size` is
+        // only reached when the product is valid.
+        let period_su = match period.checked_mul(su) {
+            Some(v) => v,
+            None => return extents, // overflow — return empty, never panic
+        };
+        let su_in_object = period_su % obj_size; // obj_size non-zero, guarded above
+
+        // SECURITY: `su_in_object + offset_in_su` can theoretically overflow if
+        // layout parameters are inconsistent (e.g. object_size not a multiple of
+        // stripe_unit). Reject rather than panic.
+        let object_offset = match su_in_object.checked_add(offset_in_su) {
+            Some(v) => v,
+            None => return extents, // overflow — return empty, never panic
+        };
+
         // Bytes remaining in this stripe unit.
+        // `offset_in_su = pos % su` so `offset_in_su < su`; subtraction cannot underflow.
         let bytes_in_su = su - offset_in_su;
         let chunk = remaining.min(bytes_in_su);
 
@@ -766,6 +812,14 @@ impl CephClient {
     }
 
     /// Grant a capability on an inode.
+    //
+    // SECURITY: this accepts an MDS cap grant with no solicitation check — an
+    // unsolicited grant of WRITE/EXCL is a privilege escalation once the MDS wire
+    // path is live. The seq-replay guard now lives in CapTable::insert, but a
+    // full fix must also correlate the grant to a prior client cap REQUEST (see
+    // the pending_caps table + record_pending_cap pattern in ceph.rs). This stub
+    // module has no live MDS dispatch, so the gap is latent; the wire path MUST
+    // add solicitation correlation before exposing grant_cap to a remote MDS.
     pub fn grant_cap(&mut self, cap: CephCap) -> Result<()> {
         self.caps.insert(cap)?;
         self.session.caps_held = self.session.caps_held.saturating_add(1);

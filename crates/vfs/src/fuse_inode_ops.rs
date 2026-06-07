@@ -556,15 +556,32 @@ impl FuseInodeConn {
 
     /// Complete (dequeue) the pending request with the given unique ID.
     ///
+    /// `expected_opcode` must match the opcode recorded at submit time.
+    /// Mismatches indicate a cross-type confusion attack from the daemon and
+    /// are rejected with `Err(InvalidArgument)`.  An unknown or stale `unique`
+    /// (no matching in-flight slot) is rejected with `Err(NotFound)`.
+    ///
     /// # Errors
     ///
-    /// - `NotFound` if no pending request has `unique`.
-    pub fn complete(&mut self, unique: u64) -> Result<()> {
+    /// - `NotFound` if no in-flight request has `unique` (unknown or already
+    ///   completed — duplicate reply).
+    /// - `InvalidArgument` if the slot's opcode does not match `expected_opcode`
+    ///   (reply/request type confusion).
+    pub fn complete(&mut self, unique: u64, expected_opcode: FuseOpcode) -> Result<()> {
+        // SECURITY: find the slot by unique id first, then verify opcode.
+        // Matching only on unique allows a rogue daemon to send a reply for
+        // request A with the opcode of request B, causing type confusion in
+        // the completion handler.  Reject both unknown ids and opcode mismatches.
         let pos = self
             .pending
             .iter()
             .position(|p| p.in_use && p.unique == unique)
             .ok_or(Error::NotFound)?;
+        let slot = &self.pending[pos];
+        if slot.opcode != expected_opcode {
+            // SECURITY: opcode mismatch — reject cross-type reply confusion.
+            return Err(Error::InvalidArgument);
+        }
         self.pending[pos] = PendingReq::empty();
         self.count = self.count.saturating_sub(1);
         Ok(())
@@ -642,9 +659,20 @@ impl FuseInodeOps {
     /// # Errors
     ///
     /// - `NotFound` if `unique` does not match a pending lookup.
+    /// - `InvalidArgument` if the reply opcode does not match `FuseOpcode::Lookup`,
+    ///   or if the daemon supplied a zero node ID (reserved/invalid).
     /// - `OutOfMemory` if the attr cache is full.
     pub fn complete_lookup(&mut self, unique: u64, entry: FuseEntryOut) -> Result<u64> {
-        self.conn.complete(unique)?;
+        // SECURITY: pass expected_opcode so complete() rejects a reply whose
+        // recorded opcode does not match Lookup (cross-type confusion guard).
+        self.conn.complete(unique, FuseOpcode::Lookup)?;
+        // SECURITY: nodeid 0 is reserved (FUSE_ROOT_ID == 1; 0 is never valid).
+        // Accepting it would allow a malicious daemon to corrupt the attr cache
+        // entry at slot 0 or produce a zero-valued node ID that collides with
+        // the "no entry" sentinel used elsewhere in the VFS.
+        if entry.nodeid == 0 {
+            return Err(Error::InvalidArgument);
+        }
         self.attr_cache.insert(entry.nodeid, entry.attr)?;
         Ok(entry.nodeid)
     }
@@ -670,9 +698,13 @@ impl FuseInodeOps {
     /// # Errors
     ///
     /// - `NotFound` if `unique` does not match a pending request.
+    /// - `InvalidArgument` if the reply opcode does not match `FuseOpcode::Getattr`
+    ///   (cross-type confusion guard).
     /// - `OutOfMemory` if the attr cache is full.
     pub fn complete_getattr(&mut self, unique: u64, nodeid: u64, attr: FuseAttr) -> Result<()> {
-        self.conn.complete(unique)?;
+        // SECURITY: pass expected_opcode so complete() rejects a reply whose
+        // recorded opcode does not match Getattr (cross-type confusion guard).
+        self.conn.complete(unique, FuseOpcode::Getattr)?;
         self.attr_cache.insert(nodeid, attr)
     }
 

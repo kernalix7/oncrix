@@ -188,16 +188,47 @@ impl MdsSession {
     }
 
     /// Record a reply from the MDS.
-    pub fn on_reply(&mut self, tid: u64, err: i32) -> Result<()> {
+    ///
+    /// The reply is accepted only when ALL of the following hold:
+    ///  1. A request with the given `tid` exists in the in-flight table.
+    ///  2. That request has already been sent (`sent == true`).
+    ///  3. The request has NOT yet been replied to (`replied == false`).
+    ///  4. The `reply_session_id` matches the session's own `session_id`.
+    ///
+    /// Violations return `InvalidArgument` (duplicate/stale/unsolicited reply)
+    /// or `NotFound` (unknown tid).
+    pub fn on_reply(&mut self, tid: u64, err: i32, reply_session_id: u64) -> Result<()> {
+        // SECURITY: validate session_id correlation so that a reply injected
+        // by a different (possibly attacker-controlled) session cannot be
+        // applied to this session's in-flight requests.
+        if reply_session_id != self.session_id {
+            // SECURITY: cross-session reply injection rejected.
+            return Err(Error::InvalidArgument);
+        }
+
         for slot in &mut self.requests {
             if slot.as_ref().map(|r| r.tid) == Some(tid) {
                 if let Some(req) = slot.as_mut() {
+                    // SECURITY: reject replies for requests that were never sent
+                    // (e.g., the request is still being prepared locally).
+                    if !req.sent {
+                        return Err(Error::InvalidArgument);
+                    }
+                    // SECURITY: reject duplicate replies for the same tid.
+                    // A second reply for an already-completed request could be
+                    // used to overwrite the stored error code or trigger
+                    // double-completion of state machines.
+                    if req.replied {
+                        return Err(Error::InvalidArgument);
+                    }
                     req.replied = true;
                     req.reply_err = err;
                     return Ok(());
                 }
             }
         }
+        // Unknown tid: the request was never in flight or has already been
+        // consumed via complete_request().
         Err(Error::NotFound)
     }
 
