@@ -24,6 +24,7 @@
 //! Reference: Linux `block/blk-cgroup.c`, `block/blk-throttle.c`,
 //! `block/blk-iolatency.c`.
 
+use crate::capability::{CAP_SYS_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -54,6 +55,16 @@ const LIMIT_UNLIMITED: u64 = u64::MAX;
 
 /// Token bucket refill interval (microseconds, 10ms).
 const TOKEN_REFILL_INTERVAL_US: u64 = 10_000;
+
+/// Maximum accepted finite BPS / IOPS limit.
+///
+/// BPS/IOPS limits are unprivileged, attacker-controlled inputs that
+/// are multiplied by [`TOKEN_REFILL_INTERVAL_US`] (`10_000`) when
+/// computing per-interval token budgets. Bounding any finite limit to
+/// `u64::MAX / TOKEN_REFILL_INTERVAL_US` guarantees that product can
+/// never overflow `u64`. The [`LIMIT_UNLIMITED`] sentinel bypasses the
+/// token math entirely and is therefore always accepted.
+const MAX_FINITE_LIMIT: u64 = u64::MAX / TOKEN_REFILL_INTERVAL_US;
 
 /// Maximum token accumulation factor.
 const MAX_TOKEN_BURST_FACTOR: u64 = 4;
@@ -270,24 +281,37 @@ impl BlkioDeviceRule {
         self.active = true;
     }
 
-    /// Set read BPS limit.
+    /// Clamp a finite BPS/IOPS limit to the overflow-safe ceiling.
+    ///
+    /// The [`LIMIT_UNLIMITED`] sentinel is preserved; any other value
+    /// is capped at [`MAX_FINITE_LIMIT`] so downstream token math
+    /// (`limit * TOKEN_REFILL_INTERVAL_US`) cannot overflow.
+    fn clamp_limit(value: u64) -> u64 {
+        if value == LIMIT_UNLIMITED {
+            LIMIT_UNLIMITED
+        } else {
+            value.min(MAX_FINITE_LIMIT)
+        }
+    }
+
+    /// Set read BPS limit (clamped to the overflow-safe ceiling).
     pub fn set_read_bps(&mut self, bps: u64) {
-        self.read_limit.bps = bps;
+        self.read_limit.bps = Self::clamp_limit(bps);
     }
 
-    /// Set write BPS limit.
+    /// Set write BPS limit (clamped to the overflow-safe ceiling).
     pub fn set_write_bps(&mut self, bps: u64) {
-        self.write_limit.bps = bps;
+        self.write_limit.bps = Self::clamp_limit(bps);
     }
 
-    /// Set read IOPS limit.
+    /// Set read IOPS limit (clamped to the overflow-safe ceiling).
     pub fn set_read_iops(&mut self, iops: u64) {
-        self.read_limit.iops = iops;
+        self.read_limit.iops = Self::clamp_limit(iops);
     }
 
-    /// Set write IOPS limit.
+    /// Set write IOPS limit (clamped to the overflow-safe ceiling).
     pub fn set_write_iops(&mut self, iops: u64) {
-        self.write_limit.iops = iops;
+        self.write_limit.iops = Self::clamp_limit(iops);
     }
 
     /// Get the limit for a given direction.
@@ -337,18 +361,24 @@ pub struct BlkioThrottle {
 }
 
 impl BlkioThrottle {
+    /// Tokens accrued per refill interval for a finite limit.
+    ///
+    /// Computes `limit * TOKEN_REFILL_INTERVAL_US / 1_000_000` via a
+    /// `u128` intermediate so the multiplication cannot overflow even
+    /// if `limit` is the maximum finite value. The quotient always fits
+    /// back into `u64`. `LIMIT_UNLIMITED` is passed through unchanged.
+    fn tokens_per_interval(limit: u64) -> u64 {
+        if limit == LIMIT_UNLIMITED {
+            return LIMIT_UNLIMITED;
+        }
+        let product = (limit as u128) * (TOKEN_REFILL_INTERVAL_US as u128);
+        (product / 1_000_000) as u64
+    }
+
     /// Create a new throttle state for the given limits.
     pub fn new_for_limits(limit: &ThrottleLimit) -> Self {
-        let bps_per_interval = if limit.bps == LIMIT_UNLIMITED {
-            LIMIT_UNLIMITED
-        } else {
-            (limit.bps * TOKEN_REFILL_INTERVAL_US) / 1_000_000
-        };
-        let iops_per_interval = if limit.iops == LIMIT_UNLIMITED {
-            LIMIT_UNLIMITED
-        } else {
-            (limit.iops * TOKEN_REFILL_INTERVAL_US) / 1_000_000
-        };
+        let bps_per_interval = Self::tokens_per_interval(limit.bps);
+        let iops_per_interval = Self::tokens_per_interval(limit.iops);
         let max_bytes = if bps_per_interval == LIMIT_UNLIMITED {
             LIMIT_UNLIMITED
         } else {
@@ -381,8 +411,7 @@ impl BlkioThrottle {
         self.last_refill_us = now_us;
 
         if limit.bps != LIMIT_UNLIMITED {
-            let refill_bytes =
-                (limit.bps * TOKEN_REFILL_INTERVAL_US / 1_000_000).saturating_mul(intervals);
+            let refill_bytes = Self::tokens_per_interval(limit.bps).saturating_mul(intervals);
             self.byte_tokens = self
                 .byte_tokens
                 .saturating_add(refill_bytes)
@@ -390,8 +419,7 @@ impl BlkioThrottle {
         }
 
         if limit.iops != LIMIT_UNLIMITED {
-            let refill_ops =
-                (limit.iops * TOKEN_REFILL_INTERVAL_US / 1_000_000).saturating_mul(intervals);
+            let refill_ops = Self::tokens_per_interval(limit.iops).saturating_mul(intervals);
             self.io_tokens = self
                 .io_tokens
                 .saturating_add(refill_ops)
@@ -891,6 +919,15 @@ impl Default for BlkioCgroupController {
 // ── BlkioCgroupRegistry ────────────────────────────────────────────
 
 /// System-wide registry of blkio cgroup controllers.
+///
+// SECURITY: every mutating entry point (`create`, `destroy`,
+// `set_read_bps`, `set_write_bps`, `set_read_iops`, `set_write_iops`)
+// takes a caller `CapSet` and requires `CAP_SYS_ADMIN` fail-closed.
+// The future syscall dispatch site (cgroupfs / io.max write handler)
+// MUST pass the calling thread's real *effective* capability set here
+// — never a synthesised `CapSet::FULL`. Per-task creds are not yet
+// threaded into this subsystem, so unprivileged callers must supply
+// `CapSet::EMPTY`, which denies the operation.
 pub struct BlkioCgroupRegistry {
     /// All controller slots.
     controllers: [BlkioCgroupController; MAX_BLKIO_CGROUPS],
@@ -922,8 +959,36 @@ impl BlkioCgroupRegistry {
         Ok(())
     }
 
+    /// Fail-closed capability gate for blkio-cgroup mutations.
+    ///
+    /// Blkio-cgroup writes are unprivileged, attacker-controlled inputs,
+    /// so every mutating entry point requires `CAP_SYS_ADMIN` in the
+    /// caller's effective set. When the capability is absent (the
+    /// unprivileged default) the operation is denied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::PermissionDenied` if `caller_caps` lacks
+    /// `CAP_SYS_ADMIN`.
+    fn require_admin(caller_caps: CapSet) -> Result<()> {
+        if caller_caps.has(CAP_SYS_ADMIN) {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
+        }
+    }
+
     /// Create a new blkio cgroup controller.
-    pub fn create(&mut self, name: &[u8]) -> Result<u32> {
+    ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
+    /// - `Error::NotImplemented` — registry is not initialized.
+    /// - `Error::OutOfMemory` — no free slots available.
+    pub fn create(&mut self, name: &[u8], caller_caps: CapSet) -> Result<u32> {
+        Self::require_admin(caller_caps)?;
         if !self.initialized {
             return Err(Error::NotImplemented);
         }
@@ -943,7 +1008,15 @@ impl BlkioCgroupRegistry {
     }
 
     /// Destroy a blkio cgroup controller.
-    pub fn destroy(&mut self, id: u32) -> Result<()> {
+    ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
+    /// - `Error::NotFound` — controller does not exist.
+    pub fn destroy(&mut self, id: u32, caller_caps: CapSet) -> Result<()> {
+        Self::require_admin(caller_caps)?;
         let ctrl = self
             .controllers
             .iter_mut()
@@ -952,6 +1025,90 @@ impl BlkioCgroupRegistry {
         ctrl.deactivate();
         self.active_count = self.active_count.saturating_sub(1);
         Ok(())
+    }
+
+    /// Set a read BPS limit for a device on a controller.
+    ///
+    /// The limit is clamped to the overflow-safe ceiling by the
+    /// underlying controller. Requires `CAP_SYS_ADMIN` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
+    /// - `Error::NotFound` — controller does not exist.
+    /// - `Error::OutOfMemory` — device rule table is full.
+    pub fn set_read_bps(
+        &mut self,
+        id: u32,
+        device: DeviceId,
+        bps: u64,
+        caller_caps: CapSet,
+    ) -> Result<()> {
+        Self::require_admin(caller_caps)?;
+        self.get_mut(id)?.set_read_bps(device, bps)
+    }
+
+    /// Set a write BPS limit for a device on a controller.
+    ///
+    /// The limit is clamped to the overflow-safe ceiling by the
+    /// underlying controller. Requires `CAP_SYS_ADMIN` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
+    /// - `Error::NotFound` — controller does not exist.
+    /// - `Error::OutOfMemory` — device rule table is full.
+    pub fn set_write_bps(
+        &mut self,
+        id: u32,
+        device: DeviceId,
+        bps: u64,
+        caller_caps: CapSet,
+    ) -> Result<()> {
+        Self::require_admin(caller_caps)?;
+        self.get_mut(id)?.set_write_bps(device, bps)
+    }
+
+    /// Set a read IOPS limit for a device on a controller.
+    ///
+    /// The limit is clamped to the overflow-safe ceiling by the
+    /// underlying controller. Requires `CAP_SYS_ADMIN` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
+    /// - `Error::NotFound` — controller does not exist.
+    /// - `Error::OutOfMemory` — device rule table is full.
+    pub fn set_read_iops(
+        &mut self,
+        id: u32,
+        device: DeviceId,
+        iops: u64,
+        caller_caps: CapSet,
+    ) -> Result<()> {
+        Self::require_admin(caller_caps)?;
+        self.get_mut(id)?.set_read_iops(device, iops)
+    }
+
+    /// Set a write IOPS limit for a device on a controller.
+    ///
+    /// The limit is clamped to the overflow-safe ceiling by the
+    /// underlying controller. Requires `CAP_SYS_ADMIN` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
+    /// - `Error::NotFound` — controller does not exist.
+    /// - `Error::OutOfMemory` — device rule table is full.
+    pub fn set_write_iops(
+        &mut self,
+        id: u32,
+        device: DeviceId,
+        iops: u64,
+        caller_caps: CapSet,
+    ) -> Result<()> {
+        Self::require_admin(caller_caps)?;
+        self.get_mut(id)?.set_write_iops(device, iops)
     }
 
     /// Look up a controller by ID.

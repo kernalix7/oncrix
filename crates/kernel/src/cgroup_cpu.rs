@@ -19,6 +19,7 @@
 //! - [`CpuCgroupController`] — a single CPU cgroup instance
 //! - [`CpuCgroupRegistry`] — system-wide registry of CPU cgroups
 
+use crate::capability::{CAP_SYS_ADMIN, CapSet};
 use oncrix_lib::{Error, Result};
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -369,6 +370,15 @@ impl CpuCgroupController {
 /// Manages up to [`MAX_CPU_CGROUPS`] controllers in a fixed-size
 /// array. Each controller is identified by a unique `u64` ID
 /// assigned at creation time.
+///
+// SECURITY: every mutating entry point (`create`, `destroy`,
+// `set_bandwidth`, `set_weight`) takes a caller `CapSet` and requires
+// `CAP_SYS_ADMIN` fail-closed. The future syscall dispatch site
+// (cgroupfs / cpu.max / cpu.weight write handler) MUST pass the
+// calling thread's real *effective* capability set here — never a
+// synthesised `CapSet::FULL`. Per-task creds are not yet threaded into
+// this subsystem, so unprivileged callers must supply `CapSet::EMPTY`,
+// which denies the operation.
 pub struct CpuCgroupRegistry {
     /// Fixed-size array of controller slots.
     controllers: [CpuCgroupController; MAX_CPU_CGROUPS],
@@ -405,15 +415,38 @@ impl CpuCgroupRegistry {
         self.count == 0
     }
 
+    /// Fail-closed capability gate for CPU-cgroup mutations.
+    ///
+    /// CPU-cgroup writes are unprivileged, attacker-controlled inputs,
+    /// so every mutating entry point requires `CAP_SYS_ADMIN` in the
+    /// caller's effective set. When the capability is absent (the
+    /// unprivileged default) the operation is denied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::PermissionDenied` if `caller_caps` lacks
+    /// `CAP_SYS_ADMIN`.
+    fn require_admin(caller_caps: CapSet) -> Result<()> {
+        if caller_caps.has(CAP_SYS_ADMIN) {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
+        }
+    }
+
     /// Creates a new CPU cgroup controller with the given name.
     ///
     /// Returns the new controller's unique ID.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::InvalidArgument` — name is empty or too long.
     /// - `Error::OutOfMemory` — no free slots available.
-    pub fn create(&mut self, name: &[u8]) -> Result<u64> {
+    pub fn create(&mut self, name: &[u8], caller_caps: CapSet) -> Result<u64> {
+        Self::require_admin(caller_caps)?;
         if name.is_empty() || name.len() > MAX_NAME_LEN {
             return Err(Error::InvalidArgument);
         }
@@ -444,11 +477,15 @@ impl CpuCgroupRegistry {
 
     /// Destroys a CPU cgroup controller by ID.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::NotFound` — controller does not exist.
     /// - `Error::Busy` — controller still has attached PIDs.
-    pub fn destroy(&mut self, id: u64) -> Result<()> {
+    pub fn destroy(&mut self, id: u64, caller_caps: CapSet) -> Result<()> {
+        Self::require_admin(caller_caps)?;
         let idx = self.index_of(id)?;
         if self.controllers[idx].pid_count > 0 {
             return Err(Error::Busy);
@@ -471,22 +508,43 @@ impl CpuCgroupRegistry {
 
     /// Sets bandwidth parameters for a controller.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::NotFound` — controller does not exist.
     /// - `Error::InvalidArgument` — invalid bandwidth parameters.
-    pub fn set_bandwidth(&mut self, id: u64, quota: i64, period: u64, burst: u64) -> Result<()> {
+    pub fn set_bandwidth(
+        &mut self,
+        id: u64,
+        quota: i64,
+        period: u64,
+        burst: u64,
+        caller_caps: CapSet,
+    ) -> Result<()> {
+        Self::require_admin(caller_caps)?;
         let idx = self.index_of(id)?;
         self.controllers[idx].set_bandwidth(quota, period, burst)
     }
 
     /// Sets weight and nice parameters for a controller.
     ///
+    /// Requires `CAP_SYS_ADMIN` in `caller_caps` (fail-closed).
+    ///
     /// # Errors
     ///
+    /// - `Error::PermissionDenied` — caller lacks `CAP_SYS_ADMIN`.
     /// - `Error::NotFound` — controller does not exist.
     /// - `Error::InvalidArgument` — invalid weight or nice value.
-    pub fn set_weight(&mut self, id: u64, weight: u32, nice: i32) -> Result<()> {
+    pub fn set_weight(
+        &mut self,
+        id: u64,
+        weight: u32,
+        nice: i32,
+        caller_caps: CapSet,
+    ) -> Result<()> {
+        Self::require_admin(caller_caps)?;
         let idx = self.index_of(id)?;
         self.controllers[idx].set_weight(weight, nice)
     }
