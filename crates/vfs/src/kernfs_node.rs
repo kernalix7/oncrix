@@ -292,7 +292,13 @@ pub fn kernfs_remove(tree: &mut KernfsTree, ino: u64) -> Result<()> {
 /// Increment the active reference count for a node.
 pub fn kernfs_get(tree: &mut KernfsTree, ino: u64) -> Result<()> {
     let slot = tree.find_by_ino(ino).ok_or(Error::NotFound)?;
-    tree.nodes[slot].active_refs += 1;
+    // SECURITY: checked_add prevents wrapping an i32 active_refs to a negative
+    // value when called repeatedly by an attacker; a negative count would
+    // defeat the `active_refs <= 0` removal guard in kernfs_put/kernfs_remove.
+    tree.nodes[slot].active_refs = tree.nodes[slot]
+        .active_refs
+        .checked_add(1)
+        .ok_or(Error::OutOfMemory)?;
     Ok(())
 }
 
@@ -301,7 +307,13 @@ pub fn kernfs_get(tree: &mut KernfsTree, ino: u64) -> Result<()> {
 /// If the count reaches 0 and the node is marked removed, the slot is freed.
 pub fn kernfs_put(tree: &mut KernfsTree, ino: u64) -> Result<()> {
     let slot = tree.find_by_ino(ino).ok_or(Error::NotFound)?;
-    tree.nodes[slot].active_refs -= 1;
+    // SECURITY: checked_sub — an unbalanced put (more puts than gets, e.g. a
+    // double-release) must not underflow the i32 ref-count and panic in ring 0;
+    // mirrors the checked_add guard in kernfs_get.
+    tree.nodes[slot].active_refs = tree.nodes[slot]
+        .active_refs
+        .checked_sub(1)
+        .ok_or(Error::InvalidArgument)?;
     if tree.nodes[slot].active_refs <= 0 && tree.nodes[slot].flags.is_removed() {
         tree.nodes[slot] = KernfsNode::empty();
         tree.count = tree.count.saturating_sub(1);
@@ -374,7 +386,10 @@ pub fn kernfs_attr_read(
     if !tree.nodes[slot].flags.is_file() {
         return Err(Error::InvalidArgument);
     }
-    let len = tree.nodes[slot].attr_data_len;
+    // SECURITY: attr_data_len is a pub field; clamp to MAX_ATTR_DATA before
+    // using it as a slice bound so that a caller who sets it to an arbitrary
+    // value cannot cause an out-of-bounds index into the fixed attr_data array.
+    let len = tree.nodes[slot].attr_data_len.min(MAX_ATTR_DATA);
     if offset >= len {
         return Ok(0);
     }

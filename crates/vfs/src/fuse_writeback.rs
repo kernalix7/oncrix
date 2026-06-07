@@ -367,10 +367,25 @@ impl WritebackCache {
     }
 
     /// Create a writeback cache with a custom flush policy.
-    pub fn with_policy(policy: FlushPolicy) -> Self {
+    pub fn with_policy(mut policy: FlushPolicy) -> Self {
+        // SECURITY: daemon-supplied max_batch must not exceed the fixed
+        // batch_pages array bound; clamp it so the loop index stays in range.
+        policy.max_batch = policy.max_batch.min(MAX_PAGES_PER_REQ);
         let mut cache = Self::new();
         cache.policy = policy;
         cache
+    }
+
+    /// Update the flush policy at runtime.
+    ///
+    /// `policy.max_batch` is clamped to [`MAX_PAGES_PER_REQ`] so a
+    /// daemon-supplied value can never cause an out-of-bounds write into
+    /// the fixed-size `batch_pages` array inside `writeback_pages`.
+    pub fn set_policy(&mut self, mut policy: FlushPolicy) {
+        // SECURITY: same clamp as with_policy — attacker-controlled max_batch
+        // must not exceed the compile-time array bound.
+        policy.max_batch = policy.max_batch.min(MAX_PAGES_PER_REQ);
+        self.policy = policy;
     }
 
     /// Enable writeback caching.
@@ -433,7 +448,12 @@ impl WritebackCache {
             if let Some(existing) = self.inodes[inode_idx].find_page(page_idx) {
                 // Page already dirty — update timestamps.
                 self.inodes[inode_idx].pages[existing].last_write = self.current_time_ms;
-                self.inodes[inode_idx].pages[existing].write_count += 1;
+                // SECURITY: saturating_add — repeated userspace re-writes of the
+                // same dirty page must not panic on a u32 stat-counter wrap.
+                self.inodes[inode_idx].pages[existing].write_count = self.inodes[inode_idx].pages
+                    [existing]
+                    .write_count
+                    .saturating_add(1);
             } else {
                 // New dirty page.
                 let slot = self.inodes[inode_idx]
@@ -511,8 +531,13 @@ impl WritebackCache {
             let mut batch_count = 0usize;
             let mut min_offset = u64::MAX;
 
+            // SECURITY: policy.max_batch is already clamped to MAX_PAGES_PER_REQ
+            // in with_policy/set_policy, but clamp again here as a defence-in-
+            // depth guard so batch_count never indexes outside batch_pages[].
+            let batch_limit = self.policy.max_batch.min(MAX_PAGES_PER_REQ);
+
             for page in &self.inodes[inode_idx].pages {
-                if batch_count >= self.policy.max_batch {
+                if batch_count >= batch_limit {
                     break;
                 }
                 if page.in_use {
@@ -545,7 +570,9 @@ impl WritebackCache {
                 .ok_or(Error::Busy)?;
 
             let req_id = self.next_req_id;
-            self.next_req_id += 1;
+            // SECURITY: wrapping_add — a plain += 1 panics in ring 0 on u32 wrap
+            // under overflow-checks (matches the passthrough/mount counters).
+            self.next_req_id = self.next_req_id.wrapping_add(1);
 
             // SECURITY: batch_count is bounded by MAX_PAGES_PER_REQ (32) so
             // the multiply cannot overflow u64 in practice, but use checked
@@ -638,18 +665,60 @@ impl WritebackCache {
     }
 
     /// Report a failed write request.
+    ///
+    /// Pages that were optimistically marked clean when the request was
+    /// created are re-dirtied here so the data is not silently lost.
     pub fn fail_write(&mut self, req_id: u32) -> Result<()> {
-        let req = self
-            .requests
-            .iter_mut()
-            .find(|r| r.in_use && r.req_id == req_id)
-            .ok_or(Error::NotFound)?;
+        // Locate the request and copy out the fields we need before releasing
+        // the mutable borrow on `requests` (we need `&mut self.inodes` next).
+        let (failed_inode, page_indices, page_count) = {
+            let req = self
+                .requests
+                .iter_mut()
+                .find(|r| r.in_use && r.req_id == req_id)
+                .ok_or(Error::NotFound)?;
 
-        // Mark pages as dirty again (they were optimistically cleaned).
-        // In a real implementation we would re-dirty the pages.
-        req.in_use = false;
+            // SECURITY: page_count is kernel-internal (set in writeback_pages),
+            // but clamp to MAX_PAGES_PER_REQ before using it as a slice bound.
+            let pc = req.page_count.min(MAX_PAGES_PER_REQ);
+            let indices = req.page_indices;
+            let ino = req.inode;
+            req.in_use = false;
+            (ino, indices, pc)
+        };
+
         self.stats.write_reqs_failed += 1;
         self.state = WritebackState::Error;
+
+        // Re-dirty the pages so data is not permanently lost.
+        // If the inode slot was already evicted we skip silently; the
+        // data is gone in that edge case but we must not panic.
+        if let Some(inode_idx) = self
+            .inodes
+            .iter()
+            .position(|d| d.in_use && d.inode == failed_inode)
+        {
+            for &page_idx in &page_indices[..page_count] {
+                // Re-mark an existing slot, or allocate a fresh one.
+                if let Some(slot) = self.inodes[inode_idx].find_page(page_idx) {
+                    // SECURITY: re-mark as in_use so the page is not lost.
+                    self.inodes[inode_idx].pages[slot].in_use = true;
+                } else if let Some(slot) = self.inodes[inode_idx].find_free_page() {
+                    self.inodes[inode_idx].pages[slot].page_index = page_idx;
+                    self.inodes[inode_idx].pages[slot].dirtied_at = self.current_time_ms;
+                    self.inodes[inode_idx].pages[slot].last_write = self.current_time_ms;
+                    self.inodes[inode_idx].pages[slot].write_count = 1;
+                    self.inodes[inode_idx].pages[slot].in_use = true;
+                    self.inodes[inode_idx].dirty_count += 1;
+                    self.stats.pages_flushed = self.stats.pages_flushed.saturating_sub(1);
+                    self.stats.current_dirty += 1;
+                }
+                // If both find_page and find_free_page fail (table full), we
+                // cannot re-dirty — this is an OOM condition; the data loss is
+                // unavoidable but we must not panic.
+            }
+        }
+
         Ok(())
     }
 

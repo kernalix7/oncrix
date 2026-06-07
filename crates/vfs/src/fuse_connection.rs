@@ -55,6 +55,23 @@ impl FuseConnFlags {
     pub const PARALLEL_DIROPS: u32 = 1 << 18;
     pub const POSIX_ACL: u32 = 1 << 19;
 
+    /// Bitmask of all capability bits this kernel implementation supports.
+    ///
+    /// SECURITY: daemon-supplied capability flags are masked against this
+    /// constant before being stored so that unknown/future bits from an
+    /// untrusted daemon can never enable kernel code paths that were not
+    /// deliberately enabled here.
+    pub const KERNEL_SUPPORTED_CAPS: u32 = Self::ASYNC_READ
+        | Self::POSIX_LOCKS
+        | Self::ATOMIC_O_TRUNC
+        | Self::EXPORT_SUPPORT
+        | Self::BIG_WRITES
+        | Self::DONT_MASK
+        | Self::WRITEBACK_CACHE
+        | Self::NO_OPEN_SUPPORT
+        | Self::PARALLEL_DIROPS
+        | Self::POSIX_ACL;
+
     /// Check whether a specific capability is set.
     #[inline]
     pub fn has(&self, flag: u32) -> bool {
@@ -213,7 +230,10 @@ impl FuseConnection {
             return Err(Error::InvalidArgument);
         }
         let _ = daemon_minor; // minor is informational
-        self.flags = FuseConnFlags(daemon_flags);
+        // SECURITY: mask daemon-supplied capability bits against the set this
+        // kernel actually supports; storing unknown bits verbatim could enable
+        // kernel code paths that were never intended to be activated.
+        self.flags = FuseConnFlags(daemon_flags & FuseConnFlags::KERNEL_SUPPORTED_CAPS);
         // SECURITY: max_write comes from the untrusted daemon; clamp it to
         // [4096, FUSE_MAX_REQUEST_SIZE] so oversized values cannot drive
         // unbounded allocations in the write path.

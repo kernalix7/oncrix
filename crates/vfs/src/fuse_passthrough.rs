@@ -301,7 +301,11 @@ impl PassthroughTable {
             .position(|e| !e.active)
             .ok_or(Error::OutOfMemory)?;
         let handle = self.next_handle;
-        self.next_handle += 1;
+        // SECURITY: use wrapping_add so that a u32 rollover does not panic
+        // under overflow-checks=true.  Skip the 0 sentinel on wrap so that
+        // handle 0 is never handed to a caller (0 is the invalid/unset value).
+        let next = self.next_handle.wrapping_add(1);
+        self.next_handle = if next == 0 { 1 } else { next };
         let entry = &mut self.entries[slot];
         entry.handle = handle;
         entry.nodeid = nodeid;

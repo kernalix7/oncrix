@@ -303,14 +303,23 @@ impl QgroupTable {
         for i in 0..tc_count {
             if let Some(qg) = self.find_mut(to_charge[i]) {
                 if rfer_delta >= 0 {
+                    // SECURITY: saturating_add prevents wrap on attacker-supplied rfer_delta.
                     qg.info.rfer = qg.info.rfer.saturating_add(rfer_delta as u64);
                 } else {
-                    qg.info.rfer = qg.info.rfer.saturating_sub((-rfer_delta) as u64);
+                    // SECURITY: checked_neg guards against i64::MIN negation panic (overflow-checks
+                    // are ON in this build; -i64::MIN panics in ring 0 = machine halt).
+                    // Saturate to i64::MAX magnitude on the pathological value so accounting
+                    // remains conservative rather than silent.
+                    let mag = rfer_delta.checked_neg().unwrap_or(i64::MAX) as u64;
+                    qg.info.rfer = qg.info.rfer.saturating_sub(mag);
                 }
                 if excl_delta >= 0 {
+                    // SECURITY: saturating_add prevents wrap on attacker-supplied excl_delta.
                     qg.info.excl = qg.info.excl.saturating_add(excl_delta as u64);
                 } else {
-                    qg.info.excl = qg.info.excl.saturating_sub((-excl_delta) as u64);
+                    // SECURITY: same checked_neg guard as rfer branch above.
+                    let mag = excl_delta.checked_neg().unwrap_or(i64::MAX) as u64;
+                    qg.info.excl = qg.info.excl.saturating_sub(mag);
                 }
             }
         }

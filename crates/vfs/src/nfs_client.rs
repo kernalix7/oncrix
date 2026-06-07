@@ -428,7 +428,10 @@ impl NfsClientSubsystem {
         req.op = op;
         req.fh = fh;
         req.offset = offset;
-        req.length = length;
+        // SECURITY: clamp the caller-supplied length to the fixed data buffer size;
+        // a daemon or userspace caller could pass an arbitrary u32, which would cause
+        // the server to read/write beyond `req.data` when the reply is processed.
+        req.length = length.min(NFS_DATA_BUF as u32);
         req.state = NfsRequestState::Pending;
         req.xid = xid;
         req.result = 0;
@@ -441,16 +444,27 @@ impl NfsClientSubsystem {
     ///
     /// Called by the RPC layer when a reply arrives.
     ///
+    /// `wire_xid` is the XID (transaction ID) extracted from the RPC reply
+    /// header.  It must match the XID that was assigned when the request was
+    /// submitted; mismatches are rejected with [`Error::InvalidArgument`] so
+    /// that a spoofed or replayed reply cannot be accepted.
+    ///
     /// The `bytes` value is a server-supplied wire count.  It is clamped to
-    /// [`NFS_DATA_BUF`] before being stored so that callers slicing
-    /// `req.data[..req.bytes_transferred as usize]` can never index out of
-    /// bounds regardless of what the server sends.
+    /// [`NFS_DATA_BUF`] before being stored and before being added to stats,
+    /// so that callers slicing `req.data[..req.bytes_transferred as usize]`
+    /// can never index out of bounds regardless of what the server sends.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] — `slot` out of range.
-    /// - [`Error::NotFound`] — slot is not in `InFlight` state.
-    pub fn complete_request(&mut self, slot: usize, result: i32, bytes: u32) -> Result<()> {
+    /// - [`Error::InvalidArgument`] — `slot` out of range or XID mismatch.
+    /// - [`Error::NotFound`] — slot is not in `InFlight` or `Pending` state.
+    pub fn complete_request(
+        &mut self,
+        slot: usize,
+        wire_xid: u32,
+        result: i32,
+        bytes: u32,
+    ) -> Result<()> {
         if slot >= NFS_MAX_PENDING {
             return Err(Error::InvalidArgument);
         }
@@ -458,19 +472,30 @@ impl NfsClientSubsystem {
         if req.state != NfsRequestState::InFlight && req.state != NfsRequestState::Pending {
             return Err(Error::NotFound);
         }
-        // Clamp to the fixed data buffer size so a malicious/buggy server
-        // cannot cause an out-of-bounds slice later.
-        req.bytes_transferred = bytes.min(NFS_DATA_BUF as u32);
+        // SECURITY: correlate the reply to the pending request by XID so that a
+        // spoofed, replayed, or out-of-order RPC reply is rejected before any
+        // state is mutated.
+        if req.xid != wire_xid {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: clamp the server-supplied byte count to the fixed data buffer
+        // before storing it AND before crediting it to statistics; an attacker-
+        // controlled server byte count must not escape into stats unclamped, as
+        // wrapping arithmetic on a u64 counter with a giant value would corrupt
+        // the accounting visible to the VFS.
+        let safe_bytes = bytes.min(NFS_DATA_BUF as u32);
+        req.bytes_transferred = safe_bytes;
         req.result = result;
         if result == 0 {
             req.state = NfsRequestState::Complete;
             self.stats.completions = self.stats.completions.wrapping_add(1);
             match req.op {
                 NfsOp::Read => {
-                    self.stats.bytes_read = self.stats.bytes_read.wrapping_add(bytes as u64);
+                    self.stats.bytes_read = self.stats.bytes_read.wrapping_add(safe_bytes as u64);
                 }
                 NfsOp::Write => {
-                    self.stats.bytes_written = self.stats.bytes_written.wrapping_add(bytes as u64);
+                    self.stats.bytes_written =
+                        self.stats.bytes_written.wrapping_add(safe_bytes as u64);
                 }
                 _ => {}
             }
@@ -576,8 +601,9 @@ mod tests {
         let slot = sub
             .submit_request(m as u8, NfsOp::Read, dummy_fh(), 0, 512)
             .unwrap();
+        let wire_xid = sub.client.pending_ops[slot].xid;
         sub.poll();
-        sub.complete_request(slot, 0, 512).unwrap();
+        sub.complete_request(slot, wire_xid, 0, 512).unwrap();
         assert_eq!(sub.stats().bytes_read, 512);
         sub.release_slot(slot).unwrap();
     }
@@ -589,10 +615,11 @@ mod tests {
         let slot = sub
             .submit_request(m as u8, NfsOp::Read, dummy_fh(), 0, NFS_DATA_BUF as u32)
             .unwrap();
+        let wire_xid = sub.client.pending_ops[slot].xid;
         sub.poll();
         // Server claims it transferred more bytes than the buffer can hold.
         let oversized: u32 = NFS_DATA_BUF as u32 + 1;
-        sub.complete_request(slot, 0, oversized).unwrap();
+        sub.complete_request(slot, wire_xid, 0, oversized).unwrap();
         // Must be clamped — never exceed NFS_DATA_BUF.
         assert_eq!(
             sub.client.pending_ops[slot].bytes_transferred, NFS_DATA_BUF as u32,
