@@ -17,6 +17,12 @@ pub const VIOMMU_MAX_DOMAINS: usize = 64;
 /// Maximum number of endpoint attachments.
 pub const VIOMMU_MAX_ENDPOINTS: usize = 256;
 
+/// Upper bound on a single IOVA range size (512 GiB).
+///
+/// Wire/device-supplied sizes must be clamped to this value before arithmetic
+/// so that `iova + size` cannot overflow a `u64` regardless of `iova`.
+pub const VIOMMU_MAX_MAP_SIZE: u64 = 512 * 1024 * 1024 * 1024;
+
 /// VirtIO IOMMU feature bits (VIRTIO_IOMMU_F_*).
 pub mod features {
     /// Supports page-table input address size configuration.
@@ -243,6 +249,11 @@ impl VirtioIommu {
     }
 
     /// Builds a Map request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `size` is zero, exceeds
+    /// [`VIOMMU_MAX_MAP_SIZE`], or if `iova + size` would wrap a `u64`.
     pub fn build_map(
         &mut self,
         domain_id: u32,
@@ -252,9 +263,12 @@ impl VirtioIommu {
         flags: u32,
     ) -> Result<MapRequest> {
         self.find_domain(domain_id)?;
-        if size == 0 {
+        if size == 0 || size > VIOMMU_MAX_MAP_SIZE {
             return Err(Error::InvalidArgument);
         }
+        // Checked addition: iova + size must not wrap. Subtract 1 only after
+        // confirming the sum is representable.
+        let virt_end = iova.checked_add(size - 1).ok_or(Error::InvalidArgument)?;
         Ok(MapRequest {
             req_type: VirtioIommuReqType::Map as u8,
             _reserved: [0u8; 3],
@@ -262,24 +276,31 @@ impl VirtioIommu {
             domain: domain_id,
             _reserved2: [0u8; 4],
             virt_start: iova,
-            virt_end: iova + size - 1,
+            virt_end,
             phys_start: paddr,
         })
     }
 
     /// Builds an Unmap request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `size` is zero, exceeds
+    /// [`VIOMMU_MAX_MAP_SIZE`], or if `iova + size` would wrap a `u64`.
     pub fn build_unmap(&mut self, domain_id: u32, iova: u64, size: u64) -> Result<UnmapRequest> {
         self.find_domain(domain_id)?;
-        if size == 0 {
+        if size == 0 || size > VIOMMU_MAX_MAP_SIZE {
             return Err(Error::InvalidArgument);
         }
+        // Checked addition: iova + (size - 1) must not wrap.
+        let virt_end = iova.checked_add(size - 1).ok_or(Error::InvalidArgument)?;
         Ok(UnmapRequest {
             req_type: VirtioIommuReqType::Unmap as u8,
             _reserved: [0u8; 3],
             domain: domain_id,
             _reserved2: [0u8; 4],
             virt_start: iova,
-            virt_end: iova + size - 1,
+            virt_end,
         })
     }
 
