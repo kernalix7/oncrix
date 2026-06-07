@@ -129,16 +129,24 @@ pub struct ZswapStats {
 
 // ── Helper ──────────────────────────────────────────────────────
 
-/// Compute a simple checksum by summing all bytes.
+/// Compute a position-sensitive checksum over `data` (FNV-1a, 32-bit).
 ///
-/// This is not cryptographically secure; it is used only for
-/// basic integrity verification of cached page data.
+/// This is not cryptographically secure, but unlike a plain additive sum it
+/// is order-dependent: byte permutations and compensating multi-byte edits
+/// produce different digests, so accidental and trivially-shaped corruption
+/// of cached page data is detected on load. Both the store and load sides
+/// recompute over the identical `buf[..len]` slice, so any algorithm change
+/// here is self-consistent (the pool holds no persisted digests).
 pub fn simple_checksum(data: &[u8]) -> u32 {
-    let mut sum: u32 = 0;
+    // FNV-1a constants (32-bit).
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let mut hash = FNV_OFFSET;
     for &b in data {
-        sum = sum.wrapping_add(u32::from(b));
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
-    sum
+    hash
 }
 
 // ── ZswapPool ───────────────────────────────────────────────────
@@ -277,7 +285,8 @@ impl ZswapPool {
     /// # Errors
     ///
     /// - `NotFound` — no entry for the given swap offset.
-    /// - `InvalidArgument` — `buf` is too small for the data.
+    /// - `InvalidArgument` — `buf` is too small for the data, or the
+    ///   reconstructed page fails checksum verification (corruption).
     pub fn load(&mut self, swap_offset: u64, buf: &mut [u8]) -> Result<usize> {
         let entry = self
             .entries
@@ -291,6 +300,20 @@ impl ZswapPool {
 
         let len = entry.compressed_len;
         buf[..len].copy_from_slice(&entry.compressed_data[..len]);
+
+        // SECURITY: verify integrity of the reconstructed page before
+        // handing it back. On store the checksum is computed over the
+        // full original page (`simple_checksum(page_data)`); stub
+        // compression is a plain copy so `compressed_len == original_len`
+        // and `buf[..len]` is exactly that original byte range. Recompute
+        // over the identical slice and compare. On mismatch the cached
+        // data is corrupt: zero the partially-written output so no stale
+        // or corrupt bytes leak to the caller, then reject.
+        if simple_checksum(&buf[..len]) != entry.checksum {
+            buf[..len].fill(0);
+            return Err(Error::InvalidArgument);
+        }
+
         entry.access_count += 1;
 
         Ok(entry.original_len)
