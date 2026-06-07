@@ -18,8 +18,15 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 39;
 /// Maximum number of concurrent outstanding FUSE requests.
 pub const FUSE_MAX_INFLIGHT: usize = 64;
 
-/// Size of the FUSE request/reply header in bytes.
+/// Size of the FUSE request (kernel→daemon) header in bytes (`FuseInHeader`).
 pub const FUSE_HEADER_SIZE: usize = 40;
+
+/// Size of the FUSE reply (daemon→kernel) header in bytes (`FuseOutHeader`).
+///
+/// // SECURITY: FuseOutHeader is {len:u32, error:i32, unique:u64} = 16 bytes.
+/// Using the 40-byte in-header constant here would silently discard 24 bytes of
+/// daemon payload and corrupt the reply body offset — keep these separate.
+pub const FUSE_OUT_HEADER_SIZE: usize = 16;
 
 /// FUSE opcode identifiers for kernel→daemon messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,11 +142,15 @@ pub struct FuseInHeader {
 
 impl FuseInHeader {
     /// Decode a `FuseInHeader` from the first 40 bytes of a buffer.
+    ///
+    /// // SECURITY: hdr.len is daemon-controlled. Validate it falls within
+    /// [FUSE_HEADER_SIZE, buf.len()] before any downstream payload slice to
+    /// prevent OOB reads from an attacker-supplied length field.
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < FUSE_HEADER_SIZE {
             return Err(Error::InvalidArgument);
         }
-        Ok(Self {
+        let hdr = Self {
             len: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             opcode: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
             unique: u64::from_le_bytes([
@@ -152,7 +163,15 @@ impl FuseInHeader {
             gid: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
             pid: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
             padding: u32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
-        })
+        };
+        // SECURITY [OOB]: hdr.len is attacker-controlled. It must cover at
+        // least the fixed header and must not exceed the actual received buffer.
+        // Violating either bound means the daemon sent a malformed frame.
+        let claimed = hdr.len as usize;
+        if claimed < FUSE_HEADER_SIZE || claimed > buf.len() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(hdr)
     }
 }
 
@@ -216,37 +235,85 @@ pub struct FuseRequestQueue {
 
 impl FuseRequestQueue {
     /// Create an empty queue.
+    ///
+    /// `next_unique` starts at 0 so the first `wrapping_add(1)` in `enqueue`
+    /// produces 1 — the lowest valid unique ID (0 is reserved/invalid).
     pub const fn new() -> Self {
         Self {
             slots: [const { FuseRequest::new() }; FUSE_MAX_INFLIGHT],
-            next_unique: 1,
+            next_unique: 0,
         }
     }
 
     /// Enqueue a new request, returning its unique ID or `Busy` if full.
+    ///
+    /// // SECURITY: unique must never be 0 (reserved/invalid) and must not
+    /// collide with any currently active slot.  wrapping_add alone can produce
+    /// 0 on overflow; we skip it and scan for collisions so that a stale
+    /// generation can never alias a live request.
     pub fn enqueue(&mut self, opcode: u32) -> Result<u64> {
-        for slot in self.slots.iter_mut() {
-            if !slot.active {
-                let unique = self.next_unique;
-                self.next_unique = self.next_unique.wrapping_add(1);
-                slot.unique = unique;
-                slot.opcode = opcode;
-                slot.active = true;
-                return Ok(unique);
+        // Find a free slot first so we don't burn a unique on a full queue.
+        let slot_idx = self
+            .slots
+            .iter()
+            .position(|s| !s.active)
+            .ok_or(Error::Busy)?;
+
+        // Advance next_unique, skipping 0 and any id already in an active slot.
+        let unique = loop {
+            self.next_unique = self.next_unique.wrapping_add(1);
+            if self.next_unique == 0 {
+                // Skip the reserved-zero id on wrap-around.
+                self.next_unique = 1;
             }
-        }
-        Err(Error::Busy)
+            let candidate = self.next_unique;
+            // Reject a candidate that collides with a still-active slot
+            // (extremely rare — only reachable after u64 near-full wrap).
+            if !self.slots.iter().any(|s| s.active && s.unique == candidate) {
+                break candidate;
+            }
+        };
+
+        self.slots[slot_idx].unique = unique;
+        self.slots[slot_idx].opcode = opcode;
+        self.slots[slot_idx].active = true;
+        Ok(unique)
     }
 
-    /// Complete a request by unique ID, returning its opcode.
-    pub fn complete(&mut self, unique: u64) -> Result<u32> {
+    /// Complete a request by unique ID and expected opcode.
+    ///
+    /// The caller must supply `expected_opcode` — the opcode it sent for this
+    /// unique.  Returns the stored opcode on success so callers can confirm it.
+    ///
+    /// // SECURITY: three guards are enforced here:
+    /// 1. unique == 0 is always invalid (reserved; would match no real slot).
+    /// 2. A reply for an unknown or already-completed unique is rejected
+    ///    (prevents stale/duplicate replay: the slot is cleared on first
+    ///    completion so a second attempt finds no active slot and gets NotFound).
+    /// 3. expected_opcode must match the stored opcode (prevents cross-type
+    ///    confusion where a daemon routes a reply to the wrong request type).
+    pub fn complete(&mut self, unique: u64, expected_opcode: u32) -> Result<u32> {
+        // SECURITY: unique 0 is reserved and must never appear in a valid reply.
+        if unique == 0 {
+            return Err(Error::InvalidArgument);
+        }
         for slot in self.slots.iter_mut() {
             if slot.active && slot.unique == unique {
+                // SECURITY: opcode in the reply must match the opcode we sent.
+                // A mismatch means the daemon is sending a cross-type reply
+                // (type-confusion attack or protocol corruption).
+                if slot.opcode != expected_opcode {
+                    return Err(Error::InvalidArgument);
+                }
                 let opcode = slot.opcode;
+                // SECURITY: clear slot immediately — any second call with the
+                // same unique finds no active slot and returns NotFound,
+                // preventing duplicate-completion / replay.
                 *slot = FuseRequest::new();
                 return Ok(opcode);
             }
         }
+        // Unknown or already-completed unique — reject.
         Err(Error::NotFound)
     }
 
