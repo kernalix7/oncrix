@@ -235,7 +235,11 @@ impl VirtioBlk {
 
     /// Return the device capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
-        self.config.capacity * SECTOR_SIZE as u64
+        // SECURITY: `capacity` is a device-supplied u64 from MMIO config space.
+        // A large value (> u64::MAX / 512) would overflow the multiplication and
+        // panic in ring 0 with overflow-checks ON.  Use saturating_mul so that
+        // an out-of-range capacity saturates to u64::MAX rather than panicking.
+        self.config.capacity.saturating_mul(SECTOR_SIZE as u64)
     }
 
     /// Submit a read request for `sector_count` sectors starting at `sector`.
@@ -403,10 +407,16 @@ impl VirtioBlk {
                 // fields.  Validate each index before using it to index `desc`.
                 // An out-of-range value from a malicious device would otherwise
                 // cause an OOB array access (panic / kernel memory corruption).
+                // SECURITY: besides bounding each device-supplied .next, require
+                // the chain indices to be DISTINCT — an aliased .next (e.g.
+                // d2 == d1) would double-free the same descriptor and corrupt the
+                // free list. desc_head is the driver-allocated head and is always
+                // freed; d1/d2 only when in-range and not aliasing a prior index.
                 let d1 = self.vq.desc[desc_head as usize].next;
-                if (d1 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                if (d1 as usize) < crate::virtio::MAX_QUEUE_SIZE && d1 != desc_head {
                     let d2 = self.vq.desc[d1 as usize].next;
-                    if (d2 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                    if (d2 as usize) < crate::virtio::MAX_QUEUE_SIZE && d2 != desc_head && d2 != d1
+                    {
                         self.vq.free_desc(d2);
                     }
                     self.vq.free_desc(d1);

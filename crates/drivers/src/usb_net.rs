@@ -722,10 +722,27 @@ impl CdcNcmDevice {
             return Err(Error::InvalidArgument);
         }
 
-        let block_length = u16::from_le_bytes([ntb_data[6], ntb_data[7]]) as usize;
-        let ndp_index = u16::from_le_bytes([ntb_data[8], ntb_data[9]]) as usize;
+        // SECURITY: Read wHeaderLength/wSequence/wBlockLength/wNdpIndex at the
+        // correct repr(C) offsets: [4..6]=header_length, [6..8]=sequence,
+        // [8..10]=block_length, [10..12]=ndp_index.  The previous code read
+        // block_length from [6..8] and ndp_index from [8..10], which were the
+        // wrong (off-by-4) offsets — a device could supply a crafted sequence
+        // number as the block length, bypassing the bounds check below.
+        let block_length = u16::from_le_bytes([ntb_data[8], ntb_data[9]]) as usize;
+        let ndp_index = u16::from_le_bytes([ntb_data[10], ntb_data[11]]) as usize;
 
-        if block_length > ntb_data.len() || ndp_index + 8 > ntb_data.len() {
+        // SECURITY: Reject an NTB whose declared block_length is smaller than
+        // the fixed header (attacker could craft a zero-length block that still
+        // passes the > ntb_data.len() check) or larger than the actual buffer.
+        if block_length < core::mem::size_of::<NtbHeader>() || block_length > ntb_data.len() {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: ndp_index must point to a region with at least 8 bytes
+        // (NDP fixed header) within the declared block, not just the raw buffer.
+        if ndp_index
+            .checked_add(8)
+            .map_or(true, |end| end > block_length)
+        {
             return Err(Error::InvalidArgument);
         }
 
@@ -733,7 +750,13 @@ impl CdcNcmDevice {
         let mut ndp_off = ndp_index;
 
         // Walk NDP chain.
-        while ndp_off + 8 <= ntb_data.len() {
+        // SECURITY: All NDP/datagram offsets are validated against block_length
+        // (the declared NTB extent, itself already bounded to ntb_data.len())
+        // using checked_add to prevent integer overflow before any slice.
+        while ndp_off
+            .checked_add(8)
+            .map_or(false, |end| end <= block_length)
+        {
             let ndp_sig = u32::from_le_bytes([
                 ntb_data[ndp_off],
                 ntb_data[ndp_off + 1],
@@ -751,10 +774,14 @@ impl CdcNcmDevice {
 
             // Datagram pointers start at NDP offset + 8, each is 4 bytes.
             let dp_start = ndp_off + 8;
-            let dp_end = ndp_off + ndp_len;
+            // SECURITY: clamp dp_end to block_length so an oversized ndp_len
+            // from a hostile device cannot cause us to read beyond the NTB.
+            let dp_end = (ndp_off.saturating_add(ndp_len))
+                .min(block_length)
+                .min(ntb_data.len());
 
             let mut dp_off = dp_start;
-            while dp_off + 4 <= dp_end.min(ntb_data.len()) {
+            while dp_off.checked_add(4).map_or(false, |end| end <= dp_end) {
                 let dg_index =
                     u16::from_le_bytes([ntb_data[dp_off], ntb_data[dp_off + 1]]) as usize;
                 let dg_length =
@@ -765,17 +792,44 @@ impl CdcNcmDevice {
                     break;
                 }
 
-                let dg_end = dg_index + dg_length;
-                if dg_end <= ntb_data.len() && dg_length <= MAX_FRAME_SIZE {
-                    if self.ecm.rx_enqueue(&ntb_data[dg_index..dg_end]) {
-                        accepted += 1;
+                // SECURITY: Use checked_add to detect overflow on attacker-controlled
+                // dg_index + dg_length; validate the result against both block_length
+                // and ntb_data.len() before forming a slice.  Skip malformed entries
+                // rather than panicking or exposing kernel memory.
+                let dg_end_opt = dg_index.checked_add(dg_length);
+                if let Some(dg_end) = dg_end_opt {
+                    if dg_end <= block_length
+                        && dg_end <= ntb_data.len()
+                        && dg_length <= MAX_FRAME_SIZE
+                    {
+                        if self.ecm.rx_enqueue(&ntb_data[dg_index..dg_end]) {
+                            accepted += 1;
+                        }
                     }
+                    // else: datagram exceeds block or buffer bounds — skip silently.
                 }
+                // else: dg_index + dg_length overflowed — skip silently.
 
                 dp_off += 4;
             }
 
+            // SECURITY: Break on next_ndp == 0 (end-of-chain sentinel) or when
+            // next_ndp + 8 would exceed block_length (out-of-bounds NDP hop).
             if next_ndp == 0 {
+                break;
+            }
+            if next_ndp
+                .checked_add(8)
+                .map_or(true, |end| end > block_length)
+            {
+                break;
+            }
+            // SECURITY: require strict forward progress. next_ndp is bounded above
+            // (<= block_length) but a hostile device can set it to point at the
+            // current or an earlier NDP, forming a cycle — without this guard the
+            // NDP-chain walk loops forever (ring-0 CPU hang / machine halt). A
+            // strictly increasing offset bounded by block_length always terminates.
+            if next_ndp <= ndp_off {
                 break;
             }
             ndp_off = next_ndp;
@@ -825,6 +879,13 @@ impl CdcNcmDevice {
             }
         }
 
+        // SECURITY: payload_off is accumulated from attacker-influenced frame
+        // sizes and alignment padding; if it exceeds u16::MAX the truncating
+        // cast would silently produce a smaller block_length that no longer
+        // covers the written payload, corrupting the NTB.  Reject early.
+        if payload_off > u16::MAX as usize {
+            return Err(Error::OutOfMemory);
+        }
         let block_length = payload_off as u16;
 
         // NDP starts right after the NTB header (offset 12).

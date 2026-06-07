@@ -493,8 +493,35 @@ impl BlkRequestQueue {
                 found = true;
                 // Free the 3-descriptor chain.
                 let d0 = expected_head;
+                // SECURITY: `d1` and `d2` are the `.next` fields of device-DMA-writable
+                // descriptors.  A malicious or buggy device can write any u16 value here.
+                // Validate each index against QUEUE_DEPTH before using it as an array
+                // index; an out-of-range value would panic (OOB) in ring 0 with
+                // overflow-checks ON.  Mirror the pattern in virtio.rs Virtqueue::free_desc.
                 let d1 = self.descs[d0 as usize].next;
+                if (d1 as usize) >= QUEUE_DEPTH {
+                    self.free_desc(d0);
+                    self.inflight[slot].active = false;
+                    break;
+                }
                 let d2 = self.descs[d1 as usize].next;
+                if (d2 as usize) >= QUEUE_DEPTH {
+                    self.free_desc(d1);
+                    self.free_desc(d0);
+                    self.inflight[slot].active = false;
+                    break;
+                }
+                // SECURITY: the device-supplied .next fields can alias (e.g.
+                // descs[d1].next == d1), which would double-free the same index
+                // and corrupt the free stack (a later alloc hands the same
+                // descriptor out twice). A valid 3-descriptor chain visits three
+                // DISTINCT indices; on any self-reference free only the known-good
+                // driver-allocated head and stop.
+                if d1 == d0 || d2 == d0 || d2 == d1 {
+                    self.free_desc(d0);
+                    self.inflight[slot].active = false;
+                    break;
+                }
                 self.free_desc(d2);
                 self.free_desc(d1);
                 self.free_desc(d0);

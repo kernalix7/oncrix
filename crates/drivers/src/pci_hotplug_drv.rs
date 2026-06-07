@@ -126,19 +126,38 @@ pub enum SlotPower {
 
 #[inline]
 unsafe fn read16(base: usize, offset: u16) -> u16 {
-    // SAFETY: caller guarantees base+offset is valid ECAM capability space.
+    // SECURITY: guard against cap_base near usize::MAX — a device-supplied ECAM
+    // base close to usize::MAX would cause base + offset to wrap (overflow-checks
+    // ON → panic in ring-0 = machine halt). Reject by returning a safe zero
+    // sentinel; callers treat 0 as "no bits set" and take no destructive action.
+    if base > usize::MAX - 0x1F {
+        return 0;
+    }
+    // SAFETY: caller guarantees base+offset is valid ECAM capability space;
+    // overflow is ruled out by the guard above.
     unsafe { core::ptr::read_volatile((base + offset as usize) as *const u16) }
 }
 
 #[inline]
 unsafe fn write16(base: usize, offset: u16, val: u16) {
-    // SAFETY: caller guarantees base+offset is valid ECAM capability space.
+    // SECURITY: same cap_base overflow guard as read16 — silently drop the write
+    // rather than letting base + offset wrap and corrupt arbitrary memory.
+    if base > usize::MAX - 0x1F {
+        return;
+    }
+    // SAFETY: caller guarantees base+offset is valid ECAM capability space;
+    // overflow is ruled out by the guard above.
     unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u16, val) }
 }
 
 #[inline]
 unsafe fn read32(base: usize, offset: u16) -> u32 {
-    // SAFETY: caller guarantees base+offset is valid ECAM capability space.
+    // SECURITY: same cap_base overflow guard — return 0 sentinel on bad base.
+    if base > usize::MAX - 0x1F {
+        return 0;
+    }
+    // SAFETY: caller guarantees base+offset is valid ECAM capability space;
+    // overflow is ruled out by the guard above.
     unsafe { core::ptr::read_volatile((base + offset as usize) as *const u32) }
 }
 

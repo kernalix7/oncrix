@@ -133,7 +133,13 @@ impl DrmFramebuffer {
 
     /// Return whether the given rectangle is within bounds.
     pub const fn rect_in_bounds(&self, x: u32, y: u32, w: u32, h: u32) -> bool {
-        x + w <= self.width && y + h <= self.height
+        // SECURITY: x+w and y+h can overflow u32 when the rectangle fields are
+        // attacker-controlled (USB/virtio/DRM config); use checked_add so an
+        // overflowed sum never compares <= width/height as a false-positive.
+        match (x.checked_add(w), y.checked_add(h)) {
+            (Some(r), Some(b)) => r <= self.width && b <= self.height,
+            _ => false,
+        }
     }
 }
 
@@ -157,11 +163,16 @@ pub struct DirtyRect {
 impl DirtyRect {
     /// Expand the dirty rectangle to include the given region.
     pub fn expand(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        // SECURITY: saturating_add on the edges — although callers reach this
+        // only after rect_in_bounds validates x+w/y+h, a defense-in-depth
+        // saturating add keeps expand() panic-free for any (x,w)/(y,h).
+        let x2 = x.saturating_add(w);
+        let y2 = y.saturating_add(h);
         if !self.valid {
             self.x1 = x;
             self.y1 = y;
-            self.x2 = x + w;
-            self.y2 = y + h;
+            self.x2 = x2;
+            self.y2 = y2;
             self.valid = true;
         } else {
             if x < self.x1 {
@@ -170,11 +181,11 @@ impl DirtyRect {
             if y < self.y1 {
                 self.y1 = y;
             }
-            if x + w > self.x2 {
-                self.x2 = x + w;
+            if x2 > self.x2 {
+                self.x2 = x2;
             }
-            if y + h > self.y2 {
-                self.y2 = y + h;
+            if y2 > self.y2 {
+                self.y2 = y2;
             }
         }
     }
@@ -370,7 +381,9 @@ impl DrmFbHelper {
 
         self.dirty.expand(x, y, w, h);
         self.stats.fill_rects += 1;
-        self.stats.pixels_written += (w * h) as u64;
+        // SECURITY: w*h overflows u32 for large attacker-controlled rectangles;
+        // widen both operands to u64 before multiplying.
+        self.stats.pixels_written += w as u64 * h as u64;
         Ok(())
     }
 
@@ -423,7 +436,9 @@ impl DrmFbHelper {
 
         self.dirty.expand(dst_x, dst_y, w, h);
         self.stats.copy_rects += 1;
-        self.stats.pixels_written += (w * h) as u64;
+        // SECURITY: w*h overflows u32 for large attacker-controlled rectangles;
+        // widen both operands to u64 before multiplying.
+        self.stats.pixels_written += w as u64 * h as u64;
         Ok(())
     }
 
@@ -484,11 +499,19 @@ impl DrmFbHelper {
     pub fn draw_string(&mut self, x: u32, y: u32, s: &[u8], fg: u32, bg: u32) {
         let mut cx = x;
         for &ch in s {
-            if cx + FONT_WIDTH > self.active_fb_width() {
+            // SECURITY: cx+FONT_WIDTH overflows u32 when cx is near u32::MAX
+            // (attacker-controlled starting x); saturating_sub keeps the check
+            // monotone and can never produce a false "fits" result from wrap-around.
+            if self.active_fb_width().saturating_sub(FONT_WIDTH) < cx {
                 break;
             }
             let _ = self.draw_char(cx, y, ch, fg, bg);
-            cx += FONT_WIDTH;
+            // SECURITY: cx+FONT_WIDTH overflows u32 for the same reason; break
+            // rather than wrap so subsequent iterations do not use a bogus x.
+            cx = match cx.checked_add(FONT_WIDTH) {
+                Some(v) => v,
+                None => break,
+            };
         }
     }
 
