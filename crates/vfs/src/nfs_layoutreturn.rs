@@ -332,24 +332,61 @@ impl LayoutReturnTable {
 
     /// Process a LAYOUTRETURN from a client.
     ///
-    /// Returns `Err(NotFound)` if no matching layout is found.
+    /// Returns `Err(NotFound)` if no matching layout is found, or
+    /// `Err(InvalidArgument)` if an `Fsid`/`All` return carries a non-zero
+    /// stateid (which would indicate a server trying to impersonate a specific
+    /// client identity via the wire field).
+    ///
+    /// # Security
+    ///
+    /// For `Fsid` and `All` return types the caller's authenticated client
+    /// identity MUST be supplied by the session/RPC layer, not extracted from
+    /// the server-supplied stateid.  RFC 8881 §18.44.1 mandates that bulk
+    /// LAYOUTRETURN operations use the special all-zeros stateid; any other
+    /// value is a protocol violation and is rejected here (fail-closed).
+    ///
+    /// TODO: thread the authenticated `caller_client_id` through the RPC
+    /// session context and pass it explicitly to `return_all_for_client` so
+    /// that bulk returns are correctly scoped to the authenticated client.
+    // SECURITY: Do NOT derive client identity from args.stateid.seqid.
+    // A hostile server can supply any seqid value to mass-return layouts
+    // belonging to an arbitrary client_id.  We instead validate that the
+    // stateid is the RFC-mandated all-zeros sentinel and reject anything else.
+    // Until the authenticated caller_client_id is threaded through the call
+    // stack, Fsid/All returns are only accepted for the all-zeros stateid, and
+    // return_all_for_client is NOT called (no state mutation on untrusted input).
     pub fn process_return(&mut self, args: &LayoutReturnArgs) -> Result<LayoutReturnResult> {
         match args.return_type {
             LrReturnType::File => self.return_file(args),
             LrReturnType::Fsid => {
-                // FSID return: mark all layouts for this client as returned.
-                self.return_all_for_client(args.stateid.seqid as u64);
-                Ok(LayoutReturnResult {
-                    layout_retained: false,
-                    new_stateid: None,
-                })
+                // SECURITY: RFC 8881 §18.44.1 requires the all-zeros stateid
+                // for FSID-scope returns.  Any other stateid is attacker-
+                // controlled and MUST NOT be used to derive client_id.
+                // Reject non-zero stateids fail-closed to prevent a hostile
+                // server from mass-returning another client's layouts.
+                if !args.stateid.is_zero() {
+                    return Err(Error::InvalidArgument);
+                }
+                // SECURITY NOTE: caller_client_id must come from the
+                // authenticated session context (e.g. the NFSv4.1 session's
+                // confirmed clientid), not from any wire field.  Until that
+                // context is threaded through, fail SAFE with NotImplemented:
+                // returning a vacuous Ok would tell the caller the bulk return
+                // succeeded while no layouts were actually revoked — a silent
+                // data-integrity gap.  NotImplemented makes the unperformed
+                // operation explicit so the caller does not drop dirty state.
+                Err(Error::NotImplemented)
             }
             LrReturnType::All => {
-                self.return_all_for_client(args.stateid.seqid as u64);
-                Ok(LayoutReturnResult {
-                    layout_retained: false,
-                    new_stateid: None,
-                })
+                // SECURITY: same rationale as Fsid above.
+                if !args.stateid.is_zero() {
+                    return Err(Error::InvalidArgument);
+                }
+                // SECURITY NOTE: caller_client_id must come from the
+                // authenticated session context, not from any wire field.
+                // Fail SAFE with NotImplemented rather than a vacuous Ok that
+                // would mask an unperformed bulk return (see Fsid arm).
+                Err(Error::NotImplemented)
             }
         }
     }
@@ -399,6 +436,17 @@ impl LayoutReturnTable {
     }
 
     /// Mark all layouts held by `client_id` as returned.
+    ///
+    /// # Security
+    ///
+    /// `client_id` MUST be sourced from the authenticated session context
+    /// (the NFSv4.1 confirmed clientid), never from a wire field.  This
+    /// function is currently unused because `process_return` (the only caller)
+    /// now rejects bulk returns until the authenticated client_id is threaded
+    /// through the call stack.  It is retained here as the correct
+    /// implementation target; the dead_code lint is suppressed intentionally.
+    // SECURITY: Do not call this with a client_id derived from any wire field.
+    #[allow(dead_code)]
     fn return_all_for_client(&mut self, client_id: u64) {
         for slot in &mut self.entries {
             if let Some(entry) = slot.as_mut() {

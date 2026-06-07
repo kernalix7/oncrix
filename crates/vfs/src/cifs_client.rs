@@ -273,25 +273,41 @@ impl CifsMount {
 
     /// Enforce the session signing policy on an inbound SMB2 response.
     ///
-    /// Must be called after [`cifs_smb2::decode_header`] succeeds.  When
-    /// `self.security.signing_required` is set and the response flags indicate
-    /// `SMB2_FLAGS_SIGNED`, this function **rejects the message** because
-    /// HMAC-SHA256/AES-CMAC verification is not available at this layer.
+    /// Must be called after [`cifs_smb2::decode_header`] succeeds.
     ///
-    /// # Security
+    /// # Security — signing fail-closed (F2)
     ///
-    /// // SECURITY: when `signing_required` is true we fail closed rather than
-    /// // accepting an unverified signature.  Real HMAC-SHA256 (SMB ≤ 3.0) or
-    /// // AES-CMAC (SMB 3.x) verification over the full message with the 16-byte
-    /// // signature field zeroed must be wired here before this guard is relaxed.
-    /// // The session signing key is available after SESSION_SETUP completes.
+    /// When `signing_required` is `true`:
+    ///
+    /// - A response that **lacks** `SMB2_FLAGS_SIGNED` (flag cleared by a MitM
+    ///   or rogue server) is rejected with `Err(PermissionDenied)`.  The
+    ///   original code had the condition inverted: it fired only when the flag
+    ///   WAS set, meaning an unsigned response silently passed through.
+    /// - A response that **has** `SMB2_FLAGS_SIGNED` is also rejected while the
+    ///   HMAC-SHA256/AES-CMAC verification path is not wired; accepting an
+    ///   unverified signature is equivalent to no signing at all.
+    ///
+    /// // SECURITY TODO: wire real HMAC-SHA256 (SMB ≤ 3.0) or AES-CMAC
+    /// // (SMB 3.x) verification over the full message (signature field zeroed)
+    /// // using the session signing key obtained after SESSION_SETUP.  Only then
+    /// // remove the Err below for the signed path (keep the unsigned-response
+    /// // rejection unconditionally).
     pub fn validate_response_signing(&self, response_flags: u32) -> Result<()> {
         // SMB2_FLAGS_SIGNED = 0x0000_0008 (defined in cifs_smb2)
         const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
-        if self.security.signing_required && (response_flags & SMB2_FLAGS_SIGNED != 0) {
-            // SECURITY: wiring point — replace this Err with actual
-            // HMAC-SHA256/AES-CMAC verification when the session key is
-            // available.  Never accept an unverified signed message.
+        if self.security.signing_required {
+            // SECURITY (F2): fail-closed — reject BOTH unsigned responses
+            // (missing flag) AND signed-but-unverifiable responses (flag present
+            // but no crypto wired yet).
+            if response_flags & SMB2_FLAGS_SIGNED == 0 {
+                // SECURITY: response is missing SMB2_FLAGS_SIGNED while signing
+                // is required — MitM/rogue server stripped the flag to bypass
+                // verification.  Reject.
+                return Err(Error::PermissionDenied);
+            }
+            // SECURITY TODO: replace this Err with actual HMAC-SHA256/AES-CMAC
+            // verification when the session key is available.  Until then,
+            // keep rejecting to avoid accepting a forged signed response.
             return Err(Error::PermissionDenied);
         }
         Ok(())

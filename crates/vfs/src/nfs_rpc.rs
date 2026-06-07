@@ -528,25 +528,58 @@ impl RpcReply {
         let reply_stat_raw = xdr.decode_u32()?;
         let reply_status = if reply_stat_raw == 0 {
             ReplyStatus::MsgAccepted
-        } else {
+        } else if reply_stat_raw == 1 {
             ReplyStatus::MsgDenied
+        } else {
+            return Err(Error::InvalidArgument);
         };
 
-        // Verifier
+        // SECURITY: branch on reply_status BEFORE decoding any status-dependent
+        // fields.  A MSG_DENIED reply has no verifier; reading verifier bytes on
+        // the Denied path would consume reject_stat bytes as verf_flavor/len and
+        // silently discard the auth-rejection reason.
+        if reply_status == ReplyStatus::MsgDenied {
+            // RFC 5531 §9.2: rejected_reply = { RPC_MISMATCH { low, high } |
+            //                                   AUTH_ERROR   { auth_stat    } }
+            // We parse enough to validate the wire format then return an error
+            // so the caller treats this call as definitively failed.
+            let _reject_stat = xdr.decode_u32()?; // 0=RPC_MISMATCH, 1=AUTH_ERROR
+            // Do not attempt to continue; deny = hard failure.
+            return Err(Error::PermissionDenied);
+        }
+
+        // --- MsgAccepted path only below this point ---
+
+        // SECURITY: decode verifier flavor with strict validation — unknown
+        // flavors are rejected rather than silently mapped to AUTH_NONE, which
+        // would bypass GSS/Kerberos integrity verification.
         let verf_flavor_raw = xdr.decode_u32()?;
-        let verf_body = xdr.decode_opaque()?;
-        let verf_flavor = AuthFlavor::from_u32(verf_flavor_raw).unwrap_or(AuthFlavor::AuthNone);
+        let verf_flavor = AuthFlavor::from_u32(verf_flavor_raw).ok_or(Error::InvalidArgument)?;
+
+        // SECURITY: cap verifier body length before decoding to prevent an
+        // attacker-supplied 65535-byte verf_len from causing a large allocation.
+        // RFC 5531 limits AUTH_SYS verifiers to 400 bytes; use the same limit.
+        let verf_len = xdr.decode_u32()? as usize;
+        if verf_len > 400 {
+            // SECURITY: reject oversized verifier; fail closed.
+            return Err(Error::InvalidArgument);
+        }
+        let verf_pad = (4 - (verf_len % 4)) % 4;
+        if xdr.pos + verf_len + verf_pad > xdr.data.len() {
+            return Err(Error::IoError);
+        }
+        let verf_body = xdr.data[xdr.pos..xdr.pos + verf_len].to_vec();
+        xdr.pos += verf_len + verf_pad;
+
         let verf = OpaqueAuth {
             flavor: verf_flavor,
             body: verf_body,
         };
 
-        let accept_stat = if reply_status == ReplyStatus::MsgAccepted {
-            let stat = xdr.decode_u32()?;
-            AcceptStat::from_u32(stat).unwrap_or(AcceptStat::SystemErr)
-        } else {
-            AcceptStat::SystemErr
-        };
+        // SECURITY: reject unknown accept_stat values rather than mapping them
+        // to SystemErr; an unmapped value is an out-of-spec server response.
+        let stat = xdr.decode_u32()?;
+        let accept_stat = AcceptStat::from_u32(stat).ok_or(Error::InvalidArgument)?;
 
         let payload = xdr.data[xdr.pos..].to_vec();
         Ok(Self {
@@ -644,7 +677,10 @@ impl RpcClient {
                 if pc.xid == xid {
                     let proc = pc.proc;
                     *slot = None;
-                    self.num_pending -= 1;
+                    // SECURITY: saturating_sub — overflow-checks ON would panic
+                    // (ring-0 DoS) on any desync between num_pending and the
+                    // slot array; never underflow on untrusted reply traffic.
+                    self.num_pending = self.num_pending.saturating_sub(1);
                     self.replies_received += 1;
                     return Some(proc);
                 }
@@ -678,7 +714,8 @@ impl RpcClient {
                 if let Some(pc) = slot {
                     if pc.xid == xid {
                         *slot = None;
-                        self.num_pending -= 1;
+                        // SECURITY: saturating_sub — see match_reply.
+                        self.num_pending = self.num_pending.saturating_sub(1);
                         break;
                     }
                 }

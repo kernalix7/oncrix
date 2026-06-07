@@ -396,13 +396,37 @@ impl XdrBuffer {
             1 => RpcReplyStatus::Denied,
             _ => return Err(Error::IoError),
         };
-        // Skip verifier (flavor + opaque length).
+        // Skip verifier (flavor + opaque body).
+        // SECURITY: only the verifier body is present on an Accepted reply.
+        // Reject the reply if reply_status is Denied — a Denied reply has no
+        // verifier field; reading it would consume reject_stat bytes as
+        // verf_flavor/len and silently discard the denial reason.
+        if reply_status == RpcReplyStatus::Denied {
+            // Hard-fail on any denial; do not attempt to parse further.
+            return Err(Error::PermissionDenied);
+        }
         let _verf_flavor = self.decode_u32()?;
         let verf_len = self.decode_u32()? as usize;
-        if self.pos + verf_len > self.len {
+        // SECURITY: cap verifier body length before computing the padded size.
+        // An attacker-controlled verf_len up to 65535 would otherwise pass the
+        // bounds check (which used the unpadded value) and then advance pos by
+        // the padded value, silently overshooting self.len.
+        if verf_len > MAX_CRED_LEN {
             return Err(Error::InvalidArgument);
         }
-        self.pos += (verf_len + 3) & !3;
+        // SECURITY: compute the 4-byte-padded length and bounds-check THAT
+        // value (not the unpadded verf_len) before advancing pos, so that a
+        // non-4-aligned verifier cannot make pos overshoot len.
+        let verf_padded = (verf_len + 3) & !3;
+        if self
+            .pos
+            .checked_add(verf_padded)
+            .ok_or(Error::InvalidArgument)?
+            > self.len
+        {
+            return Err(Error::InvalidArgument);
+        }
+        self.pos += verf_padded;
 
         let accept_status = if reply_status == RpcReplyStatus::Accepted {
             match self.decode_u32()? {
@@ -748,18 +772,28 @@ impl RpcClient {
         let mut buf = XdrBuffer::from_bytes(reply_data)?;
         let hdr = buf.decode_reply_header()?;
 
+        // SECURITY: find and remove the matching pending slot UNCONDITIONALLY
+        // before inspecting accept_status.  Returning early on a non-Success
+        // status without clearing the slot leaks it permanently; 32 crafted
+        // error replies (one per slot) would exhaust the pending table and
+        // cause every subsequent call to fail with Err(Busy) — a DoS.
+        // Every reply that matches an outstanding XID must free exactly one slot,
+        // regardless of whether the reply carries Success or an error status.
+        let slot_pos = self.pending[..MAX_PENDING_CALLS]
+            .iter()
+            .position(|p| p.in_use && p.xid == hdr.xid)
+            .ok_or(Error::NotFound)?;
+        // Slot found — clear it now, before any further error return.
+        self.pending[slot_pos] = RpcPendingCall::empty();
+        self.pending_count = self.pending_count.saturating_sub(1);
+        self.reply_count += 1;
+
+        // Now that the slot is freed, check the application-level status and
+        // surface the error to the caller.
         if hdr.accept_status != RpcAcceptStatus::Success {
             return Err(Error::IoError);
         }
 
-        // Find and remove the matching pending call.
-        let pos = self.pending[..MAX_PENDING_CALLS]
-            .iter()
-            .position(|p| p.in_use && p.xid == hdr.xid)
-            .ok_or(Error::NotFound)?;
-        self.pending[pos] = RpcPendingCall::empty();
-        self.pending_count = self.pending_count.saturating_sub(1);
-        self.reply_count += 1;
         Ok(hdr)
     }
 

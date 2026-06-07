@@ -184,10 +184,19 @@ impl FuseReplyBuf {
 
     /// Copy `src` bytes starting at `offset` into `buf`.
     fn write_bytes(&mut self, offset: usize, src: &[u8]) -> Result<()> {
-        if offset + src.len() > FUSE_REPLY_BUF_SIZE {
+        // SECURITY (F3): `offset + src.len()` is an unchecked addition that
+        // overflows to a small value when `offset` or `src.len()` is near
+        // `usize::MAX`, making the guard false and the following slice
+        // out-of-bounds — a ring-0 panic under overflow-checks=ON.
+        // Use checked_add so overflow is treated as InvalidArgument, matching
+        // the pattern already used in FuseArgBuf::read_u32_le / read_u64_le.
+        let end = offset
+            .checked_add(src.len())
+            .ok_or(Error::InvalidArgument)?;
+        if end > FUSE_REPLY_BUF_SIZE {
             return Err(Error::InvalidArgument);
         }
-        self.buf[offset..offset + src.len()].copy_from_slice(src);
+        self.buf[offset..end].copy_from_slice(src);
         Ok(())
     }
 }
