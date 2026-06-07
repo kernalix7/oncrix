@@ -57,41 +57,50 @@ const ROOT_UID: u32 = 0;
 /// Root GID.
 const ROOT_GID: u32 = 0;
 
+// SECURITY: these capability bit numbers MUST match the single canonical
+// assignment in [`crate::capability`] (Linux-aligned).  This module's
+// credential bitmap is 64 bits wide (`MAX_CAPS`), so every canonical bit
+// (max `CAP_LAST` = 41) fits.  A divergent numbering here was a TCB landmine:
+// if this store were ever checked against a `crate::capability::CapSet`
+// bitmap, bit 8 (here once `CAP_SYS_MODULE`) is canonically `CAP_SETPCAP`,
+// silently granting/denying the wrong privilege.  Keep these in lockstep
+// with `crate::capability`; do not renumber independently.
+
 /// Capability bit: override file permission checks.
-pub const CAP_DAC_OVERRIDE: u32 = 0;
+pub const CAP_DAC_OVERRIDE: u32 = 1;
 
 /// Capability bit: change ownership of files.
-pub const CAP_CHOWN: u32 = 1;
+pub const CAP_CHOWN: u32 = 0;
 
 /// Capability bit: bypass permission checks on kill/signal.
-pub const CAP_KILL: u32 = 2;
+pub const CAP_KILL: u32 = 5;
 
 /// Capability bit: set UID arbitrarily.
-pub const CAP_SETUID: u32 = 3;
+pub const CAP_SETUID: u32 = 7;
 
 /// Capability bit: set GID arbitrarily.
-pub const CAP_SETGID: u32 = 4;
+pub const CAP_SETGID: u32 = 6;
 
 /// Capability bit: perform network operations.
-pub const CAP_NET_ADMIN: u32 = 5;
+pub const CAP_NET_ADMIN: u32 = 12;
 
 /// Capability bit: bind to privileged ports.
-pub const CAP_NET_BIND_SERVICE: u32 = 6;
+pub const CAP_NET_BIND_SERVICE: u32 = 10;
 
 /// Capability bit: general system administration.
-pub const CAP_SYS_ADMIN: u32 = 7;
+pub const CAP_SYS_ADMIN: u32 = 21;
 
 /// Capability bit: load and unload kernel modules.
-pub const CAP_SYS_MODULE: u32 = 8;
+pub const CAP_SYS_MODULE: u32 = 16;
 
 /// Capability bit: reboot the system.
-pub const CAP_SYS_BOOT: u32 = 9;
+pub const CAP_SYS_BOOT: u32 = 22;
 
 /// Capability bit: override resource limits.
-pub const CAP_SYS_RESOURCE: u32 = 10;
+pub const CAP_SYS_RESOURCE: u32 = 24;
 
 /// Capability bit: perform raw I/O operations.
-pub const CAP_SYS_RAWIO: u32 = 11;
+pub const CAP_SYS_RAWIO: u32 = 17;
 
 // ── CredState ────────────────────────────────────────────────────────────────
 
