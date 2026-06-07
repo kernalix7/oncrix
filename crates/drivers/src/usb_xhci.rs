@@ -377,8 +377,9 @@ impl TransferRing {
     /// Enqueues a TRB to the ring.
     ///
     /// Sets the cycle bit and advances the enqueue pointer. If the
-    /// pointer reaches the Link TRB, it wraps around and toggles the
-    /// cycle state.
+    /// pointer reaches the Link TRB slot (index `RING_SIZE - 1`), it
+    /// updates the Link TRB cycle bit and wraps around to index 0,
+    /// toggling the cycle state.
     ///
     /// # Errors
     ///
@@ -388,24 +389,41 @@ impl TransferRing {
         if !self.initialised {
             return Err(Error::IoError);
         }
-        // Check if ring is full (enqueue catches up to dequeue).
-        let next = (self.enqueue + 1) % (RING_SIZE - 1);
-        if next == self.dequeue {
+
+        // SECURITY: Compute the raw next index before any modulo so that the
+        // Link-TRB slot (RING_SIZE - 1) is reachable.  The previous
+        // `(enqueue + 1) % (RING_SIZE - 1)` kept enqueue in [0, RING_SIZE-2],
+        // making the wrap-around branch permanently dead code and preventing
+        // the Link TRB from ever being activated.
+        // enqueue is always in [0, RING_SIZE-2], so raw_next <= RING_SIZE-1;
+        // no overflow is possible.
+        let raw_next = self.enqueue + 1; // bounded: enqueue < RING_SIZE-1
+
+        // Full-ring check: if advancing would collide with the dequeue pointer
+        // (accounting for the Link-TRB slot which is not a data slot).
+        let data_next = if raw_next == RING_SIZE - 1 {
+            0
+        } else {
+            raw_next
+        };
+        if data_next == self.dequeue {
             return Err(Error::Busy);
         }
 
         trb.set_cycle(self.cycle_state);
         let idx = self.enqueue;
         self.trbs[idx] = trb;
-        self.enqueue = next;
-        self.total_enqueued += 1;
+        self.total_enqueued = self.total_enqueued.wrapping_add(1);
 
-        // Wrap around via Link TRB.
-        if self.enqueue == RING_SIZE - 1 {
-            self.enqueue = 0;
+        // Wrap around via Link TRB when the next slot is the Link TRB.
+        if raw_next == RING_SIZE - 1 {
+            // Update the Link TRB cycle bit to the NEW cycle state (post-toggle),
+            // so the hardware follows the link with the correct cycle.
             self.cycle_state = !self.cycle_state;
-            // Update Link TRB cycle bit.
             self.trbs[RING_SIZE - 1].set_cycle(self.cycle_state);
+            self.enqueue = 0;
+        } else {
+            self.enqueue = raw_next;
         }
 
         Ok(idx)
@@ -551,8 +569,15 @@ impl EventRing {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `index` is out of range.
+    /// Returns [`Error::IoError`] if the ring is not initialised, or
+    /// [`Error::InvalidArgument`] if `index` is out of range.
     pub fn inject_event(&mut self, index: usize, trb: Trb) -> Result<()> {
+        // SECURITY: Guard matches the pattern used by dequeue() and
+        // available_count(): writes to an uninitialised ring are rejected
+        // so that a caller cannot plant TRBs before the ring is set up.
+        if !self.initialised {
+            return Err(Error::IoError);
+        }
         if index >= EVENT_RING_SIZE {
             return Err(Error::InvalidArgument);
         }

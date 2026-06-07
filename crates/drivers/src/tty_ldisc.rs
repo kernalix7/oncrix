@@ -329,11 +329,13 @@ impl LdiscOps for NTty {
             let to_copy = nl_pos.min(buf.len());
             buf[..to_copy].copy_from_slice(&self.read_buf[..to_copy]);
             self.read_buf.drain(..to_copy);
-            // Always decrement: a line token was consumed regardless of whether
-            // the caller-supplied buf was large enough for every byte (partial
-            // reads on the same line re-enter with line_count already 0, which
-            // is prevented by the guard at the top of this branch).
-            self.line_count = self.line_count.saturating_sub(1);
+            // Decrement only when the WHOLE line token (through the NL) was
+            // consumed. On a partial canonical read (caller buf smaller than the
+            // line) the line is not finished, so line_count must stay > 0 to keep
+            // the next read in this canonical branch for the remainder.
+            if to_copy == nl_pos {
+                self.line_count = self.line_count.saturating_sub(1);
+            }
             Ok(to_copy)
         } else {
             if self.read_buf.is_empty() {
@@ -350,8 +352,24 @@ impl LdiscOps for NTty {
         if !self.opened {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: buf.len() comes from a userspace write(2) count.  A value
+        // >= usize::MAX/2 would overflow the *2 capacity below and cause a
+        // ring-0 panic (overflow-checks = on in dev/test).  Cap to MAX_READ
+        // before any arithmetic so the multiply is always safe.
+        //
+        // CONTRACT: at most MAX_READ bytes are written per call; this is a POSIX
+        // short write (the returned count may be < the requested length), and
+        // callers must loop on the returned count to write the remainder.
+        let buf = if buf.len() > MAX_READ {
+            &buf[..MAX_READ]
+        } else {
+            buf
+        };
         // Apply output processing: NL → CR+NL if onlcr.
         if self.flags.onlcr {
+            // Capacity: at most buf.len() extra CR bytes; with the cap above
+            // buf.len() <= MAX_READ so buf.len() * 2 <= MAX_READ * 2 which
+            // fits comfortably in usize.
             let mut processed = Vec::with_capacity(buf.len() * 2);
             for &b in buf {
                 if b == NL {

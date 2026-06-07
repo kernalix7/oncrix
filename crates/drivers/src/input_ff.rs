@@ -232,6 +232,14 @@ pub struct FfDevice {
 impl FfDevice {
     /// Create a new force feedback device.
     pub const fn new(max_effects: usize) -> Self {
+        // SECURITY: cap max_effects to the fixed slot array size so a
+        // device-reported value > MAX_EFFECTS cannot be used to bypass the
+        // per-device limit enforced in upload().
+        let max_effects = if max_effects > MAX_EFFECTS {
+            MAX_EFFECTS
+        } else {
+            max_effects
+        };
         Self {
             max_effects,
             gain: DEFAULT_GAIN,
@@ -254,6 +262,14 @@ impl FfDevice {
     ///
     /// Returns [`Error::OutOfMemory`] if no slots remain.
     pub fn upload(&mut self, mut effect: FfEffect) -> Result<i16> {
+        // SECURITY: enforce the device-declared hardware limit.  self.max_effects
+        // is capped at MAX_EFFECTS in new(), so scanning only slots 0..max_effects
+        // prevents a device from advertising more slots than the fixed array holds,
+        // and prevents userspace from exhausting hardware effect memory by uploading
+        // effects beyond what the device supports.
+        if self.effect_count() >= self.max_effects {
+            return Err(Error::OutOfMemory);
+        }
         let slot = self.find_free_slot().ok_or(Error::OutOfMemory)?;
         let id = slot as i16;
         effect.id = id;
