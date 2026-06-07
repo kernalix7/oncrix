@@ -211,11 +211,23 @@ impl ExtentCompressInfo {
     }
 
     /// Compression ratio as a percentage (0 = perfect, 100 = no improvement).
+    ///
+    /// Returns a value in `[0, 100]`.
     pub fn ratio_pct(&self) -> u32 {
-        if self.original_len == 0 {
-            return 0;
-        }
-        ((self.compressed_len * 100) / self.original_len) as u32
+        // SECURITY: compressed_len and original_len are on-disk u64 values and
+        // are attacker-controlled.  `compressed_len * 100` can overflow u64
+        // (e.g. compressed_len = u64::MAX), and original_len == 0 would cause
+        // a divide-by-zero panic under overflow-checks.  Use saturating_mul so
+        // overflow produces u64::MAX (→ ratio clamped to 100), checked_div to
+        // handle the zero divisor, and min(100) to keep the result in range.
+        let ratio = self
+            .compressed_len
+            .saturating_mul(100)
+            .checked_div(self.original_len)
+            .unwrap_or(0);
+        // Clamp to [0, 100]: a ratio > 100 means the "compressed" data is
+        // larger than the original, which is valid but not useful above 100%.
+        ratio.min(100) as u32
     }
 }
 

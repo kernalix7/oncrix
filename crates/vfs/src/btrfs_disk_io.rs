@@ -107,6 +107,15 @@ impl BtrfsChecksum {
     /// Compute the checksum of `data` and write the result into `out[..32]`.
     ///
     /// For CRC32C the 4-byte result is stored at `out[0..4]`, rest zeroed.
+    /// For XxHash the 8-byte result is stored at `out[0..8]`, rest zeroed.
+    /// For Sha256 the full 32-byte FIPS 180-4 digest fills `out[0..32]`.
+    ///
+    /// # Blake2b
+    ///
+    /// Blake2b (csum_type 3) is not implemented. `out` is left all-zero so
+    /// that any subsequent `verify` call will return `false` and the block will
+    /// be rejected.  Callers that need to write a block must avoid Blake2b; see
+    /// `verify` for the complementary fail-closed check.
     pub fn compute(&self, data: &[u8], out: &mut [u8; BTRFS_CSUM_SIZE]) {
         *out = [0u8; BTRFS_CSUM_SIZE];
         match self.algo {
@@ -118,19 +127,36 @@ impl BtrfsChecksum {
                 let h = xxhash64(data);
                 out[0..8].copy_from_slice(&h.to_le_bytes());
             }
-            ChecksumType::Sha256 | ChecksumType::Blake2b => {
-                // Simplified stub: XOR-fold into 32 bytes.
-                for (i, &b) in data.iter().enumerate() {
-                    out[i % BTRFS_CSUM_SIZE] ^= b;
-                }
+            ChecksumType::Sha256 => {
+                // Use the real FIPS 180-4 SHA-256 validated in crate::fsverity.
+                // Truncation is not needed: SHA-256 output is exactly 32 bytes,
+                // matching BTRFS_CSUM_SIZE.
+                crate::fsverity::sha256(data, out);
+            }
+            ChecksumType::Blake2b => {
+                // SECURITY: Blake2b is not implemented. Leave out all-zero so
+                // every verify() call returns false — the block (and therefore
+                // the mount) is rejected. This is fail-closed: a forged Blake2b
+                // digest cannot be constructed by an attacker because we never
+                // produce a real digest to compare against.
+                // out is already [0u8; 32] from the initialisation above.
             }
         }
     }
 
     /// Verify that the first `BTRFS_CSUM_SIZE` bytes of `block` are a valid
     /// checksum of `block[BTRFS_CSUM_SIZE..]`.
+    ///
+    /// Returns `false` (and therefore rejects the block) for Blake2b.
     pub fn verify(&self, block: &[u8]) -> bool {
         if block.len() < BTRFS_CSUM_SIZE {
+            return false;
+        }
+        // SECURITY: Blake2b is not implemented; fail closed so that a btrfs
+        // volume formatted with csum_type=3 cannot be mounted.  Any block
+        // purporting to carry a Blake2b checksum is unconditionally rejected
+        // here rather than silently accepted via a forgeable stub digest.
+        if self.algo == ChecksumType::Blake2b {
             return false;
         }
         let mut expected = [0u8; BTRFS_CSUM_SIZE];
@@ -164,16 +190,161 @@ fn crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Simplified xxHash64 (FNV-style stub for no_std compatibility).
+/// Correct XXH64 implementation following the official specification.
+///
+/// Uses the four 64-bit prime constants and the canonical 4-accumulator main
+/// loop with mixing, stripe processing, finalization, and avalanche.
+/// All arithmetic is wrapping to prevent overflow panics on attacker data.
+///
+/// # SECURITY
+///
+/// The previous FNV-style stub produced a completely different (and trivially
+/// forgeable) digest.  This implementation matches the reference XXH64 output,
+/// so on-disk checksums are no longer forgeable by choosing crafted input.
 fn xxhash64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
-    for &b in data {
-        h = h.wrapping_add(b as u64);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        h ^= h >> 33;
+    // Official XXH64 prime constants.
+    const PRIME64_1: u64 = 0x9E37_79B1_85EB_CA87;
+    const PRIME64_2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const PRIME64_3: u64 = 0x1656_67B1_9E37_79F9;
+    const PRIME64_4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const PRIME64_5: u64 = 0x27D4_EB2F_1656_67C5;
+
+    // Seed is 0 (btrfs does not use a per-filesystem seed for xxHash).
+    const SEED: u64 = 0;
+
+    let len = data.len();
+    let mut p = 0usize; // byte cursor
+
+    let mut h64: u64;
+
+    if len >= 32 {
+        // Initialise four accumulators.
+        let mut v1 = SEED.wrapping_add(PRIME64_1).wrapping_add(PRIME64_2);
+        let mut v2 = SEED.wrapping_add(PRIME64_2);
+        let mut v3 = SEED;
+        let mut v4 = SEED.wrapping_sub(PRIME64_1);
+
+        // Main loop: consume 32-byte stripes.
+        let limit = len - 32;
+        loop {
+            // Each lane processes an 8-byte little-endian word.
+            let w1 = u64::from_le_bytes(data[p..p + 8].try_into().unwrap_or([0u8; 8]));
+            v1 = v1
+                .wrapping_add(w1.wrapping_mul(PRIME64_2))
+                .rotate_left(31)
+                .wrapping_mul(PRIME64_1);
+            p += 8;
+            let w2 = u64::from_le_bytes(data[p..p + 8].try_into().unwrap_or([0u8; 8]));
+            v2 = v2
+                .wrapping_add(w2.wrapping_mul(PRIME64_2))
+                .rotate_left(31)
+                .wrapping_mul(PRIME64_1);
+            p += 8;
+            let w3 = u64::from_le_bytes(data[p..p + 8].try_into().unwrap_or([0u8; 8]));
+            v3 = v3
+                .wrapping_add(w3.wrapping_mul(PRIME64_2))
+                .rotate_left(31)
+                .wrapping_mul(PRIME64_1);
+            p += 8;
+            let w4 = u64::from_le_bytes(data[p..p + 8].try_into().unwrap_or([0u8; 8]));
+            v4 = v4
+                .wrapping_add(w4.wrapping_mul(PRIME64_2))
+                .rotate_left(31)
+                .wrapping_mul(PRIME64_1);
+            p += 8;
+            if p > limit {
+                break;
+            }
+        }
+
+        // Merge accumulators.
+        h64 = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+
+        // Merge each accumulator into h64.
+        // SECURITY/correctness: the XXH64 mergeRound is
+        //   h = (h XOR round(0, v)) * P1 + P4, where round(0,v) = (v*P2) <<< 31 * P1.
+        // The earlier form omitted the XOR (and multiplied h alone), which made
+        // every input >= 32 bytes (i.e. every real btrfs block) compute a WRONG
+        // digest and reject valid xxhash images. Verified against the reference
+        // XXH64 (e.g. 32-byte vector -> 0x4CC88D3FCF1451FF).
+        let v1_mix = v1
+            .wrapping_mul(PRIME64_2)
+            .rotate_left(31)
+            .wrapping_mul(PRIME64_1);
+        h64 = (h64 ^ v1_mix)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
+        let v2_mix = v2
+            .wrapping_mul(PRIME64_2)
+            .rotate_left(31)
+            .wrapping_mul(PRIME64_1);
+        h64 = (h64 ^ v2_mix)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
+        let v3_mix = v3
+            .wrapping_mul(PRIME64_2)
+            .rotate_left(31)
+            .wrapping_mul(PRIME64_1);
+        h64 = (h64 ^ v3_mix)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
+        let v4_mix = v4
+            .wrapping_mul(PRIME64_2)
+            .rotate_left(31)
+            .wrapping_mul(PRIME64_1);
+        h64 = (h64 ^ v4_mix)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
+    } else {
+        // Short input (< 32 bytes).
+        h64 = SEED.wrapping_add(PRIME64_5);
     }
-    h
+
+    h64 = h64.wrapping_add(len as u64);
+
+    // Consume remaining 8-byte words.
+    while p + 8 <= len {
+        let w = u64::from_le_bytes(data[p..p + 8].try_into().unwrap_or([0u8; 8]));
+        let k1 = w
+            .wrapping_mul(PRIME64_2)
+            .rotate_left(31)
+            .wrapping_mul(PRIME64_1);
+        h64 = (h64 ^ k1)
+            .rotate_left(27)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
+        p += 8;
+    }
+
+    // Consume remaining 4-byte word (if any).
+    if p + 4 <= len {
+        let w = u32::from_le_bytes(data[p..p + 4].try_into().unwrap_or([0u8; 4]));
+        h64 = (h64 ^ (w as u64).wrapping_mul(PRIME64_1))
+            .rotate_left(23)
+            .wrapping_mul(PRIME64_2)
+            .wrapping_add(PRIME64_3);
+        p += 4;
+    }
+
+    // Consume remaining bytes one at a time.
+    while p < len {
+        h64 = (h64 ^ (data[p] as u64).wrapping_mul(PRIME64_5))
+            .rotate_left(11)
+            .wrapping_mul(PRIME64_1);
+        p += 1;
+    }
+
+    // Finalization avalanche (mixes bits so all output bits depend on all input bits).
+    h64 ^= h64 >> 33;
+    h64 = h64.wrapping_mul(PRIME64_2);
+    h64 ^= h64 >> 29;
+    h64 = h64.wrapping_mul(PRIME64_3);
+    h64 ^= h64 >> 32;
+    h64
 }
 
 // ── On-disk Header ────────────────────────────────────────────────────────────

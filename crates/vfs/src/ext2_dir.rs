@@ -206,7 +206,14 @@ impl DirBlock {
         let name_len = self.data[off + 6];
         let file_type = self.data[off + 7];
 
-        if rec_len < 8 || off + rec_len as usize > DIR_BLOCK_SIZE {
+        // SECURITY: rec_len and name_len are attacker-controlled on-disk values.
+        // Reject rec_len that is smaller than the 4-aligned minimum required to
+        // hold the fixed 8-byte header plus name_len name bytes.  Without this
+        // check slack() = rec_len - actual_len would underflow (usize subtract
+        // panic) when overflow-checks are enabled.  Also reject rec_len that
+        // would push the next entry pointer past the block boundary.
+        let min_needed = (8usize + name_len as usize + 3) & !3;
+        if (rec_len as usize) < min_needed || off + rec_len as usize > DIR_BLOCK_SIZE {
             return None;
         }
         if name_len as usize > MAX_NAME_LEN {

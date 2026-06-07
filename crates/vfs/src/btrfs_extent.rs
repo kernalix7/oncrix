@@ -167,8 +167,14 @@ impl ExtentItem {
                         count: nc,
                     },
                 ) if er == nr && eo == no && ef == nf => {
-                    *ec += nc;
-                    self.refs += *nc as u64;
+                    // SECURITY: on-disk count fields are attacker-controlled; use checked_add
+                    // to prevent u32 wrap which would silently under-count live references.
+                    *ec = ec.checked_add(*nc).ok_or(Error::InvalidArgument)?;
+                    // SECURITY: also guard the global refs counter against overflow.
+                    self.refs = self
+                        .refs
+                        .checked_add(*nc as u64)
+                        .ok_or(Error::InvalidArgument)?;
                     return Ok(());
                 }
                 (
@@ -181,8 +187,14 @@ impl ExtentItem {
                         count: nc,
                     },
                 ) if ep == np => {
-                    *ec += nc;
-                    self.refs += *nc as u64;
+                    // SECURITY: on-disk count fields are attacker-controlled; use checked_add
+                    // to prevent u32 wrap which would silently under-count live references.
+                    *ec = ec.checked_add(*nc).ok_or(Error::InvalidArgument)?;
+                    // SECURITY: also guard the global refs counter against overflow.
+                    self.refs = self
+                        .refs
+                        .checked_add(*nc as u64)
+                        .ok_or(Error::InvalidArgument)?;
                     return Ok(());
                 }
                 _ => {}
@@ -191,7 +203,12 @@ impl ExtentItem {
         if self.inline_refs.len() >= MAX_INLINE_REFS {
             return Err(Error::OutOfMemory);
         }
-        self.refs += iref.ref_count() as u64;
+        // SECURITY: ref_count() is an on-disk u32 cast to u64; checked_add prevents
+        // wrapping self.refs on a crafted image with pathological ref counts.
+        self.refs = self
+            .refs
+            .checked_add(iref.ref_count() as u64)
+            .ok_or(Error::InvalidArgument)?;
         self.inline_refs.push(iref);
         Ok(())
     }
@@ -217,12 +234,26 @@ impl ExtentItem {
                     },
                 ) if er == nr && eo == no && ef == nf => {
                     if *ec <= *nc {
-                        self.refs -= *ec as u64;
+                        // SECURITY: use checked_sub (not saturating_sub) for the free
+                        // decision: clamping refs to 0 silently frees an extent that is
+                        // still referenced by other on-disk back-refs (UAF).  An
+                        // inconsistent image must be rejected with an error instead.
+                        self.refs = self
+                            .refs
+                            .checked_sub(*ec as u64)
+                            .ok_or(Error::InvalidArgument)?;
                         found = true;
                         true
                     } else {
-                        *ec -= nc;
-                        self.refs -= *nc as u64;
+                        // SECURITY: checked_sub on the inline count — attacker-controlled
+                        // nc > ec would underflow the u32 and corrupt the ref count.
+                        *ec = ec.checked_sub(*nc).ok_or(Error::InvalidArgument)?;
+                        // SECURITY: checked_sub on the global refs counter — an
+                        // inconsistent image must be surfaced, not silently clamped.
+                        self.refs = self
+                            .refs
+                            .checked_sub(*nc as u64)
+                            .ok_or(Error::InvalidArgument)?;
                         found = true;
                         false
                     }
@@ -238,12 +269,24 @@ impl ExtentItem {
                     },
                 ) if ep == np => {
                     if *ec <= *nc {
-                        self.refs -= *ec as u64;
+                        // SECURITY: use checked_sub (not saturating_sub) for the free
+                        // decision: clamping refs to 0 silently frees an extent that is
+                        // still referenced (UAF on a crafted image).
+                        self.refs = self
+                            .refs
+                            .checked_sub(*ec as u64)
+                            .ok_or(Error::InvalidArgument)?;
                         found = true;
                         true
                     } else {
-                        *ec -= nc;
-                        self.refs -= *nc as u64;
+                        // SECURITY: checked_sub on the inline count — prevents underflow
+                        // on a crafted image where nc > ec.
+                        *ec = ec.checked_sub(*nc).ok_or(Error::InvalidArgument)?;
+                        // SECURITY: checked_sub on the global refs counter.
+                        self.refs = self
+                            .refs
+                            .checked_sub(*nc as u64)
+                            .ok_or(Error::InvalidArgument)?;
                         found = true;
                         false
                     }
@@ -251,7 +294,9 @@ impl ExtentItem {
                 (InlineRef::TreeBlockRef { root: er }, InlineRef::TreeBlockRef { root: nr })
                     if er == nr =>
                 {
-                    self.refs -= 1;
+                    // SECURITY: use checked_sub — a crafted image with refs == 0 before
+                    // this drop must be rejected, not silently clamped (UAF risk).
+                    self.refs = self.refs.checked_sub(1).ok_or(Error::InvalidArgument)?;
                     found = true;
                     true
                 }
@@ -259,7 +304,9 @@ impl ExtentItem {
                     InlineRef::SharedBlockRef { parent: ep },
                     InlineRef::SharedBlockRef { parent: np },
                 ) if ep == np => {
-                    self.refs -= 1;
+                    // SECURITY: use checked_sub — reject images where refs underflows
+                    // instead of silently freeing a still-referenced extent.
+                    self.refs = self.refs.checked_sub(1).ok_or(Error::InvalidArgument)?;
                     found = true;
                     true
                 }
@@ -351,8 +398,14 @@ impl BlockGroup {
 
     /// Bytes effectively available for new allocations.
     pub fn available(&self) -> u64 {
-        self.total
-            .saturating_sub(self.used + self.pinned + self.reserved)
+        // SECURITY: used/pinned/reserved are on-disk-derived; saturating_add prevents
+        // a crafted image from wrapping the sum below self.total, which would make
+        // available() return a falsely large value and allow over-allocation.
+        let committed = self
+            .used
+            .saturating_add(self.pinned)
+            .saturating_add(self.reserved);
+        self.total.saturating_sub(committed)
     }
 
     /// Account for bytes being allocated in this group.
@@ -360,14 +413,19 @@ impl BlockGroup {
         if bytes > self.available() {
             return Err(Error::OutOfMemory);
         }
-        self.used += bytes;
+        // SECURITY: bytes is on-disk-derived; checked_add prevents wrapping self.used
+        // even though available() already bounds the value — defence in depth.
+        self.used = self.used.checked_add(bytes).ok_or(Error::OutOfMemory)?;
         Ok(())
     }
 
     /// Account for bytes being freed in this group (moves to pinned).
     pub fn account_free(&mut self, bytes: u64) {
         self.used = self.used.saturating_sub(bytes);
-        self.pinned += bytes;
+        // SECURITY: bytes is ultimately derived from on-disk num_bytes; saturating_add
+        // prevents a crafted image from wrapping pinned to a small value, which would
+        // allow the same bytes to be re-allocated while still pinned.
+        self.pinned = self.pinned.saturating_add(bytes);
     }
 
     /// Unpin bytes after a transaction commits.
@@ -484,7 +542,12 @@ impl ExtentTree {
             if let Some(bg) = &self.block_groups[i] {
                 if !bg.ro && bg.flags & flags == flags && bg.available() >= num_bytes {
                     found_bg = Some(i);
-                    found_start = bg.start + bg.used;
+                    // SECURITY: start and used are both on-disk-derived; checked_add
+                    // rejects a crafted image where their sum overflows u64.
+                    found_start = bg
+                        .start
+                        .checked_add(bg.used)
+                        .ok_or(Error::InvalidArgument)?;
                     break;
                 }
             }
@@ -500,7 +563,13 @@ impl ExtentTree {
         let mut item = ExtentItem::new(bytenr, num_bytes, self.current_transid, flags);
         item.add_ref(iref)?;
 
-        self.total_allocated += num_bytes;
+        // SECURITY: num_bytes is on-disk-derived; checked_add prevents wrapping
+        // total_allocated, which would make the filesystem appear to have less
+        // allocated space than it truly does.
+        self.total_allocated = self
+            .total_allocated
+            .checked_add(num_bytes)
+            .ok_or(Error::OutOfMemory)?;
 
         // Insert sorted by bytenr
         let pos = self.extents.partition_point(|e| e.bytenr < bytenr);
@@ -554,7 +623,9 @@ impl ExtentTree {
         let mut total = 0u64;
         for i in 0..self.num_block_groups {
             if let Some(bg) = &self.block_groups[i] {
-                total += bg.used;
+                // SECURITY: bg.used is on-disk-derived; saturating_add prevents wrapping
+                // the accumulator to a small value on a crafted multi-group image.
+                total = total.saturating_add(bg.used);
             }
         }
         total
@@ -565,7 +636,9 @@ impl ExtentTree {
         let mut total = 0u64;
         for i in 0..self.num_block_groups {
             if let Some(bg) = &self.block_groups[i] {
-                total += bg.pinned;
+                // SECURITY: bg.pinned is on-disk-derived; saturating_add prevents
+                // wrapping the accumulator on a crafted image.
+                total = total.saturating_add(bg.pinned);
             }
         }
         total
@@ -619,11 +692,18 @@ impl ExtentTree {
                 let should_free = self.extents[pos].drop_ref(&dref.iref)?;
                 if should_free {
                     let item = self.extents.remove(pos);
-                    self.total_allocated -= item.num_bytes;
+                    // SECURITY: on-disk num_bytes is attacker-controlled; saturating_sub
+                    // prevents a u64 underflow from halting the kernel.
+                    self.total_allocated = self.total_allocated.saturating_sub(item.num_bytes);
                     // Free space in the owning block group
                     for i in 0..self.num_block_groups {
                         if let Some(bg) = &mut self.block_groups[i] {
-                            if item.bytenr >= bg.start && item.bytenr < bg.start + bg.length {
+                            // SECURITY: avoid bare `bg.start + bg.length` addition — both
+                            // fields are on-disk-derived and their sum may overflow u64 on a
+                            // crafted image.  The >= guard ensures item.bytenr >= bg.start,
+                            // so the subtraction item.bytenr - bg.start is safe and we then
+                            // compare against bg.length (no addition needed, no overflow).
+                            if item.bytenr >= bg.start && item.bytenr - bg.start < bg.length {
                                 bg.account_free(item.num_bytes);
                                 break;
                             }
@@ -643,7 +723,16 @@ impl Default for ExtentTree {
 }
 
 /// Compute the block group start for a given byte offset and group size.
+///
+/// Returns 0 when `bg_size` is zero (on-disk value is attacker-controlled;
+/// dividing by zero would panic and halt the kernel).
 pub fn bg_start(bytenr: u64, bg_size: u64) -> u64 {
+    // SECURITY: bg_size comes from on-disk data and is fully attacker-controlled.
+    // A zero value would cause a div-by-zero panic (overflow-checks=on in dev/test,
+    // and integer divide-by-zero always panics in Rust regardless of profile).
+    if bg_size == 0 {
+        return 0;
+    }
     (bytenr / bg_size) * bg_size
 }
 

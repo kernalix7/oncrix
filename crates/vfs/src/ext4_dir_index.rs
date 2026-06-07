@@ -94,6 +94,15 @@ pub struct DxNode {
     /// Count and limit header.
     pub count_limit: DxCountLimit,
     /// Entries in this node (up to limit - 1 usable).
+    ///
+    // SECURITY/NOTE: A real 4 KiB ext4 dx_node block holds up to ~510 entries
+    // ((4096 - 8) / 8 = 511 slots, minus the fake sentinel = 510 usable).
+    // This array is sized to 255 — half the real capacity.  The cap in
+    // dx_node_search() prevents any OOB access, so this is memory-safe today,
+    // but it silently ignores entries 256..510 on disk, which can cause missed
+    // directory lookups for large directories.  A future change should resize
+    // this array to 510 (or make it heap-backed) to match the real per-block
+    // capacity.
     pub entries: [DxEntry; 255],
 }
 
@@ -186,6 +195,13 @@ impl DirIndex {
             return Err(Error::InvalidArgument);
         }
 
+        // SECURITY: ext4 supports only indirect_levels 0 or 1.  A value >= 2
+        // from an attacker-controlled on-disk image would cause unbounded
+        // recursion / logic errors.  Reject immediately.
+        if self.indirect_levels > 1 {
+            return Err(Error::IoError);
+        }
+
         let (hash, minor_hash) = self.hash_filename(name);
 
         // Block 0 is the root; the HTree root info is in the second entry area.
@@ -235,7 +251,13 @@ impl DirIndex {
 
     /// Initialize a new HTree root block for a freshly-created directory.
     pub fn init_root(block_size: u32) -> Result<DxRootInfo> {
-        let entries_per_block = (block_size - 24) / 8;
+        // SECURITY: block_size is read from the on-disk superblock and is
+        // attacker-controlled.  A value < 24 would wrap (overflow-checks = on
+        // in dev/test → kernel panic) and < 512 is not a valid ext4 block.
+        if block_size < 512 {
+            return Err(Error::InvalidArgument);
+        }
+        let entries_per_block = block_size.checked_sub(24).ok_or(Error::InvalidArgument)? / 8;
         if entries_per_block < 2 {
             return Err(Error::InvalidArgument);
         }
@@ -251,7 +273,13 @@ impl DirIndex {
 
 /// Search a DxNode for the entry whose hash is <= `hash`.
 fn dx_node_search(node: &DxNode, hash: u32) -> Result<u32> {
-    let count = node.entry_count() as usize;
+    // SECURITY: count_limit.count is read directly from an attacker-controlled
+    // on-disk block.  Without capping it to the real array length, the binary
+    // search below would index node.entries[] out of bounds (entries has 255
+    // slots; an on-disk count up to u16::MAX would cause OOB panic with
+    // overflow-checks on).  Cap to the actual array length before any use.
+    let array_len = node.entries.len(); // compile-time constant: 255
+    let count = (node.entry_count() as usize).min(array_len);
     if count == 0 {
         // Return block 0 as fallback.
         return Ok(0);

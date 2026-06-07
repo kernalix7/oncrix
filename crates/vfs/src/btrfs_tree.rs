@@ -412,7 +412,13 @@ impl BtrfsTree {
             if node.is_leaf() {
                 let slot = node.leaf_search(key);
                 path.leaf_slot = slot;
-                let nritems = node.header.nritems as usize;
+                // SECURITY: nritems is an on-disk (attacker-controlled) u32.
+                // Without this cap, `slot < nritems` could be true at slot==32,
+                // and `node.leaf_items[slot]` would index past the 32-element
+                // array — a panic (kernel halt) in overflow-check mode.
+                // leaf_search() already caps internally, but we must also cap
+                // here so the index used in the exact_match check is bounded.
+                let nritems = (node.header.nritems as usize).min(MAX_LEAF_ITEMS);
                 path.exact_match = slot < nritems
                     && node.leaf_items[slot]
                         .as_ref()
