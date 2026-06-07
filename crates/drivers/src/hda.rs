@@ -333,8 +333,11 @@ pub struct HdaCodec {
     pub revision: u8,
     /// Discovered widgets.
     pub widgets: [HdaWidget; MAX_WIDGETS],
-    /// Number of valid entries in `widgets`.
-    pub widget_count: usize,
+    /// Number of valid entries in `widgets` (always `<= MAX_WIDGETS`).
+    ///
+    /// Private to prevent external callers from setting an out-of-bounds
+    /// count; use [`add_widget`](HdaCodec::add_widget) to increment.
+    widget_count: usize,
     /// Audio Function Group root node ID.
     pub afg_node: u8,
 }
@@ -351,6 +354,26 @@ impl HdaCodec {
             widget_count: 0,
             afg_node: 0,
         }
+    }
+
+    /// Returns the number of valid widgets discovered in this codec.
+    ///
+    /// Always `<= MAX_WIDGETS`.
+    pub fn widget_count(&self) -> usize {
+        self.widget_count
+    }
+
+    /// Attempt to add a widget to this codec.
+    ///
+    /// Returns [`Error::OutOfMemory`] if the codec already contains
+    /// [`MAX_WIDGETS`] widgets.
+    pub fn add_widget(&mut self, widget: HdaWidget) -> Result<()> {
+        if self.widget_count >= MAX_WIDGETS {
+            return Err(Error::OutOfMemory);
+        }
+        self.widgets[self.widget_count] = widget;
+        self.widget_count += 1;
+        Ok(())
     }
 }
 
@@ -633,8 +656,10 @@ impl HdaController {
         let encoded = fmt.encode();
 
         // Find the first AudioOutput widget.
+        // Cap at MAX_WIDGETS to guard against a corrupt/stale count.
+        let scan_limit = codec_info.widget_count().min(MAX_WIDGETS);
         let mut target_node: Option<u8> = None;
-        for i in 0..codec_info.widget_count {
+        for i in 0..scan_limit {
             let w = &codec_info.widgets[i];
             if w.widget_type == WidgetType::AudioOutput && w.active {
                 target_node = Some(w.node_id);

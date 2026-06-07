@@ -327,7 +327,10 @@ pub fn parse_gpt(
 
     let num_entries = (header.num_partition_entries as usize).min(GPT_MAX_ENTRIES);
     let entry_size = header.partition_entry_size as usize;
-    if entry_size < GPT_ENTRY_SIZE {
+    // Reject a clearly corrupt entry_size: must be in [GPT_ENTRY_SIZE, 4096].
+    // A value like 4 GiB is unambiguously invalid and would make the offset
+    // arithmetic skip large sections of the buffer even with the bounds guard.
+    if entry_size < GPT_ENTRY_SIZE || entry_size > 4096 {
         return Err(Error::InvalidArgument);
     }
 
@@ -336,7 +339,10 @@ pub fn parse_gpt(
         if count >= MAX_PARTITIONS {
             break;
         }
-        let off = i * entry_size;
+        // Use checked_mul as a defensive measure; entry_size <= 4096 and
+        // i <= 128, so this cannot overflow on any supported platform, but
+        // the check makes the invariant explicit and costs nothing.
+        let off = i.checked_mul(entry_size).ok_or(Error::InvalidArgument)?;
         if off + GPT_ENTRY_SIZE > entries_buf.len() {
             break;
         }

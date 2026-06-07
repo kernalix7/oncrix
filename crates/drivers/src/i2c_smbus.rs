@@ -257,9 +257,15 @@ pub struct SmBusTransaction {
     /// Whether to append/check a Packet Error Code byte.
     pub pec: bool,
     /// Data bytes (for write operations or block transfers).
+    ///
+    /// `data[..SMBUS_MAX_BLOCK]` holds payload; `data[SMBUS_MAX_BLOCK]` is
+    /// reserved for the PEC byte.  Access through [`Self::data()`] and
+    /// [`Self::set_data()`] to guarantee the invariant `data_len <= SMBUS_MAX_BLOCK`.
     pub data: [u8; SMBUS_MAX_BLOCK + 1],
-    /// Number of valid bytes in `data`.
-    pub data_len: usize,
+    /// Number of valid payload bytes in `data` (private — enforced by setter).
+    ///
+    /// Invariant: `data_len <= SMBUS_MAX_BLOCK`.
+    data_len: usize,
 }
 
 impl SmBusTransaction {
@@ -275,9 +281,33 @@ impl SmBusTransaction {
         }
     }
 
-    /// Data slice.
+    /// Returns the valid payload slice.
+    ///
+    /// The length is clamped to `SMBUS_MAX_BLOCK` defensively, even though
+    /// the invariant enforced by [`Self::set_data_len`] should already guarantee
+    /// this.  This ensures the accessor is safe regardless of how `data_len`
+    /// was last set.
     pub fn data(&self) -> &[u8] {
-        &self.data[..self.data_len]
+        let len = self.data_len.min(SMBUS_MAX_BLOCK);
+        &self.data[..len]
+    }
+
+    /// Returns the number of valid payload bytes.
+    pub fn data_len(&self) -> usize {
+        self.data_len.min(SMBUS_MAX_BLOCK)
+    }
+
+    /// Set `data_len` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `len > SMBUS_MAX_BLOCK`.
+    pub fn set_data_len(&mut self, len: usize) -> Result<()> {
+        if len > SMBUS_MAX_BLOCK {
+            return Err(Error::InvalidArgument);
+        }
+        self.data_len = len;
+        Ok(())
     }
 
     /// Set write data from a slice.
@@ -520,8 +550,14 @@ impl<A: I2cAdapter> I2cBus<A> {
                 Ok(())
             }
             SmBusTransactionKind::ReadBlock => {
-                let n = self.smbus_read_block(txn.addr, txn.command, &mut txn.data)?;
-                txn.data_len = n;
+                // Pass only the payload portion (first SMBUS_MAX_BLOCK bytes);
+                // txn.data[SMBUS_MAX_BLOCK] is reserved for PEC and must not be
+                // overwritten by smbus_read_block.  The returned count is clamped
+                // by smbus_read_block itself, but we re-clamp here for defence in
+                // depth and to satisfy the data_len invariant.
+                let n =
+                    self.smbus_read_block(txn.addr, txn.command, &mut txn.data[..SMBUS_MAX_BLOCK])?;
+                txn.data_len = n.min(SMBUS_MAX_BLOCK);
                 Ok(())
             }
             SmBusTransactionKind::ProcessCall => {
@@ -962,8 +998,9 @@ impl<A: I2cAdapter> I2cBus<A> {
         let wlen = 2 + write_data.len();
 
         // Read back: length byte + up to SMBUS_MAX_BLOCK bytes.
-        let rlen = read_buf.len().min(SMBUS_MAX_BLOCK) + 1;
-        let _rbuf = [0u8; SMBUS_MAX_BLOCK + 1];
+        // We always request the maximum possible response so the count byte
+        // and all payload bytes arrive in a single transfer.
+        let rlen = SMBUS_MAX_BLOCK + 1;
 
         let mut write_msg = I2cMsg::write(I2cAddress::SevenBit(addr), &wbuf[..wlen])?;
         let read_msg = I2cMsg::read(I2cAddress::SevenBit(addr), rlen)?;
@@ -972,9 +1009,21 @@ impl<A: I2cAdapter> I2cBus<A> {
         self.adapter.transfer(msgs)?;
 
         let resp = msgs[1].data();
-        let count = if resp.is_empty() { 0 } else { resp[0] as usize };
+        if resp.is_empty() {
+            return Err(Error::IoError);
+        }
+        // The first byte is the device-supplied count.  We must verify that
+        // enough bytes were actually received before trusting it; a short
+        // transfer indicates a hardware/protocol error.
+        let count = resp[0] as usize;
+        // Safety boundary: clamp against both the caller's buffer and the spec
+        // maximum.  This is the authoritative bound for all subsequent indexing.
         let actual = count.min(read_buf.len()).min(SMBUS_MAX_BLOCK);
-        if actual > 0 && resp.len() > actual {
+        if resp.len() < actual + 1 {
+            // Device claimed more bytes than the transfer delivered.
+            return Err(Error::IoError);
+        }
+        if actual > 0 {
             read_buf[..actual].copy_from_slice(&resp[1..1 + actual]);
         }
         Ok(actual)

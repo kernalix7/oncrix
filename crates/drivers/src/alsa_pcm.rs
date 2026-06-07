@@ -124,6 +124,13 @@ impl PcmFormat {
 // PCM Hardware Parameters
 // ---------------------------------------------------------------------------
 
+/// Maximum buffer size in bytes accepted from an untrusted hw_params value (256 MiB).
+///
+/// Any combination of `buffer_size * bytes_per_frame` or `period_size *
+/// bytes_per_frame` that would exceed this limit is rejected by
+/// [`PcmHwParams::is_valid`] before any byte-count is computed.
+pub const MAX_BUFFER_BYTES: u32 = 256 * 1024 * 1024;
+
 /// PCM hardware configuration parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct PcmHwParams {
@@ -154,19 +161,32 @@ impl PcmHwParams {
         }
     }
 
-    /// Returns bytes per frame (channels * bytes per sample).
-    pub fn bytes_per_frame(&self) -> u32 {
-        self.channels * self.format.sample_bytes() as u32
+    /// Returns bytes per frame (channels × bytes per sample).
+    ///
+    /// Returns `None` on arithmetic overflow (channels or format size
+    /// too large for a `u32`).
+    pub fn bytes_per_frame(&self) -> Option<u32> {
+        self.channels.checked_mul(self.format.sample_bytes() as u32)
     }
 
-    /// Returns bytes per period.
-    pub fn bytes_per_period(&self) -> u32 {
-        self.period_size * self.bytes_per_frame()
+    /// Returns bytes per period, or `None` on overflow.
+    ///
+    /// Callers should first verify [`is_valid`](Self::is_valid) returns
+    /// `true`, which guarantees this value is bounded by
+    /// [`MAX_BUFFER_BYTES`].
+    pub fn bytes_per_period(&self) -> Option<u32> {
+        let bpf = self.bytes_per_frame()?;
+        self.period_size.checked_mul(bpf)
     }
 
-    /// Returns total buffer size in bytes.
-    pub fn buffer_bytes(&self) -> u32 {
-        self.buffer_size * self.bytes_per_frame()
+    /// Returns total buffer size in bytes, or `None` on overflow.
+    ///
+    /// Callers should first verify [`is_valid`](Self::is_valid) returns
+    /// `true`, which guarantees this value is bounded by
+    /// [`MAX_BUFFER_BYTES`].
+    pub fn buffer_bytes(&self) -> Option<u32> {
+        let bpf = self.bytes_per_frame()?;
+        self.buffer_size.checked_mul(bpf)
     }
 
     /// Returns the period duration in microseconds.
@@ -178,14 +198,38 @@ impl PcmHwParams {
     }
 
     /// Validates that parameters are within sensible bounds.
+    ///
+    /// This function is guaranteed to be panic-free: every arithmetic
+    /// operation uses [`checked_mul`](u32::checked_mul) so an
+    /// overflow returns `false` instead of triggering a ring-0 panic.
+    ///
+    /// Additionally, `buffer_bytes()` must be `<= MAX_BUFFER_BYTES`
+    /// (256 MiB) to prevent oversized DMA allocations.
     pub fn is_valid(&self) -> bool {
-        self.rate > 0
-            && self.channels > 0
-            && self.channels <= 32
-            && self.period_size > 0
-            && self.buffer_size >= self.period_size
-            && self.periods >= 2
-            && self.buffer_size == self.period_size * self.periods
+        // Basic range checks (no arithmetic yet).
+        if self.rate == 0
+            || self.channels == 0
+            || self.channels > 32
+            || self.period_size == 0
+            || self.periods < 2
+        {
+            return false;
+        }
+
+        // period_size * periods must equal buffer_size (checked).
+        let computed_buf = match self.period_size.checked_mul(self.periods) {
+            Some(v) => v,
+            None => return false,
+        };
+        if self.buffer_size != computed_buf || self.buffer_size < self.period_size {
+            return false;
+        }
+
+        // buffer_bytes must be representable and <= MAX_BUFFER_BYTES.
+        match self.buffer_bytes() {
+            Some(bytes) => bytes <= MAX_BUFFER_BYTES,
+            None => false,
+        }
     }
 }
 
@@ -484,7 +528,8 @@ impl PcmSubstream {
             return Err(Error::InvalidArgument);
         }
         ops.hw_params(self.stream, &params)?;
-        self.dma_buf_size = params.buffer_bytes();
+        // is_valid() guarantees buffer_bytes() is Some and <= MAX_BUFFER_BYTES.
+        self.dma_buf_size = params.buffer_bytes().ok_or(Error::InvalidArgument)?;
         self.ring_buf = Some(PcmRingBuffer::new(&params));
         self.hw_params = Some(params);
         self.state = PcmState::Setup;
@@ -678,12 +723,22 @@ impl PcmDevice {
     }
 
     /// Returns a mutable reference to a playback substream.
+    ///
+    /// Returns [`Error::InvalidArgument`] if `index >= MAX_SUBSTREAMS`.
     pub fn playback_mut(&mut self, index: usize) -> Result<&mut PcmSubstream> {
+        if index >= MAX_SUBSTREAMS {
+            return Err(Error::InvalidArgument);
+        }
         self.playback[index].as_mut().ok_or(Error::NotFound)
     }
 
     /// Returns a mutable reference to a capture substream.
+    ///
+    /// Returns [`Error::InvalidArgument`] if `index >= MAX_SUBSTREAMS`.
     pub fn capture_mut(&mut self, index: usize) -> Result<&mut PcmSubstream> {
+        if index >= MAX_SUBSTREAMS {
+            return Err(Error::InvalidArgument);
+        }
         self.capture[index].as_mut().ok_or(Error::NotFound)
     }
 }
@@ -723,12 +778,22 @@ impl PcmRegistry {
     }
 
     /// Returns a mutable reference to the PCM device at `index`.
+    ///
+    /// Returns [`Error::InvalidArgument`] if `index >= MAX_PCM_DEVICES`.
     pub fn get_mut(&mut self, index: usize) -> Result<&mut PcmDevice> {
+        if index >= MAX_PCM_DEVICES {
+            return Err(Error::InvalidArgument);
+        }
         self.devices[index].as_mut().ok_or(Error::NotFound)
     }
 
     /// Returns a reference to the PCM device at `index`.
+    ///
+    /// Returns [`Error::InvalidArgument`] if `index >= MAX_PCM_DEVICES`.
     pub fn get(&self, index: usize) -> Result<&PcmDevice> {
+        if index >= MAX_PCM_DEVICES {
+            return Err(Error::InvalidArgument);
+        }
         self.devices[index].as_ref().ok_or(Error::NotFound)
     }
 

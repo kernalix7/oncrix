@@ -367,6 +367,48 @@ impl LoopDevice {
         Ok(())
     }
 
+    /// Translate a sector range to a byte range, checking for overflow.
+    ///
+    /// Returns `(byte_offset, byte_count)` where `byte_offset` is the
+    /// absolute position in the backing file (i.e., already including the
+    /// device offset) and `byte_count` is the total number of bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] on arithmetic overflow or when the
+    /// range extends beyond the device capacity.
+    fn translate_sector(
+        start_sector: u64,
+        sector_count: u32,
+        block_size: u64,
+        device_offset: u64,
+        capacity: u64,
+    ) -> Result<(u64, u64)> {
+        // sector_start_byte = start_sector * block_size (within device space)
+        let sector_start_byte = start_sector
+            .checked_mul(block_size)
+            .ok_or(Error::InvalidArgument)?;
+        // byte_count = sector_count * block_size
+        let byte_count = u64::from(sector_count)
+            .checked_mul(block_size)
+            .ok_or(Error::InvalidArgument)?;
+        // absolute byte_offset in the backing file
+        let byte_offset = sector_start_byte
+            .checked_add(device_offset)
+            .ok_or(Error::InvalidArgument)?;
+        // end of the requested range must not exceed device_offset + capacity
+        let end = byte_offset
+            .checked_add(byte_count)
+            .ok_or(Error::InvalidArgument)?;
+        let limit = device_offset
+            .checked_add(capacity)
+            .ok_or(Error::InvalidArgument)?;
+        if end > limit {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((byte_offset, byte_count))
+    }
+
     /// Read sectors from the loop device.
     ///
     /// Translates the sector range into a byte read against the
@@ -376,7 +418,8 @@ impl LoopDevice {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if the device is not
-    /// attached or the read range is out of bounds.
+    /// attached, the arithmetic overflows, or the read range is out
+    /// of bounds.
     pub fn read_sectors(
         &mut self,
         start_sector: u64,
@@ -388,15 +431,16 @@ impl LoopDevice {
         }
 
         let block_size = u64::from(self.config.block_size);
-        let byte_offset = start_sector * block_size + self.config.offset;
-        let byte_count = u64::from(sector_count) * block_size;
-
-        if byte_offset + byte_count > self.config.offset + self.capacity {
-            return Err(Error::InvalidArgument);
-        }
+        let (_byte_offset, byte_count) = Self::translate_sector(
+            start_sector,
+            sector_count,
+            block_size,
+            self.config.offset,
+            self.capacity,
+        )?;
 
         // In a real implementation:
-        // vfs_read(self.backing.fd, byte_offset, buffer, byte_count)
+        // vfs_read(self.backing.fd, _byte_offset, _buffer, byte_count)
 
         self.read_count += 1;
         self.read_bytes += byte_count;
@@ -409,8 +453,8 @@ impl LoopDevice {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if the device is not
-    /// attached, the device is read-only, or the write range is
-    /// out of bounds.
+    /// attached, the device is read-only, the arithmetic overflows,
+    /// or the write range is out of bounds.
     pub fn write_sectors(
         &mut self,
         start_sector: u64,
@@ -426,15 +470,16 @@ impl LoopDevice {
         }
 
         let block_size = u64::from(self.config.block_size);
-        let byte_offset = start_sector * block_size + self.config.offset;
-        let byte_count = u64::from(sector_count) * block_size;
-
-        if byte_offset + byte_count > self.config.offset + self.capacity {
-            return Err(Error::InvalidArgument);
-        }
+        let (_byte_offset, byte_count) = Self::translate_sector(
+            start_sector,
+            sector_count,
+            block_size,
+            self.config.offset,
+            self.capacity,
+        )?;
 
         // In a real implementation:
-        // vfs_write(self.backing.fd, byte_offset, buffer, byte_count)
+        // vfs_write(self.backing.fd, _byte_offset, _buffer, byte_count)
 
         self.write_count += 1;
         self.write_bytes += byte_count;

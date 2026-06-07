@@ -98,8 +98,18 @@ impl SwapEntry {
     }
 
     /// Returns the byte offset within the swap device.
+    ///
+    /// The swap offset is a 56-bit field decoded directly from a
+    /// (potentially attacker-controlled or corrupted) page-table
+    /// entry via [`from_raw`], so `swp_offset() * PAGE_SIZE` can
+    /// exceed `u64::MAX` (max offset `2^56 - 1` times `PAGE_SIZE`
+    /// is `~2^68`). With overflow checks enabled a plain multiply
+    /// would panic in ring 0 and halt the machine, so this uses a
+    /// saturating multiply. Callers MUST still validate the offset
+    /// against the device's real page count ([`SwapInfo::pages`])
+    /// before using it to address backing storage.
     pub fn byte_offset(self) -> u64 {
-        self.swp_offset() * PAGE_SIZE
+        self.swp_offset().saturating_mul(PAGE_SIZE)
     }
 }
 

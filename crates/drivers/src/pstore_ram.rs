@@ -181,14 +181,17 @@ impl DmesgEntry {
         Ok(entry)
     }
 
-    /// Returns `true` if this entry has a valid magic number.
+    /// Returns `true` if this entry has a valid magic number and sane length.
     pub fn is_valid(&self) -> bool {
-        self.magic == ENTRY_MAGIC
+        self.magic == ENTRY_MAGIC && self.data_len <= MAX_ENTRY_DATA
     }
 
     /// Returns the data payload as a byte slice.
+    ///
+    /// Clamps `data_len` to [`MAX_ENTRY_DATA`] so a corrupt persisted length
+    /// cannot cause an out-of-bounds slice in ring-0.
     pub fn data(&self) -> &[u8] {
-        &self.data[..self.data_len]
+        &self.data[..self.data_len.min(MAX_ENTRY_DATA)]
     }
 
     /// Marks this entry as recovered.
