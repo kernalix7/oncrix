@@ -108,41 +108,238 @@ impl HashAlgo {
     }
 }
 
-// ── Hash functions (stubs) ────────────────────────────────────────────────────
+// ── Hash functions ────────────────────────────────────────────────────────────
 
-/// Compute a SHA-256-like hash of `data` into `out`.
-///
-/// This is a deterministic stub using FNV-1a folded into 32 bytes.
-/// A real implementation would call a hardware-accelerated SHA-256.
-pub fn sha256(data: &[u8], out: &mut [u8; SHA256_DIGEST_SIZE]) {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+// fs-verity is part of the integrity TCB: a leaf/page digest is what stands
+// between a tampered page and the user.  It therefore MUST use a real
+// cryptographic hash, not a folded FNV stub (which collides trivially).
+//
+// `oncrix-vfs` cannot depend on `oncrix-kernel` (the kernel crate depends on
+// vfs, so that would be a dependency cycle), so the verified SHA-256 is
+// implemented here self-contained per FIPS 180-4 — the same algorithm and
+// round constants as `crates/kernel/src/crypto.rs`.
+
+/// SHA-256 block size in bytes (512-bit message block).
+const SHA256_BLOCK_SIZE: usize = 64;
+
+/// SHA-256 initial hash values (FIPS 180-4 §5.3.3): the first 32 bits of the
+/// fractional parts of the square roots of the first eight primes.
+const SHA256_H_INIT: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+/// SHA-256 round constants (FIPS 180-4 §4.2.2): the first 32 bits of the
+/// fractional parts of the cube roots of the first 64 primes.
+const SHA256_K: [u32; 64] = [
+    0x428a_2f98,
+    0x7137_4491,
+    0xb5c0_fbcf,
+    0xe9b5_dba5,
+    0x3956_c25b,
+    0x59f1_11f1,
+    0x923f_82a4,
+    0xab1c_5ed5,
+    0xd807_aa98,
+    0x1283_5b01,
+    0x2431_85be,
+    0x550c_7dc3,
+    0x72be_5d74,
+    0x80de_b1fe,
+    0x9bdc_06a7,
+    0xc19b_f174,
+    0xe49b_69c1,
+    0xefbe_4786,
+    0x0fc1_9dc6,
+    0x240c_a1cc,
+    0x2de9_2c6f,
+    0x4a74_84aa,
+    0x5cb0_a9dc,
+    0x76f9_88da,
+    0x983e_5152,
+    0xa831_c66d,
+    0xb003_27c8,
+    0xbf59_7fc7,
+    0xc6e0_0bf3,
+    0xd5a7_9147,
+    0x06ca_6351,
+    0x1429_2967,
+    0x27b7_0a85,
+    0x2e1b_2138,
+    0x4d2c_6dfc,
+    0x5338_0d13,
+    0x650a_7354,
+    0x766a_0abb,
+    0x81c2_c92e,
+    0x9272_2c85,
+    0xa2bf_e8a1,
+    0xa81a_664b,
+    0xc24b_8b70,
+    0xc76c_51a3,
+    0xd192_e819,
+    0xd699_0624,
+    0xf40e_3585,
+    0x106a_a070,
+    0x19a4_c116,
+    0x1e37_6c08,
+    0x2748_774c,
+    0x34b0_bcb5,
+    0x391c_0cb3,
+    0x4ed8_aa4a,
+    0x5b9c_ca4f,
+    0x682e_6ff3,
+    0x748f_82ee,
+    0x78a5_636f,
+    0x84c8_7814,
+    0x8cc7_0208,
+    0x90be_fffa,
+    0xa450_6ceb,
+    0xbef9_a3f7,
+    0xc671_78f2,
+];
+
+/// Process one 64-byte block through the SHA-256 compression function.
+fn sha256_compress(h: &mut [u32; 8], block: &[u8; SHA256_BLOCK_SIZE]) {
+    let mut w = [0u32; 64];
+    let mut t = 0usize;
+    while t < 16 {
+        let base = t.wrapping_mul(4);
+        w[t] = u32::from_be_bytes([
+            block[base],
+            block[base.wrapping_add(1)],
+            block[base.wrapping_add(2)],
+            block[base.wrapping_add(3)],
+        ]);
+        t = t.wrapping_add(1);
     }
-    // Spread 64-bit hash into 32 bytes deterministically.
-    for i in 0..8usize {
-        let word = h.wrapping_mul(0x9e37_79b9_7f4a_7c15_u64.wrapping_add(i as u64));
-        out[i * 4..(i + 1) * 4].copy_from_slice(&(word as u32).to_le_bytes());
+    while t < 64 {
+        let s0 = w[t.wrapping_sub(15)].rotate_right(7)
+            ^ w[t.wrapping_sub(15)].rotate_right(18)
+            ^ (w[t.wrapping_sub(15)] >> 3);
+        let s1 = w[t.wrapping_sub(2)].rotate_right(17)
+            ^ w[t.wrapping_sub(2)].rotate_right(19)
+            ^ (w[t.wrapping_sub(2)] >> 10);
+        w[t] = w[t.wrapping_sub(16)]
+            .wrapping_add(s0)
+            .wrapping_add(w[t.wrapping_sub(7)])
+            .wrapping_add(s1);
+        t = t.wrapping_add(1);
+    }
+
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut hh = h[7];
+
+    let mut i = 0usize;
+    while i < 64 {
+        let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = hh
+            .wrapping_add(big_s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(w[i]);
+        let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = big_s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+        i = i.wrapping_add(1);
+    }
+
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
+/// Compute the real SHA-256 (FIPS 180-4) digest of `data` into `out`.
+///
+/// This is a genuine cryptographic hash: leaf and Merkle-node digests
+/// produced here are collision-resistant, so a tampered page cannot be
+/// forged to match a stored digest.
+pub fn sha256(data: &[u8], out: &mut [u8; SHA256_DIGEST_SIZE]) {
+    let mut h = SHA256_H_INIT;
+    let total_bits = (data.len() as u64).wrapping_mul(8);
+
+    // Process all complete 64-byte blocks straight from the input.
+    let full_blocks = data.len() / SHA256_BLOCK_SIZE;
+    let mut block = [0u8; SHA256_BLOCK_SIZE];
+    let mut b = 0usize;
+    while b < full_blocks {
+        let start = b.wrapping_mul(SHA256_BLOCK_SIZE);
+        block.copy_from_slice(&data[start..start.wrapping_add(SHA256_BLOCK_SIZE)]);
+        sha256_compress(&mut h, &block);
+        b = b.wrapping_add(1);
+    }
+
+    // Assemble the final (padded) block(s) from the trailing bytes.
+    let rem_start = full_blocks.wrapping_mul(SHA256_BLOCK_SIZE);
+    let rem = &data[rem_start..];
+    let mut last = [0u8; SHA256_BLOCK_SIZE];
+    last[..rem.len()].copy_from_slice(rem);
+    last[rem.len()] = 0x80;
+
+    if rem.len() >= 56 {
+        // Not enough room for the 8-byte length; emit this block and start fresh.
+        sha256_compress(&mut h, &last);
+        last = [0u8; SHA256_BLOCK_SIZE];
+    }
+
+    let len_bytes = total_bits.to_be_bytes();
+    last[56..].copy_from_slice(&len_bytes);
+    sha256_compress(&mut h, &last);
+
+    let mut w = 0usize;
+    while w < 8 {
+        let bytes = h[w].to_be_bytes();
+        let base = w.wrapping_mul(4);
+        out[base] = bytes[0];
+        out[base.wrapping_add(1)] = bytes[1];
+        out[base.wrapping_add(2)] = bytes[2];
+        out[base.wrapping_add(3)] = bytes[3];
+        w = w.wrapping_add(1);
     }
 }
 
-/// Compute a SHA-512-like hash of `data` into `out`.
-pub fn sha512(data: &[u8], out: &mut [u8; SHA512_DIGEST_SIZE]) {
-    let mut h0: u64 = 0x6a09_e667_f3bc_c908;
-    let mut h1: u64 = 0xbb67_ae85_84ca_a73b;
-    for &b in data {
-        h0 ^= b as u64;
-        h0 = h0.wrapping_mul(0x0000_0100_0000_01B3);
-        h1 ^= h0;
-        h1 = h1.wrapping_mul(0xc4cc_eb20_02db_8c08);
+/// Compare two digests in constant time.
+///
+/// Returns `true` only if both slices have the same length and identical
+/// contents.  Timing is independent of the position of the first differing
+/// byte, so it cannot be used as an oracle to forge a digest byte-by-byte.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-    for i in 0..8usize {
-        let w0 = h0.wrapping_mul(0x9e37_79b9_7f4a_7c15_u64.wrapping_add(i as u64));
-        let w1 = h1.wrapping_mul(0xbf58_476d_1ce4_e5b9_u64.wrapping_add(i as u64));
-        out[i * 4..(i + 1) * 4].copy_from_slice(&(w0 as u32).to_le_bytes());
-        out[32 + i * 4..32 + (i + 1) * 4].copy_from_slice(&(w1 as u32).to_le_bytes());
+    let mut diff = 0u8;
+    let mut i = 0usize;
+    while i < a.len() {
+        diff |= a[i] ^ b[i];
+        i = i.wrapping_add(1);
     }
+    diff == 0
 }
 
 // ── MerkleNode ────────────────────────────────────────────────────────────────
@@ -218,7 +415,12 @@ impl Default for MerkleTree {
 
 impl MerkleTree {
     /// Hash one block of data (with optional salt) using the tree's algorithm.
-    fn hash_block(&self, data: &[u8], out: &mut [u8; MAX_DIGEST_SIZE]) -> usize {
+    ///
+    /// Returns the digest length on success.  SHA-512 fails closed with
+    /// [`Error::NotImplemented`]: no verified SHA-512 is available in this
+    /// crate, and silently producing a non-cryptographic digest would let a
+    /// tampered page be accepted.
+    fn hash_block(&self, data: &[u8], out: &mut [u8; MAX_DIGEST_SIZE]) -> Result<usize> {
         match self.algo {
             HashAlgo::Sha256 => {
                 let mut buf = [0u8; MAX_SALT_SIZE + VERITY_BLOCK_SIZE];
@@ -229,14 +431,9 @@ impl MerkleTree {
                 let mut digest = [0u8; SHA256_DIGEST_SIZE];
                 sha256(&buf[..len], &mut digest);
                 out[..SHA256_DIGEST_SIZE].copy_from_slice(&digest);
-                SHA256_DIGEST_SIZE
+                Ok(SHA256_DIGEST_SIZE)
             }
-            HashAlgo::Sha512 => {
-                let mut digest = [0u8; SHA512_DIGEST_SIZE];
-                sha512(data, &mut digest);
-                out[..SHA512_DIGEST_SIZE].copy_from_slice(&digest);
-                SHA512_DIGEST_SIZE
-            }
+            HashAlgo::Sha512 => Err(Error::NotImplemented),
         }
     }
 
@@ -263,7 +460,7 @@ impl MerkleTree {
         for i in 0..leaf_count {
             read_block(i as u64, &mut buf)?;
             let mut hash = [0u8; MAX_DIGEST_SIZE];
-            let hash_len = self.hash_block(&buf, &mut hash);
+            let hash_len = self.hash_block(&buf, &mut hash)?;
             if self.node_count >= MAX_MERKLE_NODES {
                 return Err(Error::OutOfMemory);
             }
@@ -302,7 +499,7 @@ impl MerkleTree {
                 }
 
                 let mut hash = [0u8; MAX_DIGEST_SIZE];
-                let hash_len = self.hash_block(&concat[..concat_len], &mut hash);
+                let hash_len = self.hash_block(&concat[..concat_len], &mut hash)?;
                 if self.node_count >= MAX_MERKLE_NODES {
                     return Err(Error::OutOfMemory);
                 }
@@ -335,25 +532,17 @@ impl MerkleTree {
             return Err(Error::InvalidArgument);
         }
         let expected = &self.nodes[page_idx];
-        let mut computed_hash = [0u8; MAX_DIGEST_SIZE];
-        let hash_len = match self.algo {
-            HashAlgo::Sha256 => {
-                let mut digest = [0u8; SHA256_DIGEST_SIZE];
-                sha256(data, &mut digest);
-                computed_hash[..SHA256_DIGEST_SIZE].copy_from_slice(&digest);
-                SHA256_DIGEST_SIZE
-            }
-            HashAlgo::Sha512 => {
-                let mut digest = [0u8; SHA512_DIGEST_SIZE];
-                sha512(data, &mut digest);
-                computed_hash[..SHA512_DIGEST_SIZE].copy_from_slice(&digest);
-                SHA512_DIGEST_SIZE
-            }
-        };
-        if computed_hash[..hash_len] != expected.hash[..expected.hash_len] {
-            return Err(Error::IoError);
+        // Recompute the leaf digest with the tree's salt, exactly as `build`
+        // did, so a salted leaf compares against the matching stored digest.
+        let mut computed = [0u8; MAX_DIGEST_SIZE];
+        let hash_len = self.hash_block(data, &mut computed)?;
+        // Constant-time compare: never branch on the position of the first
+        // differing byte, so the comparison cannot be used as a forging oracle.
+        if constant_time_eq(&computed[..hash_len], &expected.hash[..expected.hash_len]) {
+            Ok(())
+        } else {
+            Err(Error::IoError)
         }
-        Ok(())
     }
 }
 
@@ -489,14 +678,13 @@ impl FsVerityVerifier {
                 computed[..SHA256_DIGEST_SIZE].copy_from_slice(&digest);
                 SHA256_DIGEST_SIZE
             }
-            HashAlgo::Sha512 => {
-                let mut digest = [0u8; SHA512_DIGEST_SIZE];
-                sha512(data, &mut digest);
-                computed[..SHA512_DIGEST_SIZE].copy_from_slice(&digest);
-                SHA512_DIGEST_SIZE
-            }
+            // Fail closed: no verified SHA-512 is available, so a SHA-512
+            // verity file can never be accepted on a fabricated digest.
+            HashAlgo::Sha512 => return Err(Error::NotImplemented),
         };
-        if expected_hash.len() != hash_len || computed[..hash_len] != expected_hash[..hash_len] {
+        if expected_hash.len() != hash_len
+            || !constant_time_eq(&computed[..hash_len], &expected_hash[..hash_len])
+        {
             return Err(Error::IoError);
         }
         Ok(())
