@@ -536,13 +536,18 @@ impl BandwidthPool {
             self.stats.periods_exhausted += 1;
         }
 
-        // Update utilization stats
+        // Update utilization stats.
+        // SECURITY: `consumed_us` saturating-accumulates toward `u64::MAX`, so
+        // `consumed_us * 100` would overflow and panic in ring 0. Compute the
+        // percentage in u128 and the running average with checked/u128 math.
         if let Some(quota) = self.params.effective_quota_us() {
             if quota > 0 {
-                let util = (self.runtime.consumed_us * 100) / quota;
+                let util = ((self.runtime.consumed_us as u128 * 100) / quota as u128)
+                    .min(u64::MAX as u128) as u64;
                 let window = STAT_WINDOW_PERIODS;
-                self.stats.avg_utilization_pct =
-                    (self.stats.avg_utilization_pct * (window - 1) + util) / window;
+                let prev = self.stats.avg_utilization_pct as u128;
+                let blended = (prev * (window as u128 - 1) + util as u128) / window as u128;
+                self.stats.avg_utilization_pct = blended.min(u64::MAX as u128) as u64;
             }
         }
 
@@ -601,7 +606,10 @@ impl BandwidthPool {
     /// Return the utilization ratio (0-100) for the current period.
     pub fn current_utilization_pct(&self) -> u64 {
         match self.params.effective_quota_us() {
-            Some(quota) if quota > 0 => (self.runtime.consumed_us * 100) / quota,
+            // SECURITY: u128 intermediate — `consumed_us * 100` would overflow
+            // u64 once `consumed_us` saturates, panicking under overflow-checks.
+            Some(quota) if quota > 0 => ((self.runtime.consumed_us as u128 * 100) / quota as u128)
+                .min(u64::MAX as u128) as u64,
             _ => 0,
         }
     }
@@ -612,8 +620,13 @@ impl BandwidthPool {
             return false;
         }
         match self.params.effective_quota_us() {
+            // SECURITY: `effective_quota_us` returns `None` for the unlimited
+            // sentinel, so `quota` here is finite; still, `quota * PCT` can
+            // overflow u64 for a large finite quota. `saturating_mul` keeps the
+            // threshold safe (saturation only makes un-throttling more
+            // conservative, never wrong).
             Some(quota) if quota > 0 => {
-                let threshold = (quota * UNTHROTTLE_HYSTERESIS_PCT) / 100;
+                let threshold = quota.saturating_mul(UNTHROTTLE_HYSTERESIS_PCT) / 100;
                 self.runtime.remaining_us >= threshold
             }
             _ => true,
@@ -957,9 +970,13 @@ impl CfsBandwidthController {
             let ci = ci as usize;
             if ci < MAX_BANDWIDTH_GROUPS && self.hierarchy[ci].is_active() {
                 let w = self.hierarchy[ci].weight as u64;
-                let share = (available * w) / total_weight;
+                // SECURITY: `available` may be up to `u64::MAX` (unlimited pool
+                // remaining) and `w` up to `u32::MAX`, so `available * w` would
+                // overflow u64. Compute the proportional share in u128.
+                let share = ((available as u128 * w as u128) / (total_weight.max(1) as u128))
+                    .min(u64::MAX as u128) as u64;
                 self.hierarchy[ci].allocated_us = share;
-                let _ = self.pools[ci].runtime.replenish(share, share, now_us);
+                self.pools[ci].runtime.replenish(share, share, now_us);
             }
         }
 

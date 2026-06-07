@@ -717,8 +717,15 @@ impl ReadCapacity10Response {
     }
 
     /// Total capacity in bytes.
+    ///
+    /// Returns `u64::MAX` on arithmetic overflow (device reported
+    /// `last_lba = u32::MAX` with a large `block_size`).
     pub fn capacity_bytes(&self) -> u64 {
-        (self.last_lba as u64 + 1) * self.block_size as u64
+        // last_lba is u32; +1 cannot overflow u64.
+        let sectors = self.last_lba as u64 + 1;
+        sectors
+            .checked_mul(self.block_size as u64)
+            .unwrap_or(u64::MAX)
     }
 
     /// Total number of sectors.
@@ -753,13 +760,21 @@ impl ReadCapacity16Response {
     }
 
     /// Total capacity in bytes.
+    ///
+    /// Returns `u64::MAX` on arithmetic overflow (device reported
+    /// `last_lba = u64::MAX` or an abnormally large `block_size`).
     pub fn capacity_bytes(&self) -> u64 {
-        (self.last_lba + 1) * self.block_size as u64
+        self.last_lba
+            .checked_add(1)
+            .and_then(|sectors| sectors.checked_mul(self.block_size as u64))
+            .unwrap_or(u64::MAX)
     }
 
     /// Total number of sectors.
+    ///
+    /// Returns `u64::MAX` when `last_lba == u64::MAX` to avoid wrapping.
     pub fn total_sectors(&self) -> u64 {
-        self.last_lba + 1
+        self.last_lba.saturating_add(1)
     }
 }
 
@@ -931,8 +946,15 @@ impl ScsiDevice {
     }
 
     /// Returns total capacity in bytes.
+    ///
+    /// Both operands are device-reported (`capacity_sectors` can saturate to
+    /// `u64::MAX` for a hostile READ CAPACITY response), so the product is
+    /// computed with `checked_mul` and saturated rather than panicking in
+    /// ring 0 under overflow-checks.
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_sectors * self.block_size as u64
+        self.capacity_sectors
+            .checked_mul(self.block_size as u64)
+            .unwrap_or(u64::MAX)
     }
 
     /// Populate device info from INQUIRY data.
@@ -1207,19 +1229,41 @@ pub fn build_read_capacity_16(data_addr: u64) -> ScsiRequest {
 }
 
 /// Build a READ(10) request.
-pub fn build_read_10(lba: u32, count: u16, data_addr: u64) -> ScsiRequest {
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `count` is zero or if
+/// `count * SECTOR_SIZE` overflows `usize`.
+pub fn build_read_10(lba: u32, count: u16, data_addr: u64) -> Result<ScsiRequest> {
+    if count == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let data_len = (count as usize)
+        .checked_mul(SECTOR_SIZE as usize)
+        .ok_or(Error::InvalidArgument)?;
     let mut req = ScsiRequest::new(ScsiCommand::Read10 { lba, count });
     req.data_addr = data_addr;
-    req.data_len = count as usize * SECTOR_SIZE as usize;
-    req
+    req.data_len = data_len;
+    Ok(req)
 }
 
 /// Build a WRITE(10) request.
-pub fn build_write_10(lba: u32, count: u16, data_addr: u64) -> ScsiRequest {
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `count` is zero or if
+/// `count * SECTOR_SIZE` overflows `usize`.
+pub fn build_write_10(lba: u32, count: u16, data_addr: u64) -> Result<ScsiRequest> {
+    if count == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    let data_len = (count as usize)
+        .checked_mul(SECTOR_SIZE as usize)
+        .ok_or(Error::InvalidArgument)?;
     let mut req = ScsiRequest::new(ScsiCommand::Write10 { lba, count });
     req.data_addr = data_addr;
-    req.data_len = count as usize * SECTOR_SIZE as usize;
-    req
+    req.data_len = data_len;
+    Ok(req)
 }
 
 /// Build a REQUEST SENSE request.

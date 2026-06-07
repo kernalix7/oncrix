@@ -736,9 +736,13 @@ impl AtaDrive {
         self.info.dma_supported = buf[49] & (1 << 8) != 0;
 
         // Words 60-61: total user-addressable LBA28 sectors.
+        // Both words are device-controlled (untrusted).  Clamp to the LBA28
+        // maximum (2^28) so that a malicious or buggy device cannot report an
+        // inflated capacity that bypasses the LBA28 guard in validate_transfer.
         let lo = buf[60] as u64;
         let hi = buf[61] as u64;
-        self.info.total_sectors = lo | (hi << 16);
+        let raw_sectors = lo | (hi << 16);
+        self.info.total_sectors = raw_sectors.min(LBA28_MAX_SECTORS);
     }
 }
 

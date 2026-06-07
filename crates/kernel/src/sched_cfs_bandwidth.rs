@@ -52,6 +52,14 @@ const DEFAULT_PERIOD_US: u64 = 100_000;
 /// Unlimited quota sentinel.
 const QUOTA_UNLIMITED: i64 = -1;
 
+/// Maximum finite quota in microseconds (~1 year of CPU time).
+///
+/// Bounds an untrusted quota so that runtime accounting in `i64`
+/// microseconds can never approach `i64::MAX` / `i64::MIN`, keeping
+/// every subtraction and negation in [`consume_runtime`] panic-free
+/// under `overflow-checks`.
+const MAX_QUOTA_US: i64 = 31_536_000_000_000;
+
 // ══════════════════════════════════════════════════════════════
 // ThrottleState
 // ══════════════════════════════════════════════════════════════
@@ -207,7 +215,9 @@ impl CfsBandwidthSubsystem {
         if period_us < MIN_PERIOD_US || period_us > MAX_PERIOD_US {
             return Err(Error::InvalidArgument);
         }
-        if quota_us != QUOTA_UNLIMITED && quota_us <= 0 {
+        // SECURITY: reject non-sentinel quotas <= 0 and bound the upper end so
+        // runtime accounting stays well within `i64` range (no overflow panic).
+        if quota_us != QUOTA_UNLIMITED && (quota_us <= 0 || quota_us > MAX_QUOTA_US) {
             return Err(Error::InvalidArgument);
         }
 
@@ -247,6 +257,12 @@ impl CfsBandwidthSubsystem {
         if period_us < MIN_PERIOD_US || period_us > MAX_PERIOD_US {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: bound the quota exactly as `register` does — previously this
+        // path accepted any `i64` (including negative non-sentinel values and
+        // values that would later overflow runtime accounting).
+        if quota_us != QUOTA_UNLIMITED && (quota_us <= 0 || quota_us > MAX_QUOTA_US) {
+            return Err(Error::InvalidArgument);
+        }
         self.entries[slot].quota_us = quota_us;
         self.entries[slot].period_us = period_us;
         self.entries[slot].state = if quota_us == QUOTA_UNLIMITED {
@@ -280,24 +296,43 @@ impl CfsBandwidthSubsystem {
             return Ok(false);
         }
 
-        self.entries[slot].runtime_remaining_us -= runtime_us as i64;
-        self.stats.total_runtime_us += runtime_us;
+        // SECURITY: already throttled — short-circuit before any further
+        // subtraction so an attacker cannot keep driving `runtime_remaining_us`
+        // toward `i64::MIN` with repeated charges (which would underflow and
+        // panic in ring 0 under overflow-checks).
+        if self.entries[slot].is_throttled() {
+            return Ok(true);
+        }
+
+        // SECURITY: `runtime_us` is an untrusted u64. A value above
+        // `i64::MAX` would cast negative (turning the subtraction into an add)
+        // and an unbounded charge would underflow `i64`. Clamp to `MAX_QUOTA_US`
+        // — itself a sane bound — then use `saturating_sub` so the remaining
+        // runtime can never wrap below `i64::MIN`.
+        let delta = (runtime_us.min(MAX_QUOTA_US as u64)) as i64;
+        self.entries[slot].runtime_remaining_us = self.entries[slot]
+            .runtime_remaining_us
+            .saturating_sub(delta);
+        self.stats.total_runtime_us = self.stats.total_runtime_us.saturating_add(runtime_us);
 
         if self.entries[slot].runtime_remaining_us <= 0 {
             // Try burst budget.
             if self.entries[slot].burst_enabled && self.entries[slot].burst_us > 0 {
-                let needed = (-self.entries[slot].runtime_remaining_us) as u64;
+                // `unsigned_abs` avoids negating `i64::MIN` (which would panic);
+                // `runtime_remaining_us` is already clamped non-negative-of-magnitude
+                // by the saturating subtraction above.
+                let needed = self.entries[slot].runtime_remaining_us.unsigned_abs();
                 if needed <= self.entries[slot].burst_us {
                     self.entries[slot].burst_us -= needed;
                     self.entries[slot].runtime_remaining_us = 0;
-                    self.stats.total_burst_us += needed;
+                    self.stats.total_burst_us = self.stats.total_burst_us.saturating_add(needed);
                     return Ok(false);
                 }
             }
 
             self.entries[slot].state = ThrottleState::Throttled;
-            self.entries[slot].nr_throttled += 1;
-            self.stats.total_throttled += 1;
+            self.entries[slot].nr_throttled = self.entries[slot].nr_throttled.saturating_add(1);
+            self.stats.total_throttled = self.stats.total_throttled.saturating_add(1);
             return Ok(true);
         }
 
