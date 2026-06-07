@@ -288,7 +288,9 @@ impl HubDescriptor {
 
     /// Whether port `port` (1-based) is non-removable.
     pub fn is_non_removable(&self, port: u8) -> bool {
-        if port == 0 || port > 32 {
+        // `device_removable` is a u32; `port` must stay in 0..=31 or the
+        // shift overflows and panics in ring 0 under overflow-checks.
+        if port == 0 || port > 31 {
             return false;
         }
         (self.device_removable >> port) & 1 == 1
@@ -401,7 +403,16 @@ pub struct UsbHub {
 
 impl UsbHub {
     /// Create a new hub instance from a parsed descriptor.
-    pub const fn new(device_address: u8, depth: u8, descriptor: HubDescriptor) -> Self {
+    ///
+    /// `descriptor.num_ports` is clamped to [`MAX_PORTS_PER_HUB`] here so that
+    /// every downstream use of the field is bounded by the backing array length,
+    /// regardless of what the device reported.
+    pub fn new(device_address: u8, depth: u8, mut descriptor: HubDescriptor) -> Self {
+        // Clamp the device-reported port count to the backing array capacity so
+        // that every downstream slice/index operation is unconditionally safe.
+        if descriptor.num_ports as usize > MAX_PORTS_PER_HUB {
+            descriptor.num_ports = MAX_PORTS_PER_HUB as u8;
+        }
         Self {
             device_address,
             depth,
@@ -496,8 +507,12 @@ impl UsbHub {
     }
 
     /// Iterate over port states (1-based ports up to `num_ports`).
+    ///
+    /// The slice length is clamped to the backing array capacity so this is
+    /// always in-bounds, even if the stored `num_ports` somehow exceeds it.
     pub fn ports(&self) -> &[PortState] {
-        &self.ports[..self.descriptor.num_ports as usize]
+        let n = (self.descriptor.num_ports as usize).min(self.ports.len());
+        &self.ports[..n]
     }
 
     /// Number of downstream ports.
@@ -510,9 +525,11 @@ impl UsbHub {
         self.descriptor.usb_version >= 0x0300
     }
 
-    /// Validate a 1-based port number.
+    /// Validate a 1-based port number against both the device-reported count
+    /// and the backing array length so that subsequent indexing is always safe.
     fn check_port(&self, port: u8) -> Result<()> {
-        if port == 0 || port > self.descriptor.num_ports {
+        let effective_max = (self.descriptor.num_ports as usize).min(self.ports.len());
+        if port == 0 || port as usize > effective_max {
             Err(Error::InvalidArgument)
         } else {
             Ok(())
@@ -1152,9 +1169,15 @@ impl UsbHub {
     ///
     /// Returns an array of setup packets to send (one per port).
     /// In a real driver these would be submitted as control transfers.
+    ///
+    /// The loop bound is clamped to `min(num_ports, MAX_PORTS_PER_HUB)` so the
+    /// device-reported count can never drive an out-of-bounds write into `packets`.
     pub fn power_on_all_ports(&self) -> [Option<UsbSetupPacket>; MAX_PORTS_PER_HUB] {
         let mut packets = [None; MAX_PORTS_PER_HUB];
-        for p in 1..=self.descriptor.num_ports as usize {
+        // Clamp to backing array length; `new()` already clamps `num_ports`, but
+        // an extra `.min` here makes the invariant explicit and defence-in-depth.
+        let count = (self.descriptor.num_ports as usize).min(packets.len());
+        for p in 1..=count {
             packets[p - 1] = Some(UsbSetupPacket::set_port_feature(
                 p as u8,
                 PORT_FEATURE_POWER,

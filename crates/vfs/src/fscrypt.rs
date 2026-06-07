@@ -16,9 +16,25 @@
 //! - Each encrypted inode stores an [`FscryptContext`] containing
 //!   the policy and a random nonce.
 //! - Block encryption/decryption uses AES-128-CBC (derived from the
-//!   per-file key) with the block number mixed into the IV.
-//! - Filename encryption uses the same per-file key in CBC mode
-//!   with a zeroed IV, padded to 16-byte alignment.
+//!   per-file key) with a per-block ESSIV IV.
+//! - Filename encryption uses the same per-file key in CBC mode with
+//!   a key-dependent, non-zero IV, padded to 16-byte alignment.
+//!
+//! # Security
+//!
+//! IV derivation uses ESSIV: the IV-encryption key is
+//! `SHA-256(per_file_key)` (truncated to AES-128) and the IV is
+//! `AES-128(ESSIV_key, tweak)`. For contents the tweak is the block
+//! number; for filenames it is a fixed domain-separation seed. This
+//! replaces an earlier weak scheme that used the bare block number as
+//! the content IV and an all-zero filename IV — both attacker
+//! predictable. The cipher (AES-128, FIPS 197) and hash (SHA-256,
+//! FIPS 180-4) are real, in-tree primitives.
+//!
+//! Note: a production deployment should additionally move to
+//! AES-256-XTS for contents and AES-256-CTS-CBC for filenames to
+//! match Linux fscrypt; the policy enum already enumerates those
+//! modes for forward compatibility.
 //!
 //! # References
 //!
@@ -491,8 +507,9 @@ impl FscryptRegistry {
             out[i] = 0;
             i += 1;
         }
-        // Build IV from block number.
-        let iv = block_num_to_iv(block_num);
+        // Derive an unpredictable per-block IV via ESSIV rather than
+        // using the bare block number (which is attacker-predictable).
+        let iv = derive_content_iv(&derived, block_num);
         // Encrypt in place using CBC.
         aes128_cbc_encrypt(&derived, &iv, &mut out[..padded_len])?;
         Ok(padded_len)
@@ -532,7 +549,8 @@ impl FscryptRegistry {
             out[i] = data[i];
             i += 1;
         }
-        let iv = block_num_to_iv(block_num);
+        // Reproduce the same ESSIV-derived IV used during encryption.
+        let iv = derive_content_iv(&derived, block_num);
         aes128_cbc_decrypt(&derived, &iv, &mut out[..data.len()])?;
         Ok(data.len())
     }
@@ -570,7 +588,9 @@ impl FscryptRegistry {
             out[i] = 0;
             i += 1;
         }
-        let iv = [0u8; AES_BLOCK_SIZE];
+        // Use a key-dependent, non-zero filename IV instead of an
+        // all-zero IV so identical names do not leak via equal prefixes.
+        let iv = derive_filename_iv(&derived);
         aes128_cbc_encrypt(&derived, &iv, &mut out[..padded_len])?;
         Ok(padded_len)
     }
@@ -602,7 +622,8 @@ impl FscryptRegistry {
             out[i] = data[i];
             i += 1;
         }
-        let iv = [0u8; AES_BLOCK_SIZE];
+        // Reproduce the same key-dependent filename IV from encryption.
+        let iv = derive_filename_iv(&derived);
         aes128_cbc_decrypt(&derived, &iv, &mut out[..data.len()])?;
         Ok(data.len())
     }
@@ -699,18 +720,79 @@ fn round_up_16(len: usize) -> usize {
     }
 }
 
-/// Builds a 16-byte IV from a block number.
+/// Builds a 16-byte block-number tweak (little-endian, zero-padded).
 ///
 /// The block number is placed in the first 8 bytes (little-endian)
-/// with the remaining 8 bytes zeroed.
-fn block_num_to_iv(block_num: u64) -> [u8; AES_BLOCK_SIZE] {
-    let mut iv = [0u8; AES_BLOCK_SIZE];
+/// with the remaining 8 bytes zeroed. This value is *not* used as a
+/// raw IV; it is the plaintext fed into the ESSIV transform by
+/// [`derive_content_iv`] so that the actual IV is unpredictable.
+fn block_num_to_tweak(block_num: u64) -> [u8; AES_BLOCK_SIZE] {
+    let mut tweak = [0u8; AES_BLOCK_SIZE];
     let bytes = block_num.to_le_bytes();
     let mut i = 0usize;
     while i < 8 {
-        iv[i] = bytes[i];
+        tweak[i] = bytes[i];
         i += 1;
     }
+    tweak
+}
+
+/// Domain-separation seed for the per-file filename IV.
+///
+/// A fixed, non-zero 16-byte constant fed through the ESSIV
+/// transform to produce a key-dependent, non-zero filename IV. The
+/// value itself is arbitrary; it only needs to be stable and distinct
+/// from any plausible block-number tweak.
+const FILENAME_IV_SEED: [u8; AES_BLOCK_SIZE] = [
+    0x66, 0x73, 0x63, 0x72, 0x79, 0x70, 0x74, 0x2d, 0x66, 0x6e, 0x61, 0x6d, 0x65, 0x2d, 0x69, 0x76,
+];
+
+/// Derives the ESSIV key from a per-file data key.
+///
+/// Following the ESSIV construction, the IV-encryption key is
+/// `SHA-256(data_key)` truncated to the AES-128 key length. Hashing
+/// the data key yields an IV key that is cryptographically
+/// independent of the data key itself.
+fn derive_essiv_key(derived_key: &[u8; DERIVED_KEY_SIZE]) -> [u8; DERIVED_KEY_SIZE] {
+    let hash = sha256_digest(derived_key);
+    let mut essiv_key = [0u8; DERIVED_KEY_SIZE];
+    let mut i = 0usize;
+    while i < DERIVED_KEY_SIZE {
+        essiv_key[i] = hash[i];
+        i += 1;
+    }
+    essiv_key
+}
+
+/// Derives a per-block content IV using ESSIV.
+///
+/// Computes `IV = AES-128(ESSIV_key, block_number_tweak)` where the
+/// ESSIV key is derived from the per-file data key. Encrypting the
+/// block number under an independent key makes the IV unpredictable
+/// to an attacker, defeating the watermarking and chosen-plaintext
+/// weaknesses of using the bare block number as a CBC IV.
+///
+/// Both the encrypt and decrypt paths call this so the IV is
+/// reproducible for a given (key, block) pair.
+fn derive_content_iv(derived_key: &[u8; DERIVED_KEY_SIZE], block_num: u64) -> [u8; AES_BLOCK_SIZE] {
+    let essiv_key = derive_essiv_key(derived_key);
+    let rk = aes128_expand_key(&essiv_key);
+    let mut iv = block_num_to_tweak(block_num);
+    aes128_encrypt_block(&rk, &mut iv);
+    iv
+}
+
+/// Derives a non-zero, per-file filename IV using ESSIV.
+///
+/// Computes `IV = AES-128(ESSIV_key, FILENAME_IV_SEED)`. Because the
+/// IV depends on the per-file key, identical filenames under
+/// different files no longer encrypt to identical ciphertext, closing
+/// the prefix-equality leak of the previous all-zero IV.
+fn derive_filename_iv(derived_key: &[u8; DERIVED_KEY_SIZE]) -> [u8; AES_BLOCK_SIZE] {
+    let essiv_key = derive_essiv_key(derived_key);
+    let rk = aes128_expand_key(&essiv_key);
+    let mut iv = FILENAME_IV_SEED;
+    aes128_encrypt_block(&rk, &mut iv);
     iv
 }
 

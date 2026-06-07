@@ -30,6 +30,7 @@
 //!
 //! Reference: Linux `net/netfilter/nf_tables_core.c`, `nft_compat.c`.
 
+use crate::capability::{CAP_NET_ADMIN, ThreadCapState};
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,21 @@ pub enum Verdict {
 impl Default for Verdict {
     fn default() -> Self {
         Self::Accept
+    }
+}
+
+impl Verdict {
+    /// Returns `true` if this verdict transfers control to another chain
+    /// (`Jump`/`Goto`).
+    ///
+    /// Real chain resolution is not yet implemented, so these verdicts cannot
+    /// be evaluated safely: a terminal `Jump`/`Goto` would be silently
+    /// discarded and the packet would fall through to the default `Accept`,
+    /// causing the firewall to fail OPEN (a `jump drop_chain` rule would be
+    /// bypassed). The install path rejects such verdicts so a ruleset can
+    /// never be admitted in a silently-ineffective state.
+    pub fn is_chain_transfer(self) -> bool {
+        matches!(self, Self::Jump(_) | Self::Goto(_))
     }
 }
 
@@ -272,6 +288,22 @@ impl Rule {
         self.expr_count += 1;
         Ok(())
     }
+
+    /// Returns `true` if this rule could yield an unresolved chain-transfer
+    /// verdict (`Jump`/`Goto`), either as its terminal verdict or via an
+    /// `Immediate` expression.
+    ///
+    /// Such verdicts cannot be evaluated until real chain resolution exists;
+    /// see [`Verdict::is_chain_transfer`].
+    fn has_chain_transfer(&self) -> bool {
+        if self.verdict.is_chain_transfer() {
+            return true;
+        }
+        self.exprs[..self.expr_count]
+            .iter()
+            .flatten()
+            .any(|e| matches!(e, Expr::Immediate(v) if v.is_chain_transfer()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,12 +386,37 @@ impl Chain {
     }
 
     /// Add a rule at the end of the chain.
-    pub fn add_rule(&mut self, mut rule: Rule) -> Result<u32> {
+    ///
+    /// Installing a firewall rule is a privileged operation; `caps` must hold
+    /// `CAP_NET_ADMIN` in its effective set. Per-task credentials are not yet
+    /// threaded into the nftables engine, so the dispatcher must supply the
+    /// caller's [`ThreadCapState`]; this fails closed (deny) when the
+    /// capability is absent.
+    ///
+    /// Rules whose terminal verdict — or any `Immediate` expression — is a
+    /// chain transfer (`Jump`/`Goto`) are rejected with
+    /// [`Error::InvalidArgument`]. Real chain resolution is not implemented
+    /// yet, so admitting such a rule would let it be silently discarded at
+    /// evaluation time, causing the firewall to fail OPEN. Rejecting at
+    /// install keeps a ruleset from ever being admitted in a silently-
+    /// ineffective state; see [`Verdict::is_chain_transfer`].
+    pub fn add_rule(&mut self, caps: &ThreadCapState, mut rule: Rule) -> Result<u32> {
+        // SECURITY: privileged op — fail closed unless the caller is
+        // CAP_NET_ADMIN. Compare against the threaded caller credential, never
+        // a value supplied alongside the rule.
+        if !caps.capable(CAP_NET_ADMIN) {
+            return Err(Error::PermissionDenied);
+        }
+        // SECURITY: fail closed against the Jump/Goto fail-open path until real
+        // chain resolution lands (see process()/eval_chain()).
+        if rule.has_chain_transfer() {
+            return Err(Error::InvalidArgument);
+        }
         if self.rule_count >= MAX_RULES_PER_CHAIN {
             return Err(Error::OutOfMemory);
         }
         let handle = self.next_handle;
-        self.next_handle += 1;
+        self.next_handle = self.next_handle.saturating_add(1);
         rule.handle = handle;
         self.rules[self.rule_count] = Some(rule);
         self.rule_count += 1;
@@ -605,15 +662,15 @@ fn eval_rule(rule: &mut Rule, pkt: &PktCtx, sets: &[Option<NfSet>; MAX_SETS]) ->
 
         // Immediate verdict terminates the rule early
         if let Expr::Immediate(v) = expr {
-            rule.packets += 1;
-            rule.bytes += pkt.pkt_len as u64;
+            rule.packets = rule.packets.saturating_add(1);
+            rule.bytes = rule.bytes.saturating_add(pkt.pkt_len as u64);
             return Some(v);
         }
     }
 
     // All expressions passed → apply terminal verdict
-    rule.packets += 1;
-    rule.bytes += pkt.pkt_len as u64;
+    rule.packets = rule.packets.saturating_add(1);
+    rule.bytes = rule.bytes.saturating_add(pkt.pkt_len as u64);
     Some(rule.verdict)
 }
 
@@ -806,7 +863,12 @@ impl NfTables {
             match verdict {
                 Verdict::Accept | Verdict::Drop | Verdict::Queue(_) => return verdict,
                 Verdict::Continue | Verdict::Return => continue,
-                Verdict::Jump(_) | Verdict::Goto(_) => continue,
+                // SECURITY: chain transfers cannot be installed (see
+                // Chain::add_rule) and chain resolution is not implemented. A
+                // residual Jump/Goto reaching here must fail CLOSED rather than
+                // fall through to Accept, which would bypass a jump-to-drop
+                // chain (firewall fail-open).
+                Verdict::Jump(_) | Verdict::Goto(_) => return Verdict::Drop,
             }
         }
 
@@ -858,8 +920,8 @@ impl NfTables {
             for chain in table.chains[..table.chain_count].iter().flatten() {
                 stats.rules += chain.rule_count;
                 for rule in chain.rules[..chain.rule_count].iter().flatten() {
-                    stats.total_packets += rule.packets;
-                    stats.total_bytes += rule.bytes;
+                    stats.total_packets = stats.total_packets.saturating_add(rule.packets);
+                    stats.total_bytes = stats.total_bytes.saturating_add(rule.bytes);
                 }
             }
         }
@@ -889,4 +951,109 @@ pub struct NfStats {
     pub total_packets: u64,
     /// Total matched bytes.
     pub total_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admin_caps() -> ThreadCapState {
+        let mut caps = ThreadCapState::new_unprivileged();
+        caps.effective.set(CAP_NET_ADMIN);
+        caps
+    }
+
+    #[test]
+    fn add_rule_requires_net_admin() {
+        let mut chain = Chain::new_base(b"input", NfHook::Input, 0, ChainPolicy::Drop);
+        let rule = Rule::new(0, Verdict::Accept);
+        let unpriv = ThreadCapState::new_unprivileged();
+        assert_eq!(chain.add_rule(&unpriv, rule), Err(Error::PermissionDenied));
+        assert_eq!(chain.rule_count, 0);
+    }
+
+    #[test]
+    fn add_rule_admin_accepts_terminal_verdict() {
+        let mut chain = Chain::new_base(b"input", NfHook::Input, 0, ChainPolicy::Drop);
+        let rule = Rule::new(0, Verdict::Drop);
+        assert!(chain.add_rule(&admin_caps(), rule).is_ok());
+        assert_eq!(chain.rule_count, 1);
+    }
+
+    #[test]
+    fn add_rule_rejects_jump_terminal_verdict() {
+        let mut chain = Chain::new_regular(b"c");
+        let rule = Rule::new(0, Verdict::Jump(0));
+        assert_eq!(
+            chain.add_rule(&admin_caps(), rule),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(chain.rule_count, 0);
+    }
+
+    #[test]
+    fn add_rule_rejects_goto_terminal_verdict() {
+        let mut chain = Chain::new_regular(b"c");
+        let rule = Rule::new(0, Verdict::Goto(1));
+        assert_eq!(
+            chain.add_rule(&admin_caps(), rule),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn add_rule_rejects_immediate_jump_expr() {
+        let mut chain = Chain::new_regular(b"c");
+        let mut rule = Rule::new(0, Verdict::Accept);
+        rule.add_expr(Expr::Immediate(Verdict::Jump(2))).ok();
+        assert_eq!(
+            chain.add_rule(&admin_caps(), rule),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn process_drops_residual_chain_transfer() {
+        // A rule carrying a chain-transfer verdict cannot be installed via
+        // add_rule, but constructing the engine state directly mimics a
+        // residual Jump reaching the evaluator: process() must fail closed.
+        let mut nft = NfTables::new();
+        let idx = nft.add_table(Table::new(b"t", NfFamily::Inet)).unwrap_or(0);
+        let table = match nft.get_table_mut(idx) {
+            Some(t) => t,
+            None => panic!("table missing"),
+        };
+        let cidx = table
+            .add_chain(Chain::new_base(
+                b"in",
+                NfHook::Input,
+                0,
+                ChainPolicy::Accept,
+            ))
+            .unwrap_or(0);
+        if let Some(chain) = table.chains[cidx].as_mut() {
+            let mut rule = Rule::new(1, Verdict::Jump(0));
+            rule.enabled = true;
+            chain.rules[0] = Some(rule);
+            chain.rule_count = 1;
+        }
+        let pkt = PktCtx::default();
+        assert_eq!(nft.process(NfHook::Input, &pkt), Verdict::Drop);
+    }
+
+    #[test]
+    fn counters_saturate_without_panic() {
+        let mut rule = Rule::new(0, Verdict::Accept);
+        rule.packets = u64::MAX;
+        rule.bytes = u64::MAX;
+        let pkt = PktCtx {
+            pkt_len: 100,
+            ..Default::default()
+        };
+        let sets: [Option<NfSet>; MAX_SETS] = [const { None }; MAX_SETS];
+        let v = eval_rule(&mut rule, &pkt, &sets);
+        assert_eq!(v, Some(Verdict::Accept));
+        assert_eq!(rule.packets, u64::MAX);
+        assert_eq!(rule.bytes, u64::MAX);
+    }
 }

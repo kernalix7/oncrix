@@ -463,6 +463,7 @@ impl MemfdManager {
 
     /// Resizes a memfd (analogous to `ftruncate`).
     ///
+    /// The caller must be the creating process (`caller_pid == owner_pid`).
     /// Enforces `F_SEAL_SHRINK` and `F_SEAL_GROW` seals. New bytes
     /// beyond the old size are zero-filled. The size must not exceed
     /// [`MAX_MEMFD_DATA`].
@@ -470,15 +471,22 @@ impl MemfdManager {
     /// # Errors
     ///
     /// - [`Error::NotFound`] if `fd` is not registered.
-    /// - [`Error::PermissionDenied`] if a shrink/grow seal prevents
-    ///   the operation.
+    /// - [`Error::PermissionDenied`] if `caller_pid != owner_pid` or a
+    ///   shrink/grow seal prevents the operation.
     /// - [`Error::InvalidArgument`] if `new_size` exceeds capacity.
-    pub fn resize(&mut self, fd: u32, new_size: usize) -> Result<()> {
+    // SECURITY: ownership check before any size mutation — only the fd
+    // owner may truncate the memfd.
+    pub fn resize(&mut self, fd: u32, new_size: usize, caller_pid: u64) -> Result<()> {
         if new_size > MAX_MEMFD_DATA {
             return Err(Error::InvalidArgument);
         }
 
         let idx = self.find_fd_index(fd)?;
+
+        if self.files[idx].owner_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+
         let old_size = self.files[idx].size;
 
         if new_size < old_size && self.files[idx].has_seal(seal_flags::F_SEAL_SHRINK) {
@@ -518,6 +526,7 @@ impl MemfdManager {
 
     /// Writes data to a memfd at the given offset.
     ///
+    /// The caller must be the creating process (`caller_pid == owner_pid`).
     /// Enforces `F_SEAL_WRITE`. If the write would extend past the
     /// current size, the file is implicitly grown (unless
     /// `F_SEAL_GROW` is set).
@@ -527,12 +536,19 @@ impl MemfdManager {
     /// # Errors
     ///
     /// - [`Error::NotFound`] if `fd` is not registered.
-    /// - [`Error::PermissionDenied`] if `F_SEAL_WRITE` is set.
+    /// - [`Error::PermissionDenied`] if `caller_pid != owner_pid` or
+    ///   `F_SEAL_WRITE` is set.
     /// - [`Error::InvalidArgument`] if `offset + data.len()` would
     ///   exceed [`MAX_MEMFD_DATA`].
-    pub fn write(&mut self, fd: u32, offset: usize, data: &[u8]) -> Result<usize> {
+    // SECURITY: ownership check before any mutation — only the fd owner
+    // may write to the memfd.  When a proper fd-table is threaded, this
+    // check moves to the fd-table lookup; here we compare PIDs directly.
+    pub fn write(&mut self, fd: u32, offset: usize, data: &[u8], caller_pid: u64) -> Result<usize> {
         let idx = self.find_fd_index(fd)?;
 
+        if self.files[idx].owner_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
         if self.files[idx].has_seal(seal_flags::F_SEAL_WRITE) {
             return Err(Error::PermissionDenied);
         }

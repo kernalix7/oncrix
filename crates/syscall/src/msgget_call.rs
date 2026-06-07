@@ -223,7 +223,7 @@ pub fn do_msgget(table: &mut MsgTable, key: i32, msgflg: i32, uid: u32) -> Resul
     if key == IPC_PRIVATE {
         let slot = table.alloc_slot().ok_or(Error::OutOfMemory)?;
         let id = table.next_id;
-        table.next_id += 1;
+        table.next_id = table.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
         table.queues[slot] = Some(MsgQueue::new(key, id, mode, uid));
         return Ok(id);
     }
@@ -241,7 +241,7 @@ pub fn do_msgget(table: &mut MsgTable, key: i32, msgflg: i32, uid: u32) -> Resul
 
     let slot = table.alloc_slot().ok_or(Error::OutOfMemory)?;
     let id = table.next_id;
-    table.next_id += 1;
+    table.next_id = table.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
     table.queues[slot] = Some(MsgQueue::new(key, id, mode, uid));
     Ok(id)
 }
@@ -327,9 +327,58 @@ pub fn do_msgrcv(
     Ok(q.remove_at(msg_idx).unwrap())
 }
 
+// ---------------------------------------------------------------------------
+// Capability constant (matches Linux ABI and bpf_calls.rs)
+// ---------------------------------------------------------------------------
+
+/// Linux capability number for `CAP_SYS_ADMIN` (= 21).
+///
+/// Required for privileged IPC control operations when the caller is
+/// neither the owner nor the creator of the resource.
+pub const CAP_SYS_ADMIN: u32 = 21;
+
 /// Handler for `msgctl(IPC_RMID)`.
-pub fn do_msgctl_rmid(table: &mut MsgTable, msqid: i32) -> Result<()> {
+///
+/// Removes the message queue identified by `msqid`.
+///
+/// # Access control
+///
+/// POSIX.1-2024 and Linux `ipc_check_perms` require the caller to be the
+/// owner (`queue.uid`) **or** hold `CAP_SYS_ADMIN`.  Any other caller
+/// receives [`Error::PermissionDenied`] (→ `EPERM`).  The check is
+/// **fail-closed**: `NotFound` is returned before the permission check so
+/// no information about the queue's existence is leaked to an unprivileged
+/// caller that supplies an unknown id.
+///
+/// # Parameters
+///
+/// - `caller_uid`    — effective UID of the calling process.
+/// - `is_privileged` — `true` when the caller holds `CAP_SYS_ADMIN`
+///   (`CAP_SYS_ADMIN = 21`).
+///
+/// # Errors
+///
+/// | `Error`            | Condition                                     |
+/// |--------------------|-----------------------------------------------|
+/// | `NotFound`         | `msqid` does not identify a live queue        |
+/// | `PermissionDenied` | Caller is not the owner and is not privileged |
+// SECURITY: fail-closed ownership check — any caller that is neither
+// the queue owner (uid) nor holds CAP_SYS_ADMIN is denied.  When per-task
+// credential threading is wired, replace `is_privileged` with a real
+// capability check against the calling task's cap_effective bitmask
+// (capability number CAP_SYS_ADMIN = 21).
+pub fn do_msgctl_rmid(
+    table: &mut MsgTable,
+    msqid: i32,
+    caller_uid: u32,
+    is_privileged: bool,
+) -> Result<()> {
     let idx = table.find_by_id(msqid).ok_or(Error::NotFound)?;
+    // SAFETY-NOTE: idx came from find_by_id so the slot is Some.
+    let queue = table.queues[idx].as_ref().unwrap();
+    if !is_privileged && caller_uid != queue.uid {
+        return Err(Error::PermissionDenied);
+    }
     table.queues[idx] = None;
     Ok(())
 }
@@ -389,5 +438,44 @@ mod tests {
         let (d, len) = make_data(b"abc");
         assert_eq!(len, 3);
         assert_eq!(&d[..3], b"abc");
+    }
+
+    // --- do_msgctl_rmid ownership gate ---
+
+    /// Queue owner may remove their own queue.
+    #[test]
+    fn rmid_owner_succeeds() {
+        let mut t = MsgTable::new();
+        let id = do_msgget(&mut t, IPC_PRIVATE, 0o600, 1000).unwrap();
+        assert!(do_msgctl_rmid(&mut t, id, 1000, false).is_ok());
+        assert!(t.find_by_id(id).is_none());
+    }
+
+    /// Privileged caller may remove any queue regardless of uid.
+    #[test]
+    fn rmid_privileged_succeeds() {
+        let mut t = MsgTable::new();
+        let id = do_msgget(&mut t, IPC_PRIVATE, 0o600, 1000).unwrap();
+        assert!(do_msgctl_rmid(&mut t, id, 0, true).is_ok());
+    }
+
+    /// Unprivileged stranger must be denied — privilege escalation path.
+    #[test]
+    fn rmid_stranger_denied() {
+        let mut t = MsgTable::new();
+        let id = do_msgget(&mut t, IPC_PRIVATE, 0o600, 1000).unwrap();
+        assert_eq!(
+            do_msgctl_rmid(&mut t, id, 1001, false),
+            Err(Error::PermissionDenied),
+        );
+        // Queue must still exist after the failed removal.
+        assert!(t.find_by_id(id).is_some());
+    }
+
+    /// Non-existent msqid returns NotFound.
+    #[test]
+    fn rmid_not_found() {
+        let mut t = MsgTable::new();
+        assert_eq!(do_msgctl_rmid(&mut t, 999, 0, true), Err(Error::NotFound),);
     }
 }

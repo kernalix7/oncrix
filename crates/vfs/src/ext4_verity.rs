@@ -247,23 +247,35 @@ impl VerityState {
     }
 
     /// Verify a single data page (identified by `page_idx`) against the Merkle
-    /// tree by simulating a bottom-up hash walk.
+    /// tree.
     ///
-    /// In a real implementation this reads actual tree blocks and recomputes
-    /// hashes.  Here we simulate the walk and assume correctness unless the
-    /// verity state is uninitialised.
+    /// fs-verity is part of the integrity TCB: this must return [`VerifyResult::Ok`]
+    /// **only** after the page has been hashed and that hash has been confirmed
+    /// against the Merkle leaf digest up to the descriptor root.  The real tree
+    /// blocks and per-page leaf digests are not loaded by this state (no page
+    /// data is plumbed in and [`MerkleBlock`] holds only an abbreviated block),
+    /// so there is nothing to authenticate against.
+    ///
+    /// Rather than rubber-stamp every in-range page — which would let a tampered
+    /// page through unconditionally — this **fails closed** and reports the
+    /// Merkle tree as unavailable.  A caller must treat any non-`Ok` result as a
+    /// verification failure and refuse the read.  Wiring the real bottom-up hash
+    /// walk (recompute leaf, compare against the stored digest in constant time,
+    /// climb to the root) is what flips this to a genuine accept/reject.
     pub fn verify_page(&mut self, page_idx: u64) -> VerifyResult {
         if !self.initialised {
             self.verify_failures += 1;
             return VerifyResult::MerkleUnavailable;
         }
-        // Check page is within the file.
+        // Reject anything outside the file outright.
         if page_idx >= self.desc.data_block_count() {
             self.verify_failures += 1;
             return VerifyResult::LeafHashMismatch { page_idx };
         }
-        self.reads_verified += 1;
-        VerifyResult::Ok
+        // Fail closed: the leaf/root digests required to authenticate this page
+        // are not available, so the page cannot be proven authentic.
+        self.verify_failures += 1;
+        VerifyResult::MerkleUnavailable
     }
 
     /// Simulate enabling verity on a file: seal it and record the root hash.
