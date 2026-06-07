@@ -194,6 +194,12 @@ pub fn parse_xsdt(data: &[u8]) -> Result<XsdtInfo> {
         return Err(Error::InvalidArgument);
     }
     let table_len = hdr.length as usize;
+    // SECURITY: table_len is firmware-controlled. If table_len < hdr_size the slice
+    // &data[hdr_size..table_len] would be an inverted range, causing a ring-0 panic.
+    // Reject before any slice operation.
+    if table_len < hdr_size {
+        return Err(Error::InvalidArgument);
+    }
     if data.len() < table_len {
         return Err(Error::InvalidArgument);
     }
@@ -330,6 +336,14 @@ pub fn parse_madt(data: &[u8]) -> Result<MadtInfo> {
         return Err(Error::InvalidArgument);
     }
     let table_len = hdr.length as usize;
+    // SECURITY: table_len is firmware-controlled. Require it to cover at least
+    // the SDT header (sdt_hdr_size) plus the 8 MADT-specific bytes (lapic_address
+    // + flags) that are read below. Without this check the checksum window could
+    // exclude those fields while the code still reads them, allowing an attacker
+    // to bypass integrity verification.
+    if table_len < sdt_hdr_size + 8 {
+        return Err(Error::InvalidArgument);
+    }
     if data.len() < table_len {
         return Err(Error::InvalidArgument);
     }
@@ -480,6 +494,14 @@ pub fn parse_fadt(data: &[u8]) -> Result<FadtInfo> {
     }
     let table_len = hdr.length as usize;
     if data.len() < table_len {
+        return Err(Error::InvalidArgument);
+    }
+    // SECURITY: floor the firmware-supplied table_len to the same minimum required
+    // of data.len() above, BEFORE checksumming. Otherwise a shrunk table_len makes
+    // validate_checksum cover only the header while the FADT body fields below
+    // (read from outside the checksummed window) escape integrity verification —
+    // the same checksum-window bypass closed for the MADT parser.
+    if table_len < sdt_hdr_size + 72 {
         return Err(Error::InvalidArgument);
     }
     validate_checksum(&data[..table_len])?;

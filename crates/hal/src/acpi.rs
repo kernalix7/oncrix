@@ -73,9 +73,13 @@ pub fn parse_rsdp(data: &[u8]) -> Result<RsdpInfo> {
     }
 
     // ACPI 2.0+ has extended checksum over full structure.
-    // Use rsdp.length (not hardcoded 36) and clamp to available data for safety.
+    // SECURITY: rsdp.length is firmware-controlled. If it is < 36 the window
+    // would exclude xsdt_address (bytes 24-31) and extended_checksum (byte 32),
+    // allowing those fields to be tampered without failing the checksum. Floor
+    // the window to the minimum RSDP v2 size (36 bytes) so those fields are
+    // always covered. data.len() >= size_of::<Rsdp>() (36) was verified above.
     if rsdp.revision >= 2 {
-        let check_len = (rsdp.length as usize).min(data.len());
+        let check_len = (rsdp.length as usize).max(36).min(data.len());
         let full_sum: u8 = data[..check_len]
             .iter()
             .fold(0u8, |acc, &b| acc.wrapping_add(b));
@@ -324,6 +328,13 @@ pub fn parse_madt(data: &[u8]) -> Result<MadtInfo> {
     }
 
     let length = header.length as usize;
+    // SECURITY: length is firmware-controlled. If length < SDT_HEADER_SIZE + 8
+    // the checksum window excludes the MADT-specific lapic_address and flags
+    // fields that are read unconditionally below, allowing those 8 bytes to be
+    // outside the integrity-checked region. Reject before calling the checksum.
+    if length < SDT_HEADER_SIZE + 8 {
+        return Err(Error::InvalidArgument);
+    }
     if !validate_sdt_checksum(data, length) {
         return Err(Error::InvalidArgument);
     }

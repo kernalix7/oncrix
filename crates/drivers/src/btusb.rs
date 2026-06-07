@@ -36,8 +36,15 @@ pub const EVT_LE_META: u8 = 0x3E;
 
 /// Maximum sizes for HCI packets.
 pub const HCI_CMD_MAX_SIZE: usize = 260; // 3-byte header + 255 params
-pub const HCI_EVENT_MAX_SIZE: usize = 257; // 2-byte header + 255 params
-pub const HCI_ACL_MAX_SIZE: usize = 1028; // 4-byte header + 1024 data
+// SECURITY: an HCI event is type(1) + code(1) + plen(1) + up to 255 params = 258
+// bytes. The old value of 257 (which omitted the leading packet-type byte) was one
+// short, so a spec-legal event with plen==255 could never satisfy the 3+plen
+// completion condition and was wrongly dropped.
+pub const HCI_EVENT_MAX_SIZE: usize = 258; // 1 type + 1 code + 1 plen + 255 params
+// SECURITY: 1 type byte + 4 header bytes + 1024 payload bytes = 1029 total.
+// The old value of 1028 caused an off-by-one OOB write when data.len()==1024
+// because pkt[5..1029] exceeded the array bound.
+pub const HCI_ACL_MAX_SIZE: usize = 1029; // 1 type + 4-byte header + 1024 data
 pub const HCI_SCO_MAX_SIZE: usize = 255; // 3-byte header + 255 data
 
 /// HCI command header (3 bytes).
@@ -236,6 +243,15 @@ impl BtUsb {
         // code or de-syncing the HCI stream.
         if self.event_len >= 3 {
             let plen = self.event_buf[2] as usize;
+            // SECURITY: the buffer fits the largest spec-legal event (3+255==258
+            // == HCI_EVENT_MAX_SIZE), so every valid plen completes. This guard is
+            // a defensive backstop: any plen that would need more than the buffer
+            // holds is treated as a framing error — reset and resync rather than
+            // wedge the reassembler or fabricate a shorter event from truncated data.
+            if plen > HCI_EVENT_MAX_SIZE - 3 {
+                self.event_len = 0;
+                return None;
+            }
             if self.event_len >= 3 + plen {
                 let code = self.event_buf[1];
                 self.event_len = 0;

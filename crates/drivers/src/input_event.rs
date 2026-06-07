@@ -447,12 +447,16 @@ impl InputSubsystem {
 
     /// Returns a mutable reference to the device at `index`.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut InputDevice> {
-        self.devices[index].as_mut()
+        // SECURITY: caller-supplied index is untrusted; use slice::get_mut so an
+        // out-of-bounds value returns None instead of panicking in ring 0.
+        self.devices.get_mut(index).and_then(|d| d.as_mut())
     }
 
     /// Returns a reference to the device at `index`.
     pub fn get(&self, index: usize) -> Option<&InputDevice> {
-        self.devices[index].as_ref()
+        // SECURITY: caller-supplied index is untrusted; use slice::get so an
+        // out-of-bounds value returns None instead of panicking in ring 0.
+        self.devices.get(index).and_then(|d| d.as_ref())
     }
 
     /// Returns the number of registered devices.
