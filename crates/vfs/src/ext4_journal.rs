@@ -35,6 +35,33 @@
 
 use oncrix_lib::{Error, Result};
 
+// ── CRC32c (Castagnoli) ───────────────────────────────────────────────────────
+
+/// Software CRC32c using the Castagnoli polynomial (reversed bit order).
+///
+/// Used to verify the journal superblock integrity field. The reversed
+/// polynomial 0x82F6_3B78 is the standard for CRC32c / iSCSI / ext4 / JBD2.
+///
+/// # SECURITY
+///
+/// This is the canonical reference implementation — do NOT substitute a weaker
+/// hash (CRC32-ISO, Adler, FNV, etc.) or the integrity check is forgeable.
+fn crc32c(data: &[u8]) -> u32 {
+    const POLY: u32 = 0x82F6_3B78;
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 // ── Journal constants ─────────────────────────────────────────────────────────
 
 /// JBD2 journal superblock magic number.
@@ -146,6 +173,9 @@ pub struct JournalSuperblock {
     pub _padding: [u8; 3],
     /// Number of write/read barriers used.
     pub s_num_fc_blks: u32,
+    /// CRC32c of the superblock with this field zeroed (valid when
+    /// `s_checksum_type == 1`).
+    pub s_checksum: u32,
 }
 
 impl Default for JournalSuperblock {
@@ -169,12 +199,16 @@ impl Default for JournalSuperblock {
             s_checksum_type: 1,
             _padding: [0u8; 3],
             s_num_fc_blks: 0,
+            s_checksum: 0,
         }
     }
 }
 
 impl JournalSuperblock {
     /// Serialise the superblock to `buf` in big-endian format.
+    ///
+    /// When `s_checksum_type == 1` (CRC32c) the CRC is computed over bytes
+    /// 0..84 with the checksum field (bytes 80..84) zeroed, then stored.
     ///
     /// Returns the number of bytes written, or `InvalidArgument` if `buf` is
     /// too short.
@@ -200,25 +234,82 @@ impl JournalSuperblock {
         buf[72] = self.s_checksum_type;
         buf[73..76].copy_from_slice(&self._padding);
         buf[76..80].copy_from_slice(&self.s_num_fc_blks.to_be_bytes());
-        Ok(80)
+        // SECURITY: compute and store CRC32c over bytes 0..84 with the
+        // checksum field (bytes 80..84) zeroed, matching the JBD2 convention.
+        buf[80..84].copy_from_slice(&[0u8; 4]);
+        if self.s_checksum_type == 1 {
+            let computed = crc32c(&buf[0..84]);
+            buf[80..84].copy_from_slice(&computed.to_be_bytes());
+        }
+        Ok(84)
     }
 
     /// Deserialise the superblock from `buf` in big-endian format.
+    ///
+    /// # Security validation
+    ///
+    /// - Rejects `s_maxlen == 0` (zero divisor in block allocation).
+    /// - Rejects `s_first == 0` (block 0 is the journal superblock itself).
+    /// - Rejects `s_first >= s_maxlen` (first usable block beyond the journal).
+    /// - When `s_checksum_type == 1` (CRC32c), verifies the stored CRC32c by
+    ///   zeroing the checksum field and recomputing; rejects on mismatch.
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 80 {
+        // SECURITY: 84 bytes required — 80 original fields + 4-byte checksum.
+        if buf.len() < 84 {
             return Err(Error::InvalidArgument);
         }
         let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != JBD2_MAGIC {
             return Err(Error::InvalidArgument);
         }
+
+        // SECURITY: parse s_maxlen and s_first before any arithmetic.
+        let s_maxlen = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let s_first = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+
+        // SECURITY: reject degenerate journal geometry that would cause
+        // divide-by-zero (s_maxlen == 0) or allow overwriting the superblock
+        // block itself (s_first == 0), or make the first usable block lie
+        // outside the journal (s_first >= s_maxlen).
+        if s_maxlen == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if s_first == 0 || s_first >= s_maxlen {
+            return Err(Error::InvalidArgument);
+        }
+
+        let s_checksum_type = buf[72];
+        let s_checksum = u32::from_be_bytes([buf[80], buf[81], buf[82], buf[83]]);
+
+        // SECURITY: when s_checksum_type == 1 (CRC32c), verify the stored
+        // CRC32c over bytes 0..84 with the checksum field zeroed.  A tampered
+        // on-disk superblock will have a wrong CRC and is rejected here,
+        // preventing arbitrary journal parameters from reaching mount logic.
+        if s_checksum_type == 1 {
+            // Copy first 84 bytes into a stack buffer and zero the checksum
+            // field so the CRC covers the same bytes as during serialization.
+            let mut tmp = [0u8; 84];
+            tmp.copy_from_slice(&buf[0..84]);
+            tmp[80] = 0;
+            tmp[81] = 0;
+            tmp[82] = 0;
+            tmp[83] = 0;
+            let computed = crc32c(&tmp);
+            if computed != s_checksum {
+                // SECURITY: reject journal superblock with invalid CRC32c —
+                // a tampered descriptor/commit block could otherwise write
+                // arbitrary FS data on mount.
+                return Err(Error::InvalidArgument);
+            }
+        }
+
         let mut uuid = [0u8; UUID_LEN];
         uuid.copy_from_slice(&buf[40..56]);
         Ok(Self {
             s_header_magic: magic,
             s_header_blocktype: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            s_maxlen: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            s_first: u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            s_maxlen,
+            s_first,
             s_sequence: u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
             s_start: u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]),
             s_errno: i32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]),
@@ -230,9 +321,10 @@ impl JournalSuperblock {
             s_dynsuper: u32::from_be_bytes([buf[60], buf[61], buf[62], buf[63]]),
             s_max_transaction: u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]),
             s_max_trans_data: u32::from_be_bytes([buf[68], buf[69], buf[70], buf[71]]),
-            s_checksum_type: buf[72],
+            s_checksum_type,
             _padding: [buf[73], buf[74], buf[75]],
             s_num_fc_blks: u32::from_be_bytes([buf[76], buf[77], buf[78], buf[79]]),
+            s_checksum,
         })
     }
 }
@@ -552,8 +644,9 @@ impl Journal {
         let committed_seq = tx.sequence;
         self.current_tx = None;
         self.pending_checkpoints += 1;
-        // Update superblock.
-        self.superblock.s_sequence = committed_seq as u32 + 1;
+        // SECURITY: JBD2 sequence numbers are u32 and wrap by design; use
+        // wrapping_add(1) so a sequence at u32::MAX does not panic.
+        self.superblock.s_sequence = (committed_seq as u32).wrapping_add(1);
         Ok(committed_seq)
     }
 
@@ -667,14 +760,24 @@ impl Journal {
     }
 
     fn alloc_journal_blocks(&mut self, count: u64) -> Result<u64> {
+        // SECURITY: s_first is an attacker-controlled on-disk field.  Use
+        // checked_add so that a crafted (journal_size + s_first) sum cannot
+        // wrap and defeat the subsequent bounds comparison.
+        let s_first = self.superblock.s_first as u64;
         // Wrap around the journal ring.
-        let start =
-            self.next_journal_block % self.journal_size.max(1) + self.superblock.s_first as u64;
-        let new_next = self.next_journal_block + count;
-        if new_next > self.journal_size + self.superblock.s_first as u64 {
+        let start = self.next_journal_block % self.journal_size.max(1) + s_first;
+        let new_next = self
+            .next_journal_block
+            .checked_add(count)
+            .ok_or(Error::InvalidArgument)?;
+        let limit = self
+            .journal_size
+            .checked_add(s_first)
+            .ok_or(Error::InvalidArgument)?;
+        if new_next > limit {
             // Simple wrap-around: assume checkpointed space is available.
             self.next_journal_block = count;
-            return Ok(self.superblock.s_first as u64);
+            return Ok(s_first);
         }
         self.next_journal_block = new_next;
         Ok(start)

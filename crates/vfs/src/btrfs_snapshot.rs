@@ -58,14 +58,60 @@ impl BtrfsKey {
 }
 
 /// btrfs inode reference — maps an inode to its parent and name.
+///
+/// # Security
+///
+/// The on-disk `name_len` field is a `u16` (0–65535) but the `name` buffer is
+/// only [`BTRFS_SUBVOL_NAME_MAX`] bytes (255). Always construct via
+/// [`BtrfsInodeRef::new`] so that the length is validated before any slice
+/// operation; never trust a raw on-disk `name_len` directly.
 #[derive(Debug, Clone)]
 pub struct BtrfsInodeRef {
     /// Index in the parent directory.
     pub index: u64,
-    /// Name length.
+    /// Name length (always < [`BTRFS_SUBVOL_NAME_MAX`]).
     pub name_len: u16,
     /// Name bytes.
     pub name: [u8; BTRFS_SUBVOL_NAME_MAX],
+}
+
+impl BtrfsInodeRef {
+    /// Construct a [`BtrfsInodeRef`] from a parent `index` and a name slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `name` is empty or its length is
+    /// `>= BTRFS_SUBVOL_NAME_MAX` (255), ensuring the fixed buffer is never
+    /// over-indexed.
+    ///
+    /// # Security
+    ///
+    /// When parsing from disk, the raw `name_len` u16 must be clamped to
+    /// `BTRFS_SUBVOL_NAME_MAX - 1` (i.e., 254) **before** slicing the name
+    /// buffer. This constructor enforces that invariant; do not bypass it.
+    pub fn new(index: u64, name: &[u8]) -> Result<Self> {
+        // SECURITY: name_len is u16 (up to 65535) but the name buffer is only
+        // BTRFS_SUBVOL_NAME_MAX (255) bytes. Reject any name that would OOB-index
+        // the fixed array — on-disk name lengths are fully attacker-controlled.
+        if name.is_empty() || name.len() >= BTRFS_SUBVOL_NAME_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        let mut buf = [0u8; BTRFS_SUBVOL_NAME_MAX];
+        buf[..name.len()].copy_from_slice(name);
+        Ok(Self {
+            index,
+            // Safe: name.len() < BTRFS_SUBVOL_NAME_MAX <= 255, so it fits in u16.
+            name_len: name.len() as u16,
+            name: buf,
+        })
+    }
+
+    /// Returns the validated name slice (length is always in-bounds).
+    pub fn name_bytes(&self) -> &[u8] {
+        // SECURITY: name_len was validated at construction time; this cast and
+        // slice are always in-bounds.
+        &self.name[..self.name_len as usize]
+    }
 }
 
 /// Root item describing a subvolume or snapshot root.

@@ -77,19 +77,67 @@ pub struct ExfatBootSector {
 }
 
 impl ExfatBootSector {
+    /// Validates shift fields so that subsequent arithmetic methods cannot panic.
+    ///
+    /// `bytes_per_sector_shift` must be 9–12 (512–4096 bytes/sector, per the
+    /// exFAT specification). `sectors_per_cluster_shift` must be ≤ 25, and the
+    /// combined shift must be ≤ 25 so that the resulting byte count fits in u32.
+    /// `cluster_count` must be non-zero to prevent division-by-zero in the
+    /// allocation bitmap.
+    pub fn validate(&self) -> Result<()> {
+        // SECURITY: bytes_per_sector_shift outside 9..=12 violates the exFAT spec
+        // and would cause 1u64 << n to shift by an enormous or tiny amount.
+        if self.bytes_per_sector_shift < 9 || self.bytes_per_sector_shift > 12 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: shift of ≥ 64 on a u64 panics in overflow-checks mode.
+        if self.sectors_per_cluster_shift > 25 {
+            return Err(Error::InvalidArgument);
+        }
+        let combined = self.bytes_per_sector_shift as u32 + self.sectors_per_cluster_shift as u32;
+        if combined > 25 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: cluster_count == 0 causes div0 in AllocationBitmap::allocate.
+        if self.cluster_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
     /// Returns the number of bytes per cluster.
-    pub fn bytes_per_cluster(&self) -> u64 {
-        1u64 << (self.bytes_per_sector_shift + self.sectors_per_cluster_shift)
+    ///
+    /// Returns `Err(InvalidArgument)` if either shift field is out of the
+    /// validated range (the caller must have called `validate()` first, but
+    /// we defend here too so the methods can never panic).
+    pub fn bytes_per_cluster(&self) -> Result<u64> {
+        // SECURITY: unvalidated on-disk shift fields; use checked_shl to
+        // guarantee no panic regardless of attacker-controlled values.
+        let combined = (self.bytes_per_sector_shift as u32)
+            .checked_add(self.sectors_per_cluster_shift as u32)
+            .ok_or(Error::InvalidArgument)?;
+        1u64.checked_shl(combined).ok_or(Error::InvalidArgument)
     }
 
     /// Returns the byte offset on disk for a given cluster number.
     pub fn cluster_to_byte_offset(&self, cluster: u32) -> Result<u64> {
-        if cluster < EXFAT_FIRST_CLUSTER || cluster > self.cluster_count + 1 {
+        // SECURITY: cluster_count can be u32::MAX; adding 1 without a saturating
+        // add wraps to 0, making the upper-bound check always pass.
+        let max_valid = self.cluster_count.saturating_add(1);
+        if cluster < EXFAT_FIRST_CLUSTER || cluster > max_valid {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: use checked_shl for the sectors_per_cluster_shift (on-disk u8).
+        let cluster_offset = (cluster as u64 - EXFAT_FIRST_CLUSTER as u64)
+            .checked_shl(self.sectors_per_cluster_shift as u32)
+            .ok_or(Error::InvalidArgument)?;
         let sector = (self.cluster_heap_offset as u64)
-            + ((cluster as u64 - EXFAT_FIRST_CLUSTER as u64) << self.sectors_per_cluster_shift);
-        Ok(sector << self.bytes_per_sector_shift)
+            .checked_add(cluster_offset)
+            .ok_or(Error::InvalidArgument)?;
+        // SECURITY: use checked_shl for the bytes_per_sector_shift (on-disk u8).
+        sector
+            .checked_shl(self.bytes_per_sector_shift as u32)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Returns the byte offset of the FAT for `cluster`.
@@ -97,9 +145,13 @@ impl ExfatBootSector {
         if cluster < EXFAT_FIRST_CLUSTER {
             return Err(Error::InvalidArgument);
         }
-        let fat_byte_off =
-            ((self.fat_offset as u64) << self.bytes_per_sector_shift) + (cluster as u64 * 4);
-        Ok(fat_byte_off)
+        // SECURITY: use checked_shl for the bytes_per_sector_shift (on-disk u8).
+        let fat_base = (self.fat_offset as u64)
+            .checked_shl(self.bytes_per_sector_shift as u32)
+            .ok_or(Error::InvalidArgument)?;
+        fat_base
+            .checked_add(cluster as u64 * 4)
+            .ok_or(Error::InvalidArgument)
     }
 }
 
@@ -260,6 +312,11 @@ impl AllocationBitmap {
     /// We use checked arithmetic to avoid u32 wrap when computing `bytes_needed`,
     /// and we cap against the fixed 8192-byte array before accepting the value.
     pub fn load(&mut self, data: &[u8], cluster_count: u32) -> Result<()> {
+        // SECURITY: cluster_count == 0 causes div0 in allocate() via the modulo
+        // `(c + 1) % self.cluster_count`.  Reject it here at the source.
+        if cluster_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
         // Cap cluster_count to the maximum the fixed bits array can represent
         // (8192 bytes * 8 bits/byte = 65536 clusters).
         if cluster_count as usize > 8192 * 8 {
@@ -300,6 +357,11 @@ impl AllocationBitmap {
 
     /// Allocates the next free cluster, starting from the hint.
     pub fn allocate(&mut self) -> Result<u32> {
+        // SECURITY: cluster_count == 0 would cause `(c + 1) % self.cluster_count`
+        // to divide by zero.  load() rejects it, but we guard here too.
+        if self.cluster_count == 0 {
+            return Err(Error::OutOfMemory);
+        }
         let start = self.next_hint;
         let mut c = start;
         loop {
@@ -311,6 +373,7 @@ impl AllocationBitmap {
             }
             if !self.is_allocated(c) {
                 self.set_allocated(c, true);
+                // SECURITY: cluster_count != 0 (checked above); modulo is safe.
                 self.next_hint = (c + 1) % self.cluster_count;
                 return Ok(c + EXFAT_FIRST_CLUSTER);
             }

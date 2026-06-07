@@ -26,6 +26,34 @@ use oncrix_lib::{Error, Result};
 /// ext4 xattr block magic number.
 pub const EXT4_XATTR_MAGIC: u32 = 0xEA020000;
 
+// ---------------------------------------------------------------------------
+// CRC32C (Castagnoli, reversed-poly 0x82F63B78)
+//
+// SECURITY: Reimplemented in-module because btrfs_disk_io::crc32c is private.
+// Used to verify the on-disk block checksum before trusting any field.
+// ---------------------------------------------------------------------------
+
+/// Compute a software CRC32C checksum (Castagnoli polynomial).
+///
+/// The standard initialisation / finalisation values (`!0` init, bitwise NOT
+/// of the running register as output) match RFC 3720 and the Linux ext4
+/// implementation.
+fn crc32c(data: &[u8]) -> u32 {
+    const POLY: u32 = 0x82F6_3B78;
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 /// Maximum xattr name length.
 pub const XATTR_NAME_MAX: usize = 255;
 
@@ -92,9 +120,37 @@ impl XattrHeader {
         }
     }
 
-    /// Validate magic number.
+    /// Validate magic number only.
+    ///
+    /// For full integrity verification (including checksum) use
+    /// [`XattrHeader::verify_checksum`] when the raw block bytes are available.
     pub fn is_valid(&self) -> bool {
         self.magic == EXT4_XATTR_MAGIC
+    }
+
+    /// Verify the CRC32c block checksum stored in `self.checksum`.
+    ///
+    /// SECURITY: The checksum covers the entire 4 KiB block with the four
+    /// checksum bytes zeroed, matching the Linux ext4 metadata-checksum
+    /// scheme.  Callers MUST reject the block when this returns `false` —
+    /// accepting an unverified on-disk checksum allows an attacker-controlled
+    /// image to bypass integrity guarantees.
+    ///
+    /// `block_bytes` must be the raw 4 KiB block data with the checksum field
+    /// at byte offset 16 (bytes 16–19 inclusive, little-endian u32).
+    pub fn verify_checksum(&self, block_bytes: &[u8]) -> bool {
+        // SECURITY: minimum sanity — block must be large enough to contain
+        // the checksum field at offset 16.
+        const CHECKSUM_OFFSET: usize = 16;
+        const CHECKSUM_LEN: usize = 4;
+        if block_bytes.len() < CHECKSUM_OFFSET + CHECKSUM_LEN {
+            return false;
+        }
+        // Zero the checksum field in a local copy before computing CRC32c.
+        let mut buf = block_bytes.to_vec();
+        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + CHECKSUM_LEN].copy_from_slice(&[0u8; 4]);
+        let computed = crc32c(&buf);
+        computed == self.checksum
     }
 }
 
@@ -165,8 +221,27 @@ impl XattrEntry {
     }
 
     /// Return the value as a byte slice.
+    ///
+    /// SECURITY: `value_size` is an on-disk u32 and is attacker-controlled.
+    /// Clamp to the actual buffer length to prevent OOB slice in ring-0.
     pub fn value_bytes(&self) -> &[u8] {
-        &self.value[..self.value_size as usize]
+        // SECURITY: cap value_size to buffer length before slicing.
+        let len = (self.value_size as usize).min(self.value.len());
+        &self.value[..len]
+    }
+
+    /// Validate that `value_size` does not exceed the inline buffer length.
+    ///
+    /// Call this immediately after deserialising an on-disk entry.  Returns
+    /// `Err(InvalidArgument)` when the field is out of range so the caller
+    /// can reject the block without panicking.
+    pub fn validate_value_size(&self) -> Result<()> {
+        // SECURITY: reject on-disk value_size that exceeds the inline buffer;
+        // value_bytes() clamps, but callers should detect corruption early.
+        if self.value_size as usize > self.value.len() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
     }
 }
 

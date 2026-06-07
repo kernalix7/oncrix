@@ -236,14 +236,25 @@ impl ChunkAlloc {
             }
             RaidProfile::Dup => {
                 self.stripes[0] = Stripe::new(0, base_physical, self.logical_length);
-                self.stripes[1] =
-                    Stripe::new(0, base_physical + self.logical_length, self.logical_length);
+                // SECURITY: on-disk base_physical and logical_length are attacker-controlled;
+                // use checked_add to avoid wrapping overflow that would alias physical addresses.
+                let second_offset = base_physical
+                    .checked_add(self.logical_length)
+                    .ok_or(Error::InvalidArgument)?;
+                self.stripes[1] = Stripe::new(0, second_offset, self.logical_length);
                 self.stripe_count = 2;
             }
             RaidProfile::Raid0 | RaidProfile::Raid10 => {
                 for i in 0..data_stripes {
                     let dev = (i % num_devices) as u8;
-                    let offset = base_physical + (i as u64 / num_devices as u64) * stripe_size;
+                    // SECURITY: on-disk stripe_size and i are attacker-influenced; use
+                    // checked_mul then checked_add to prevent wrapping physical address.
+                    let stripe_offset = (i as u64 / num_devices as u64)
+                        .checked_mul(stripe_size)
+                        .ok_or(Error::InvalidArgument)?;
+                    let offset = base_physical
+                        .checked_add(stripe_offset)
+                        .ok_or(Error::InvalidArgument)?;
                     self.stripes[i] = Stripe::new(dev, offset, stripe_size);
                 }
                 self.stripe_count = data_stripes;
@@ -258,13 +269,26 @@ impl ChunkAlloc {
                 // Data stripes.
                 for i in 0..data_stripes {
                     let dev = (i % num_devices) as u8;
-                    self.stripes[i] =
-                        Stripe::new(dev, base_physical + i as u64 * stripe_size, stripe_size);
+                    // SECURITY: i and stripe_size are attacker-influenced; checked arithmetic
+                    // prevents wrapping overflow producing a bogus physical address.
+                    let stripe_offset = (i as u64)
+                        .checked_mul(stripe_size)
+                        .ok_or(Error::InvalidArgument)?;
+                    let phys = base_physical
+                        .checked_add(stripe_offset)
+                        .ok_or(Error::InvalidArgument)?;
+                    self.stripes[i] = Stripe::new(dev, phys, stripe_size);
                 }
                 // Parity stripes at end.
                 for p in 0..parity {
                     let dev = ((data_stripes + p) % num_devices) as u8;
-                    let offset = base_physical + (data_stripes + p) as u64 * stripe_size;
+                    // SECURITY: same overflow risk for parity stripe physical address.
+                    let stripe_offset = ((data_stripes + p) as u64)
+                        .checked_mul(stripe_size)
+                        .ok_or(Error::InvalidArgument)?;
+                    let offset = base_physical
+                        .checked_add(stripe_offset)
+                        .ok_or(Error::InvalidArgument)?;
                     self.stripes[data_stripes + p] = Stripe::parity(dev, offset, stripe_size);
                 }
                 self.stripe_count = data_stripes + parity;
@@ -300,7 +324,15 @@ pub fn calc_stripe_offset(
     if stripe_size == 0 || data_stripe_count == 0 {
         return Err(Error::InvalidArgument);
     }
-    let stripe_set_size = stripe_size * data_stripe_count as u64;
+    // SECURITY: stripe_size comes from on-disk chunk items; reject if it exceeds
+    // MAX_CHUNK_SIZE so the multiplication below cannot overflow u64.
+    if stripe_size > MAX_CHUNK_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+    // SECURITY: checked_mul guards against stripe_size * data_stripe_count wrapping.
+    let stripe_set_size = stripe_size
+        .checked_mul(data_stripe_count as u64)
+        .ok_or(Error::InvalidArgument)?;
     let offset_in_set = logical_offset % stripe_set_size;
     let stripe_index = (offset_in_set / stripe_size) as usize;
     let offset_in_stripe = offset_in_set % stripe_size;
@@ -309,20 +341,29 @@ pub fn calc_stripe_offset(
 
 /// Computes the physical address for a given logical offset within a chunk.
 pub fn logical_to_physical(chunk: &ChunkAlloc, logical_offset: u64) -> Result<(u8, u64)> {
+    // SECURITY: validate logical_offset is in-range before any arithmetic;
+    // logical_length is an on-disk field so this check is mandatory.
     if logical_offset >= chunk.logical_length {
         return Err(Error::InvalidArgument);
     }
     match chunk.profile {
-        RaidProfile::Single | RaidProfile::Dup => Ok((
-            chunk.stripes[0].device_index,
-            chunk.stripes[0].physical_offset + logical_offset,
-        )),
+        RaidProfile::Single | RaidProfile::Dup => {
+            // SECURITY: physical_offset is an on-disk value; checked_add prevents
+            // wrapping that would produce a bogus device address.
+            let phys = chunk.stripes[0]
+                .physical_offset
+                .checked_add(logical_offset)
+                .ok_or(Error::InvalidArgument)?;
+            Ok((chunk.stripes[0].device_index, phys))
+        }
         RaidProfile::Raid1 => {
             // Read from first copy by default.
-            Ok((
-                chunk.stripes[0].device_index,
-                chunk.stripes[0].physical_offset + logical_offset,
-            ))
+            // SECURITY: same overflow risk as Single/Dup.
+            let phys = chunk.stripes[0]
+                .physical_offset
+                .checked_add(logical_offset)
+                .ok_or(Error::InvalidArgument)?;
+            Ok((chunk.stripes[0].device_index, phys))
         }
         RaidProfile::Raid0 | RaidProfile::Raid10 | RaidProfile::Raid5 | RaidProfile::Raid6 => {
             let (stripe_idx, offset_in_stripe) =
@@ -331,10 +372,13 @@ pub fn logical_to_physical(chunk: &ChunkAlloc, logical_offset: u64) -> Result<(u
                 return Err(Error::InvalidArgument);
             }
             let stripe = &chunk.stripes[stripe_idx];
-            Ok((
-                stripe.device_index,
-                stripe.physical_offset + offset_in_stripe,
-            ))
+            // SECURITY: physical_offset + offset_in_stripe could overflow if on-disk
+            // stripe physical_offset is near u64::MAX.
+            let phys = stripe
+                .physical_offset
+                .checked_add(offset_in_stripe)
+                .ok_or(Error::InvalidArgument)?;
+            Ok((stripe.device_index, phys))
         }
     }
 }
@@ -454,15 +498,26 @@ pub fn mirror_write_targets(
     length: u64,
     out: &mut [DispatchResult; MAX_RAID_DEVICES],
 ) -> Result<usize> {
+    // SECURITY: logical_offset comes from caller; validate it is within the chunk
+    // before computing any physical address — chunk.logical_length is on-disk data.
+    if logical_offset >= chunk.logical_length {
+        return Err(Error::InvalidArgument);
+    }
     let mut count = 0;
     for i in 0..chunk.stripe_count.min(MAX_RAID_DEVICES) {
         let stripe = &chunk.stripes[i];
         if stripe.is_parity {
             continue;
         }
+        // SECURITY: physical_offset is an on-disk field; checked_add prevents wrapping
+        // overflow that would target an incorrect physical device address.
+        let phys = stripe
+            .physical_offset
+            .checked_add(logical_offset)
+            .ok_or(Error::InvalidArgument)?;
         out[count] = DispatchResult {
             device_index: stripe.device_index,
-            physical_offset: stripe.physical_offset + logical_offset,
+            physical_offset: phys,
             length,
             is_parity: false,
             direction: IoDirection::Write,

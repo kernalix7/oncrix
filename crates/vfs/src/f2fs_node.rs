@@ -179,13 +179,27 @@ impl NatCache {
     }
 
     /// Look up a NID in the cache.
+    ///
+    /// Returns `Some` only when the cached entry was actually stored under this
+    /// exact NID.  A FREE entry (`block_addr == NULL_ADDR`) whose `ino` does
+    /// not match is a hash-slot collision, not a hit.
     pub fn lookup(&self, nid: Nid) -> Option<&NatEntry> {
         let idx = (nid as usize) % NAT_CACHE_SIZE;
         let entry = &self.entries[idx];
-        if entry.ino == nid || entry.block_addr == NULL_ADDR {
+        // SECURITY: The previous condition `entry.ino == nid || entry.block_addr
+        // == NULL_ADDR` caused any *free* (unallocated) slot to be returned as a
+        // valid hit for whatever NID hashed to that slot.  An attacker who can
+        // influence NID allocation could exploit this to obtain a free entry
+        // (block_addr=NULL_ADDR) masquerading as a resolved mapping, leading to
+        // type-confusion and potential NULL-block dereference.  Match on identity
+        // only: the slot is a hit if and only if its stored ino equals the
+        // requested nid.
+        // SECURITY: also require a real (non-free) mapping — a free slot has
+        // ino==0, so a lookup of nid==0 would otherwise match an empty slot.
+        if entry.ino == nid && entry.block_addr != NULL_ADDR {
             Some(entry)
         } else {
-            // Collision — would need a secondary lookup in production.
+            // Collision or empty slot — caller must fall back to on-disk NAT.
             None
         }
     }

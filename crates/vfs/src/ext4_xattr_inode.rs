@@ -84,12 +84,23 @@ pub struct XattrEntryHeader {
 
 impl XattrEntryHeader {
     /// Returns the total on-disk size of this entry including name and value,
-    /// rounded up to [`XATTR_ALIGN`] bytes.
-    pub const fn entry_size(&self) -> usize {
-        let raw = core::mem::size_of::<XattrEntryHeader>()
-            + self.name_len as usize
-            + self.value_len as usize;
-        (raw + XATTR_ALIGN - 1) & !(XATTR_ALIGN - 1)
+    /// rounded up to [`XATTR_ALIGN`] bytes, or `None` on overflow.
+    ///
+    /// SECURITY: `name_len` and `value_len` are on-disk u8/u32 fields and are
+    /// attacker-controlled.  Adding them unchecked can overflow a usize on
+    /// 32-bit targets and wrap on 64-bit targets with adversarial values.
+    /// All callers must handle the `None` case and reject the entry.
+    pub fn entry_size(&self) -> Option<usize> {
+        let base = core::mem::size_of::<XattrEntryHeader>();
+        // SECURITY: use checked_add for each step — name_len (u8→usize) and
+        // value_len (u32→usize) are both attacker-controlled on-disk fields.
+        let raw = base
+            .checked_add(self.name_len as usize)
+            .and_then(|s| s.checked_add(self.value_len as usize))?;
+        // Round up to XATTR_ALIGN.  XATTR_ALIGN is a power of two so the
+        // rounding itself cannot overflow as long as raw < usize::MAX - XATTR_ALIGN.
+        raw.checked_add(XATTR_ALIGN - 1)
+            .map(|v| v & !(XATTR_ALIGN - 1))
     }
 }
 
@@ -126,8 +137,25 @@ impl XattrEntry {
     }
 
     /// Returns the attribute value as a byte slice.
+    ///
+    /// SECURITY: `header.value_len` is an on-disk u32 and is attacker-controlled.
+    /// Clamp to the actual buffer length to prevent an OOB slice panic in ring-0.
     pub fn value(&self) -> &[u8] {
-        &self.value_buf[..self.header.value_len as usize]
+        // SECURITY: cap value_len to buffer length before slicing.
+        let len = (self.header.value_len as usize).min(self.value_buf.len());
+        &self.value_buf[..len]
+    }
+
+    /// Validate that `header.value_len` does not exceed the inline buffer length.
+    ///
+    /// SECURITY: Call immediately after deserialising an on-disk entry to
+    /// reject corrupt images early.  Returns `Err(InvalidArgument)` when the
+    /// on-disk field is out of range.
+    pub fn validate_value_len(&self) -> Result<()> {
+        if self.header.value_len as usize > self.value_buf.len() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
     }
 }
 
@@ -231,14 +259,26 @@ impl InodeXattrStore {
                 && self.entries[i].header.name_index == name_index
                 && self.entries[i].name() == name
             {
-                let old_size = self.entries[i].header.entry_size();
+                // SECURITY: entry_size() returns Option; reject overflow entries.
+                let old_size = self.entries[i]
+                    .header
+                    .entry_size()
+                    .ok_or(Error::InvalidArgument)?;
                 let new_header = build_header(name_index, name, value);
-                let new_size = new_header.entry_size();
+                // SECURITY: entry_size() for the new header must not overflow either.
+                let new_size = new_header.entry_size().ok_or(Error::InvalidArgument)?;
                 let delta = new_size.saturating_sub(old_size);
                 if self.bytes_used + delta > INLINE_XATTR_MAX {
                     return Err(Error::OutOfMemory);
                 }
-                self.bytes_used = self.bytes_used - old_size + new_size;
+                // SECURITY: use saturating_sub + saturating_add to guard against
+                // bytes_used underflow when old_size > bytes_used due to
+                // concurrent corruption.  Fix for: `bytes_used - old_size + new_size`
+                // underflow when old_size > self.bytes_used.
+                self.bytes_used = self
+                    .bytes_used
+                    .saturating_sub(old_size)
+                    .saturating_add(new_size);
                 self.entries[i].header = new_header;
                 self.entries[i].value_buf[..value.len()].copy_from_slice(value);
                 return Ok(());
@@ -250,7 +290,9 @@ impl InodeXattrStore {
             return Err(Error::OutOfMemory);
         }
         let hdr = build_header(name_index, name, value);
-        if self.bytes_used + hdr.entry_size() > INLINE_XATTR_MAX {
+        // SECURITY: entry_size() returns Option; reject if overflow.
+        let hdr_size = hdr.entry_size().ok_or(Error::InvalidArgument)?;
+        if self.bytes_used + hdr_size > INLINE_XATTR_MAX {
             return Err(Error::OutOfMemory);
         }
         let idx = self.count;
@@ -258,7 +300,7 @@ impl InodeXattrStore {
         self.entries[idx].name_buf[..name.len()].copy_from_slice(name);
         self.entries[idx].value_buf[..value.len()].copy_from_slice(value);
         self.entries[idx].active = true;
-        self.bytes_used += hdr.entry_size();
+        self.bytes_used += hdr_size;
         self.count += 1;
         Ok(())
     }
@@ -271,7 +313,9 @@ impl InodeXattrStore {
             .iter()
             .position(|e| e.active && e.header.name_index == name_index && e.name() == name)
             .ok_or(Error::NotFound)?;
-        let freed = self.entries[pos].header.entry_size();
+        // SECURITY: entry_size() returns Option; treat overflow as 0 freed bytes
+        // (saturating_sub handles the accounting safely regardless).
+        let freed = self.entries[pos].header.entry_size().unwrap_or(0);
         self.entries[pos] = self.entries[self.count - 1];
         self.entries[self.count - 1] = XattrEntry::default();
         self.count -= 1;
