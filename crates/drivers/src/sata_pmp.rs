@@ -10,9 +10,9 @@
 //! # Architecture
 //!
 //! A PMP attaches to a single host AHCI port and fans out to up to 15
-//! device ports. The PMP exposes a control port (port 15) accessible
-//! via the General Status and Control Registers (GSCRs), and up to 14
-//! device ports (0–13) for attached drives.
+//! device ports (0–14) for attached drives. The PMP exposes a control
+//! port (port 15) accessible via the General Status and Control
+//! Registers (GSCRs).
 //!
 //! ```text
 //! Host AHCI Port
@@ -188,7 +188,13 @@ pub struct PmpIdentity {
 impl PmpIdentity {
     /// Decode identity from raw GSCR values.
     pub fn from_gscr(prod_id: u32, revision: u32, port_info: u32) -> Self {
-        let num_ports = ((port_info & GSCR_PORT_COUNT_MASK) + 1) as u8;
+        // SECURITY: GSCR[2] bits[3:0] are device-supplied and encode the number
+        // of fan-out device ports DIRECTLY (not count-1), per the SATA Port
+        // Multiplier spec (cf. Linux libata-pmp.c, which reads the field as the
+        // count). Clamp to PMP_MAX_DEVICE_PORTS (15) here — the single entry
+        // point — so num_ports can never exceed the fixed `ports` array length.
+        // A field of 0 (no exposed ports) stays 0 so detect() rejects it.
+        let num_ports = (port_info & GSCR_PORT_COUNT_MASK).min(PMP_MAX_DEVICE_PORTS as u32) as u8;
         Self {
             product_id: prod_id,
             revision,
@@ -343,7 +349,11 @@ impl PmpDevice {
     ///
     /// Returns [`Error::InvalidArgument`] if `port_idx >= num_ports`.
     pub fn handle_hotplug(&mut self, port_idx: u8, gscr: &GscrAccessor) -> Result<PmpPortStatus> {
-        if port_idx as usize >= self.identity.num_ports as usize {
+        // SECURITY: Bound against the fixed array size, not the device-reported
+        // num_ports. Even if a malicious device advertises a count that slips
+        // past the from_gscr clamp (e.g. via a race), this guard ensures we
+        // never index outside the 15-element `ports` array.
+        if port_idx as usize >= PMP_MAX_DEVICE_PORTS {
             return Err(Error::InvalidArgument);
         }
         let sstatus = gscr.read(port_idx, 0);
@@ -365,7 +375,10 @@ impl PmpDevice {
         enable: bool,
         gscr: &GscrAccessor,
     ) -> Result<()> {
-        if port_idx as usize >= self.identity.num_ports as usize {
+        // SECURITY: Bound against the fixed array size, not the device-reported
+        // num_ports. Prevents OOB index into the 15-element `ports` array even
+        // if a device supplies a manipulated port count.
+        if port_idx as usize >= PMP_MAX_DEVICE_PORTS {
             return Err(Error::InvalidArgument);
         }
         // SControl is at GSCR index 1 in the per-port register space.
@@ -417,7 +430,11 @@ impl PmpDevice {
 
     /// Return the count of ports in `Present` state.
     pub fn present_port_count(&self) -> usize {
-        self.ports[..self.identity.num_ports as usize]
+        // SECURITY: Clamp the slice bound to PMP_MAX_DEVICE_PORTS so that a
+        // device-supplied num_ports value (even one that bypassed the entry-point
+        // clamp via a race or future code change) can never produce an OOB slice.
+        let bound = (self.identity.num_ports as usize).min(PMP_MAX_DEVICE_PORTS);
+        self.ports[..bound]
             .iter()
             .filter(|p| p.status == PmpPortStatus::Present)
             .count()

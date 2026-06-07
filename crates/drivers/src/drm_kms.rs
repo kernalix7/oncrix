@@ -376,6 +376,13 @@ impl Connector {
             return Err(Error::InvalidArgument);
         }
 
+        // SECURITY: Verify EDID block checksum (byte-127 rule: sum of all 128
+        // bytes mod 256 must equal 0). Reject forged/corrupt EDID blocks that
+        // could carry malicious timing values before any field is parsed.
+        if edid.iter().take(128).fold(0u8, |a, &b| a.wrapping_add(b)) != 0 {
+            return Err(Error::InvalidArgument);
+        }
+
         // Physical dimensions: bytes[21:22] = width cm, height cm.
         self.width_mm = edid[21] as u32 * 10;
         self.height_mm = edid[22] as u32 * 10;
@@ -395,17 +402,35 @@ impl Connector {
 
             let hdisplay = (edid[base + 2] as u16) | (((edid[base + 4] as u16) & 0xF0) << 4);
             let hblank = (edid[base + 3] as u16) | (((edid[base + 4] as u16) & 0x0F) << 8);
-            let htotal = hdisplay + hblank;
+            // SECURITY: device-supplied fields — saturating_add prevents u16
+            // overflow panic on malicious EDID blanking values.
+            let htotal = hdisplay.saturating_add(hblank);
 
             let vdisplay = (edid[base + 5] as u16) | (((edid[base + 7] as u16) & 0xF0) << 4);
             let vblank = (edid[base + 6] as u16) | (((edid[base + 7] as u16) & 0x0F) << 8);
-            let vtotal = vdisplay + vblank;
+            // SECURITY: same as htotal above.
+            let vtotal = vdisplay.saturating_add(vblank);
 
             let hfp = (edid[base + 8] as u16) | (((edid[base + 11] as u16) >> 6) << 8);
             let hsw = (edid[base + 9] as u16) | ((((edid[base + 11] as u16) >> 4) & 0x3) << 8);
             let vfp =
                 ((edid[base + 10] as u16) >> 4) | ((((edid[base + 11] as u16) >> 2) & 0x3) << 4);
             let vsw = (edid[base + 10] as u16) & 0xF | (((edid[base + 11] as u16) & 0x3) << 4);
+
+            // SECURITY: Compute sync positions with saturating arithmetic to
+            // prevent ring-0 overflow panics on attacker-supplied porch/width values.
+            let hsync_start = hdisplay.saturating_add(hfp);
+            let hsync_end = hsync_start.saturating_add(hsw);
+            let vsync_start = vdisplay.saturating_add(vfp);
+            let vsync_end = vsync_start.saturating_add(vsw);
+
+            // SECURITY: Reject modes where sync positions are inconsistent with
+            // the total (mirrors drm_crtc.rs DisplayMode::is_valid()). A malicious
+            // EDID could supply hsync_start > htotal which would produce an
+            // invalid pipeline configuration and potentially a later panic.
+            if hsync_start > htotal || vsync_start > vtotal {
+                continue;
+            }
 
             let flags_byte = edid[base + 17];
             let mut flags = 0u32;
@@ -427,12 +452,12 @@ impl Connector {
             let mode = DisplayMode {
                 pixel_clock_khz,
                 hdisplay,
-                hsync_start: hdisplay + hfp,
-                hsync_end: hdisplay + hfp + hsw,
+                hsync_start,
+                hsync_end,
                 htotal,
                 vdisplay,
-                vsync_start: vdisplay + vfp,
-                vsync_end: vdisplay + vfp + vsw,
+                vsync_start,
+                vsync_end,
                 vtotal,
                 flags,
                 name,
@@ -548,13 +573,27 @@ pub struct Framebuffer {
 
 impl Framebuffer {
     /// Compute the minimum pitch for the given width and format.
+    ///
+    /// # SECURITY
+    ///
+    /// `width` and `bytes_per_pixel` are device-supplied values and may be
+    /// attacker-controlled. `saturating_mul` prevents a ring-0 overflow panic;
+    /// a saturated result will cause the caller's size or validation check to
+    /// fail rather than wrap to a small value.
     pub fn min_pitch(width: u32, format: PixelFormat) -> u32 {
-        width * format.bytes_per_pixel()
+        // SECURITY: device-supplied width — saturating prevents overflow panic.
+        width.saturating_mul(format.bytes_per_pixel())
     }
 
     /// Compute the minimum framebuffer size in bytes.
+    ///
+    /// # SECURITY
+    ///
+    /// Both dimensions are device-supplied. `saturating_mul` on the u64
+    /// products prevents ring-0 overflow panics on malicious EDID data.
     pub fn min_size(width: u32, height: u32, format: PixelFormat) -> u64 {
-        Self::min_pitch(width, format) as u64 * height as u64
+        // SECURITY: device-supplied height — use u64 saturating to avoid panic.
+        (Self::min_pitch(width, format) as u64).saturating_mul(height as u64)
     }
 }
 
@@ -826,7 +865,10 @@ impl DrmDevice {
     /// Allocate the next unique KMS object ID.
     fn alloc_id(&mut self) -> u32 {
         let id = self.next_id;
-        self.next_id += 1;
+        // SECURITY: wrapping_add avoids overflow panic; skip 0 so callers can
+        // use 0 as a sentinel "no ID". IDs wrap after u32::MAX allocations —
+        // acceptable for a fixed-size registry capped at MAX_* objects.
+        self.next_id = self.next_id.wrapping_add(1).max(1);
         id
     }
 
@@ -929,6 +971,15 @@ impl DrmDevice {
     /// Associates `connector_id` → `encoder_id` → `crtc_id`, sets
     /// the mode, and attaches the framebuffer to the primary plane.
     ///
+    /// # Security
+    ///
+    /// **SECURITY**: This is a destructive display-pipeline operation.
+    /// The ioctl dispatcher MUST verify DRM-master ownership or
+    /// `CAP_SYS_ADMIN` before calling this function. The kernel has no
+    /// per-task credential wiring at this layer yet; until it does, the
+    /// dispatcher is the only enforcement point — callers that bypass it
+    /// can reconfigure any display output without restriction.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if any ID is not found, or
@@ -995,6 +1046,13 @@ impl DrmDevice {
     /// # Errors
     ///
     /// Returns the first driver error encountered.
+    //
+    // SECURITY: atomic_commit is a destructive display-pipeline operation
+    // (re-programs CRTC mode + planes on the hardware). Like mode_set, it has no
+    // privilege check at this layer because the kernel has no per-task DRM creds
+    // wired yet. The ioctl dispatcher MUST verify DRM-master ownership /
+    // CAP_SYS_ADMIN before calling this; do not expose it to an unprivileged
+    // caller.
     pub fn atomic_commit<D: DrmDriver>(&mut self, driver: &mut D, fb: &Framebuffer) -> Result<()> {
         for slot in self.crtcs[..self.crtc_count].iter() {
             if let Some(crtc) = slot {

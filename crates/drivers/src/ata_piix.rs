@@ -363,7 +363,9 @@ impl AtaDevice {
 
     /// Returns the capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
-        self.total_sectors * self.sector_size as u64
+        // SECURITY: both fields come from device-supplied IDENTIFY data; use
+        // saturating_mul to prevent u64 overflow (overflow-checks=on panics).
+        self.total_sectors.saturating_mul(self.sector_size as u64)
     }
 
     /// Returns the capacity in MiB.
@@ -411,11 +413,33 @@ impl AtaDevice {
         let lba48_hi = dword(data, 102) as u64;
         let lba48_total = lba48_lo | (lba48_hi << 32);
 
+        // SECURITY: sector counts are device-supplied; clamp to the ATA-defined
+        // maximums so that downstream index/shift arithmetic cannot overflow.
         self.total_sectors = if self.lba48 && lba48_total > 0 {
-            lba48_total
+            lba48_total.min(LBA48_MAX_SECTORS)
         } else {
-            lba28 as u64
+            (lba28 as u64).min(LBA28_MAX_SECTORS)
         };
+
+        // Word 106, bit 12: device reports logical sector size in words 117/118.
+        // Validate the reported size is a power-of-two in [512, 32768]; otherwise
+        // default to 512.  Both word 117 and word 106 are device-supplied.
+        // SECURITY: sector_size is untrusted; reject values outside the legal
+        // range to prevent divide-by-zero and non-power-of-two in callers.
+        let word106 = word(data, 106);
+        if word106 & (1 << 14) != 0 && word106 & (1 << 15) == 0 && word106 & (1 << 12) != 0 {
+            // Words 117..118 form a 32-bit logical sector size in words (LE).
+            let sz_words = (word(data, 117) as u32) | ((word(data, 118) as u32) << 16);
+            let sz_bytes = sz_words.saturating_mul(2);
+            // Accept only power-of-two sizes in [512, 32768].
+            if sz_bytes >= 512 && sz_bytes <= 32768 && sz_bytes.is_power_of_two() {
+                self.sector_size = sz_bytes;
+            } else {
+                self.sector_size = SECTOR_SIZE as u32;
+            }
+        } else {
+            self.sector_size = SECTOR_SIZE as u32;
+        }
 
         // Word 82, bit 5: write cache supported.
         // Word 85, bit 5: write cache enabled.
