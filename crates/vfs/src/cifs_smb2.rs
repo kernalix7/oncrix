@@ -65,6 +65,13 @@ pub const MAX_SEC_BUF: usize = 4096;
 /// Maximum path length in tree connect.
 pub const MAX_TREE_PATH: usize = 256;
 
+/// Maximum server-advertised I/O size (read/write/transact) accepted from the wire.
+///
+/// MS-SMB2 §3.2.5.3 allows servers to return any value; we cap at 16 MiB to prevent
+/// a malicious server from causing integer overflow or excessive allocation when the
+/// value is later added to a header offset.
+pub const SMB2_MAX_IO_SIZE: u32 = 16 * 1024 * 1024; // 16 MiB
+
 /// SMB3.1.1 dialect value.
 pub const SMB311_DIALECT: u16 = 0x0311;
 /// SMB3.0.2 dialect value.
@@ -260,22 +267,30 @@ pub struct NegotiateRequest {
 
 impl NegotiateRequest {
     /// Encode into `buf` (starting after the 64-byte SMB2 header).
+    ///
+    /// `dialect_count` is clamped to [`MAX_DIALECTS`] before computing the
+    /// encoded size.  Without the clamp, a `dialect_count` larger than
+    /// `MAX_DIALECTS` would return an `Ok(size)` claiming more bytes were
+    /// written than the write loop actually produced, leaking uninitialised
+    /// buffer bytes on the wire.
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize> {
-        let size = 36 + self.dialect_count as usize * 2;
+        // Clamp to the number of dialect slots we actually have, so that the
+        // reported size always matches the bytes written below.
+        let count = (self.dialect_count as usize).min(MAX_DIALECTS);
+        let size = 36 + count * 2;
         if buf.len() < size {
             return Err(Error::InvalidArgument);
         }
         buf[0..2].copy_from_slice(&36u16.to_le_bytes()); // StructureSize
-        buf[2..4].copy_from_slice(&self.dialect_count.to_le_bytes());
+        // Write the clamped count onto the wire so the peer knows how many
+        // dialect entries follow.
+        buf[2..4].copy_from_slice(&(count as u16).to_le_bytes());
         buf[4..6].copy_from_slice(&self.security_mode.to_le_bytes());
         buf[6..8].fill(0); // Reserved
         buf[8..12].copy_from_slice(&self.capabilities.to_le_bytes());
         buf[12..28].copy_from_slice(&self.client_guid);
         buf[28..36].fill(0); // ClientStartTime or NegotiateContextOffset
-        for i in 0..self.dialect_count as usize {
-            if i >= MAX_DIALECTS {
-                break;
-            }
+        for i in 0..count {
             buf[36 + i * 2..36 + i * 2 + 2].copy_from_slice(&self.dialects[i].to_le_bytes());
         }
         Ok(size)
@@ -303,6 +318,12 @@ pub struct NegotiateResponse {
 
 impl NegotiateResponse {
     /// Parse from wire bytes (after SMB2 header).
+    ///
+    /// The three server-supplied I/O size fields (`max_transact_size`,
+    /// `max_read_size`, `max_write_size`) are clamped to [`SMB2_MAX_IO_SIZE`]
+    /// (16 MiB) at parse time.  A rogue server can return `u32::MAX`; callers
+    /// that later compute `header_offset + max_read_size` would overflow
+    /// without this guard.
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < 64 {
             return Err(Error::InvalidArgument);
@@ -319,13 +340,16 @@ impl NegotiateResponse {
             ),
             max_transact_size: u32::from_le_bytes(
                 buf[20..24].try_into().map_err(|_| Error::InvalidArgument)?,
-            ),
+            )
+            .min(SMB2_MAX_IO_SIZE),
             max_read_size: u32::from_le_bytes(
                 buf[24..28].try_into().map_err(|_| Error::InvalidArgument)?,
-            ),
+            )
+            .min(SMB2_MAX_IO_SIZE),
             max_write_size: u32::from_le_bytes(
                 buf[28..32].try_into().map_err(|_| Error::InvalidArgument)?,
-            ),
+            )
+            .min(SMB2_MAX_IO_SIZE),
             system_time: u64::from_le_bytes(
                 buf[40..48].try_into().map_err(|_| Error::InvalidArgument)?,
             ),
@@ -438,8 +462,14 @@ pub struct WriteResponse {
 
 impl WriteResponse {
     /// Parse from wire bytes (after SMB2 header).
+    ///
+    /// MS-SMB2 §2.2.22: WRITE response body is 16 bytes minimum:
+    /// `[0..2]` StructureSize (17), `[2..4]` Reserved, `[4..8]` Count,
+    /// `[8..12]` Remaining, `[12..16]` WriteChannelInfoOffset/Length.
+    /// A guard of 8 would allow a 8-11 byte body to pass while the code
+    /// then indexes `buf[8..12]`, causing a ring-0 panic.
     pub fn parse(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 8 {
+        if buf.len() < 16 {
             return Err(Error::InvalidArgument);
         }
         Ok(Self {
