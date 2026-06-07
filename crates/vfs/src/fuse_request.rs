@@ -370,7 +370,15 @@ impl FuseReqQueue {
         for i in 0..REQ_QUEUE_DEPTH {
             if self.slots[i].state == FuseReqState::Empty {
                 let unique = self.next_unique;
-                self.next_unique = self.next_unique.wrapping_add(1);
+                // SECURITY (F4): unique == 0 is the FUSE-protocol reserved value.
+                // wrapping_add(1) can produce 0 when next_unique wraps from u64::MAX.
+                // Skip 0 so that deliver_reply's unique==0 rejection is never triggered
+                // by a legitimately submitted request, matching the skip-zero pattern
+                // used in fuse_lowlevel.rs FuseRequestQueue::enqueue.
+                self.next_unique = match self.next_unique.wrapping_add(1) {
+                    0 => 1,
+                    n => n,
+                };
 
                 let mut arg_buf = FuseArgBuf::new();
                 arg_buf.write(args);
@@ -412,8 +420,24 @@ impl FuseReqQueue {
 
     /// Delivers a daemon reply identified by `unique`.
     ///
+    /// `expected_opcode` must match the opcode that was submitted with this
+    /// unique ID.  A mismatch means the daemon is injecting a reply for a
+    /// different operation type than was requested (cross-type body injection).
+    ///
     /// Transitions the matching slot from `InFlight` to `Done`.
-    pub fn deliver_reply(&mut self, unique: u64, error: i32, data: &[u8]) -> Result<()> {
+    pub fn deliver_reply(
+        &mut self,
+        unique: u64,
+        expected_opcode: u32,
+        error: i32,
+        data: &[u8],
+    ) -> Result<()> {
+        // SECURITY (F4): unique == 0 is the FUSE-protocol reserved value; a
+        // daemon sending unique == 0 must be rejected to prevent slot-scanning.
+        // Mirror: fuse_lowlevel.rs FuseRequestQueue::complete line ~297.
+        if unique == 0 {
+            return Err(Error::InvalidArgument);
+        }
         // SECURITY: data comes from an untrusted FUSE daemon; cap before use.
         if data.len() > FUSE_ARG_MAX {
             return Err(Error::InvalidArgument);
@@ -426,8 +450,24 @@ impl FuseReqQueue {
 
         for i in 0..REQ_QUEUE_DEPTH {
             if self.slots[i].state == FuseReqState::InFlight && self.slots[i].req.unique == unique {
-                let mut data_buf = FuseArgBuf::new();
-                data_buf.write(data);
+                // SECURITY (F1): Verify the daemon's reply opcode matches the opcode
+                // the kernel placed in this slot.  An untrusted daemon could send a
+                // reply with the same unique but a body shaped for a different opcode,
+                // causing callers to misinterpret the payload (cross-type injection).
+                if self.slots[i].req.opcode != expected_opcode {
+                    return Err(Error::InvalidArgument);
+                }
+                // SECURITY (F2): When the daemon signals an error (error != 0), do NOT
+                // store the daemon-supplied body bytes.  A crafted error reply could
+                // pre-load attacker-controlled bytes into the slot for a caller that
+                // skips to_result() and reads the data field directly.
+                let data_buf = if error != 0 {
+                    FuseArgBuf::new()
+                } else {
+                    let mut buf = FuseArgBuf::new();
+                    buf.write(data);
+                    buf
+                };
                 self.slots[i].reply = FuseWireReply {
                     len: reply_len,
                     error,
@@ -724,7 +764,7 @@ mod tests {
         let req = q.dequeue_pending().unwrap();
         assert_eq!(req.opcode, FUSE_LOOKUP);
         assert_eq!(req.unique, uid);
-        q.deliver_reply(uid, 0, b"reply").unwrap();
+        q.deliver_reply(uid, FUSE_LOOKUP, 0, b"reply").unwrap();
         let reply = q.collect_reply(uid).unwrap();
         assert!(reply.is_ok());
         assert_eq!(reply.data.as_bytes(), b"reply");
@@ -757,7 +797,7 @@ mod tests {
         let uid = q.submit(FUSE_GETATTR, 1, 0, 0, 0, b"").unwrap();
         q.dequeue_pending();
         assert!(matches!(
-            q.deliver_reply(uid + 1, 0, b""),
+            q.deliver_reply(uid + 1, FUSE_GETATTR, 0, b""),
             Err(Error::NotFound)
         ));
     }
@@ -800,10 +840,70 @@ mod tests {
         let mut q = FuseReqQueue::new();
         let uid = q.submit(FUSE_GETATTR, 1, 0, 0, 0, b"").unwrap();
         q.dequeue_pending();
-        q.deliver_reply(uid, 0, b"").unwrap();
+        q.deliver_reply(uid, FUSE_GETATTR, 0, b"").unwrap();
         q.collect_reply(uid).unwrap();
         assert_eq!(q.stats.submitted, 1);
         assert_eq!(q.stats.completed, 1);
         assert_eq!(q.stats.errors, 0);
+    }
+
+    // ── Security regression tests ────────────────────────────────────
+
+    /// F1: A daemon reply with a mismatched opcode must be rejected.
+    #[test]
+    fn test_deliver_reply_opcode_mismatch_rejected() {
+        let mut q = FuseReqQueue::new();
+        let uid = q.submit(FUSE_LOOKUP, 1, 0, 0, 0, b"file").unwrap();
+        q.dequeue_pending();
+        // Daemon sends a GETATTR-shaped body for a LOOKUP slot — cross-type injection.
+        assert!(matches!(
+            q.deliver_reply(uid, FUSE_GETATTR, 0, b"attrbody"),
+            Err(Error::InvalidArgument)
+        ));
+    }
+
+    /// F2: When the daemon returns an error, the body bytes must NOT be stored.
+    #[test]
+    fn test_deliver_reply_error_body_discarded() {
+        let mut q = FuseReqQueue::new();
+        let uid = q.submit(FUSE_READ, 1, 0, 0, 0, b"").unwrap();
+        q.dequeue_pending();
+        // Daemon signals error=-5 but also sends attacker-controlled body bytes.
+        q.deliver_reply(uid, FUSE_READ, -5, b"attacker_bytes")
+            .unwrap();
+        let reply = q.collect_reply(uid).unwrap();
+        assert_ne!(reply.error, 0);
+        // Body must be empty regardless of what the daemon sent.
+        assert!(reply.data.is_empty(), "error reply body must be empty");
+    }
+
+    /// F4: deliver_reply must reject unique == 0.
+    #[test]
+    fn test_deliver_reply_rejects_unique_zero() {
+        let mut q = FuseReqQueue::new();
+        assert!(matches!(
+            q.deliver_reply(0, FUSE_LOOKUP, 0, b""),
+            Err(Error::InvalidArgument)
+        ));
+    }
+
+    /// F4: submit must never assign unique == 0 even after a u64 wraparound.
+    #[test]
+    fn test_submit_skips_unique_zero_on_wraparound() {
+        let mut q = FuseReqQueue::new();
+        // Force next_unique to u64::MAX so the next wrapping_add would produce 0.
+        q.next_unique = u64::MAX;
+        let uid = q.submit(FUSE_GETATTR, 1, 0, 0, 0, b"").unwrap();
+        // submit captures next_unique (u64::MAX) BEFORE advancing, so this
+        // request is assigned u64::MAX (non-zero), and the counter then steps
+        // to wrapping_add(1) == 0, which the skip rewrites to 1.
+        assert_ne!(uid, 0, "submit must not assign unique == 0");
+        assert_eq!(uid, u64::MAX, "the in-flight request keeps the pre-wrap id");
+        // The counter skipped 0 and landed on 1, so the NEXT submit is non-zero.
+        assert_eq!(
+            q.next_unique, 1,
+            "wraparound must skip the reserved 0 value"
+        );
+        assert_ne!(q.submit(FUSE_GETATTR, 1, 0, 0, 0, b"").unwrap(), 0);
     }
 }

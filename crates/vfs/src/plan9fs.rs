@@ -784,6 +784,13 @@ pub struct Plan9Session {
     root_fid: u32,
     /// Next tag number for request/response matching.
     next_tag: u16,
+    // SECURITY: every build_t* stores the tag it allocated here; every
+    // handle_r* reads the reply tag from parse_header and rejects it unless
+    // it matches this field.  This prevents a malicious/compromised 9P server
+    // from replying with a forged tag that would be accepted as the response
+    // to a different in-flight request (FID/QID spoofing, F1 fix).
+    /// Tag of the most-recently-sent request; validated on every reply.
+    pending_tag: u16,
     /// Message serialization buffer.
     msg_buf: Plan9Message,
     /// User ID for authentication.
@@ -803,6 +810,7 @@ impl Plan9Session {
             fid_table: FidTable::new(),
             root_fid: NOFID,
             next_tag: 1,
+            pending_tag: 0,
             msg_buf: Plan9Message::new(),
             uid: 0,
             mount_path: [0; MAX_MOUNT_PATH],
@@ -836,6 +844,9 @@ impl Plan9Session {
     /// [`handle_rversion`](Self::handle_rversion) with the reply.
     pub fn build_tversion(&mut self) -> Result<&[u8]> {
         self.state = SessionState::Negotiating;
+        // SECURITY: Tversion always uses NOTAG (0xFFFF) per 9P spec; record it
+        // in pending_tag so handle_rversion can enforce the required value (F2).
+        self.pending_tag = NOTAG;
         self.msg_buf.reset(P9MessageType::Tversion, NOTAG);
         self.msg_buf.put_u32(self.msize)?;
         self.msg_buf.put_string(&P9_VERSION)?;
@@ -853,10 +864,17 @@ impl Plan9Session {
     ///   is bounded by `min(received_len, VERSION_STR_LEN)` so a crafted
     ///   short string cannot cause an out-of-bounds index).
     pub fn handle_rversion(&mut self, reply: &[u8]) -> Result<()> {
-        let (msg_type, _tag, offset) = Plan9Message::parse_header(reply)?;
+        let (msg_type, reply_tag, offset) = Plan9Message::parse_header(reply)?;
         if msg_type != P9MessageType::Rversion {
             self.state = SessionState::Error;
             return Err(Error::IoError);
+        }
+        // SECURITY: 9P spec §4.1 requires the Rversion tag to equal NOTAG
+        // (0xFFFF).  A server that sends any other tag value is either broken
+        // or adversarial; reject it before consuming any body fields (F1/F2).
+        if reply_tag != NOTAG {
+            self.state = SessionState::Error;
+            return Err(Error::InvalidArgument);
         }
         let (server_msize, offset) = Plan9Message::read_u32(reply, offset)?;
 
@@ -920,6 +938,9 @@ impl Plan9Session {
         self.uid = uid;
         let (slot, fid_num) = self.fid_table.alloc()?;
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag so handle_rattach can reject
+        // any reply whose tag does not match this outstanding request (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Tattach, tag);
         self.msg_buf.put_u32(fid_num)?;
         self.msg_buf.put_u32(NOFID)?; // afid (no auth)
@@ -937,7 +958,14 @@ impl Plan9Session {
 
     /// Handle an Rattach reply from the server.
     pub fn handle_rattach(&mut self, reply: &[u8]) -> Result<P9Qid> {
-        let (msg_type, _tag, offset) = Plan9Message::parse_header(reply)?;
+        let (msg_type, reply_tag, offset) = Plan9Message::parse_header(reply)?;
+        // SECURITY: reject any reply whose tag does not match the tag sent in
+        // the outstanding Tattach; prevents FID/QID spoofing via forged replies
+        // from an adversarial server (F1).
+        if reply_tag != self.pending_tag {
+            self.state = SessionState::Error;
+            return Err(Error::InvalidArgument);
+        }
         if msg_type == P9MessageType::Rerror {
             self.state = SessionState::Error;
             return Err(Error::IoError);
@@ -972,6 +1000,9 @@ impl Plan9Session {
         let _src_slot = self.fid_table.lookup(src_fid)?;
         let (_dst_slot, dst_fid) = self.fid_table.alloc()?;
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag so handle_rwalk can reject
+        // any reply whose tag does not match this outstanding request (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Twalk, tag);
         self.msg_buf.put_u32(src_fid)?;
         self.msg_buf.put_u32(dst_fid)?;
@@ -992,7 +1023,14 @@ impl Plan9Session {
         reply: &[u8],
         dst_fid: u32,
     ) -> Result<(usize, [P9Qid; MAX_WALK_ELEMS])> {
-        let (msg_type, _tag, mut offset) = Plan9Message::parse_header(reply)?;
+        let (msg_type, reply_tag, mut offset) = Plan9Message::parse_header(reply)?;
+        // SECURITY: reject any reply whose tag does not match the tag sent in
+        // the outstanding Twalk; prevents FID/QID spoofing via forged replies
+        // from an adversarial server (F1).
+        if reply_tag != self.pending_tag {
+            let _ = self.fid_table.release(dst_fid);
+            return Err(Error::InvalidArgument);
+        }
         if msg_type == P9MessageType::Rerror {
             // Walk failed — release the destination FID.
             let _ = self.fid_table.release(dst_fid);
@@ -1059,6 +1097,9 @@ impl Plan9Session {
         }
         let _slot = self.fid_table.lookup(fid)?;
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag so handle_ropen can reject
+        // any reply whose tag does not match this outstanding request (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Topen, tag);
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u8(mode.0)?;
@@ -1081,7 +1122,13 @@ impl Plan9Session {
         fid: u32,
         mode: P9OpenMode,
     ) -> Result<(P9Qid, u32)> {
-        let (msg_type, _tag, offset) = Plan9Message::parse_header(reply)?;
+        let (msg_type, reply_tag, offset) = Plan9Message::parse_header(reply)?;
+        // SECURITY: reject any reply whose tag does not match the tag sent in
+        // the outstanding Topen; prevents FID/QID spoofing via forged replies
+        // from an adversarial server (F1).
+        if reply_tag != self.pending_tag {
+            return Err(Error::InvalidArgument);
+        }
         if msg_type == P9MessageType::Rerror {
             return Err(Error::PermissionDenied);
         }
@@ -1107,7 +1154,17 @@ impl Plan9Session {
         // Pass the absolute offset of the iounit field, not `offset + consumed`
         // (which would be correct here only by coincidence and would fail if the
         // header offset were ever non-zero relative to the QID start).
-        let (iounit, _) = Plan9Message::read_u32(reply, qid_end)?;
+        let (raw_iounit, _) = Plan9Message::read_u32(reply, qid_end)?;
+        // SECURITY: clamp the server-supplied iounit to MAX_IO_SIZE (F3).
+        // An adversarial server can send iounit=0 to cause a divide-by-zero in
+        // a read/write loop, or iounit > MAX_IO_SIZE to cause a buffer overflow.
+        // When iounit is 0, substitute MAX_IO_SIZE (the agreed-upon maximum)
+        // rather than propagating a value that callers cannot safely use.
+        let iounit = if raw_iounit == 0 {
+            MAX_IO_SIZE as u32
+        } else {
+            raw_iounit.min(MAX_IO_SIZE as u32)
+        };
         let slot = self.fid_table.lookup(fid)?;
         let fid_entry = self.fid_table.get_mut(slot)?;
         fid_entry.state = FidState::Open;
@@ -1133,6 +1190,8 @@ impl Plan9Session {
             count
         };
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag for reply validation (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Tread, tag);
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u64(offset)?;
@@ -1159,6 +1218,8 @@ impl Plan9Session {
             data.len()
         };
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag for reply validation (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Twrite, tag);
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u64(offset)?;
@@ -1171,6 +1232,9 @@ impl Plan9Session {
     pub fn build_tclunk(&mut self, fid: u32) -> Result<&[u8]> {
         let _slot = self.fid_table.lookup(fid)?;
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag so handle_rclunk can reject
+        // any reply whose tag does not match this outstanding request (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Tclunk, tag);
         self.msg_buf.put_u32(fid)?;
         Ok(self.msg_buf.finalize())
@@ -1178,7 +1242,13 @@ impl Plan9Session {
 
     /// Handle an Rclunk reply and release the FID.
     pub fn handle_rclunk(&mut self, reply: &[u8], fid: u32) -> Result<()> {
-        let (msg_type, _tag, _offset) = Plan9Message::parse_header(reply)?;
+        let (msg_type, reply_tag, _offset) = Plan9Message::parse_header(reply)?;
+        // SECURITY: reject any reply whose tag does not match the tag sent in
+        // the outstanding Tclunk; prevents FID spoofing via forged replies
+        // from an adversarial server (F1).
+        if reply_tag != self.pending_tag {
+            return Err(Error::InvalidArgument);
+        }
         if msg_type == P9MessageType::Rerror {
             return Err(Error::IoError);
         }
@@ -1192,6 +1262,8 @@ impl Plan9Session {
     pub fn build_tremove(&mut self, fid: u32) -> Result<&[u8]> {
         let _slot = self.fid_table.lookup(fid)?;
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag for reply validation (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Tremove, tag);
         self.msg_buf.put_u32(fid)?;
         Ok(self.msg_buf.finalize())
@@ -1201,6 +1273,8 @@ impl Plan9Session {
     pub fn build_tstat(&mut self, fid: u32) -> Result<&[u8]> {
         let _slot = self.fid_table.lookup(fid)?;
         let tag = self.alloc_tag();
+        // SECURITY: record the client-chosen tag for reply validation (F1).
+        self.pending_tag = tag;
         self.msg_buf.reset(P9MessageType::Tstat, tag);
         self.msg_buf.put_u32(fid)?;
         Ok(self.msg_buf.finalize())

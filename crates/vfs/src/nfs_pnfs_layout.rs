@@ -107,8 +107,24 @@ pub struct LayoutSegment {
 
 impl LayoutSegment {
     /// Returns `true` if this segment overlaps the range `[off, off+len)`.
-    pub const fn overlaps(&self, off: u64, len: u64) -> bool {
-        self.offset < off + len && off < self.offset + self.length
+    ///
+    /// # Security
+    ///
+    /// `offset`, `length`, `off`, and `len` may all be server-supplied wire
+    /// values.  Bare addition of two u64 fields would panic under
+    /// overflow-checks (ring-0 halt) or silently wrap (making non-overlapping
+    /// ranges appear non-overlapping when they actually overflow and DO overlap
+    /// — a use-after-recall vulnerability).  Both end-points are computed with
+    /// `checked_add`, saturating to `u64::MAX` on overflow so that an
+    /// intentionally huge range is treated as extending to the very end of the
+    /// address space rather than wrapping past zero.
+    // SECURITY: checked_add + u64::MAX sentinel prevents overflow-panic and
+    // wrap-around false-negative in the overlap test on attacker-controlled
+    // wire fields (RFC 5661 §12 layout ranges are fully attacker-controlled).
+    pub fn overlaps(&self, off: u64, len: u64) -> bool {
+        let seg_end = self.offset.checked_add(self.length).unwrap_or(u64::MAX);
+        let range_end = off.checked_add(len).unwrap_or(u64::MAX);
+        self.offset < range_end && off < seg_end
     }
 
     /// Returns `true` if the segment can satisfy an access of the given mode.
@@ -308,9 +324,23 @@ impl FileLayout {
 
     /// Adds a layout segment obtained from a successful LAYOUTGET operation.
     ///
-    /// Returns [`Error::OutOfMemory`] if the segment table is full, or
-    /// [`Error::AlreadyExists`] if an identical segment already exists.
+    /// Returns [`Error::OutOfMemory`] if the segment table is full,
+    /// [`Error::AlreadyExists`] if an identical segment already exists, or
+    /// [`Error::InvalidArgument`] if the segment's byte range overflows u64.
     pub fn add_segment(&mut self, seg: LayoutSegment) -> Result<()> {
+        // SECURITY: Reject any server-supplied segment whose end-point would
+        // overflow u64, EXCEPT the RFC 5661 §12 "to end of file" sentinel
+        // (length == u64::MAX), which is a valid in-spec LAYOUTGET grant.
+        // An overflowing non-sentinel range would later cause overlaps() to
+        // return wrong results (treating the segment as non-overlapping with
+        // anything), allowing a layout to remain "valid" after a recall covers
+        // its true byte range — a use-after-recall vulnerability.  overlaps()
+        // saturates the same computation to u64::MAX, so the EOF sentinel is
+        // handled consistently there and must not be rejected here.
+        if seg.length != u64::MAX && seg.offset.checked_add(seg.length).is_none() {
+            return Err(Error::InvalidArgument);
+        }
+
         for s in &self.segments[..self.seg_count] {
             if s.active
                 && s.iomode == seg.iomode

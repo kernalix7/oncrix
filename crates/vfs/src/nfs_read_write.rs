@@ -625,10 +625,34 @@ impl NfsIoEngine {
     /// In a real driver this would parse the XDR reply into `NfsReadResult`.
     /// Here we validate the count and update accounting.
     ///
+    /// # Parameters
+    ///
+    /// - `requested` — the count the **client** originally sent in the READ RPC.
+    ///   Per RFC 1813 §3.3.6 and RFC 7530 §16.23 the server MUST NOT return
+    ///   more data than the client requested.
+    /// - `count` — byte count reported in the server reply.
+    /// - `eof` — whether the server signalled end-of-file.
+    ///
     /// # Errors
     ///
-    /// - `InvalidArgument` if `count > MAX_IO_SIZE`.
-    pub fn process_read_reply(&mut self, count: u32, eof: bool) -> Result<NfsReadResult> {
+    /// - `InvalidArgument` if `count > requested` (server sent more than asked —
+    ///   attacker-controlled wire value; accepting it would cause an OOB write).
+    /// - `InvalidArgument` if `count as usize > MAX_IO_SIZE` (absolute ceiling).
+    pub fn process_read_reply(
+        &mut self,
+        requested: u32,
+        count: u32,
+        eof: bool,
+    ) -> Result<NfsReadResult> {
+        // SECURITY: Both checks must be performed before touching any buffer.
+        // A malicious server can set `count` to any value in the reply.
+        // Accepting count > requested would let the server trick us into
+        // recording (and later copying) more bytes than the caller allocated,
+        // causing an OOB write / ring-0 panic with overflow-checks ON.
+        // Accepting count > MAX_IO_SIZE would overflow NfsReadResult::data.
+        if count > requested {
+            return Err(Error::InvalidArgument);
+        }
         if count as usize > MAX_IO_SIZE {
             return Err(Error::InvalidArgument);
         }
@@ -679,16 +703,54 @@ impl NfsIoEngine {
         Ok(self.io_buf.as_bytes())
     }
 
-    /// Record a WRITE reply: fill in the verifier for the matching writeback.
+    /// Record a WRITE reply: validate the committed count and fill in the
+    /// verifier for the matching writeback slot.
+    ///
+    /// # Parameters
+    ///
+    /// - `fh_bytes` — file handle bytes from the reply (used to correlate).
+    /// - `offset` — file offset from the reply (used to correlate).
+    /// - `committed_count` — byte count the **server** claims to have written,
+    ///   taken directly from the wire reply.
+    /// - `verf` — write verifier returned by the server.
     ///
     /// # Errors
     ///
-    /// - `NotFound` if no matching writeback entry exists.
-    pub fn process_write_reply(&mut self, fh_bytes: &[u8], offset: u64, verf: u64) -> Result<()> {
+    /// - `NotFound` if no matching writeback entry exists for `(fh, offset)`.
+    /// - `IoError` if `committed_count == 0` (server wrote nothing, treat as
+    ///   an I/O error to force a retry rather than silently losing data) or if
+    ///   `committed_count > writeback[pos].count` (server claims to have written
+    ///   more bytes than the client sent — impossible for an honest server;
+    ///   accepting the inflated value would corrupt our dirty-range accounting).
+    pub fn process_write_reply(
+        &mut self,
+        fh_bytes: &[u8],
+        offset: u64,
+        committed_count: u32,
+        verf: u64,
+    ) -> Result<()> {
         let pos = self.writeback[..MAX_WRITEBACK]
             .iter()
             .position(|w| w.in_use && w.offset == offset && w.fh.as_bytes() == fh_bytes)
             .ok_or(Error::NotFound)?;
+
+        // SECURITY: Validate the server-supplied committed_count against the
+        // client-chosen slot count before updating any state.
+        //
+        // committed_count == 0 means the server wrote nothing; surfacing this
+        // as IoError forces an explicit retry rather than silently losing the
+        // dirty write (silent data loss).
+        //
+        // committed_count > writeback[pos].count is impossible for an honest
+        // server (it cannot have written more than it received).  Accepting an
+        // inflated value from an untrusted/malicious server would corrupt the
+        // dirty-range tracking used by the COMMIT path, potentially causing
+        // us to acknowledge data that was never actually persisted.
+        let sent = self.writeback[pos].count;
+        if committed_count == 0 || committed_count > sent {
+            return Err(Error::IoError);
+        }
+
         self.writeback[pos].verf = verf;
         Ok(())
     }

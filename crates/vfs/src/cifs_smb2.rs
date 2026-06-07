@@ -100,12 +100,22 @@ pub struct PendingRequest {
     /// The command that was sent; a response with a different command is rejected
     /// (cross-type confusion attack).
     pub command: u16,
+    /// The TreeId of the session that sent this request.
+    ///
+    /// SECURITY: a cross-session reply injection attack can forge a response whose
+    /// MessageId matches an in-flight entry but whose TreeId/SessionId belong to a
+    /// different session.  Storing and verifying these fields closes that attack.
+    pub tree_id: u32,
+    /// The SessionId of the session that sent this request.
+    pub session_id: u64,
 }
 
 impl PendingRequest {
     const EMPTY: Self = Self {
         message_id: 0,
         command: 0,
+        tree_id: 0,
+        session_id: 0,
     };
 }
 
@@ -129,8 +139,18 @@ impl PendingRequestTable {
     }
 
     /// Register an outgoing request.  Returns `Busy` if the table is full or
-    /// `AlreadyExists` if `message_id == 0` (reserved as "empty" sentinel).
-    pub fn register(&mut self, message_id: u64, command: u16) -> Result<()> {
+    /// `InvalidArgument` if `message_id == 0` (reserved as "empty" sentinel).
+    ///
+    /// `tree_id` and `session_id` are the client-side values from the request
+    /// header; they are stored and compared against the response header in
+    /// [`consume`] to detect cross-session reply injection.
+    pub fn register(
+        &mut self,
+        message_id: u64,
+        command: u16,
+        tree_id: u32,
+        session_id: u64,
+    ) -> Result<()> {
         if message_id == 0 {
             // SECURITY: MessageId 0 is the empty-slot sentinel; a server that
             // echoes it back would match every free slot.  Reject at send time.
@@ -141,6 +161,8 @@ impl PendingRequestTable {
                 *slot = PendingRequest {
                     message_id,
                     command,
+                    tree_id,
+                    session_id,
                 };
                 return Ok(());
             }
@@ -154,12 +176,20 @@ impl PendingRequestTable {
     /// 1. `message_id` is currently pending (reject unknown/stale).
     /// 2. `response_command` matches the stored request command (reject
     ///    cross-type confusion).
-    /// 3. Marks the slot empty so a replayed response is rejected (duplicate
+    /// 3. `response_tree_id` and `response_session_id` match the values stored
+    ///    at [`register`] time (reject cross-session reply injection).
+    /// 4. Marks the slot empty so a replayed response is rejected (duplicate
     ///    rejection).
     ///
     /// Returns `NotFound` when the id is unknown/stale, `InvalidArgument` when
-    /// the command does not match.
-    pub fn consume(&mut self, message_id: u64, response_command: u16) -> Result<()> {
+    /// command, TreeId, or SessionId do not match.
+    pub fn consume(
+        &mut self,
+        message_id: u64,
+        response_command: u16,
+        response_tree_id: u32,
+        response_session_id: u64,
+    ) -> Result<()> {
         // SECURITY: message_id 0 is the EMPTY-slot sentinel (PendingRequest::EMPTY
         // is { message_id: 0, command: 0 == Negotiate }); a response carrying
         // message_id==0 would otherwise spuriously match an unused slot. A real
@@ -172,6 +202,14 @@ impl PendingRequestTable {
                 if slot.command != response_command {
                     // SECURITY: response command does not match the stored
                     // request command — possible cross-type confusion; reject.
+                    return Err(Error::InvalidArgument);
+                }
+                // SECURITY: cross-session reply injection — a rogue server could
+                // send a response whose MessageId matches an in-flight entry but
+                // whose TreeId or SessionId belongs to a different tree/session.
+                // Reject any mismatch so a server cannot read or write another
+                // session's file handles by forging the correlation field alone.
+                if slot.tree_id != response_tree_id || slot.session_id != response_session_id {
                     return Err(Error::InvalidArgument);
                 }
                 // Mark consumed — any future reply with the same id is stale.
@@ -321,23 +359,25 @@ pub fn encode_header(hdr: &Smb2Header, dst: &mut [u8]) -> Result<()> {
 ///
 /// - `src` — raw received bytes; must be at least [`SMB2_HEADER_SIZE`] long.
 /// - `signing_required` — `true` when the session requires message signing
-///   (negotiated or forced by mount options).  When `true` and the server sets
-///   `SMB2_FLAGS_SIGNED`, this function **rejects the message** because
-///   HMAC-SHA256/AES-CMAC verification is not available at this layer.
+///   (negotiated or forced by mount options).
 ///
-/// # Security
+/// # Security — signing fail-closed (F1)
 ///
-/// **Signing fail-closed**: if `signing_required` is set and the inbound
-/// message carries `SMB2_FLAGS_SIGNED`, we return `Err(PermissionDenied)`.
-/// This is intentionally strict: accepting an unverified signature would allow
-/// a MitM or rogue server to forge arbitrary SMB2 responses.
+/// When `signing_required` is `true`:
 ///
-/// // SECURITY: Real HMAC-SHA256 (SMB ≤ 3.0) or AES-CMAC (SMB 3.x) verification
-/// // must be wired here before this guard is relaxed.  The key exchange happens
-/// // during SESSION_SETUP; the session signing key must be passed in alongside
-/// // `signing_required`.  Until that plumbing exists, this function rejects every
-/// // signed message when `signing_required` is true, which is the correct
-/// // fail-closed posture for an attacker-controlled server.
+/// - A response that **lacks** `SMB2_FLAGS_SIGNED` is rejected immediately
+///   (`Err(PermissionDenied)`).  A MitM or rogue server that strips the
+///   SIGNED flag to bypass verification must not succeed.
+/// - A response that **has** `SMB2_FLAGS_SIGNED` is currently also rejected
+///   because HMAC-SHA256/AES-CMAC verification is not wired at this layer.
+///   This is the correct fail-closed posture until the crypto path is ready.
+///
+/// // SECURITY TODO: wire real HMAC-SHA256 (SMB ≤ 3.0) or AES-CMAC (SMB 3.x)
+/// // verification here.  The session signing key becomes available after
+/// // SESSION_SETUP completes and must be passed alongside `signing_required`.
+/// // Steps: zero the 16-byte signature field in a scratch copy of `src`,
+/// // compute HMAC-SHA256/AES-CMAC over the full message, compare to
+/// // `src[48..64]`.  Only then remove the Err below for the signed path.
 ///
 /// # Pending-request correlation
 ///
@@ -354,14 +394,29 @@ pub fn decode_header(src: &[u8], signing_required: bool) -> Result<Smb2Header> {
     }
     let flags = u32::from_le_bytes(src[16..20].try_into().map_err(|_| Error::InvalidArgument)?);
 
-    // SECURITY: if the session requires signing and the SIGNED flag is present,
-    // we must verify HMAC-SHA256 or AES-CMAC over the full message with the
-    // signature field zeroed.  That primitive is not available at this layer, so
-    // we fail closed: reject the message.  An attacker-controlled server that
-    // sets SMB2_FLAGS_SIGNED but provides a forged signature must not pass.
-    if signing_required && (flags & SMB2_FLAGS_SIGNED != 0) {
-        // SECURITY: wiring point — replace this Err with actual
-        // HMAC-SHA256/AES-CMAC verification when the session key is available.
+    if signing_required {
+        // SECURITY (F1): fail-closed signing guard — two cases:
+        //
+        // 1. SMB2_FLAGS_SIGNED is ABSENT: the server (or MitM) did not sign
+        //    the response.  When signing is required every response must carry
+        //    the flag; a stripped flag is a protocol violation and a forgery
+        //    vector.  Reject unconditionally.
+        //
+        // 2. SMB2_FLAGS_SIGNED is PRESENT: the response claims to be signed.
+        //    We cannot verify the HMAC-SHA256/AES-CMAC yet (session key not
+        //    wired), so we still reject.  See SECURITY TODO in the doc-comment
+        //    above for the steps needed to relax this branch.
+        //
+        // Both cases return PermissionDenied so neither an unsigned nor an
+        // unverifiably-signed response can bypass the signing gate.
+        if flags & SMB2_FLAGS_SIGNED == 0 {
+            // SECURITY: response is missing SMB2_FLAGS_SIGNED while signing is
+            // required — MitM/rogue server stripped the signature flag.  Reject.
+            return Err(Error::PermissionDenied);
+        }
+        // SECURITY TODO: replace this Err with actual HMAC-SHA256/AES-CMAC
+        // verification when the session signing key is available.  Until then,
+        // keep rejecting to avoid accepting a forged (but flagged) response.
         return Err(Error::PermissionDenied);
     }
 
@@ -370,6 +425,23 @@ pub fn decode_header(src: &[u8], signing_required: bool) -> Result<Smb2Header> {
     let credits = u16::from_le_bytes(src[14..16].try_into().map_err(|_| Error::InvalidArgument)?);
     let next_command =
         u32::from_le_bytes(src[20..24].try_into().map_err(|_| Error::InvalidArgument)?);
+
+    // SECURITY (F6): next_command is a server-supplied compound-chain offset.
+    // An attacker can set it to a value >= src.len() to trick a caller that
+    // naively does `&src[next_command as usize..]` into an OOB index (ring-0
+    // panic).  Also require 8-byte alignment per MS-SMB2 §2.2.1.1.
+    if next_command != 0 {
+        if (next_command as usize) >= src.len() {
+            // SECURITY: next_command offset exceeds buffer length — reject to
+            // prevent an out-of-bounds slice index in the compound-chain walker.
+            return Err(Error::InvalidArgument);
+        }
+        if next_command % 8 != 0 {
+            // SECURITY: next_command is not 8-byte aligned per MS-SMB2 §2.2.1.1.
+            return Err(Error::InvalidArgument);
+        }
+    }
+
     let message_id =
         u64::from_le_bytes(src[24..32].try_into().map_err(|_| Error::InvalidArgument)?);
     let process_id =
@@ -464,38 +536,108 @@ pub struct NegotiateResponse {
     pub server_start_time: u64,
 }
 
+/// Supported SMB2 dialect values that the client is willing to accept.
+///
+/// SECURITY (F4): the server MUST NOT return a dialect outside this set;
+/// accepting an unlisted value is a downgrade attack.
+const SUPPORTED_DIALECTS: [u16; 5] = [
+    SMB202_DIALECT,
+    SMB210_DIALECT,
+    SMB300_DIALECT,
+    SMB302_DIALECT,
+    SMB311_DIALECT,
+];
+
+/// NT STATUS success code (STATUS_SUCCESS).
+pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+
 impl NegotiateResponse {
     /// Parse from wire bytes (after SMB2 header).
+    ///
+    /// `status` must be the `Smb2Header::status` field from the same response;
+    /// a non-zero status indicates an error body and parsing a success layout
+    /// over it yields attacker-controlled field values.
+    ///
+    /// MS-SMB2 §2.2.4 NEGOTIATE Response body layout (offsets within body):
+    ///
+    /// ```text
+    /// [0..2]   StructureSize (65)
+    /// [2..4]   SecurityMode
+    /// [4..6]   DialectRevision
+    /// [6..8]   NegotiateContextCount / Reserved
+    /// [8..24]  ServerGuid (16 bytes)
+    /// [24..28] Capabilities
+    /// [28..32] MaxTransactSize
+    /// [32..36] MaxReadSize
+    /// [36..40] MaxWriteSize
+    /// [40..48] SystemTime
+    /// [48..56] ServerStartTime
+    /// ```
     ///
     /// The three server-supplied I/O size fields (`max_transact_size`,
     /// `max_read_size`, `max_write_size`) are clamped to [`SMB2_MAX_IO_SIZE`]
     /// (16 MiB) at parse time.  A rogue server can return `u32::MAX`; callers
     /// that later compute `header_offset + max_read_size` would overflow
     /// without this guard.
-    pub fn parse(buf: &[u8]) -> Result<Self> {
+    pub fn parse(buf: &[u8], status: u32) -> Result<Self> {
+        // SECURITY (F7): parse the success body only when the header status is
+        // STATUS_SUCCESS (0).  A non-zero status means the server returned an
+        // error body; parsing the success layout over it allows a forged server
+        // to influence dialect_revision and I/O size fields through the error
+        // body bytes.
+        if status != STATUS_SUCCESS {
+            return Err(Error::IoError);
+        }
+        // SECURITY (F3): the body must be at least 56 bytes to cover
+        // ServerStartTime at [48..56].  The previous guard of 64 was correct
+        // for size but was applied to the wrong fields — the actual size fields
+        // live at [24..40], well within the 56-byte minimum.  Keep 64 as a
+        // conservative lower bound (the spec body is 65 bytes without the
+        // security blob, so 64 is a safe minimum for all fields we read).
         if buf.len() < 64 {
             return Err(Error::InvalidArgument);
         }
+        let dialect_revision =
+            u16::from_le_bytes(buf[4..6].try_into().map_err(|_| Error::InvalidArgument)?);
+        // SECURITY (F4): validate dialect_revision against the client's
+        // supported-dialect set to prevent a downgrade attack.  A rogue server
+        // that returns an unsupported dialect (e.g. 0x0200 or a future value we
+        // have not vetted) must be rejected.
+        // NOTE: the caller should additionally cross-check dialect_revision
+        // against the exact set sent in the NEGOTIATE request if that list is
+        // narrower than SUPPORTED_DIALECTS (e.g. when the mount option restricts
+        // the minimum dialect).
+        if !SUPPORTED_DIALECTS.contains(&dialect_revision) {
+            // SECURITY: server proposed a dialect not in the client's supported
+            // set — possible downgrade attack.  Reject.
+            return Err(Error::InvalidArgument);
+        }
         Ok(Self {
-            dialect_revision: u16::from_le_bytes(
-                buf[4..6].try_into().map_err(|_| Error::InvalidArgument)?,
-            ),
+            dialect_revision,
             security_mode: u16::from_le_bytes(
                 buf[2..4].try_into().map_err(|_| Error::InvalidArgument)?,
             ),
+            // SECURITY (F3): capabilities is at [24..28], not [12..16].
+            // [12..16] falls inside ServerGuid (bytes 4–8 of the 16-byte GUID),
+            // so reading capabilities from there yields attacker-controlled GUID
+            // bytes as a capability mask.
             capabilities: u32::from_le_bytes(
-                buf[12..16].try_into().map_err(|_| Error::InvalidArgument)?,
-            ),
-            max_transact_size: u32::from_le_bytes(
-                buf[20..24].try_into().map_err(|_| Error::InvalidArgument)?,
-            )
-            .min(SMB2_MAX_IO_SIZE),
-            max_read_size: u32::from_le_bytes(
                 buf[24..28].try_into().map_err(|_| Error::InvalidArgument)?,
+            ),
+            // SECURITY (F3): max_transact_size is at [28..32], not [20..24].
+            // [20..24] is ServerGuid bytes 12–16.
+            max_transact_size: u32::from_le_bytes(
+                buf[28..32].try_into().map_err(|_| Error::InvalidArgument)?,
             )
             .min(SMB2_MAX_IO_SIZE),
+            // SECURITY (F3): max_read_size is at [32..36], not [24..28].
+            max_read_size: u32::from_le_bytes(
+                buf[32..36].try_into().map_err(|_| Error::InvalidArgument)?,
+            )
+            .min(SMB2_MAX_IO_SIZE),
+            // SECURITY (F3): max_write_size is at [36..40], not [28..32].
             max_write_size: u32::from_le_bytes(
-                buf[28..32].try_into().map_err(|_| Error::InvalidArgument)?,
+                buf[36..40].try_into().map_err(|_| Error::InvalidArgument)?,
             )
             .min(SMB2_MAX_IO_SIZE),
             system_time: u64::from_le_bytes(
@@ -544,7 +686,18 @@ pub struct CreateResponse {
 
 impl CreateResponse {
     /// Parse from wire bytes (after SMB2 header).
-    pub fn parse(buf: &[u8]) -> Result<Self> {
+    ///
+    /// `status` must be the `Smb2Header::status` field from the same response.
+    ///
+    /// SECURITY (F7): a non-zero status means the server returned an error body.
+    /// Parsing the success layout over an error body allows a forged server to
+    /// supply arbitrary FileId values (file_id_persistent / file_id_volatile)
+    /// through the error body bytes, which the caller would then use for
+    /// subsequent READ/WRITE/CLOSE requests.  Reject before touching body bytes.
+    pub fn parse(buf: &[u8], status: u32) -> Result<Self> {
+        if status != STATUS_SUCCESS {
+            return Err(Error::IoError);
+        }
         if buf.len() < 88 {
             return Err(Error::InvalidArgument);
         }
@@ -611,12 +764,24 @@ pub struct WriteResponse {
 impl WriteResponse {
     /// Parse from wire bytes (after SMB2 header).
     ///
+    /// `status` must be the `Smb2Header::status` field from the same response.
+    ///
     /// MS-SMB2 §2.2.22: WRITE response body is 16 bytes minimum:
     /// `[0..2]` StructureSize (17), `[2..4]` Reserved, `[4..8]` Count,
     /// `[8..12]` Remaining, `[12..16]` WriteChannelInfoOffset/Length.
     /// A guard of 8 would allow a 8-11 byte body to pass while the code
     /// then indexes `buf[8..12]`, causing a ring-0 panic.
-    pub fn parse(buf: &[u8]) -> Result<Self> {
+    ///
+    /// SECURITY (F7): a non-zero status means the server returned an error body.
+    /// Parsing the success layout over an error body allows a forged server to
+    /// supply an inflated `count` value (more bytes written than requested),
+    /// which callers may use to advance a file-offset cursor beyond the actual
+    /// write, corrupting subsequent I/O positions.  Reject before body parse.
+    pub fn parse(buf: &[u8], status: u32) -> Result<Self> {
+        // SECURITY (F7): reject non-success status before parsing success body.
+        if status != STATUS_SUCCESS {
+            return Err(Error::IoError);
+        }
         if buf.len() < 16 {
             return Err(Error::InvalidArgument);
         }
