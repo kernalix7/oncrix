@@ -507,17 +507,29 @@ impl Dwc3Controller {
     pub fn process_events(&mut self) -> u32 {
         // SAFETY: GEVNTCOUNT is a valid DWC3 register.
         let count = unsafe { read_mmio32(self.mmio_base, DWC3_GEVNTCOUNT) };
-        let events = count / 4; // Each event is 4 bytes.
+        // SECURITY: GEVNTCOUNT bits[31:16] are reserved/undefined; masking to bits[15:0]
+        // prevents a device-supplied value from inflating the event count to ~1 billion
+        // iterations, which would hang the ring-0 interrupt handler (no fault fixup).
+        // After masking, the maximum event count is 0xFFFF/4 = 16383, matching the
+        // DWC3 EVENT_BUF_SIZE/4 spec maximum.
+        let byte_count = count & 0xFFFF;
+        let events = byte_count / 4; // Each event is 4 bytes.
 
         for _ in 0..events {
             self.event_read_ptr = (self.event_read_ptr + 4) % EVENT_BUF_SIZE;
-            self.stats.events_processed += 1;
+            // SECURITY: saturating_add so a long-running counter cannot panic on
+            // overflow under overflow-checks.
+            self.stats.events_processed = self.stats.events_processed.saturating_add(1);
         }
 
         if events > 0 {
-            // Acknowledge by writing the byte count consumed.
+            // SECURITY: acknowledge exactly the bytes the read pointer advanced
+            // (events * 4), not the raw masked byte_count. A non-multiple-of-4
+            // byte_count would otherwise ack more bytes than were consumed and
+            // desync the event ring. events <= 16383 so events*4 cannot overflow.
+            let consumed = events * 4;
             // SAFETY: GEVNTCOUNT is a valid register.
-            unsafe { write_mmio32(self.mmio_base, DWC3_GEVNTCOUNT, count) };
+            unsafe { write_mmio32(self.mmio_base, DWC3_GEVNTCOUNT, consumed) };
         }
 
         events

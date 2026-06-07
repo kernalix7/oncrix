@@ -288,8 +288,23 @@ impl ScsiDisk {
         send_command(&cap10_cdb, &mut cap_buf)?;
         let last_lba = u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]);
         let block_size = u32::from_be_bytes([cap_buf[4], cap_buf[5], cap_buf[6], cap_buf[7]]);
+
+        // SECURITY: last_lba == 0xFFFF_FFFF is the SBC sentinel meaning "device > 2 TiB;
+        // issue READ CAPACITY(16) instead".  Accepting it verbatim stores a wildly inflated
+        // capacity and may bypass later bounds checks.
+        if last_lba == 0xFFFF_FFFF {
+            return Err(Error::IoError);
+        }
+
         self.last_lba = last_lba as u64;
-        self.block_size = block_size;
+        // SECURITY: block_size == 0 from the device would cause divide-by-zero in ring 0
+        // (e.g. capacity_bytes() calls total_blocks() which is last_lba+1 but callers may
+        // divide by block_size).  Fall back to the standard block size.
+        self.block_size = if block_size == 0 {
+            SCSI_BLOCK_SIZE
+        } else {
+            block_size
+        };
 
         self.initialized = true;
         Ok(())
@@ -297,12 +312,17 @@ impl ScsiDisk {
 
     /// Returns the total capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
-        (self.last_lba + 1).saturating_mul(self.block_size as u64)
+        // SECURITY: last_lba is a pub field; probe() bounds it but a caller can
+        // set it directly, so last_lba == u64::MAX would panic on `+ 1`. Saturate.
+        self.last_lba
+            .saturating_add(1)
+            .saturating_mul(self.block_size as u64)
     }
 
     /// Returns the total number of blocks.
     pub fn total_blocks(&self) -> u64 {
-        self.last_lba + 1
+        // SECURITY: saturating_add — last_lba is pub and could be u64::MAX.
+        self.last_lba.saturating_add(1)
     }
 
     /// Builds a READ(10) CDB for `lba` and `count` blocks.

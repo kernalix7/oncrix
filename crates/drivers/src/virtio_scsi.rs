@@ -629,15 +629,46 @@ impl VirtioScsi {
 
     /// Return the sense data from the last completed request at `slot`.
     ///
-    /// Returns a slice of up to `MAX_SENSE_SIZE` bytes; the valid length
-    /// is given by `VirtioScsiRespHeader::sense_len`.
-    pub fn sense_data(&self, slot: usize) -> Option<(&[u8], u32)> {
+    /// Returns a slice whose length is already clamped to [`MAX_SENSE_SIZE`],
+    /// so callers can index or copy it directly without any further bounds
+    /// arithmetic on the raw device-supplied length.
+    ///
+    /// To detect whether the device reported more sense bytes than fit in the
+    /// buffer (i.e. truncation), use [`sense_len_raw`] alongside this method.
+    ///
+    /// [`sense_len_raw`]: VirtioScsi::sense_len_raw
+    // SECURITY: `resp.sense_len` is device-DMA-written and therefore
+    // attacker-controlled.  We clamp it to MAX_SENSE_SIZE before slicing and
+    // return ONLY the clamped slice — never the raw length — so callers cannot
+    // accidentally use the raw value as a copy count and walk past the buffer.
+    pub fn sense_data(&self, slot: usize) -> Option<&[u8]> {
         if slot >= MAX_INFLIGHT {
             return None;
         }
         let resp = &self.resp_headers[slot];
+        // SECURITY: clamp device-controlled sense_len to the actual buffer
+        // length; the slice enforces the bound at the type level.
         let len = (resp.sense_len as usize).min(MAX_SENSE_SIZE);
-        Some((&resp.sense[..len], resp.sense_len))
+        Some(&resp.sense[..len])
+    }
+
+    /// Return the raw (device-reported) sense length for `slot`.
+    ///
+    /// This value is device-DMA-written and may exceed [`MAX_SENSE_SIZE`].
+    /// It is exposed here **only** for callers that need to detect truncation
+    /// (i.e. `sense_len_raw(slot).unwrap_or(0) as usize > sense_data(slot).map_or(0, |s| s.len())`).
+    /// Never use this value as a buffer index or copy count — use
+    /// [`sense_data`] for that.
+    ///
+    /// [`sense_data`]: VirtioScsi::sense_data
+    // SECURITY: raw device length — provided separately so it cannot be
+    // confused for a safe buffer index.  Callers must not use it to subscript
+    // any slice; use sense_data() for safe bounded access.
+    pub fn sense_len_raw(&self, slot: usize) -> Option<u32> {
+        if slot >= MAX_INFLIGHT {
+            return None;
+        }
+        Some(self.resp_headers[slot].sense_len)
     }
 
     /// Return device configuration.
