@@ -185,6 +185,11 @@ pub struct VirtioNet {
     tx_hdr: VirtioNetHeader,
     /// Receive header (written by device on receive).
     pub rx_hdr: VirtioNetHeader,
+    /// Receive data buffer (DMA target for frame bytes after the header).
+    ///
+    /// The device writes frame data here via the second RX descriptor.
+    /// Sized to the maximum supported Ethernet payload + margin.
+    rx_buf: [u8; MAX_RX_BUF_SIZE],
     /// Whether the device has been initialized.
     initialized: bool,
 }
@@ -203,6 +208,7 @@ impl VirtioNet {
             },
             tx_hdr: VirtioNetHeader::zeroed(),
             rx_hdr: VirtioNetHeader::zeroed(),
+            rx_buf: [0u8; MAX_RX_BUF_SIZE],
             initialized: false,
         }
     }
@@ -249,6 +255,11 @@ impl VirtioNet {
         // Step 6a: Set up RX queue (queue 0).
         self.rx.init();
         self.setup_queue(RX_QUEUE, &self.rx)?;
+        // Post one receive buffer so the device has somewhere to DMA
+        // incoming frames.  Two descriptors: hdr (device-writable) →
+        // data (device-writable).  We do this after setup_queue so
+        // QUEUE_READY is already set.
+        self.post_rx_buf()?;
 
         // Step 6b: Set up TX queue (queue 1).
         self.tx.init();
@@ -300,6 +311,42 @@ impl VirtioNet {
             .write32(virtio::mmio_reg::QUEUE_USED_HIGH, (used_addr >> 32) as u32);
 
         self.mmio.write32(virtio::mmio_reg::QUEUE_READY, 1);
+        Ok(())
+    }
+
+    /// Post one receive buffer to the RX virtqueue.
+    ///
+    /// Sets up a two-descriptor chain:
+    /// - Descriptor 0: points at `rx_hdr` (device-writable, NEXT flag)
+    /// - Descriptor 1: points at `rx_buf` (device-writable, no NEXT)
+    ///
+    /// Both descriptors carry the `WRITE` flag so the device can DMA
+    /// data into them. After `receive()` drains a completed entry this
+    /// helper is called again to keep one buffer posted.
+    fn post_rx_buf(&mut self) -> Result<()> {
+        let d_hdr = self.rx.alloc_desc()?;
+        let d_data = match self.rx.alloc_desc() {
+            Ok(d) => d,
+            Err(e) => {
+                self.rx.free_desc(d_hdr);
+                return Err(e);
+            }
+        };
+
+        // Descriptor 0: virtio-net header (device-writable).
+        self.rx.desc[d_hdr as usize].addr = &self.rx_hdr as *const VirtioNetHeader as u64;
+        self.rx.desc[d_hdr as usize].len = NET_HDR_SIZE as u32;
+        self.rx.desc[d_hdr as usize].flags = desc_flags::NEXT | desc_flags::WRITE;
+        self.rx.desc[d_hdr as usize].next = d_data;
+
+        // Descriptor 1: packet data buffer (device-writable).
+        self.rx.desc[d_data as usize].addr = self.rx_buf.as_mut_ptr() as u64;
+        self.rx.desc[d_data as usize].len = MAX_RX_BUF_SIZE as u32;
+        self.rx.desc[d_data as usize].flags = desc_flags::WRITE;
+        self.rx.desc[d_data as usize].next = 0;
+
+        self.rx.push_avail(d_hdr);
+        self.mmio.notify(RX_QUEUE);
         Ok(())
     }
 
@@ -384,11 +431,19 @@ impl VirtioNet {
     ///
     /// If a packet has been received, copies the Ethernet frame data
     /// (without the virtio-net header) into `buf` and returns the
-    /// number of bytes written. Returns `Ok(0)` if no packet is
-    /// available.
+    /// number of bytes actually copied. Returns `Ok(0)` if no packet
+    /// is available.
     ///
     /// `buf` should be at least [`MAX_RX_BUF_SIZE`] bytes to avoid
-    /// truncation.
+    /// truncation of large frames.
+    ///
+    /// # Security
+    ///
+    /// `total_len` originates from device DMA-writable memory and is
+    /// therefore attacker-controlled. It is clamped to `MAX_RX_BUF_SIZE`
+    /// before any arithmetic and the copy length is further clamped to
+    /// `buf.len()` so the returned count never exceeds what was actually
+    /// written into the caller's buffer.
     pub fn receive(&mut self, buf: &mut [u8]) -> Result<usize> {
         if !self.initialized {
             return Err(Error::IoError);
@@ -412,21 +467,25 @@ impl VirtioNet {
             let d_next = self.rx.desc[desc_head as usize].next;
             self.rx.free_desc(d_next);
             self.rx.free_desc(desc_head);
+            // Re-post the receive buffer so future receives can proceed.
+            let _ = self.post_rx_buf();
             return Err(Error::IoError);
         }
 
         // The device wrote: virtio-net header + frame data.
-        // Strip the header to give the caller only the frame.
+        // Strip the header to give the caller only the Ethernet frame.
         let frame_len = (total_len as usize).saturating_sub(NET_HDR_SIZE);
 
+        // Clamp to the caller buffer; the returned count must never
+        // exceed what we actually copy into `buf`.
         let copy_len = frame_len.min(buf.len());
 
-        // The frame data starts after the header in the receive buffer.
-        // Since we set up the RX descriptor to point at rx_hdr, the
-        // frame data is in the second descriptor's buffer. However,
-        // we only know the total length here — the caller's buffer
-        // will contain the data if they posted it via the RX queue.
-        // For now, report the length so upper layers can process it.
+        // Copy frame bytes from rx_buf (the DMA target for the second
+        // descriptor) into the caller's buffer.
+        // Both bounds are validated above: copy_len <= frame_len <=
+        // total_len - NET_HDR_SIZE <= MAX_RX_BUF_SIZE - NET_HDR_SIZE,
+        // and copy_len <= buf.len().
+        buf[..copy_len].copy_from_slice(&self.rx_buf[..copy_len]);
 
         // Free the descriptor chain.
         // `desc_head` was validated by pop_used; free_desc guards its
@@ -434,6 +493,9 @@ impl VirtioNet {
         let d_next = self.rx.desc[desc_head as usize].next;
         self.rx.free_desc(d_next);
         self.rx.free_desc(desc_head);
+
+        // Re-post the receive buffer for the next packet.
+        let _ = self.post_rx_buf();
 
         Ok(copy_len)
     }

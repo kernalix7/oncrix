@@ -412,8 +412,24 @@ impl VirtioFs {
     ///
     /// The driver calls this when the device returns a used buffer
     /// from the virtqueue, providing the parsed response.
+    ///
+    /// # Security
+    ///
+    /// `response.data_len` is a device-supplied value and must be
+    /// clamped to `MAX_DATA_SIZE` before storing. A misbehaving or
+    /// malicious device could report a `data_len` larger than the
+    /// backing `data` array; using it unclamped to size a later
+    /// copy would cause a ring-0 panic (overflow-checks=on) or an
+    /// out-of-bounds access.
     pub fn complete_response(&mut self, unique: u64, response: VirtioFsResponse) -> Result<()> {
         if !self.initialized {
+            return Err(Error::IoError);
+        }
+
+        // Clamp device-supplied data_len to the backing buffer size.
+        // A value exceeding MAX_DATA_SIZE is either a device bug or an
+        // attempt to cause an OOB copy; reject it to keep the kernel safe.
+        if response.data_len > MAX_DATA_SIZE {
             return Err(Error::IoError);
         }
 

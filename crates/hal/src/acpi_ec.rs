@@ -378,13 +378,26 @@ impl AcpiEc {
             return Err(Error::Busy);
         }
         self.transaction_active = true;
+
+        // SECURITY: release the transaction lock on EVERY return path.
+        // `do_query` may early-return `Error::Busy` on an IBF/OBF poll
+        // timeout; if the lock were not cleared here the EC would stay
+        // permanently locked and every future EC op would block (DoS).
+        let result = self.do_query();
+        self.transaction_active = false;
+        if let Ok(code) = result {
+            if code != 0 {
+                self.query_events += 1;
+            }
+        }
+        result
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn do_query(&mut self) -> Result<u8> {
         self.wait_ibf_clear()?;
         self.write_command(EcCommand::Query.opcode());
         let code = self.wait_obf_set()?;
-        self.transaction_active = false;
-        if code != 0 {
-            self.query_events += 1;
-        }
         Ok(code)
     }
 

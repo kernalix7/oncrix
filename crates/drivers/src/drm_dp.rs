@@ -416,7 +416,8 @@ impl DpAuxController {
     /// header and payload, then reads back the reply status.
     /// In a real driver this drives the AUX encoder MMIO registers.
     ///
-    /// Returns the number of bytes transferred.
+    /// Returns the number of bytes transferred, clamped to
+    /// [`AUX_DATA_MAX`] regardless of what the sink reports.
     ///
     /// # Errors
     ///
@@ -432,8 +433,13 @@ impl DpAuxController {
         // to the controller MMIO registers and poll the reply status.
         // The reply codes are: ACK (0x00), NACK (0x01), DEFER (0x02).
         // We model a successful transfer here.
-        let _ = msg;
-        Ok(msg.size as usize)
+        //
+        // SAFETY (bounds): The sink-supplied reply length is clamped to
+        // AUX_DATA_MAX (16) so that callers can safely index `[..transferred]`
+        // into a fixed-size 16-byte buffer without an OOB panic.
+        let raw_size = msg.size as usize;
+        let transferred = raw_size.min(AUX_DATA_MAX);
+        Ok(transferred)
     }
 
     // ── DPCD access ───────────────────────────────────────────
@@ -591,10 +597,15 @@ impl DpAuxController {
     /// Writes training pattern 1, sets link parameters, and polls
     /// lane status until CR_DONE is set in all active lanes.
     ///
+    /// DEFER responses from the sink are counted against the retry budget
+    /// (kernel constant [`CR_MAX_RETRIES`]) so that a sink that always
+    /// DEFERs cannot loop the kernel indefinitely.
+    ///
     /// # Errors
     ///
     /// - [`Error::NotFound`] if `ch` is invalid.
-    /// - [`Error::IoError`] if CR fails after max retries.
+    /// - [`Error::IoError`] if CR fails after max retries or a
+    ///   non-recoverable AUX error occurs.
     pub fn clock_recovery_phase(&mut self, ch: usize, cfg: &DpLinkConfig) -> Result<()> {
         if ch >= self.channel_count || !self.channels[ch].active {
             return Err(Error::NotFound);
@@ -614,8 +625,34 @@ impl DpAuxController {
 
         let mut retries = CR_MAX_RETRIES;
         loop {
-            let status01 = self.read_dpcd_byte(ch, DPCD_LANE01_STATUS)?;
-            let status23 = self.read_dpcd_byte(ch, DPCD_LANE23_STATUS)?;
+            // Count DEFER (Busy) against the retry budget so a misbehaving
+            // sink that perpetually DEFERs cannot create an unbounded loop.
+            let status01 = match self.read_dpcd_byte(ch, DPCD_LANE01_STATUS) {
+                Ok(v) => v,
+                Err(Error::Busy) => {
+                    self.stats.defers = self.stats.defers.saturating_add(1);
+                    retries = retries.saturating_sub(1);
+                    if retries == 0 {
+                        self.channels[ch].training_state = DpTrainingState::Failed;
+                        return Err(Error::IoError);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let status23 = match self.read_dpcd_byte(ch, DPCD_LANE23_STATUS) {
+                Ok(v) => v,
+                Err(Error::Busy) => {
+                    self.stats.defers = self.stats.defers.saturating_add(1);
+                    retries = retries.saturating_sub(1);
+                    if retries == 0 {
+                        self.channels[ch].training_state = DpTrainingState::Failed;
+                        return Err(Error::IoError);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             let lanes = cfg.lanes.count();
             let cr_done = match lanes {
@@ -652,10 +689,15 @@ impl DpAuxController {
     /// Writes training pattern 2 and polls until CEQ_DONE and
     /// SYMBOL_LOCKED are set in all active lanes.
     ///
+    /// DEFER responses from the sink are counted against the retry budget
+    /// (kernel constant [`CEQ_MAX_RETRIES`]) so that a sink that always
+    /// DEFERs cannot loop the kernel indefinitely.
+    ///
     /// # Errors
     ///
     /// - [`Error::NotFound`] if `ch` is invalid.
-    /// - [`Error::IoError`] if CE fails after max retries.
+    /// - [`Error::IoError`] if CE fails after max retries or a
+    ///   non-recoverable AUX error occurs.
     pub fn channel_eq_phase(&mut self, ch: usize, cfg: &DpLinkConfig) -> Result<()> {
         if ch >= self.channel_count || !self.channels[ch].active {
             return Err(Error::NotFound);
@@ -666,8 +708,34 @@ impl DpAuxController {
 
         let mut retries = CEQ_MAX_RETRIES;
         loop {
-            let status01 = self.read_dpcd_byte(ch, DPCD_LANE01_STATUS)?;
-            let status23 = self.read_dpcd_byte(ch, DPCD_LANE23_STATUS)?;
+            // Count DEFER (Busy) against the retry budget so a misbehaving
+            // sink that perpetually DEFERs cannot create an unbounded loop.
+            let status01 = match self.read_dpcd_byte(ch, DPCD_LANE01_STATUS) {
+                Ok(v) => v,
+                Err(Error::Busy) => {
+                    self.stats.defers = self.stats.defers.saturating_add(1);
+                    retries = retries.saturating_sub(1);
+                    if retries == 0 {
+                        self.channels[ch].training_state = DpTrainingState::Failed;
+                        return Err(Error::IoError);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let status23 = match self.read_dpcd_byte(ch, DPCD_LANE23_STATUS) {
+                Ok(v) => v,
+                Err(Error::Busy) => {
+                    self.stats.defers = self.stats.defers.saturating_add(1);
+                    retries = retries.saturating_sub(1);
+                    if retries == 0 {
+                        self.channels[ch].training_state = DpTrainingState::Failed;
+                        return Err(Error::IoError);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             let lanes = cfg.lanes.count();
             let eq_done = match lanes {
