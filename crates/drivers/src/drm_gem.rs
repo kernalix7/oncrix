@@ -30,6 +30,9 @@ use oncrix_lib::{Error, Result};
 /// Maximum GEM objects per device.
 const MAX_GEM_OBJECTS: usize = 256;
 
+/// Maximum single GEM object size (256 MiB); prevents page-alignment overflow.
+const MAX_GEM_SIZE: usize = 256 * 1024 * 1024;
+
 /// Maximum handles per process.
 const MAX_HANDLES: usize = 128;
 
@@ -137,9 +140,21 @@ impl GemObject {
     /// Creates a new GEM object with the given size.
     ///
     /// The size is rounded up to the next page boundary.
-    pub fn new(id: u32, size: usize) -> Self {
-        let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `size` is zero or exceeds
+    /// [`MAX_GEM_SIZE`], or if the page-alignment arithmetic would overflow.
+    pub fn new(id: u32, size: usize) -> Result<Self> {
+        if size == 0 || size > MAX_GEM_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+        // Checked page-alignment: (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+        let aligned = size
+            .checked_add(PAGE_SIZE - 1)
+            .map(|v| v & !(PAGE_SIZE - 1))
+            .ok_or(Error::InvalidArgument)?;
+        Ok(Self {
             id,
             size: aligned,
             backing_addr: 0,
@@ -150,7 +165,7 @@ impl GemObject {
             flink_name: 0,
             prime_fd: -1,
             active: true,
-        }
+        })
     }
 
     /// Increments the reference count.
@@ -461,7 +476,7 @@ impl GemObjectPool {
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let obj = GemObject::new(id, size);
+        let obj = GemObject::new(id, size)?;
         for slot in self.objects.iter_mut() {
             if !slot.active {
                 *slot = obj;

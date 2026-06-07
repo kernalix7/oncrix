@@ -49,6 +49,9 @@ const MAX_MODES: usize = 16;
 /// Maximum GEM buffer objects per device.
 const MAX_GEM_OBJECTS: usize = 64;
 
+/// Maximum framebuffer width/height accepted from userspace (prevents u32 pitch overflow).
+const MAX_FB_DIMENSION: u32 = 16384;
+
 /// Maximum length of a mode name string.
 const MODE_NAME_LEN: usize = 32;
 
@@ -455,25 +458,43 @@ pub struct GemObject {
 
 impl GemObject {
     /// Create a new GEM object descriptor.
-    pub const fn new(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if:
+    /// - `width` or `height` exceeds [`MAX_FB_DIMENSION`] (prevents pitch overflow),
+    /// - `width * bpp` overflows `u32` (pitch overflow), or
+    /// - `pitch * height` exceeds `size` (buffer too small for the declared dimensions).
+    pub fn new(
         handle: u32,
         size: usize,
         phys_addr: u64,
         width: u32,
         height: u32,
         format: DrmFourCc,
-    ) -> Self {
+    ) -> Result<Self> {
+        if width > MAX_FB_DIMENSION || height > MAX_FB_DIMENSION {
+            return Err(Error::InvalidArgument);
+        }
         // Bytes-per-pixel: ARGB8888/XRGB8888 = 4, RGB565 = 2
         let bpp: u32 = if format == DRM_FORMAT_RGB565 { 2 } else { 4 };
-        Self {
+        let pitch = width.checked_mul(bpp).ok_or(Error::InvalidArgument)?;
+        // Verify pitch * height does not exceed the declared buffer size.
+        let required = (pitch as usize)
+            .checked_mul(height as usize)
+            .ok_or(Error::InvalidArgument)?;
+        if required > size {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self {
             handle,
             size,
             phys_addr,
-            pitch: width * bpp,
+            pitch,
             format,
             width,
             height,
-        }
+        })
     }
 }
 
@@ -739,7 +760,7 @@ impl DrmDevice {
         }
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
-        let obj = GemObject::new(handle, size, phys_addr, width, height, format);
+        let obj = GemObject::new(handle, size, phys_addr, width, height, format)?;
         self.gem_objects[self.gem_count] = Some(obj);
         self.gem_count += 1;
         Ok(handle)
