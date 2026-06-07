@@ -127,6 +127,13 @@ impl AhciPort {
     /// * `port_base` — Physical MMIO address of this port's register block.
     /// * `num_slots` — Number of command slots (from CAP.NCS).
     pub const fn new(port_base: usize, num_slots: usize) -> Self {
+        // SECURITY: num_slots comes from HBA CAP.NCS (device-supplied); clamp to
+        // AHCI_MAX_CMD_SLOTS so every downstream shift `1u32 << slot` stays in-range.
+        let num_slots = if num_slots > AHCI_MAX_CMD_SLOTS {
+            AHCI_MAX_CMD_SLOTS
+        } else {
+            num_slots
+        };
         let free_slots = if num_slots >= 32 {
             u32::MAX
         } else {
@@ -199,22 +206,29 @@ impl AhciPort {
         // In a real driver we'd write the command header at slot * sizeof(CommandHeader).
         // Here we model the CI register write.
         let _ = (ctba_paddr, write, prd_count); // consumed by caller-set CommandHeader
-        self.write32(PORT_CI, 1 << slot);
+        self.write32(PORT_CI, 1u32 << slot);
         Ok(slot)
     }
 
     /// Polls for completion of command in `slot`.
     pub fn poll_slot(&self, slot: u8) -> Result<bool> {
-        if (slot as usize) >= self.num_slots {
+        // SECURITY: slot is caller-supplied; guard against both >= num_slots and
+        // >= 32 to prevent `1u32 << slot` shift overflow (overflow-checks=on panics).
+        if (slot as usize) >= self.num_slots || (slot as usize) >= AHCI_MAX_CMD_SLOTS {
             return Err(Error::InvalidArgument);
         }
         let ci = self.read32(PORT_CI);
-        Ok((ci & (1 << slot)) == 0)
+        Ok((ci & (1u32 << slot)) == 0)
     }
 
     /// Releases `slot` back to the free pool.
     pub fn free_slot(&mut self, slot: u8) {
-        self.free_slots |= 1 << slot;
+        // SECURITY: slot is caller-supplied; guard both >= num_slots and >= 32
+        // to prevent `1u32 << slot` shift overflow (overflow-checks=on panics).
+        if (slot as usize) >= self.num_slots || (slot as usize) >= AHCI_MAX_CMD_SLOTS {
+            return;
+        }
+        self.free_slots |= 1u32 << slot;
     }
 
     /// Returns the Task File Data register (BSY/DRQ bits).

@@ -507,6 +507,13 @@ impl SenseData {
 
                 let information = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
 
+                // additional_length (SPC-5 byte 7) is the number of sense bytes
+                // the device HAS AVAILABLE, not the number actually returned, so
+                // it may legitimately exceed data.len() on a short transfer — it
+                // is stored informationally only and never used as an index/offset.
+                // Every field below is independently bounds-guarded, so no cross-
+                // check is needed (and adding one wrongly rejects valid truncated
+                // sense data).
                 let additional_length = data[7];
 
                 let (asc, ascq) = if data.len() >= 14 {
@@ -536,6 +543,9 @@ impl SenseData {
                 let sense_key = data[1] & 0x0F;
                 let asc = data[2];
                 let ascq = data[3];
+                // See the fixed-format branch: additional_length is bytes-available
+                // (informational), independently bounds-guarded reads, so no
+                // cross-check (which would reject valid truncated sense).
                 let additional_length = data[7];
 
                 Ok(Self {
@@ -710,6 +720,11 @@ impl ReadCapacity10Response {
         }
         let last_lba = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let block_size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        // SECURITY: block_size is device-supplied; a zero value causes
+        // divide-by-zero in any sector-count / capacity calculation.
+        if block_size == 0 {
+            return Err(Error::InvalidArgument);
+        }
         Ok(Self {
             last_lba,
             block_size,
@@ -753,6 +768,11 @@ impl ReadCapacity16Response {
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
         ]);
         let block_size = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        // SECURITY: block_size is device-supplied; a zero value causes
+        // divide-by-zero in any sector-count / capacity calculation.
+        if block_size == 0 {
+            return Err(Error::InvalidArgument);
+        }
         Ok(Self {
             last_lba,
             block_size,
@@ -878,7 +898,10 @@ impl ScsiRequest {
         if self.sense_len == 0 {
             return Err(Error::NotFound);
         }
-        SenseData::parse(&self.sense[..self.sense_len])
+        // SECURITY: sense_len is device-supplied; clamp to the fixed buffer
+        // length before slicing to prevent an attacker-controlled OOB index.
+        let safe_len = self.sense_len.min(MAX_SENSE_SIZE);
+        SenseData::parse(&self.sense[..safe_len])
     }
 }
 

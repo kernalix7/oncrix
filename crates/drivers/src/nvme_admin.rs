@@ -442,7 +442,9 @@ pub fn build_create_io_cq(cid: u16, qid: u16, qsize: u16, cq_phys: u64, iv: u16)
     sqe.cdw0 = NvmeSqe::make_cdw0(ADMIN_CREATE_IO_CQ, cid);
     sqe.prp1 = cq_phys;
     // CDW10: QSIZE[31:16], QID[15:0]  (QSIZE is 0-based, i.e., entries-1).
-    sqe.cdw10 = ((qsize as u32 - 1) << 16) | (qid as u32);
+    // SECURITY: qsize is caller-supplied and may be 0; saturating_sub prevents
+    // a wrapping underflow panic (overflow-checks = on in dev/test, ring 0 halt).
+    sqe.cdw10 = ((qsize as u32).saturating_sub(1) << 16) | (qid as u32);
     // CDW11: interrupt vector[31:16], IEN[1], PC[0].
     // PC=1 (physically contiguous), IEN=1 (interrupts enabled).
     sqe.cdw11 = ((iv as u32) << 16) | 0x03;
@@ -454,7 +456,9 @@ pub fn build_create_io_sq(cid: u16, qid: u16, qsize: u16, sq_phys: u64, cq_id: u
     let mut sqe = NvmeSqe::zeroed();
     sqe.cdw0 = NvmeSqe::make_cdw0(ADMIN_CREATE_IO_SQ, cid);
     sqe.prp1 = sq_phys;
-    sqe.cdw10 = ((qsize as u32 - 1) << 16) | (qid as u32);
+    // SECURITY: qsize is caller-supplied and may be 0; saturating_sub prevents
+    // a wrapping underflow panic (overflow-checks = on in dev/test, ring 0 halt).
+    sqe.cdw10 = ((qsize as u32).saturating_sub(1) << 16) | (qid as u32);
     // CDW11: CQID[31:16], QPRIO[2:1], PC[0].
     // QPRIO=00 (urgent), PC=1.
     sqe.cdw11 = ((cq_id as u32) << 16) | 0x01;

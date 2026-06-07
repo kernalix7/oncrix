@@ -300,7 +300,10 @@ impl ScsiTape {
 
     /// Record a completed read/write of `bytes` bytes.
     pub fn record_transfer(&mut self, bytes: usize, blocks: u32) {
-        self.bytes_transferred += bytes as u64;
+        // SECURITY: bytes is caller/device-supplied; plain += panics under
+        // overflow-checks when the counter wraps. Use saturating_add so a
+        // hostile or buggy device cannot halt the kernel.
+        self.bytes_transferred = self.bytes_transferred.saturating_add(bytes as u64);
         self.block_addr = self.block_addr.wrapping_add(blocks);
     }
 

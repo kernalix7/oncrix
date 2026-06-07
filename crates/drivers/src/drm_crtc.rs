@@ -558,7 +558,10 @@ impl DrmCrtc {
     ///
     /// Increments the vblank counter and pushes an event.
     pub fn handle_vblank(&mut self, timestamp_ns: u64) {
-        self.state.vblank_count += 1;
+        // SECURITY: vblank counters wrap by definition (hardware counters are
+        // finite width). wrapping_add(1) prevents an overflow panic in ring 0
+        // after u64::MAX interrupts (unreachable in practice, safe regardless).
+        self.state.vblank_count = self.state.vblank_count.wrapping_add(1);
         let event = VblankEvent {
             crtc_id: self.id,
             sequence: self.state.vblank_count,
