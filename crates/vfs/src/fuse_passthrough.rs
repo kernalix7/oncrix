@@ -140,8 +140,10 @@ impl BackingFile {
         if self.read_only {
             return Err(Error::PermissionDenied);
         }
-        let start = offset as usize;
-        let end = start + src.len();
+        // SECURITY: offset and src.len() are caller-controlled; use checked
+        // arithmetic to reject overflows before any slice indexing.
+        let start = usize::try_from(offset).map_err(|_| Error::InvalidArgument)?;
+        let end = start.checked_add(src.len()).ok_or(Error::InvalidArgument)?;
         if end > self.data.len() {
             return Err(Error::InvalidArgument);
         }

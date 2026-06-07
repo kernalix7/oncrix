@@ -86,8 +86,15 @@ impl FuseDirEntry {
     }
 
     /// Return name as a byte slice.
+    ///
+    /// `namelen` is re-clamped to `FUSE_NAME_MAX` on every access so that
+    /// any future code path that sets `namelen` from an untrusted source
+    /// cannot cause an out-of-bounds slice.
     pub fn name_bytes(&self) -> &[u8] {
-        &self.name[..self.namelen as usize]
+        // SECURITY: clamp namelen defensively — the field is u32 and FUSE_NAME_MAX
+        // is the allocation bound for `name`.
+        let len = (self.namelen as usize).min(FUSE_NAME_MAX);
+        &self.name[..len]
     }
 }
 

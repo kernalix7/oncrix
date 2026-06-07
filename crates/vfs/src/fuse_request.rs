@@ -351,6 +351,16 @@ impl FuseReqQueue {
         pid: u32,
         args: &[u8],
     ) -> Result<u64> {
+        // SECURITY: args comes from an untrusted FUSE daemon; cap before use.
+        if args.len() > FUSE_ARG_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        // 40 = FUSE wire header size; reject if addition overflows u32.
+        let total = 40usize
+            .checked_add(args.len())
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(Error::InvalidArgument)?;
+
         for i in 0..REQ_QUEUE_DEPTH {
             if self.slots[i].state == FuseReqState::Empty {
                 let unique = self.next_unique;
@@ -362,7 +372,7 @@ impl FuseReqQueue {
                 self.slots[i] = FuseReqSlot {
                     state: FuseReqState::Pending,
                     req: FuseWireReq {
-                        len: (40 + args.len()) as u32, // 40 = header size
+                        len: total,
                         opcode,
                         unique,
                         nodeid,
@@ -398,12 +408,22 @@ impl FuseReqQueue {
     ///
     /// Transitions the matching slot from `InFlight` to `Done`.
     pub fn deliver_reply(&mut self, unique: u64, error: i32, data: &[u8]) -> Result<()> {
+        // SECURITY: data comes from an untrusted FUSE daemon; cap before use.
+        if data.len() > FUSE_ARG_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        // 8 = FUSE reply-header size; reject if addition overflows u32.
+        let reply_len = 8usize
+            .checked_add(data.len())
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(Error::InvalidArgument)?;
+
         for i in 0..REQ_QUEUE_DEPTH {
             if self.slots[i].state == FuseReqState::InFlight && self.slots[i].req.unique == unique {
                 let mut data_buf = FuseArgBuf::new();
                 data_buf.write(data);
                 self.slots[i].reply = FuseWireReply {
-                    len: (8 + data.len()) as u32,
+                    len: reply_len,
                     error,
                     unique,
                     data: data_buf,
@@ -423,12 +443,17 @@ impl FuseReqQueue {
     /// Collects the reply for request `unique` and frees the slot.
     ///
     /// Returns the reply on success.  The slot transitions back to `Empty`.
+    /// Only decrements `pending_count` on the `Done → Empty` state transition
+    /// to prevent underflow from a duplicate or spurious daemon reply.
     pub fn collect_reply(&mut self, unique: u64) -> Result<FuseWireReply> {
         for i in 0..REQ_QUEUE_DEPTH {
             if self.slots[i].state == FuseReqState::Done && self.slots[i].req.unique == unique {
                 let reply = self.slots[i].reply;
+                // Transition the slot before decrementing so a second call for the
+                // same unique-id finds state == Empty and returns WouldBlock instead
+                // of decrementing again.
                 self.slots[i].state = FuseReqState::Empty;
-                self.pending_count -= 1;
+                self.pending_count = self.pending_count.saturating_sub(1);
                 return Ok(reply);
             }
         }

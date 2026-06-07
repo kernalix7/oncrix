@@ -307,16 +307,26 @@ pub struct FuseResponse {
 
 impl FuseResponse {
     /// Parse a FUSE response buffer.
+    ///
+    /// The `len` field in the wire header is daemon-controlled and therefore
+    /// untrusted.  We validate it lies within `[16, buf.len()]` and use it
+    /// to bound the payload slice — otherwise a daemon could supply `len=0`
+    /// or a value larger than `buf` to cause OOB reads.
     pub fn parse(buf: &[u8]) -> Result<Self> {
         if buf.len() < 16 {
             return Err(Error::InvalidArgument);
         }
-        let _len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let raw_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        // SECURITY: _len is untrusted; must be in [16, buf.len()].
+        if raw_len < 16 || raw_len > buf.len() {
+            return Err(Error::InvalidArgument);
+        }
         let error = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let unique = u64::from_le_bytes([
             buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]);
-        let data = buf[16..].to_vec();
+        // Use raw_len to bound the payload; excess bytes in buf are ignored.
+        let data = buf[16..raw_len].to_vec();
         Ok(Self {
             unique,
             error,

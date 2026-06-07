@@ -420,7 +420,13 @@ impl WritebackCache {
 
         let inode_idx = self.get_or_create_inode(inode, file_size)?;
         let start_page = offset / PAGE_SIZE;
-        let end_page = (offset + length + PAGE_SIZE - 1) / PAGE_SIZE;
+        // SECURITY: offset and length are caller-supplied; check for overflow
+        // before constructing the end-page index.
+        let end_page = offset
+            .checked_add(length)
+            .and_then(|n| n.checked_add(PAGE_SIZE - 1))
+            .map(|n| n / PAGE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
         let mut pages_dirtied = 0usize;
 
         for page_idx in start_page..end_page {
@@ -541,12 +547,19 @@ impl WritebackCache {
             let req_id = self.next_req_id;
             self.next_req_id += 1;
 
+            // SECURITY: batch_count is bounded by MAX_PAGES_PER_REQ (32) so
+            // the multiply cannot overflow u64 in practice, but use checked
+            // arithmetic to stay panic-free under overflow-checks=true.
+            let total_bytes = (batch_count as u64)
+                .checked_mul(PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+
             req_slot.req_id = req_id;
             req_slot.inode = inode;
             req_slot.offset = batch_pages[0] * PAGE_SIZE;
             req_slot.page_indices[..batch_count].copy_from_slice(&batch_pages[..batch_count]);
             req_slot.page_count = batch_count;
-            req_slot.total_bytes = batch_count as u64 * PAGE_SIZE;
+            req_slot.total_bytes = total_bytes;
             req_slot.reason = reason;
             req_slot.created_at = self.current_time_ms;
             req_slot.acknowledged = false;

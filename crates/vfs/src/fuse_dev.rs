@@ -40,6 +40,12 @@ use oncrix_lib::{Error, Result};
 /// Maximum on-wire message size (header + payload), in bytes.
 const MAX_MSG_SIZE: usize = 65536; // 64 KiB
 
+/// Hard upper bound on the `max_write` value advertised by a FUSE daemon (1 MiB).
+///
+/// A daemon that sets this larger is untrusted; we clamp to prevent oversized
+/// kernel allocations or arithmetic overflows in write-path sizing.
+const FUSE_MAX_REQUEST_SIZE: u32 = 1_048_576;
+
 /// Maximum payload portion of a message.
 const MAX_PAYLOAD: usize = MAX_MSG_SIZE - FuseWireHeader::SIZE;
 
@@ -461,7 +467,9 @@ impl FuseInitConfig {
         self.minor = minor;
         // Only keep capabilities both sides advertise.
         self.flags &= flags;
-        self.max_write = max_write;
+        // SECURITY: max_write is daemon-supplied and untrusted; clamp to
+        // [4096, FUSE_MAX_REQUEST_SIZE] to prevent oversized write allocations.
+        self.max_write = max_write.clamp(4096, FUSE_MAX_REQUEST_SIZE);
         self.initialized = true;
     }
 
@@ -763,8 +771,17 @@ impl FuseDevChannel {
 
         for slot in self.queue.iter_mut() {
             if slot.unique == unique && slot.state == SlotState::Done {
+                // SECURITY: reply_payload_len was written by write_reply which
+                // already enforces reply_payload_len <= MAX_PAYLOAD.  Cap it
+                // defensively before the usize→u32 cast so a logic error
+                // elsewhere cannot cause overflow or OOB.
+                let bounded_payload = slot.reply_payload_len.min(MAX_PAYLOAD);
+                let len_u32 = FuseWireReplyHeader::SIZE
+                    .checked_add(bounded_payload)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or(Error::InvalidArgument)?;
                 let rh = FuseWireReplyHeader {
-                    len: (FuseWireReplyHeader::SIZE + slot.reply_payload_len) as u32,
+                    len: len_u32,
                     error: slot.reply_error,
                     unique,
                 };
