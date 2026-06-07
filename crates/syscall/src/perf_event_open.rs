@@ -653,17 +653,35 @@ impl PerfEventContext {
     }
 
     /// Allocate a new event ID.
-    fn alloc_id(&mut self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::OutOfMemory` when the monotonic id counter would
+    /// overflow `u64`, instead of panicking (overflow-checks are ON in
+    /// kernel builds, so a bare `+= 1` would fault in ring 0).
+    fn alloc_id(&mut self) -> Result<u64> {
         let id = self.next_id;
-        self.next_id += 1;
-        id
+        // SECURITY: the id space is monotonic and never reclaimed on close,
+        // so the counter can saturate. Fail closed on overflow rather than
+        // panic at the user->kernel boundary, which would halt ring 0.
+        self.next_id = self.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
+        Ok(id)
     }
 
     /// Allocate a new file descriptor.
-    fn alloc_fd(&mut self) -> i32 {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::OutOfMemory` when the monotonic fd counter would
+    /// overflow `i32`, instead of panicking (overflow-checks are ON in
+    /// kernel builds, so a bare `+= 1` would fault in ring 0).
+    fn alloc_fd(&mut self) -> Result<i32> {
         let fd = self.next_fd;
-        self.next_fd += 1;
-        fd
+        // SECURITY: the fd space is monotonic and never reclaimed on close,
+        // so the counter can saturate. Fail closed on overflow rather than
+        // panic at the user->kernel boundary, which would halt ring 0.
+        self.next_fd = self.next_fd.checked_add(1).ok_or(Error::OutOfMemory)?;
+        Ok(fd)
     }
 
     /// Open a new performance event.
@@ -695,12 +713,15 @@ impl PerfEventContext {
         }
 
         let slot = self.find_free_slot()?;
-        let id = self.alloc_id();
-        let fd = self.alloc_fd();
 
-        let mut event = PerfEvent::new(id, *attr, pid, cpu, fd);
-
-        // Handle group membership.
+        // SECURITY: resolve and validate group membership BEFORE consuming
+        // any id/fd from the monotonic allocators. The group_fd lookup and
+        // leader checks below can reject the request; allocating first would
+        // permanently leak id/fd space (the counters are never reclaimed on
+        // close) on every rejected open. `find_free_slot` above is read-only
+        // and consumes nothing, so it is safe to run first.
+        let mut group_leader_id: Option<u64> = None;
+        let mut make_group_leader = false;
         if group_fd != FD_INVALID && flags & PERF_FLAG_FD_NO_GROUP == 0 {
             let leader_slot = self.find_by_fd(group_fd)?;
             let leader_id = match &self.events[leader_slot] {
@@ -708,13 +729,39 @@ impl PerfEventContext {
                 Some(_) => return Err(Error::InvalidArgument),
                 None => return Err(Error::NotFound),
             };
+            // Reject membership now (group full) before allocating, so a
+            // rejected join consumes no id/fd.
+            match &self.groups[leader_slot] {
+                Some(group) if group.member_count() >= MAX_GROUP_SIZE => {
+                    return Err(Error::InvalidArgument);
+                }
+                _ => {}
+            }
+            group_leader_id = Some(leader_id);
+        } else if group_fd == FD_INVALID {
+            // This event is a standalone or a new group leader.
+            make_group_leader = true;
+        }
+
+        // All validation has succeeded — only now consume id/fd space.
+        // SECURITY: allocate the fd FIRST. The fd counter (i32) saturates at
+        // 2^31 long before the id counter (u64) at 2^64, so if allocation is
+        // going to fail it fails on alloc_fd, before any id is consumed — no
+        // partial-state id leak. (alloc_id can therefore never fail here.)
+        let fd = self.alloc_fd()?;
+        let id = self.alloc_id()?;
+
+        let mut event = PerfEvent::new(id, *attr, pid, cpu, fd);
+
+        if let Some(leader_id) = group_leader_id {
             event.group_leader_id = leader_id;
-            // Add to group.
+            // Add to group. The capacity was pre-checked above, so this
+            // cannot fail; propagate the error defensively if it ever does.
+            let leader_slot = self.find_by_fd(group_fd)?;
             if let Some(ref mut group) = self.groups[leader_slot] {
                 group.add_member(id)?;
             }
-        } else if group_fd == FD_INVALID {
-            // This event is a standalone or a new group leader.
+        } else if make_group_leader {
             event.is_group_leader = true;
             self.groups[slot] = Some(PerfEventGroup::new(id));
         }
@@ -1045,5 +1092,106 @@ mod tests {
         let mut ctx = PerfEventContext::new();
         let fd = ctx.open_event(&attr, 0, -1, -1, 0).unwrap();
         assert!(ctx.read_event(fd).is_ok());
+    }
+
+    // --- F1: counter overflow must fail closed, not panic in ring 0 ---
+
+    #[test]
+    fn test_alloc_id_overflow_fails_closed() {
+        let mut ctx = PerfEventContext::new();
+        // At u64::MAX the post-allocation checked_add overflows, so the call
+        // fails closed (Err) rather than panicking in ring 0 — the saturating
+        // value itself is never handed out.
+        ctx.next_id = u64::MAX;
+        assert_eq!(ctx.alloc_id().unwrap_err(), Error::OutOfMemory);
+        // One below the brink still hands out the captured value, then the
+        // following allocation fails closed.
+        ctx.next_id = u64::MAX - 1;
+        assert_eq!(ctx.alloc_id().unwrap(), u64::MAX - 1);
+        assert_eq!(ctx.alloc_id().unwrap_err(), Error::OutOfMemory);
+    }
+
+    #[test]
+    fn test_alloc_fd_overflow_fails_closed() {
+        let mut ctx = PerfEventContext::new();
+        // At i32::MAX the post-allocation checked_add overflows -> fail closed.
+        ctx.next_fd = i32::MAX;
+        assert_eq!(ctx.alloc_fd().unwrap_err(), Error::OutOfMemory);
+        ctx.next_fd = i32::MAX - 1;
+        assert_eq!(ctx.alloc_fd().unwrap(), i32::MAX - 1);
+        assert_eq!(ctx.alloc_fd().unwrap_err(), Error::OutOfMemory);
+    }
+
+    #[test]
+    fn test_open_event_does_not_panic_on_fd_overflow() {
+        let mut ctx = PerfEventContext::new();
+        // The fd counter at i32::MAX makes the first open fail closed on
+        // alloc_fd (which runs before alloc_id), not panic — and no id is
+        // consumed because fd is allocated first.
+        ctx.next_fd = i32::MAX;
+        let id_before = ctx.next_id;
+        let attr = hw_cycles_attr();
+        assert_eq!(
+            ctx.open_event(&attr, 0, -1, -1, 0).unwrap_err(),
+            Error::OutOfMemory
+        );
+        assert_eq!(
+            ctx.next_id, id_before,
+            "fd-overflow open must consume no id"
+        );
+    }
+
+    // --- F2: a rejected open must consume no id/fd space ---
+
+    #[test]
+    fn test_rejected_group_open_consumes_no_id_fd() {
+        let mut ctx = PerfEventContext::new();
+        let attr = hw_cycles_attr();
+        let id_before = ctx.next_id;
+        let fd_before = ctx.next_fd;
+
+        // group_fd 12345 does not exist -> rejected during group validation.
+        assert_eq!(
+            ctx.open_event(&attr, 0, -1, 12345, 0).unwrap_err(),
+            Error::NotFound
+        );
+
+        // No id/fd space must have been consumed by the rejected open.
+        assert_eq!(ctx.next_id, id_before);
+        assert_eq!(ctx.next_fd, fd_before);
+        assert_eq!(ctx.event_count(), 0);
+    }
+
+    #[test]
+    fn test_rejected_nonleader_group_open_consumes_no_id_fd() {
+        let mut ctx = PerfEventContext::new();
+        let attr = hw_cycles_attr();
+        // Open a leader, then a member that joins it (member is NOT a leader).
+        let leader_fd = ctx.open_event(&attr, 0, -1, -1, 0).unwrap();
+        let member_fd = ctx.open_event(&attr, 0, -1, leader_fd, 0).unwrap();
+
+        let id_before = ctx.next_id;
+        let fd_before = ctx.next_fd;
+
+        // Targeting the non-leader member as a group leader must be rejected,
+        // and must consume no id/fd space.
+        assert_eq!(
+            ctx.open_event(&attr, 0, -1, member_fd, 0).unwrap_err(),
+            Error::InvalidArgument
+        );
+        assert_eq!(ctx.next_id, id_before);
+        assert_eq!(ctx.next_fd, fd_before);
+    }
+
+    #[test]
+    fn test_successful_group_open_still_works() {
+        let mut ctx = PerfEventContext::new();
+        let attr = hw_cycles_attr();
+        let leader_fd = ctx.open_event(&attr, 0, -1, -1, 0).unwrap();
+        // A valid join must still succeed and return a usable fd.
+        let member_fd = ctx.open_event(&attr, 0, -1, leader_fd, 0).unwrap();
+        assert_ne!(leader_fd, member_fd);
+        assert_eq!(ctx.event_count(), 2);
+        assert!(ctx.read_event(member_fd).is_ok());
     }
 }
