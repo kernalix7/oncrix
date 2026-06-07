@@ -725,10 +725,17 @@ impl BtrfsChunk {
 
     /// Translate a logical offset to a physical offset.
     ///
-    /// Returns `None` if the offset is not within this chunk.
+    /// Returns `None` if the offset is not within this chunk or if the
+    /// resulting physical address would overflow `u64`.  Both the intra-chunk
+    /// subtraction and the final addition use checked arithmetic so that
+    /// on-disk fields with attacker-controlled values cannot produce a
+    /// silent ring-0 wrap-around.
     pub fn translate(&self, logical_offset: u64) -> Option<u64> {
         if self.contains(logical_offset) {
-            Some(self.physical + (logical_offset - self.logical))
+            // logical_offset >= self.logical is guaranteed by contains(), so
+            // the subtraction is infallible; checked_add guards the physical sum.
+            let offset = logical_offset - self.logical;
+            self.physical.checked_add(offset)
         } else {
             None
         }
