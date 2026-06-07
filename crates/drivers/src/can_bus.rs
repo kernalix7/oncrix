@@ -354,7 +354,10 @@ impl CanFrame {
 
     /// Return the valid data slice (first `dlc` bytes).
     pub fn data_bytes(&self) -> &[u8] {
-        &self.data[..self.dlc as usize]
+        // SECURITY: `dlc` is a public, attacker-settable field; clamp to the
+        // backing array bound (CAN_MAX_DLC) so dlc>8 cannot create an
+        // out-of-bounds slice and panic in ring 0.
+        &self.data[..(self.dlc as usize).min(CAN_MAX_DLC)]
     }
 }
 
@@ -629,7 +632,11 @@ impl CanController {
                 write_reg8(base, REG_TX_BUF + 2, ((id >> 13) & 0xFF) as u8);
                 write_reg8(base, REG_TX_BUF + 3, ((id >> 5) & 0xFF) as u8);
                 write_reg8(base, REG_TX_BUF + 4, ((id << 3) & 0xF8) as u8);
-                for i in 0..frame.dlc as usize {
+                // SECURITY: `dlc` is public/attacker-settable; clamp the copy
+                // bound to CAN_MAX_DLC (mirrors recv()) so dlc>8 cannot index
+                // past the 8-byte data array and panic in ring 0.
+                let n = (frame.dlc as usize).min(CAN_MAX_DLC);
+                for i in 0..n {
                     write_reg8(base, REG_TX_BUF + 5 + i, frame.data[i]);
                 }
             } else {
@@ -637,7 +644,11 @@ impl CanController {
                 let id = frame.id();
                 write_reg8(base, REG_TX_BUF + 1, ((id >> 3) & 0xFF) as u8);
                 write_reg8(base, REG_TX_BUF + 2, ((id << 5) & 0xE0) as u8);
-                for i in 0..frame.dlc as usize {
+                // SECURITY: `dlc` is public/attacker-settable; clamp the copy
+                // bound to CAN_MAX_DLC (mirrors recv()) so dlc>8 cannot index
+                // past the 8-byte data array and panic in ring 0.
+                let n = (frame.dlc as usize).min(CAN_MAX_DLC);
+                for i in 0..n {
                     write_reg8(base, REG_TX_BUF + 3 + i, frame.data[i]);
                 }
             }

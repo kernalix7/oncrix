@@ -367,7 +367,10 @@ impl UsbStorageDevice {
     /// Allocate the next CBW tag.
     fn alloc_tag(&mut self) -> u32 {
         let tag = self.next_tag;
-        self.next_tag = self.next_tag.wrapping_add(1);
+        // SECURITY: wrapping_add(1) would cycle through 0, letting a device
+        // CSW with tag=0 match the very next CBW.  Tag 0 is reserved; skip it
+        // on wrap so tags stay in [1, u32::MAX] at all times.
+        self.next_tag = self.next_tag.checked_add(1).unwrap_or(1);
         tag
     }
 
@@ -422,6 +425,14 @@ impl UsbStorageDevice {
         }
 
         if !csw.is_valid(cbw.tag) {
+            return Err(Error::IoError);
+        }
+
+        // SECURITY: data_residue is device-supplied and must not exceed the
+        // declared transfer length from the CBW.  A rogue device returning a
+        // larger residue violates BOT §5.2 and could confuse upper layers
+        // about how many bytes were actually transferred.
+        if csw.data_residue > cbw.data_transfer_length {
             return Err(Error::IoError);
         }
 
@@ -615,6 +626,13 @@ impl UsbStorageDevice {
         }
 
         if !csw.is_valid(tag) {
+            return Err(Error::IoError);
+        }
+        // SECURITY: reject a device-supplied residue larger than the declared
+        // transfer length (BOT §5.2). write_blocks open-codes the CSW phase
+        // instead of going through execute_command, so it must replicate the
+        // same residue bound rather than trusting the device value.
+        if csw.data_residue > total {
             return Err(Error::IoError);
         }
         if !csw.is_success() {

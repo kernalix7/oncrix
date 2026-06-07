@@ -340,7 +340,11 @@ impl TabletDevice {
 
         // Apply fuzz filtering.
         let old = self.current_values[axis_idx];
-        let diff = (clamped - old).unsigned_abs() as i32;
+        // SECURITY: clamped and old span the full i32 range (set_range accepts
+        // min=i32::MIN / max=i32::MAX), so a plain `clamped - old` overflows and
+        // panics in ring 0 under overflow-checks. abs_diff cannot overflow; cap
+        // the u32 result at i32::MAX before narrowing.
+        let diff = clamped.abs_diff(old).min(i32::MAX as u32) as i32;
         if config.fuzz > 0 && diff < config.fuzz {
             return Ok(());
         }
@@ -396,11 +400,25 @@ impl TabletDevice {
         if button >= self.capabilities.button_count {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: button_count is clamped to 16 in set_capabilities, but guard
+        // explicitly here as well: button_state is u16, so any shift >= 16 would
+        // panic with overflow-checks=on.  Use checked_shl as the final backstop.
+        if button >= MAX_BUTTONS as u8 {
+            return Err(Error::InvalidArgument);
+        }
 
         if pressed {
-            self.button_state |= 1 << button;
+            // SECURITY: checked_shl is the authoritative shift; the guard above
+            // makes the Err branch unreachable, but we keep it for defence-in-depth.
+            let mask = (1u16)
+                .checked_shl(u32::from(button))
+                .ok_or(Error::InvalidArgument)?;
+            self.button_state |= mask;
         } else {
-            self.button_state &= !(1 << button);
+            let mask = (1u16)
+                .checked_shl(u32::from(button))
+                .ok_or(Error::InvalidArgument)?;
+            self.button_state &= !mask;
         }
 
         let event = TabletEvent {
@@ -485,7 +503,17 @@ impl TabletDevice {
     }
 
     /// Set device capabilities.
-    pub fn set_capabilities(&mut self, caps: TabletCapabilities) {
+    ///
+    /// # Security
+    ///
+    /// `button_count` is clamped to [`MAX_BUTTONS`] (16) because `button_state`
+    /// is a `u16` bitfield; any larger value would allow `report_button` to
+    /// produce a shift of >= 16 and panic in ring 0.
+    pub fn set_capabilities(&mut self, mut caps: TabletCapabilities) {
+        // SECURITY: clamp button_count to the bitfield width (u16 = 16 bits) so
+        // that a firmware-supplied count cannot later cause a shift-overflow panic
+        // in report_button.
+        caps.button_count = caps.button_count.min(MAX_BUTTONS as u8);
         self.capabilities = caps;
     }
 
