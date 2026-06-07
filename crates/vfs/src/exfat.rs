@@ -180,17 +180,26 @@ impl ExfatBootSector {
 
     /// Bytes per sector.
     pub fn bytes_per_sector(&self) -> u32 {
-        1u32 << self.bytes_per_sector_shift
+        // SECURITY: the shift fields are pub and could be set from disk without a
+        // prior validate(); checked_shl keeps the method panic-free for any value
+        // (an out-of-range shift yields 0, which downstream bounds reject).
+        1u32.checked_shl(u32::from(self.bytes_per_sector_shift))
+            .unwrap_or(0)
     }
 
     /// Sectors per cluster.
     pub fn sectors_per_cluster(&self) -> u32 {
-        1u32 << self.sectors_per_cluster_shift
+        // SECURITY: see bytes_per_sector — panic-free shift on an unvalidated field.
+        1u32.checked_shl(u32::from(self.sectors_per_cluster_shift))
+            .unwrap_or(0)
     }
 
     /// Bytes per cluster.
     pub fn bytes_per_cluster(&self) -> u32 {
-        self.bytes_per_sector() * self.sectors_per_cluster()
+        // SECURITY: saturating product so a (validated or not) large pair cannot
+        // wrap u32 in ring 0.
+        self.bytes_per_sector()
+            .saturating_mul(self.sectors_per_cluster())
     }
 
     /// Validate the boot sector.
@@ -899,7 +908,12 @@ impl InodeOps for ExfatFs {
         if disk_inode.file_type != FileType::Regular {
             return Err(Error::InvalidArgument);
         }
-        let end = offset as usize + data.len();
+        // SECURITY: (offset as usize) + data.len() overflows before the
+        // MAX_FILE_DATA bound is ever evaluated when both values are large.
+        // Use checked_add so the overflow is caught rather than wrapping.
+        let end = (offset as usize)
+            .checked_add(data.len())
+            .ok_or(Error::InvalidArgument)?;
         if end > MAX_FILE_DATA {
             return Err(Error::OutOfMemory);
         }

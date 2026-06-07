@@ -18,6 +18,31 @@
 
 use oncrix_lib::{Error, Result};
 
+// ── Entry-set checksum ────────────────────────────────────────────────────────
+
+/// Computes the exFAT entry-set checksum over `set_bytes`.
+///
+/// Per the exFAT specification (Section 6.3.4), the 16-bit checksum is
+/// computed as an additive rotate-right over every byte in the entry set.
+/// Bytes 2 and 3 of the *primary* FILE entry (the stored checksum field
+/// itself) are treated as zero so that the computation is self-consistent.
+///
+/// `set_bytes` must be a multiple of `EXFAT_ENTRY_SIZE` and non-empty;
+/// the first 32 bytes are the primary FILE entry.
+fn entry_set_checksum(set_bytes: &[u8]) -> u16 {
+    let mut checksum: u16 = 0;
+    for (i, &byte) in set_bytes.iter().enumerate() {
+        // SECURITY: skip the stored set_checksum field (bytes 2-3 of the
+        // primary FILE entry) so the computation can be self-verifying.
+        if i == 2 || i == 3 {
+            continue;
+        }
+        // Rotate right by 1, then add byte (wrapping).
+        checksum = checksum.rotate_right(1).wrapping_add(byte as u16);
+    }
+    checksum
+}
+
 /// exFAT directory entry types.
 pub mod entry_type {
     pub const END_OF_DIR: u8 = 0x00;
@@ -202,6 +227,10 @@ impl<'a> ExfatDirIter<'a> {
     /// Reads the next decoded directory entry set.
     ///
     /// Skips deleted and non-file entries; stops at end-of-directory.
+    ///
+    /// The exFAT entry-set checksum (bytes 2-3 of the FILE entry) is verified
+    /// before the entry is returned; a mismatch is treated as `IoError` so the
+    /// caller can reject the corrupted or attacker-crafted on-disk entry.
     pub fn next_entry(&mut self) -> Result<Option<ExfatDirEntrySet>> {
         loop {
             if self.offset + EXFAT_ENTRY_SIZE > self.data.len() {
@@ -217,6 +246,10 @@ impl<'a> ExfatDirIter<'a> {
                 continue;
             }
 
+            // Record where this entry set starts so we can checksum the whole
+            // span after parsing.
+            let set_start = self.offset;
+
             let file_entry = ExfatFileEntry::from_bytes(&self.data[self.offset..])?;
             let secondary_count = file_entry.secondary_count as usize;
             self.offset += EXFAT_ENTRY_SIZE;
@@ -225,8 +258,27 @@ impl<'a> ExfatDirIter<'a> {
                 continue; // Need at least STREAM_EXT + 1 FILE_NAME.
             }
 
-            if self.offset + secondary_count * EXFAT_ENTRY_SIZE > self.data.len() {
+            // SECURITY: use checked arithmetic so a large secondary_count
+            // cannot overflow the usize multiplication and bypass the bounds check.
+            let secondary_bytes = secondary_count
+                .checked_mul(EXFAT_ENTRY_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+            if self
+                .offset
+                .checked_add(secondary_bytes)
+                .ok_or(Error::InvalidArgument)?
+                > self.data.len()
+            {
                 return Err(Error::InvalidArgument);
+            }
+
+            // SECURITY: verify the entry-set checksum before trusting any
+            // of the remaining fields.  A mismatch indicates corruption or
+            // an attacker-crafted image; reject with IoError.
+            let set_end = self.offset + secondary_bytes;
+            let computed = entry_set_checksum(&self.data[set_start..set_end]);
+            if computed != file_entry.set_checksum {
+                return Err(Error::IoError);
             }
 
             // Second entry must be STREAM_EXTENSION.

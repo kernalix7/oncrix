@@ -403,13 +403,27 @@ impl Default for JournalSubsystem {
 /// is advanced to `Checkpointed` and its slot is freed.
 ///
 /// Returns the number of transactions replayed.
+//
+// SECURITY INVARIANT (for the real, disk-backed replay that will replace this
+// in-memory simulation): a journal replay is an untrusted-write primitive — a
+// crafted descriptor block names arbitrary target blocks to overwrite in the
+// live filesystem. Before applying ANY block, the real implementation MUST
+// verify (a) the commit block's crc32c (t_checksum) and (b) each descriptor
+// block tag's per-block checksum, and bound every target block number against
+// the device size; only the superblock crc is verified today.
 pub fn journal_recover(journal: &mut JournalSubsystem) -> u32 {
     journal.journal.state = JournalState::Recovery;
     let mut replayed = 0u32;
     for txn in journal.journal.transactions.iter_mut() {
         if txn.state == TransactionState::Committed {
+            // SECURITY: block_count is an attacker-controlled on-disk u32 value.
+            // Clamp it to the fixed array length before indexing to prevent OOB
+            // access on overflow-checks=on (which panics at ring-0 = machine halt).
+            let safe_count = (txn.block_count as usize)
+                .min(JBD2_MAX_BLOCKS)
+                .min(txn.blocks.len());
             // Re-apply each dirty block to the in-place location.
-            for i in 0..txn.block_count as usize {
+            for i in 0..safe_count {
                 let _block_nr = txn.blocks[i].block_nr;
                 // A real implementation would call block_write(_block_nr, &data).
                 // Here we mark the block clean to simulate writeback completion.

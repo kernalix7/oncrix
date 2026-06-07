@@ -590,7 +590,9 @@ impl F2fsFs {
                 {
                     let ino = entry.ino;
                     *slot = None;
-                    dir.count -= 1;
+                    // SECURITY: saturating_sub — defense-in-depth against a count
+                    // desync so the decrement cannot underflow-panic in ring 0.
+                    dir.count = dir.count.saturating_sub(1);
                     return Ok(ino);
                 }
             }
@@ -638,8 +640,12 @@ impl F2fsFs {
             return Err(Error::InvalidArgument);
         }
 
-        let off = offset as usize;
-        let file_len = node.size as usize;
+        // SECURITY: node.size is an on-disk (attacker-controlled) u64. Cast it
+        // to usize and clamp to the maximum addressable region so that a crafted
+        // superblock with size=UINT64_MAX cannot push arithmetic past usize::MAX
+        // and cause an OOB slice later in the read loop.
+        let off = usize::try_from(offset).map_err(|_| Error::InvalidArgument)?;
+        let file_len = (node.size as usize).min(MAX_DIRECT_ADDRS * BLOCK_SIZE);
         if off >= file_len {
             return Ok(0);
         }
@@ -684,8 +690,12 @@ impl F2fsFs {
             return Err(Error::InvalidArgument);
         }
 
-        let off = offset as usize;
-        let end = off + data.len();
+        // SECURITY: offset is caller-supplied (may be attacker-controlled when
+        // accessed via on-disk path resolution). Convert with try_from to catch
+        // values that exceed usize range, then use checked_add so the bounds
+        // comparison below is always reached with a valid, non-wrapped `end`.
+        let off = usize::try_from(offset).map_err(|_| Error::InvalidArgument)?;
+        let end = off.checked_add(data.len()).ok_or(Error::InvalidArgument)?;
         let max_size = MAX_DIRECT_ADDRS * BLOCK_SIZE;
         if end > max_size {
             return Err(Error::OutOfMemory);
@@ -707,7 +717,12 @@ impl F2fsFs {
 
                 // Update segment accounting.
                 if self.cur_segment < MAX_SEGMENTS {
-                    self.segments[self.cur_segment].valid_blocks += 1;
+                    // SECURITY: valid_blocks is a u32; saturating_add prevents
+                    // wrap-around when a segment is over-counted (e.g. via a
+                    // crafted block allocation sequence).
+                    self.segments[self.cur_segment].valid_blocks = self.segments[self.cur_segment]
+                        .valid_blocks
+                        .saturating_add(1);
                     self.checkpoint.valid_block_count += 1;
                     self.cur_block_off += 1;
                     if self.segments[self.cur_segment].is_full() {
