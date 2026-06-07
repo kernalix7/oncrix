@@ -209,11 +209,9 @@ impl I2cBus {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
         }
-        if self.device_count >= 16 {
-            return Err(Error::OutOfMemory);
-        }
-        // Check for duplicate address.
-        for dev in &self.devices[..self.device_count] {
+        // SECURITY: Check for duplicate address across ALL slots (including those
+        // beyond device_count that were previously freed by remove_device).
+        for dev in &self.devices {
             if dev.present && dev.addr == addr {
                 return Err(Error::AlreadyExists);
             }
@@ -221,7 +219,7 @@ impl I2cBus {
         let copy_len = name.len().min(32);
         let mut dev_name = [0u8; 32];
         dev_name[..copy_len].copy_from_slice(&name[..copy_len]);
-        self.devices[self.device_count] = I2cDevice {
+        let new_dev = I2cDevice {
             addr,
             name: dev_name,
             name_len: copy_len,
@@ -229,8 +227,18 @@ impl I2cBus {
             present: true,
             ten_bit: addr > 0x7F,
         };
-        self.device_count += 1;
-        Ok(())
+        // SECURITY: Reuse any slot previously freed by remove_device (present==false)
+        // before falling back to the append position.  Without this, device_count
+        // climbs monotonically to 16 and registration is permanently exhausted even
+        // when logical slots are free.
+        for dev in &mut self.devices {
+            if !dev.present {
+                *dev = new_dev;
+                self.device_count += 1;
+                return Ok(());
+            }
+        }
+        Err(Error::OutOfMemory)
     }
 
     /// Removes the device at `addr` from this bus.
@@ -238,9 +246,13 @@ impl I2cBus {
     /// Returns [`Error::NotFound`] when no device with the given
     /// address is registered.
     pub fn remove_device(&mut self, addr: u16) -> Result<()> {
-        for dev in &mut self.devices[..self.device_count] {
+        for dev in &mut self.devices {
             if dev.present && dev.addr == addr {
                 dev.present = false;
+                // SECURITY: Decrement device_count so the slot is available for
+                // reuse.  Without this decrement the count only grew, permanently
+                // exhausting the registration table after enough add/remove cycles.
+                self.device_count = self.device_count.saturating_sub(1);
                 return Ok(());
             }
         }
@@ -385,7 +397,9 @@ impl I2cBus {
     /// hardware.
     pub fn scan(&self) -> [bool; 128] {
         let mut result = [false; 128];
-        for dev in &self.devices[..self.device_count] {
+        // Iterate the full device array: add_device may reuse any slot, so
+        // the present entries are not guaranteed to be contiguous in [..device_count].
+        for dev in &self.devices {
             if dev.present && (dev.addr as usize) < 128 {
                 result[dev.addr as usize] = true;
             }
@@ -395,10 +409,9 @@ impl I2cBus {
 
     /// Returns the number of registered (present) devices.
     pub fn device_count(&self) -> usize {
-        self.devices[..self.device_count]
-            .iter()
-            .filter(|d| d.present)
-            .count()
+        // Count directly from the present flag across the full array so that
+        // entries reused by add_device in non-contiguous slots are included.
+        self.devices.iter().filter(|d| d.present).count()
     }
 }
 

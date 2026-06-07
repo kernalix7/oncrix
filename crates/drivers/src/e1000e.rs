@@ -443,6 +443,14 @@ impl E1000e {
                 self.rx_head = (idx + 1) % RING_SIZE;
                 return None;
             }
+            // SECURITY: a descriptor without End-of-Packet is a partial multi-
+            // descriptor (jumbo) fragment; returning it as a complete packet would
+            // expose a truncated, attacker-influenced frame to upper layers. Drop
+            // it (advance the ring), matching the e1000 receive() guard.
+            if rx_ring[idx].status & RX_STATUS_EOP == 0 {
+                self.rx_head = (idx + 1) % RING_SIZE;
+                return None;
+            }
             // `length` is device-written and may be attacker-controlled
             // (up to 65535). Clamp to the physical buffer size so callers
             // cannot perform an out-of-bounds read of the 2 KiB buffer.
@@ -515,6 +523,13 @@ impl E1000eRegistry {
 
     /// Returns a mutable reference to device at `index`.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut E1000e> {
+        // SECURITY: `index` is caller-supplied and may be attacker-controlled.
+        // Without this guard an out-of-bounds index would panic in ring-0,
+        // halting the machine.  Only indices within the fixed-size array are
+        // valid regardless of `self.count`.
+        if index >= MAX_CONTROLLERS {
+            return None;
+        }
         self.devices[index].as_mut()
     }
 

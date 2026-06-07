@@ -636,6 +636,32 @@ impl E1000Device {
             return None;
         }
 
+        // SECURITY: Reject descriptors whose error bits are non-zero.
+        // A device (real or malicious) may set error bits to signal CRC
+        // errors, symbol errors, sequence errors, etc.  Forwarding such
+        // frames to upper layers exposes them to crafted, corrupt data.
+        // Recycle the descriptor and discard the fragment.
+        if self.rx_ring[idx].errors != 0 {
+            self.rx_ring[idx].status = 0;
+            self.rx_ring[idx].length = 0;
+            self.rx_tail = (idx + 1) % RX_DESC_COUNT;
+            self.write_reg(REG_RDT, idx as u32);
+            return None;
+        }
+
+        // SECURITY: Reject descriptors that do not have the End-of-Packet
+        // (EOP) bit set.  Without EOP the hardware has only written a
+        // fragment of a multi-descriptor (jumbo) frame.  Treating a partial
+        // fragment as a complete packet exposes callers to truncated,
+        // attacker-influenced data.  Recycle the descriptor and discard.
+        if !self.rx_ring[idx].is_eop() {
+            self.rx_ring[idx].status = 0;
+            self.rx_ring[idx].length = 0;
+            self.rx_tail = (idx + 1) % RX_DESC_COUNT;
+            self.write_reg(REG_RDT, idx as u32);
+            return None;
+        }
+
         // The `length` field is written by the hardware/device and may be
         // attacker-controlled (malicious or buggy NIC). Cap it to BUF_SIZE
         // to prevent any caller from performing an out-of-bounds read of the

@@ -191,6 +191,19 @@ impl<HW: SpiControllerHw> SpiMaster<HW> {
         if self.device_count >= MAX_SPI_DEVICES {
             return Err(Error::OutOfMemory);
         }
+        // SECURITY: max_speed_hz==0 would reach set_clock_hz(0) in sync_transfer,
+        // causing a divide-by-zero in hardware clock divider implementations.
+        // Reject at registration time so sync_transfer can trust the value.
+        if config.max_speed_hz == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: chip_select is forwarded to hw.set_cs() during a transfer; a
+        // HAL set_cs that indexes a per-line array/register table by cs would go
+        // out of bounds for an unvalidated value. Reject a chip-select beyond the
+        // controller's device capacity at registration.
+        if config.chip_select as usize >= MAX_SPI_DEVICES {
+            return Err(Error::InvalidArgument);
+        }
         let idx = self.device_count;
         self.devices[idx] = Some(config);
         self.device_count += 1;
@@ -221,8 +234,19 @@ impl<HW: SpiControllerHw> SpiMaster<HW> {
             self.hw.set_cs(cs, true, polarity);
         }
 
+        // SECURITY: xfer.len is a pub field that may be set by untrusted/attacker-controlled
+        // code to a value larger than the actual tx/rx buffer lengths, causing OOB indexing
+        // in the per-byte loop below. Clamp len against all non-None buffer lengths so that
+        // &tx[offset..offset+chunk] and &rx[rx_offset..offset+chunk] are always in-bounds,
+        // regardless of what the caller placed in xfer.len.
+        let buf_bound = {
+            let tx_bound = xfer.tx_buf.as_ref().map_or(usize::MAX, |b| b.len());
+            let rx_bound = xfer.rx_buf.as_ref().map_or(usize::MAX, |b| b.len());
+            tx_bound.min(rx_bound)
+        };
+        let len = xfer.len.min(buf_bound);
+
         // Perform transfer in FIFO-sized chunks.
-        let len = xfer.len;
         let mut offset = 0usize;
         while offset < len {
             let chunk = (len - offset).min(FIFO_DEPTH);

@@ -479,24 +479,35 @@ impl Rtl8169 {
         }
 
         let pkt_len = (opts1 & 0x3FFF) as usize;
-        if pkt_len > 4 {
-            // strip 4-byte CRC
-            let data_len = pkt_len - 4;
-            if buf.len() < data_len {
-                return Err(Error::InvalidArgument);
-            }
-            buf[..data_len].copy_from_slice(&self.rx_buf[self.rx_head][..data_len]);
-
-            // Return descriptor to NIC.
+        // SECURITY: pkt_len is a device-DMA-controlled field. Validate both the
+        // lower bound (must hold at least the 4-byte Ethernet CRC) and the upper
+        // bound (must not exceed the fixed RX_BUF_SIZE DMA buffer) before slicing.
+        // Without this guard, a malicious/faulty device could cause an OOB slice
+        // panic (ring-0 halt) or a wrapping underflow on the CRC subtraction.
+        if pkt_len < 4 || pkt_len > RX_BUF_SIZE {
+            // Recycle the descriptor back to the NIC and skip this packet.
             let eor = self.rx_head == RX_RING_SIZE - 1;
             let buf_addr = self.rx_buf[self.rx_head].as_ptr() as u64;
             self.rx_ring[self.rx_head].set_addr(buf_addr);
             self.rx_ring[self.rx_head].setup_rx(RX_BUF_SIZE as u16, eor);
-
             self.rx_head = (self.rx_head + 1) % RX_RING_SIZE;
-            return Ok(data_len);
+            return Err(Error::IoError);
         }
-        Err(Error::Busy)
+        // strip 4-byte CRC; subtraction is safe: pkt_len >= 4 guaranteed above.
+        let data_len = pkt_len - 4;
+        if buf.len() < data_len {
+            return Err(Error::InvalidArgument);
+        }
+        buf[..data_len].copy_from_slice(&self.rx_buf[self.rx_head][..data_len]);
+
+        // Return descriptor to NIC.
+        let eor = self.rx_head == RX_RING_SIZE - 1;
+        let buf_addr = self.rx_buf[self.rx_head].as_ptr() as u64;
+        self.rx_ring[self.rx_head].set_addr(buf_addr);
+        self.rx_ring[self.rx_head].setup_rx(RX_BUF_SIZE as u16, eor);
+
+        self.rx_head = (self.rx_head + 1) % RX_RING_SIZE;
+        Ok(data_len)
     }
 
     /// Handle an interrupt.
