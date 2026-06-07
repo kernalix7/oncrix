@@ -39,6 +39,42 @@
 
 use oncrix_lib::{Error, Result};
 
+use crate::capability::{CAP_BPF, CAP_SYS_ADMIN, CapSet};
+
+// ── Privilege gate ────────────────────────────────────────────────────────────
+//
+// SECURITY: trampolines patch a live kernel function's prologue (`func_addr`)
+// to jump into a generated image that runs attached BPF programs at fentry /
+// fexit. Registering or attaching to a trampoline is therefore equivalent to
+// rewriting kernel text and running untrusted bytecode in Ring 0 — an
+// unprivileged caller reaching these is a full kernel compromise.
+//
+// No per-task credential is wired into [`TrampolineRegistry`] or
+// [`BpfTrampoline`] yet, so these methods cannot self-check the *calling*
+// task's capabilities. The invariant is FAIL CLOSED at the boundary:
+//
+//   The syscall dispatcher MUST verify the calling task holds BOTH
+//   `CAP_BPF` and `CAP_SYS_ADMIN` (via [`require_trampoline_cap`]) BEFORE
+//   invoking `TrampolineRegistry::register` or `BpfTrampoline::attach`
+//   (and the batch attach path `commit_batch`). Wiring a `CapSet` into the
+//   registry and calling the guard internally is the intended follow-up.
+
+/// Capability gate for trampoline kernel-text patching.
+///
+/// Rejects unless the supplied capability set holds both `CAP_BPF` and
+/// `CAP_SYS_ADMIN`. The syscall dispatcher MUST call this with the calling
+/// task's effective capabilities before registering or attaching to any
+/// trampoline.
+// SECURITY: attaching/registering a trampoline patches kernel function
+// prologues; gating on CAP_BPF + CAP_SYS_ADMIN is mandatory. Fails closed.
+pub fn require_trampoline_cap(caps: &CapSet) -> Result<()> {
+    if caps.has(CAP_BPF) && caps.has(CAP_SYS_ADMIN) {
+        Ok(())
+    } else {
+        Err(Error::PermissionDenied)
+    }
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Maximum number of trampolines in the global registry.
@@ -513,6 +549,11 @@ impl BpfTrampoline {
     /// Attach a BPF program to this trampoline.
     ///
     /// After attaching, the trampoline image is regenerated.
+    // SECURITY: attaching makes the (untrusted) BPF program run at the target
+    // kernel function's fentry/fexit via patched kernel text. No per-task cred
+    // is reachable here, so this fails closed at the boundary: the syscall
+    // dispatcher MUST call `require_trampoline_cap` (CAP_BPF + CAP_SYS_ADMIN)
+    // for the calling task before invoking this (and `commit_batch`).
     pub fn attach(&mut self, prog_id: u32, attach_type: AttachType, priority: u32) -> Result<()> {
         if !self.active {
             return Err(Error::NotFound);
@@ -703,6 +744,12 @@ impl TrampolineRegistry {
     /// Register a new trampoline for a target function.
     ///
     /// Returns the trampoline ID.
+    // SECURITY: this binds a trampoline to a kernel function address
+    // (`prototype.func_addr()`) and is the entry point for patching that
+    // function's prologue. No per-task cred is reachable here, so it fails
+    // closed at the boundary: the syscall dispatcher MUST call
+    // `require_trampoline_cap` (CAP_BPF + CAP_SYS_ADMIN) for the calling task
+    // before invoking this.
     pub fn register(&mut self, prototype: FuncPrototype) -> Result<u64> {
         // Check if a trampoline already exists for this address.
         let addr = prototype.func_addr();

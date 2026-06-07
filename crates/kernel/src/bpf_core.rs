@@ -139,9 +139,16 @@ impl BpfInsn {
         self.code & 0x07
     }
 
-    /// Opcode sans class bits.
+    /// Opcode (top nibble), excluding the source-modifier bit and class bits.
+    ///
+    // SECURITY/correctness: mask the top nibble only (0xf0). The source-modifier
+    // bit (BPF_X = 0x08) lives in bit 3 and is decoded separately by `src()`;
+    // including it here (the previous `& 0xf8`) made every register-source
+    // (BPF_X) ALU/JMP opcode miss its match arm and fall through to
+    // `NotImplemented`, silently disabling register-source arithmetic and
+    // leaving the per-arm `src` register bound non-load-bearing.
     pub fn op(&self) -> u8 {
-        self.code & 0xf8
+        self.code & 0xf0
     }
 
     /// Source modifier (BPF_K or BPF_X).
@@ -336,6 +343,10 @@ impl BpfVm {
 
         let mut regs = BpfRegs::new();
         // R1 = context pointer, R10 = frame pointer (top of stack).
+        // SECURITY: constant, in-range indices set before any program instruction runs.
+        // R10 is intentionally seeded here via a direct write (the public `write()` accessor
+        // rejects R10 to keep the frame pointer read-only *during* execution); no untrusted
+        // instruction index reaches these lines.
         regs.regs[1] = ctx;
         regs.regs[10] = self.stack.as_ptr() as u64 + self.stack.len() as u64;
 
@@ -355,6 +366,21 @@ impl BpfVm {
             let insn = insns[pc];
             let dst = insn.dst_reg() as usize;
             let src = insn.src_reg() as usize;
+            // SECURITY: dst_reg()/src_reg() are 4-bit instruction fields (value 0..15),
+            // but the register file has only BPF_REG_COUNT (11) entries. An untrusted /
+            // unverified program with a register byte such as 0x0b yields dst/src == 11,
+            // which would index out of bounds. With overflow/bounds checks enabled in
+            // ring 0 that is a kernel panic (machine halt); without them it is an OOB
+            // read/write of adjacent VM state. Reject any instruction whose dst or src
+            // register index is out of range BEFORE any `regs.regs[..]` access below, so
+            // every direct index in the ALU64/JMP arms is provably in bounds. Fixed
+            // indices used elsewhere (R0–R5, R10) are constants and in range by
+            // construction. This is defence-in-depth; the verifier MUST also reject such
+            // programs, but the interpreter must not trust the `verified` flag for memory
+            // safety.
+            if dst >= BPF_REG_COUNT || src >= BPF_REG_COUNT {
+                return Err(Error::InvalidArgument);
+            }
             let imm = insn.imm as i64 as u64;
             let cls = insn.class();
             let op = insn.op();
@@ -362,45 +388,47 @@ impl BpfVm {
 
             match cls {
                 c if c == class::ALU64 => {
-                    let src_val = if is_reg { regs.regs[src] } else { imm };
-                    match op {
-                        o if o == alu_op::ADD => {
-                            regs.regs[dst] = regs.regs[dst].wrapping_add(src_val)
-                        }
-                        o if o == alu_op::SUB => {
-                            regs.regs[dst] = regs.regs[dst].wrapping_sub(src_val)
-                        }
-                        o if o == alu_op::MUL => {
-                            regs.regs[dst] = regs.regs[dst].wrapping_mul(src_val)
-                        }
+                    // SECURITY: use the checked accessors regs.read()/regs.write() at every
+                    // read/write site. dst/src are already range-checked above; the accessors
+                    // additionally enforce R10's read-only frame-pointer invariant on writes,
+                    // so an untrusted program cannot clobber R10 via an ALU destination.
+                    let dst_reg = insn.dst_reg();
+                    let src_reg = insn.src_reg();
+                    let src_val = if is_reg { regs.read(src_reg)? } else { imm };
+                    let cur = regs.read(dst_reg)?;
+                    let res = match op {
+                        o if o == alu_op::ADD => cur.wrapping_add(src_val),
+                        o if o == alu_op::SUB => cur.wrapping_sub(src_val),
+                        o if o == alu_op::MUL => cur.wrapping_mul(src_val),
                         o if o == alu_op::DIV => {
                             if src_val == 0 {
                                 return Err(Error::InvalidArgument);
                             }
-                            regs.regs[dst] /= src_val;
+                            cur / src_val
                         }
-                        o if o == alu_op::OR => regs.regs[dst] |= src_val,
-                        o if o == alu_op::AND => regs.regs[dst] &= src_val,
-                        o if o == alu_op::LSH => regs.regs[dst] <<= src_val & 63,
-                        o if o == alu_op::RSH => regs.regs[dst] >>= src_val & 63,
-                        o if o == alu_op::XOR => regs.regs[dst] ^= src_val,
-                        o if o == alu_op::MOV => regs.regs[dst] = src_val,
+                        o if o == alu_op::OR => cur | src_val,
+                        o if o == alu_op::AND => cur & src_val,
+                        o if o == alu_op::LSH => cur << (src_val & 63),
+                        o if o == alu_op::RSH => cur >> (src_val & 63),
+                        o if o == alu_op::XOR => cur ^ src_val,
+                        o if o == alu_op::MOV => src_val,
                         o if o == alu_op::MOD => {
                             if src_val == 0 {
                                 return Err(Error::InvalidArgument);
                             }
-                            regs.regs[dst] %= src_val;
+                            cur % src_val
                         }
-                        o if o == alu_op::NEG => {
-                            regs.regs[dst] = (regs.regs[dst] as i64).wrapping_neg() as u64;
-                        }
+                        o if o == alu_op::NEG => (cur as i64).wrapping_neg() as u64,
                         _ => return Err(Error::NotImplemented),
-                    }
+                    };
+                    regs.write(dst_reg, res)?;
                     pc += 1;
                 }
                 c if c == class::JMP => match op {
                     o if o == jmp_op::EXIT => {
-                        return Ok(regs.regs[0]);
+                        // SECURITY: read R0 via the checked accessor (R0 is a constant,
+                        // in-range index; accessor keeps every register access uniform).
+                        return regs.read(0);
                     }
                     o if o == jmp_op::CALL => {
                         let helper_idx = insn.imm as usize;
@@ -408,21 +436,30 @@ impl BpfVm {
                             return Err(Error::InvalidArgument);
                         }
                         let helper = self.helpers[helper_idx].ok_or(Error::NotFound)?;
-                        regs.regs[0] = helper(
-                            regs.regs[1],
-                            regs.regs[2],
-                            regs.regs[3],
-                            regs.regs[4],
-                            regs.regs[5],
+                        // SECURITY: R0–R5 are constant, in-range indices; use the checked
+                        // accessors so the helper ABI registers are read/written uniformly.
+                        let r0 = helper(
+                            regs.read(1)?,
+                            regs.read(2)?,
+                            regs.read(3)?,
+                            regs.read(4)?,
+                            regs.read(5)?,
                         );
+                        regs.write(0, r0)?;
                         pc += 1;
                     }
                     o if o == jmp_op::JA => {
                         pc = (pc as isize + 1 + insn.off as isize) as usize;
                     }
                     _ => {
-                        let src_val = if is_reg { regs.regs[src] } else { imm };
-                        let dst_val = regs.regs[dst];
+                        // SECURITY: dst/src already range-checked above; read both branch
+                        // operands via the checked accessors for defence-in-depth.
+                        let src_val = if is_reg {
+                            regs.read(insn.src_reg())?
+                        } else {
+                            imm
+                        };
+                        let dst_val = regs.read(insn.dst_reg())?;
                         let taken = match op {
                             o if o == jmp_op::JEQ => dst_val == src_val,
                             o if o == jmp_op::JNE => dst_val != src_val,

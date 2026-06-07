@@ -25,6 +25,42 @@
 
 use oncrix_lib::{Error, Result};
 
+use crate::capability::{CAP_BPF, CAP_SYS_ADMIN, CapSet};
+
+// ── Privilege gate ─────────────────────────────────────────────────
+//
+// SECURITY: struct_ops register/create/activate install BPF programs as
+// kernel function pointers (e.g. `tcp_congestion_ops`) — i.e. they make an
+// untrusted-bytecode VM run as Ring-0 callback code. These are kernel-text
+// equivalent privileged operations: an unprivileged caller reaching them is
+// a full kernel compromise.
+//
+// This crate has NO per-task credential wired into [`StructOpsRegistry`] yet,
+// so these methods cannot self-check the *calling* task's capabilities. The
+// invariant is therefore FAIL CLOSED at the boundary:
+//
+//   The syscall dispatcher MUST verify the calling task holds BOTH
+//   `CAP_BPF` and `CAP_SYS_ADMIN` (via [`require_struct_ops_cap`]) BEFORE
+//   invoking `register_type`, `create_map`, or `activate_map`. Wiring a
+//   `CapSet` into the registry and calling the guard internally is the
+//   intended follow-up; until then this guard is the single chokepoint.
+
+/// Capability gate for struct_ops kernel-function-pointer patching.
+///
+/// Rejects unless the supplied capability set holds both `CAP_BPF` and
+/// `CAP_SYS_ADMIN`. The syscall dispatcher MUST call this with the calling
+/// task's effective capabilities before driving any struct_ops
+/// registration/activation path.
+// SECURITY: registering a struct_ops map patches kernel function pointers;
+// gating on CAP_BPF + CAP_SYS_ADMIN is mandatory. Fails closed.
+pub fn require_struct_ops_cap(caps: &CapSet) -> Result<()> {
+    if caps.has(CAP_BPF) && caps.has(CAP_SYS_ADMIN) {
+        Ok(())
+    } else {
+        Err(Error::PermissionDenied)
+    }
+}
+
 // ── Constants ──────────────────────────────────────────────────────
 
 /// Maximum number of struct_ops type descriptors.
@@ -510,6 +546,16 @@ impl StructOpsMap {
     }
 
     /// Attach a BPF program to a member.
+    ///
+    /// `member_idx` is bounded against the static slot array (`MAX_MEMBERS`)
+    /// here, but the *real* member count of the bound type is enforced later
+    /// in [`StructOpsRegistry::activate_map`]. The map does not hold a
+    /// reference to its [`StructOpsTypeDesc`], so it cannot self-check
+    /// `member_idx < type.member_count()` at attach time.
+    // SECURITY: a `member_idx` in `member_count..MAX_MEMBERS` is a valid array
+    // slot but a *non-existent* member of the bound type. Such an attachment
+    // is rejected at activation; this bound only prevents an out-of-bounds
+    // index panic on the fixed-size `attachments` array.
     pub fn attach_prog(&mut self, member_idx: usize, prog_id: u32) -> Result<()> {
         if self.state != StructOpsState::Init {
             return Err(Error::InvalidArgument);
@@ -537,6 +583,18 @@ impl StructOpsMap {
         } else {
             None
         }
+    }
+
+    /// Whether any active attachment sits at or beyond `member_count`.
+    ///
+    /// Used at activation to reject attachments bound to a slot that is a
+    /// valid array index (`< MAX_MEMBERS`) but not a real member of the
+    /// bound type (`>= member_count`).
+    // SECURITY: detects ghost attachments at non-existent member slots that
+    // would otherwise bypass the `0..member_count` verification loop.
+    pub fn has_attachment_beyond(&self, member_count: usize) -> bool {
+        let start = member_count.min(MAX_MEMBERS);
+        self.attachments[start..].iter().any(|a| a.active)
     }
 
     /// Transition to the Prepared state.
@@ -907,6 +965,10 @@ impl StructOpsRegistry {
     /// Register a new struct_ops type.
     ///
     /// Returns the type index for future reference.
+    // SECURITY: privileged kernel-function-pointer schema registration. No
+    // per-task cred is reachable here, so this fails closed at the boundary:
+    // the syscall dispatcher MUST call `require_struct_ops_cap` (CAP_BPF +
+    // CAP_SYS_ADMIN) for the calling task before invoking this.
     pub fn register_type(&mut self, name: &[u8], btf_id: u32, struct_size: u32) -> Result<usize> {
         if !self.initialized {
             return Err(Error::NotImplemented);
@@ -972,6 +1034,10 @@ impl StructOpsRegistry {
     /// Create a new struct_ops map for a given type.
     ///
     /// Returns the map ID.
+    // SECURITY: allocates a kernel-function-pointer binding instance. No
+    // per-task cred is reachable here, so this fails closed at the boundary:
+    // the syscall dispatcher MUST call `require_struct_ops_cap` (CAP_BPF +
+    // CAP_SYS_ADMIN) for the calling task before invoking this.
     pub fn create_map(&mut self, type_idx: usize) -> Result<u32> {
         if type_idx >= self.type_count || !self.types[type_idx].is_registered() {
             return Err(Error::NotFound);
@@ -1008,6 +1074,11 @@ impl StructOpsRegistry {
     ///
     /// This is the main entry point for activating a struct_ops
     /// instance after programs have been attached.
+    // SECURITY: this is the commit point that makes BPF programs live as
+    // kernel function pointers (full Ring-0 compromise if unprivileged). No
+    // per-task cred is reachable here, so it fails closed at the boundary:
+    // the syscall dispatcher MUST call `require_struct_ops_cap` (CAP_BPF +
+    // CAP_SYS_ADMIN) for the calling task before invoking this.
     pub fn activate_map(&mut self, map_id: u32) -> Result<()> {
         let map_idx = self.find_map_index(map_id)?;
         let type_idx = self.maps[map_idx].type_idx;
@@ -1015,8 +1086,22 @@ impl StructOpsRegistry {
         // Prepare
         self.maps[map_idx].prepare()?;
 
-        // Verify each attached program
         let member_count = self.types[type_idx].member_count();
+
+        // SECURITY: `attach_prog` only bounds `member_idx` against the static
+        // slot array (`MAX_MEMBERS`), not the bound type's real `member_count`.
+        // A program attached at e.g. slot 31 on a 2-member type would otherwise
+        // skip verification below (the loop is `0..member_count`) yet stay
+        // `active`, binding a BPF program to a non-existent kernel function
+        // pointer. Fail closed: reject activation if any active attachment
+        // references a member index outside the type's real member set.
+        if self.maps[map_idx].has_attachment_beyond(member_count) {
+            self.maps[map_idx].finalize();
+            self.map_count = self.map_count.saturating_sub(1);
+            return Err(Error::InvalidArgument);
+        }
+
+        // Verify each attached program
         for midx in 0..member_count {
             if let Some(att) = self.maps[map_idx].get_prog(midx) {
                 let prog_id = att.prog_id;
