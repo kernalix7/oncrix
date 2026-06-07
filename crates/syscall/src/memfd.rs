@@ -279,23 +279,76 @@ impl MemfdRegistry {
     }
 
     /// Write data to a memfd at the given offset.
-    pub fn memfd_write(&mut self, id: u64, offset: u64, data: &[u8]) -> Result<usize> {
-        self.find_mut(id)?.write(offset, data)
+    ///
+    /// The caller must be the creating process (`caller_pid == owner_pid`).
+    /// Seal enforcement (`F_SEAL_WRITE`, `F_SEAL_GROW`) is applied inside
+    /// [`Memfd::write`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if `caller_pid` does not match `owner_pid`.
+    /// - Propagates errors from [`Memfd::write`].
+    // SECURITY: ownership check — only the fd owner may mutate the
+    // memfd content.  When a proper fd-table is wired the check will move
+    // to the fd-table lookup; for now we compare PIDs directly.
+    pub fn memfd_write(
+        &mut self,
+        id: u64,
+        offset: u64,
+        data: &[u8],
+        caller_pid: u64,
+    ) -> Result<usize> {
+        let fd = self.find_mut(id)?;
+        if fd.owner_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+        fd.write(offset, data)
     }
 
     /// Read data from a memfd at the given offset.
+    ///
+    /// Read is not restricted by ownership; any holder of the id may read.
     pub fn memfd_read(&self, id: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
         self.get(id)?.read(offset, buf)
     }
 
     /// Truncate a memfd to the given size.
-    pub fn memfd_truncate(&mut self, id: u64, size: u64) -> Result<()> {
-        self.find_mut(id)?.truncate(size)
+    ///
+    /// The caller must be the creating process (`caller_pid == owner_pid`).
+    /// Seal enforcement (`F_SEAL_SHRINK`, `F_SEAL_GROW`) is applied inside
+    /// [`Memfd::truncate`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if `caller_pid` does not match `owner_pid`.
+    /// - Propagates errors from [`Memfd::truncate`].
+    // SECURITY: ownership check — only the fd owner may resize the file.
+    pub fn memfd_truncate(&mut self, id: u64, size: u64, caller_pid: u64) -> Result<()> {
+        let fd = self.find_mut(id)?;
+        if fd.owner_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+        fd.truncate(size)
     }
 
     /// Add seals to a memfd.
-    pub fn memfd_add_seal(&mut self, id: u64, seal: u32) -> Result<()> {
-        self.find_mut(id)?.add_seal(seal)
+    ///
+    /// The caller must be the creating process (`caller_pid == owner_pid`).
+    /// Additional constraints (e.g., `MFD_ALLOW_SEALING`, `F_SEAL_SEAL`)
+    /// are enforced inside [`Memfd::add_seal`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] if `caller_pid` does not match `owner_pid`.
+    /// - Propagates errors from [`Memfd::add_seal`].
+    // SECURITY: ownership check — sealing is a one-way, irreversible
+    // operation; only the owner may add seals.
+    pub fn memfd_add_seal(&mut self, id: u64, seal: u32, caller_pid: u64) -> Result<()> {
+        let fd = self.find_mut(id)?;
+        if fd.owner_pid != caller_pid {
+            return Err(Error::PermissionDenied);
+        }
+        fd.add_seal(seal)
     }
 
     /// Get the current seals of a memfd.

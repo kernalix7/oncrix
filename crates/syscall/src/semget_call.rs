@@ -170,7 +170,7 @@ pub fn do_semget(
         }
         let slot = table.alloc_slot().ok_or(Error::OutOfMemory)?;
         let id = table.next_id;
-        table.next_id += 1;
+        table.next_id = table.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
         table.sets[slot] = Some(SemSet {
             key,
             id,
@@ -199,7 +199,7 @@ pub fn do_semget(
     }
     let slot = table.alloc_slot().ok_or(Error::OutOfMemory)?;
     let id = table.next_id;
-    table.next_id += 1;
+    table.next_id = table.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
     table.sets[slot] = Some(SemSet {
         key,
         id,
@@ -266,13 +266,53 @@ pub fn do_semctl_getval(table: &SemTable, semid: i32, semnum: usize) -> Result<i
 }
 
 /// Handler for `semctl(SETVAL)`.
-pub fn do_semctl_setval(table: &mut SemTable, semid: i32, semnum: usize, val: i16) -> Result<()> {
+///
+/// Sets the value of semaphore `semnum` within the set identified by
+/// `semid` to `val`.
+///
+/// # Access control
+///
+/// POSIX.1-2024 §semctl: the calling process must have **write** permission
+/// on the semaphore set.  In ONCRIX the minimum requirement mirrors Linux
+/// `ipcperms`/`ipc_check_perms`: the caller must be the owner (`set.uid`),
+/// the creator (`set.cuid`), or hold `CAP_SYS_ADMIN`.  Any other caller
+/// receives [`Error::PermissionDenied`] (→ `EPERM`).
+///
+/// # Parameters
+///
+/// - `caller_uid`    — effective UID of the calling process.
+/// - `is_privileged` — `true` when the caller holds `CAP_SYS_ADMIN`
+///   (`CAP_SYS_ADMIN = 21`).
+///
+/// # Errors
+///
+/// | `Error`            | Condition                                      |
+/// |--------------------|------------------------------------------------|
+/// | `NotFound`         | `semid` does not identify a live set           |
+/// | `InvalidArgument`  | `semnum` out of range or `val` out of range    |
+/// | `PermissionDenied` | Caller is not owner/creator and not privileged |
+// SECURITY: fail-closed write-permission check.  When per-task credential
+// threading is wired, replace `is_privileged` with a real capability check
+// against the calling task's cap_effective bitmask
+// (capability number CAP_SYS_ADMIN = 21).
+pub fn do_semctl_setval(
+    table: &mut SemTable,
+    semid: i32,
+    semnum: usize,
+    val: i16,
+    caller_uid: u32,
+    is_privileged: bool,
+) -> Result<()> {
     if val < 0 || val > SEMVMX {
         return Err(Error::InvalidArgument);
     }
     let set = table.get_mut(semid).ok_or(Error::NotFound)?;
     if semnum >= set.nsems {
         return Err(Error::InvalidArgument);
+    }
+    // POSIX: owner, creator, or privileged caller only.
+    if !is_privileged && caller_uid != set.uid && caller_uid != set.cuid {
+        return Err(Error::PermissionDenied);
     }
     set.values[semnum] = val;
     Ok(())
@@ -337,8 +377,10 @@ mod tests {
     #[test]
     fn semctl_setval_getval() {
         let mut t = SemTable::new();
+        // uid=0 is both owner and creator; is_privileged=false exercises
+        // the uid == set.uid path.
         let id = do_semget(&mut t, IPC_PRIVATE, 4, 0o600, 0).unwrap();
-        do_semctl_setval(&mut t, id, 2, 10).unwrap();
+        do_semctl_setval(&mut t, id, 2, 10, 0, false).unwrap();
         assert_eq!(do_semctl_getval(&t, id, 2).unwrap(), 10);
     }
 
@@ -346,7 +388,7 @@ mod tests {
     fn semop_ok() {
         let mut t = SemTable::new();
         let id = do_semget(&mut t, IPC_PRIVATE, 2, 0, 0).unwrap();
-        do_semctl_setval(&mut t, id, 0, 5).unwrap();
+        do_semctl_setval(&mut t, id, 0, 5, 0, false).unwrap();
         let ops = [Sembuf {
             sem_num: 0,
             sem_op: -3,
@@ -418,5 +460,49 @@ mod tests {
     fn rmid_not_found() {
         let mut t = SemTable::new();
         assert_eq!(do_semctl_rmid(&mut t, 999, 0, true), Err(Error::NotFound),);
+    }
+
+    // --- do_semctl_setval ownership gate ---
+
+    /// Owner may set a semaphore value.
+    #[test]
+    fn setval_owner_succeeds() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 2, 0o600, 1000).unwrap();
+        assert!(do_semctl_setval(&mut t, id, 0, 7, 1000, false).is_ok());
+        assert_eq!(do_semctl_getval(&t, id, 0).unwrap(), 7);
+    }
+
+    /// Creator may set a value even after uid transfer.
+    #[test]
+    fn setval_creator_succeeds() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 2, 0o600, 2000).unwrap();
+        // Simulate ownership transfer.
+        if let Some(set) = t.get_mut(id) {
+            set.uid = 9999;
+        }
+        assert!(do_semctl_setval(&mut t, id, 0, 3, 2000, false).is_ok());
+    }
+
+    /// Privileged caller may set a value regardless of uid.
+    #[test]
+    fn setval_privileged_succeeds() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 2, 0o600, 1000).unwrap();
+        assert!(do_semctl_setval(&mut t, id, 1, 15, 0, true).is_ok());
+    }
+
+    /// Unprivileged stranger must be denied.
+    #[test]
+    fn setval_stranger_denied() {
+        let mut t = SemTable::new();
+        let id = do_semget(&mut t, IPC_PRIVATE, 2, 0o600, 1000).unwrap();
+        assert_eq!(
+            do_semctl_setval(&mut t, id, 0, 5, 1001, false),
+            Err(Error::PermissionDenied),
+        );
+        // Value must be unchanged.
+        assert_eq!(do_semctl_getval(&t, id, 0).unwrap(), 0);
     }
 }
