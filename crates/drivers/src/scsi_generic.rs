@@ -53,6 +53,27 @@ pub const MAX_SENSE_LEN: usize = 96;
 pub const MAX_SG_DATA_LEN: usize = 4096;
 
 // ---------------------------------------------------------------------------
+// Capability constants (Linux CAP_* numbering, matching kernel/capability.rs)
+// ---------------------------------------------------------------------------
+
+/// Capability: perform raw I/O operations (iopl/ioperm, /dev/mem, sg passthrough).
+///
+/// Must equal `CAP_SYS_RAWIO` (17) from `crates/kernel/src/capability.rs`.
+pub const CAP_SYS_RAWIO: u8 = 17;
+
+/// Test whether a caller capability bitmask grants `cap`.
+///
+/// `caller_caps` mirrors `CapSet::bits()` from `oncrix-kernel::capability`.
+/// The dispatcher threads the calling task's effective capability set here.
+#[inline]
+fn has_cap(caller_caps: u64, cap: u8) -> bool {
+    if cap >= 64 {
+        return false;
+    }
+    (caller_caps >> cap) & 1 == 1
+}
+
+// ---------------------------------------------------------------------------
 // Data transfer direction
 // ---------------------------------------------------------------------------
 
@@ -268,8 +289,32 @@ impl SgDevice {
     }
 
     /// Opens the device handle.
-    pub fn open(&mut self) {
+    ///
+    /// # Capability requirement
+    ///
+    /// Requires `CAP_SYS_RAWIO` in `caller_caps` (the calling task's effective
+    /// capability bitmask, threaded by the dispatcher from the task's
+    /// `ThreadCapState::effective`).  Fails closed — an unprivileged caller
+    /// receives `Error::PermissionDenied` before any hardware state is touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PermissionDenied`] if `caller_caps` lacks `CAP_SYS_RAWIO`.
+    ///
+    /// # Security
+    ///
+    /// SCSI generic passthrough allows sending arbitrary CDBs to hardware.
+    /// Without this gate an unprivileged caller can issue destructive commands
+    /// (FORMAT UNIT, WRITE BUFFER firmware update, etc.).  `CAP_SYS_RAWIO` is
+    /// the canonical Linux capability for raw device access; see capabilities(7).
+    pub fn open(&mut self, caller_caps: u64) -> Result<()> {
+        // SECURITY: SG_IO is an arbitrary SCSI passthrough interface.  Deny any
+        // caller that does not hold CAP_SYS_RAWIO (bit 17) in its effective set.
+        if !has_cap(caller_caps, CAP_SYS_RAWIO) {
+            return Err(Error::PermissionDenied);
+        }
         self.open = true;
+        Ok(())
     }
 
     /// Closes the device handle.
@@ -282,22 +327,48 @@ impl SgDevice {
     /// `execute` is a transport-specific function that takes the target
     /// address, CDB, data buffer, and sense buffer, returns the SCSI status.
     ///
+    /// # Capability requirement
+    ///
+    /// `caller_caps` must contain `CAP_SYS_RAWIO` (bit 17).  The dispatcher
+    /// threads the calling task's effective capability bitmask here.  This
+    /// re-checks the capability even when the device was already opened, so
+    /// privilege can be revoked between open and execute.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if the header is invalid.
-    /// Returns [`Error::NotFound`] if the device handle is closed.
-    pub fn execute<F>(&mut self, hdr: &mut SgIoHdr, execute: F) -> Result<()>
+    /// - [`Error::PermissionDenied`] — `caller_caps` lacks `CAP_SYS_RAWIO`.
+    /// - [`Error::InvalidArgument`] — header invalid, or `dxfer_len` exceeds
+    ///   `MAX_SYS_DATA_LEN` (caller must split).
+    /// - [`Error::NotFound`] — device handle is not open.
+    ///
+    /// # Security
+    ///
+    /// `dxfer_len` is device-controlled (from a user-supplied header).  We
+    /// reject values exceeding `MAX_SG_DATA_LEN` instead of silently clamping;
+    /// silent clamping would leave the CDB encoding a larger transfer than
+    /// the buffer actually provided, enabling DMA/transport overruns downstream.
+    pub fn execute<F>(&mut self, hdr: &mut SgIoHdr, caller_caps: u64, execute: F) -> Result<()>
     where
         F: FnOnce(u8, u8, u8, u8, &[u8], &mut [u8], &mut [u8]) -> Result<(u8, u8, u32)>,
     {
+        // SECURITY: Re-verify CAP_SYS_RAWIO on every execute, not just on open.
+        if !has_cap(caller_caps, CAP_SYS_RAWIO) {
+            return Err(Error::PermissionDenied);
+        }
         if !self.open {
             return Err(Error::NotFound);
         }
         hdr.validate()?;
 
-        let cdb = &hdr.cmdp[..hdr.cmd_len as usize];
         let data_len = hdr.dxfer_len as usize;
-        let actual_data_len = data_len.min(MAX_SG_DATA_LEN);
+        // Reject oversized transfers: caller must split the I/O.  Silent
+        // clamping is NOT used because the CDB would still encode the
+        // original (larger) length, producing a transport/DMA overrun.
+        if data_len > MAX_SG_DATA_LEN {
+            return Err(Error::InvalidArgument);
+        }
+
+        let cdb = &hdr.cmdp[..hdr.cmd_len as usize];
 
         let (status, sb_len, resid) = execute(
             self.host,
@@ -305,13 +376,15 @@ impl SgDevice {
             self.target,
             self.lun,
             cdb,
-            &mut self.data_buf[..actual_data_len],
+            &mut self.data_buf[..data_len],
             &mut hdr.sbp,
         )?;
 
         hdr.status = status;
         hdr.masked_status = status >> 1;
-        hdr.sb_len_wr = sb_len;
+        // Clamp sense bytes written to the actual sense buffer size so the
+        // caller cannot observe stale bytes beyond what the transport wrote.
+        hdr.sb_len_wr = sb_len.min(MAX_SENSE_LEN as u8);
         hdr.resid = resid;
         Ok(())
     }
@@ -435,5 +508,60 @@ mod tests {
         assert_eq!(idx, 0);
         assert_eq!(reg.len(), 1);
         assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn sg_open_requires_cap_sys_rawio() {
+        let mut dev = SgDevice::new(0, 0, 0, 0);
+        // No capabilities — must be denied.
+        assert_eq!(dev.open(0), Err(Error::PermissionDenied));
+        // CAP_SYS_RAWIO = bit 17.
+        let caps: u64 = 1 << CAP_SYS_RAWIO;
+        assert!(dev.open(caps).is_ok());
+        assert!(dev.is_open());
+    }
+
+    #[test]
+    fn sg_execute_rejects_oversized_dxfer_len() {
+        let mut dev = SgDevice::new(0, 0, 0, 0);
+        let caps: u64 = 1 << CAP_SYS_RAWIO;
+        dev.open(caps).unwrap();
+
+        let cdb = [0x12u8, 0, 0, 0, 36, 0]; // INQUIRY
+        let mut hdr = SgIoHdr::new_read(&cdb, (MAX_SG_DATA_LEN + 1) as u32).unwrap();
+        let result = dev.execute(&mut hdr, caps, |_, _, _, _, _, _, _| Ok((0u8, 0u8, 0u32)));
+        assert_eq!(result, Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn sg_execute_denied_without_cap() {
+        let mut dev = SgDevice::new(0, 0, 0, 0);
+        let caps: u64 = 1 << CAP_SYS_RAWIO;
+        dev.open(caps).unwrap();
+
+        let cdb = [0x12u8, 0, 0, 0, 36, 0];
+        let mut hdr = SgIoHdr::new_read(&cdb, 36).unwrap();
+        let result = dev.execute(
+            &mut hdr,
+            0, /* no caps */
+            |_, _, _, _, _, _, _| Ok((0u8, 0u8, 0u32)),
+        );
+        assert_eq!(result, Err(Error::PermissionDenied));
+    }
+
+    #[test]
+    fn sg_execute_clamps_sb_len_wr() {
+        let mut dev = SgDevice::new(0, 0, 0, 0);
+        let caps: u64 = 1 << CAP_SYS_RAWIO;
+        dev.open(caps).unwrap();
+
+        let cdb = [0x12u8, 0, 0, 0, 36, 0];
+        let mut hdr = SgIoHdr::new_read(&cdb, 36).unwrap();
+        // Transport returns sb_len larger than MAX_SENSE_LEN.
+        let result = dev.execute(&mut hdr, caps, |_, _, _, _, _, _, _| {
+            Ok((0u8, 200u8 /* > MAX_SENSE_LEN=96 */, 0u32))
+        });
+        assert!(result.is_ok());
+        assert_eq!(hdr.sb_len_wr, MAX_SENSE_LEN as u8);
     }
 }
