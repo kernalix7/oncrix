@@ -139,6 +139,11 @@ pub struct ConsolePort {
     pub open: bool,
     /// Whether the host-side of this port is connected.
     pub host_connected: bool,
+    /// Whether the device has added (allocated) this port slot. Tracked
+    /// independently of `open`/`host_connected` so a second `DeviceAdd`
+    /// for an added-but-not-yet-opened port is rejected (preventing a
+    /// host from inflating `port_count` and exhausting the table).
+    pub added: bool,
 }
 
 impl ConsolePort {
@@ -154,6 +159,7 @@ impl ConsolePort {
             tx_count: 0,
             open: false,
             host_connected: false,
+            added: false,
         }
     }
 
@@ -338,20 +344,32 @@ impl VirtioConsole {
             }
             ConsoleControlEvent::DeviceAdd => {
                 let id = ctrl.id;
-                if (id as usize) < MAX_PORTS && self.port_count < MAX_PORTS {
-                    self.ports[id as usize] = ConsolePort::new(id);
-                    self.port_count += 1;
-                    Ok(())
-                } else {
-                    Err(Error::InvalidArgument)
+                let idx = id as usize;
+                if idx >= MAX_PORTS || self.port_count >= MAX_PORTS {
+                    return Err(Error::InvalidArgument);
                 }
+                // Reject a duplicate DeviceAdd for an already-allocated port
+                // slot, tracked via `added` (not open/host_connected): a
+                // second DeviceAdd before the port is opened would otherwise
+                // clobber its buffered RX/TX data and double-count port_count,
+                // letting a host exhaust the table.
+                if self.ports[idx].added {
+                    return Err(Error::AlreadyExists);
+                }
+                self.ports[idx] = ConsolePort::new(id);
+                self.ports[idx].added = true;
+                self.port_count += 1;
+                Ok(())
             }
             ConsoleControlEvent::DeviceRemove => {
                 let id = ctrl.id;
                 if (id as usize) < MAX_PORTS {
-                    self.ports[id as usize].open = false;
-                    self.ports[id as usize].host_connected = false;
-                    self.port_count = self.port_count.saturating_sub(1);
+                    // Only decrement when the slot was actually added, so a
+                    // spurious DeviceRemove cannot underflow the accounting.
+                    if self.ports[id as usize].added {
+                        self.ports[id as usize] = ConsolePort::new(id);
+                        self.port_count = self.port_count.saturating_sub(1);
+                    }
                     Ok(())
                 } else {
                     Err(Error::InvalidArgument)

@@ -77,6 +77,16 @@ pub const VSOCK_MAX_PKT_DATA: u32 = 65_535;
 /// Host CID (always 2).
 pub const VSOCK_HOST_CID: u64 = 2;
 
+/// Maximum number of simultaneously bound local ports.
+const MAX_BOUND_PORTS: usize = 32;
+
+/// Sane upper bound for the peer credit window (4 MiB).
+///
+/// Even if the host advertises a larger `buf_alloc`, we cap the credit
+/// we extend at this value so that a malicious host cannot trick the
+/// driver into sending unbounded data.
+const MAX_CREDIT_WINDOW: u32 = 4 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Vsock Packet Types (op field)
 // ---------------------------------------------------------------------------
@@ -198,19 +208,31 @@ pub struct VsockConnection {
     pub vsock_type: u16,
     /// Our receive buffer allocation.
     pub buf_alloc: u32,
-    /// Bytes forwarded to us since last credit update.
+    /// Bytes forwarded to us since last credit update (wraps per spec).
     pub fwd_cnt: u32,
-    /// Peer's advertised buffer allocation.
+    /// Peer's advertised buffer allocation (capped to `MAX_CREDIT_WINDOW`).
     pub peer_buf_alloc: u32,
-    /// Peer's forward count.
+    /// Peer's forward count (wraps per spec).
     pub peer_fwd_cnt: u32,
 }
 
 impl VsockConnection {
-    /// Returns the number of bytes the peer can still send us.
+    /// Returns the number of bytes we may still send to the peer.
+    ///
+    /// The VirtIO vsock spec uses wrapping u32 arithmetic for the protocol
+    /// counters. The *in-flight* byte count is `peer_fwd_cnt` subtracted from
+    /// our own `fwd_cnt` using wrapping semantics, capped to the peer's
+    /// advertised window. We additionally clamp `peer_buf_alloc` to
+    /// `MAX_CREDIT_WINDOW` so a malicious host cannot grant unbounded credit.
     pub fn peer_credit(&self) -> u32 {
-        self.peer_buf_alloc
-            .saturating_sub(self.peer_fwd_cnt.wrapping_sub(self.fwd_cnt))
+        // Clamp the peer window to our self-imposed maximum so a host
+        // advertising a huge buf_alloc cannot trick us into over-sending.
+        let window = self.peer_buf_alloc.min(MAX_CREDIT_WINDOW);
+        // in_flight = bytes sent by us but not yet acknowledged by peer.
+        // Both counters wrap per protocol; saturating_sub prevents underflow
+        // when the wrapping difference exceeds the window.
+        let in_flight = self.fwd_cnt.wrapping_sub(self.peer_fwd_cnt);
+        window.saturating_sub(in_flight)
     }
 
     /// Returns `true` if the connection is in an active data-transfer state.
@@ -289,8 +311,13 @@ pub struct VirtioVsock {
     vqs: [VirtqueueState; NUM_VQS],
     /// Connection table.
     connections: [VsockConnection; MAX_CONNECTIONS],
-    /// Number of active connections.
+    /// Number of active connections (includes Closed slots that have been
+    /// compacted; see `free_connection`).
     connection_count: usize,
+    /// Set of local ports that have been explicitly bound (have a listener).
+    bound_ports: [u32; MAX_BOUND_PORTS],
+    /// Number of entries in `bound_ports`.
+    bound_port_count: usize,
 }
 
 impl VirtioVsock {
@@ -322,6 +349,8 @@ impl VirtioVsock {
                 }
             }; MAX_CONNECTIONS],
             connection_count: 0,
+            bound_ports: [0u32; MAX_BOUND_PORTS],
+            bound_port_count: 0,
         }
     }
 
@@ -348,6 +377,41 @@ impl VirtioVsock {
     /// Returns the guest CID.
     pub fn guest_cid(&self) -> u64 {
         self.guest_cid
+    }
+
+    /// Binds a local port so that inbound `VSOCK_OP_REQUEST` packets targeting
+    /// that port will be accepted.
+    ///
+    /// Returns `Error::AlreadyExists` if the port is already bound, or
+    /// `Error::OutOfMemory` if the bound-port table is full.
+    pub fn bind(&mut self, local_port: u32) -> Result<()> {
+        for i in 0..self.bound_port_count {
+            if self.bound_ports[i] == local_port {
+                return Err(Error::AlreadyExists);
+            }
+        }
+        if self.bound_port_count >= MAX_BOUND_PORTS {
+            return Err(Error::OutOfMemory);
+        }
+        self.bound_ports[self.bound_port_count] = local_port;
+        self.bound_port_count += 1;
+        Ok(())
+    }
+
+    /// Unbinds a previously bound local port.
+    ///
+    /// Returns `Error::NotFound` if the port was not bound.
+    pub fn unbind(&mut self, local_port: u32) -> Result<()> {
+        for i in 0..self.bound_port_count {
+            if self.bound_ports[i] == local_port {
+                // Swap-remove to keep the array compact.
+                let last = self.bound_port_count - 1;
+                self.bound_ports[i] = self.bound_ports[last];
+                self.bound_port_count -= 1;
+                return Ok(());
+            }
+        }
+        Err(Error::NotFound)
     }
 
     /// Initiates an outgoing connection to (`peer_cid`, `peer_port`) from
@@ -404,8 +468,17 @@ impl VirtioVsock {
 
     /// Processes an incoming packet header received on the RX queue.
     ///
+    /// `received_payload_len` is the number of payload bytes actually present
+    /// in the DMA buffer for this descriptor (i.e., the descriptor length minus
+    /// the header size). It is used to bound the `data_len` field supplied by
+    /// the host so that an over-large value cannot cause an OOB copy.
+    ///
     /// Updates connection state and returns a description of what happened.
-    pub fn receive_packet(&mut self, hdr: &VsockPacketHeader) -> Result<RxAction> {
+    pub fn receive_packet(
+        &mut self,
+        hdr: &VsockPacketHeader,
+        received_payload_len: u32,
+    ) -> Result<RxAction> {
         if !self.initialized {
             return Err(Error::IoError);
         }
@@ -414,7 +487,7 @@ impl VirtioVsock {
             VSOCK_OP_RESPONSE => self.handle_response(hdr),
             VSOCK_OP_RST => self.handle_rst(hdr),
             VSOCK_OP_SHUTDOWN => self.handle_shutdown(hdr),
-            VSOCK_OP_RW => self.handle_rw(hdr),
+            VSOCK_OP_RW => self.handle_rw(hdr, received_payload_len),
             VSOCK_OP_CREDIT_UPDATE => self.handle_credit_update(hdr),
             VSOCK_OP_CREDIT_REQUEST => self.handle_credit_request(hdr),
             _ => Ok(RxAction::Unknown),
@@ -469,6 +542,8 @@ impl VirtioVsock {
             self.transmit_header(&hdr)?;
         }
         self.connections[conn_idx].state = ConnectionState::Closing;
+        // Tear down the slot so the table slot can be reused.
+        self.free_connection(conn_idx);
         Ok(())
     }
 
@@ -477,6 +552,22 @@ impl VirtioVsock {
     // -----------------------------------------------------------------------
 
     fn handle_request(&mut self, hdr: &VsockPacketHeader) -> Result<RxAction> {
+        // Only accept a REQUEST whose destination port has a bound listener.
+        // An unbound port gets an immediate RST rather than a silent connection.
+        if !self.is_port_bound(hdr.dst_port) {
+            let rst = self.build_header(
+                hdr.dst_port,
+                hdr.src_cid,
+                hdr.src_port,
+                VSOCK_OP_RST,
+                hdr.vsock_type,
+                0,
+                0,
+            );
+            self.transmit_header(&rst)?;
+            return Ok(RxAction::Rejected);
+        }
+
         if self.connection_count >= MAX_CONNECTIONS {
             // Send RST: no room.
             let rst = self.build_header(
@@ -501,11 +592,12 @@ impl VirtioVsock {
             vsock_type: hdr.vsock_type,
             buf_alloc: 65536,
             fwd_cnt: 0,
-            peer_buf_alloc: hdr.buf_alloc,
+            // Cap incoming peer credit advertisement to our self-imposed window.
+            peer_buf_alloc: hdr.buf_alloc.min(MAX_CREDIT_WINDOW),
             peer_fwd_cnt: hdr.fwd_cnt,
         };
         self.connection_count += 1;
-        // Auto-accept: send RESPONSE.
+        // Send RESPONSE to accept.
         let resp = self.build_header(
             hdr.dst_port,
             hdr.src_cid,
@@ -527,7 +619,8 @@ impl VirtioVsock {
             return Ok(RxAction::Unknown);
         }
         conn.state = ConnectionState::Established;
-        conn.peer_buf_alloc = hdr.buf_alloc;
+        // Cap the peer's advertised credit to our self-imposed window.
+        conn.peer_buf_alloc = hdr.buf_alloc.min(MAX_CREDIT_WINDOW);
         conn.peer_fwd_cnt = hdr.fwd_cnt;
         Ok(RxAction::Connected(conn_idx))
     }
@@ -537,7 +630,9 @@ impl VirtioVsock {
             .find_connection(hdr.dst_port, hdr.src_cid, hdr.src_port)
             .unwrap_or(usize::MAX);
         if conn_idx < self.connection_count {
-            self.connections[conn_idx].state = ConnectionState::Closed;
+            // Free the slot so the table can be reused; this also decrements
+            // connection_count, preventing the host from exhausting the table.
+            self.free_connection(conn_idx);
         }
         Ok(RxAction::Reset(conn_idx))
     }
@@ -559,26 +654,51 @@ impl VirtioVsock {
             )
         };
         self.transmit_header(&rst)?;
-        self.connections[conn_idx].state = ConnectionState::Closed;
+        // Free the slot so it can be reused.
+        self.free_connection(conn_idx);
         Ok(RxAction::Disconnected(conn_idx))
     }
 
-    fn handle_rw(&mut self, hdr: &VsockPacketHeader) -> Result<RxAction> {
+    /// Handles an inbound RW (data) packet.
+    ///
+    /// `received_payload_len` is the actual number of payload bytes in the
+    /// DMA buffer (descriptor length minus header). The host-supplied
+    /// `hdr.data_len` is clamped to this value and to `VSOCK_MAX_PKT_DATA`
+    /// before being forwarded to callers, preventing OOB copies.
+    fn handle_rw(
+        &mut self,
+        hdr: &VsockPacketHeader,
+        received_payload_len: u32,
+    ) -> Result<RxAction> {
         let conn_idx = self.find_connection(hdr.dst_port, hdr.src_cid, hdr.src_port)?;
+
+        // Clamp data_len to:
+        //   1. The protocol maximum (VSOCK_MAX_PKT_DATA).
+        //   2. The actual payload bytes present in the descriptor buffer.
+        // A host lying about data_len (larger than the buffer) would otherwise
+        // cause an OOB read in the copy path.
+        let safe_data_len = hdr
+            .data_len
+            .min(VSOCK_MAX_PKT_DATA)
+            .min(received_payload_len);
+
         let conn = &mut self.connections[conn_idx];
-        conn.fwd_cnt = conn.fwd_cnt.wrapping_add(hdr.data_len);
-        conn.peer_buf_alloc = hdr.buf_alloc;
+        // fwd_cnt is a wrapping protocol counter (intentional per spec).
+        conn.fwd_cnt = conn.fwd_cnt.wrapping_add(safe_data_len);
+        // Cap incoming peer credit advertisement.
+        conn.peer_buf_alloc = hdr.buf_alloc.min(MAX_CREDIT_WINDOW);
         conn.peer_fwd_cnt = hdr.fwd_cnt;
         Ok(RxAction::Data {
             conn_idx,
-            data_len: hdr.data_len,
+            data_len: safe_data_len,
         })
     }
 
     fn handle_credit_update(&mut self, hdr: &VsockPacketHeader) -> Result<RxAction> {
         let conn_idx = self.find_connection(hdr.dst_port, hdr.src_cid, hdr.src_port)?;
         let conn = &mut self.connections[conn_idx];
-        conn.peer_buf_alloc = hdr.buf_alloc;
+        // Cap incoming peer credit advertisement.
+        conn.peer_buf_alloc = hdr.buf_alloc.min(MAX_CREDIT_WINDOW);
         conn.peer_fwd_cnt = hdr.fwd_cnt;
         Ok(RxAction::CreditUpdate(conn_idx))
     }
@@ -617,6 +737,44 @@ impl VirtioVsock {
             }
         }
         Err(Error::NotFound)
+    }
+
+    /// Returns `true` if `port` has been explicitly bound via [`bind`].
+    fn is_port_bound(&self, port: u32) -> bool {
+        for i in 0..self.bound_port_count {
+            if self.bound_ports[i] == port {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Frees a connection slot by swap-removing it and decrementing the count.
+    ///
+    /// This keeps the active connection array compact so `find_connection`
+    /// always scans only live entries and RST/close cannot exhaust the table.
+    fn free_connection(&mut self, idx: usize) {
+        if idx >= self.connection_count {
+            return;
+        }
+        self.connections[idx].state = ConnectionState::Closed;
+        let last = self.connection_count.saturating_sub(1);
+        if idx != last {
+            self.connections[idx] = self.connections[last];
+        }
+        self.connections[last] = VsockConnection {
+            state: ConnectionState::Closed,
+            local_cid: 0,
+            peer_cid: 0,
+            local_port: 0,
+            peer_port: 0,
+            vsock_type: VSOCK_TYPE_STREAM,
+            buf_alloc: 0,
+            fwd_cnt: 0,
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: 0,
+        };
+        self.connection_count = last;
     }
 
     fn build_header(
@@ -693,6 +851,9 @@ pub enum RxAction {
     /// An outbound connection was accepted by the peer.
     Connected(usize),
     /// Data received; includes connection index and payload length.
+    ///
+    /// `data_len` is the validated, clamped payload size — it is safe to use
+    /// as a copy length against the descriptor buffer.
     Data { conn_idx: usize, data_len: u32 },
     /// Peer reset the connection.
     Reset(usize),
@@ -700,7 +861,7 @@ pub enum RxAction {
     Disconnected(usize),
     /// Credit update received.
     CreditUpdate(usize),
-    /// Incoming connection was rejected (no room).
+    /// Incoming connection was rejected (no room or no listener).
     Rejected,
     /// Unknown or unhandled packet type.
     Unknown,
@@ -815,5 +976,154 @@ mod tests {
         assert_eq!(vq.size, 128);
         assert!(!vq.has_used_entries(0));
         assert!(vq.has_used_entries(1));
+    }
+
+    /// A host advertising an enormous buf_alloc must not exceed MAX_CREDIT_WINDOW.
+    #[test]
+    fn peer_credit_clamped_to_max_window() {
+        let mut conn = VsockConnection::default();
+        conn.peer_buf_alloc = u32::MAX;
+        conn.peer_fwd_cnt = 0;
+        conn.fwd_cnt = 0;
+        assert_eq!(conn.peer_credit(), MAX_CREDIT_WINDOW);
+    }
+
+    /// If in_flight equals the window, credit must be zero.
+    #[test]
+    fn peer_credit_zero_when_window_full() {
+        let mut conn = VsockConnection::default();
+        conn.peer_buf_alloc = 1024;
+        conn.peer_fwd_cnt = 0;
+        conn.fwd_cnt = 1024; // we sent 1024 bytes not yet acked
+        assert_eq!(conn.peer_credit(), 0);
+    }
+
+    /// Wrapping in_flight must not grant negative (unbounded) credit.
+    #[test]
+    fn peer_credit_no_wrap_grant() {
+        let mut conn = VsockConnection::default();
+        conn.peer_buf_alloc = 512;
+        conn.peer_fwd_cnt = 100;
+        // fwd_cnt < peer_fwd_cnt would make wrapping_sub large; credit = 0.
+        conn.fwd_cnt = 50;
+        // in_flight = 50u32.wrapping_sub(100) = u32::MAX - 49, >> window → 0
+        assert_eq!(conn.peer_credit(), 0);
+    }
+
+    /// Free-connection must decrement connection_count.
+    #[test]
+    fn free_connection_decrements_count() {
+        let mut dev = VirtioVsock::new(0);
+        dev.connection_count = 1;
+        dev.connections[0] = VsockConnection {
+            state: ConnectionState::Established,
+            local_port: 1000,
+            peer_cid: 2,
+            peer_port: 2000,
+            ..VsockConnection::default()
+        };
+        dev.free_connection(0);
+        assert_eq!(dev.connection_count, 0);
+    }
+
+    /// handle_rw must clamp data_len to received_payload_len.
+    #[test]
+    fn handle_rw_clamps_data_len() {
+        let mut dev = VirtioVsock::new(0);
+        dev.initialized = true;
+        dev.guest_cid = 3;
+        // Manually insert an established connection.
+        dev.connections[0] = VsockConnection {
+            state: ConnectionState::Established,
+            local_cid: 3,
+            peer_cid: 2,
+            local_port: 5000,
+            peer_port: 1234,
+            vsock_type: VSOCK_TYPE_STREAM,
+            buf_alloc: 65536,
+            fwd_cnt: 0,
+            peer_buf_alloc: 65536,
+            peer_fwd_cnt: 0,
+        };
+        dev.connection_count = 1;
+
+        let hdr = VsockPacketHeader {
+            src_cid: 2,
+            dst_cid: 3,
+            src_port: 1234,
+            dst_port: 5000,
+            data_len: 9000, // host lies: claims 9000 bytes
+            vsock_type: VSOCK_TYPE_STREAM,
+            op: VSOCK_OP_RW,
+            flags: 0,
+            buf_alloc: 65536,
+            fwd_cnt: 0,
+        };
+        // Only 256 bytes are actually in the buffer.
+        let result = dev.receive_packet(&hdr, 256);
+        match result {
+            Ok(RxAction::Data { data_len, .. }) => {
+                assert_eq!(
+                    data_len, 256,
+                    "data_len must be clamped to received_payload_len"
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    /// handle_request must reject packets for unbound ports.
+    #[test]
+    fn handle_request_rejects_unbound_port() {
+        let mut dev = VirtioVsock::new(0);
+        dev.initialized = true;
+        dev.guest_cid = 3;
+
+        let hdr = VsockPacketHeader {
+            src_cid: 2,
+            dst_cid: 3,
+            src_port: 9999,
+            dst_port: 8080, // not bound
+            data_len: 0,
+            vsock_type: VSOCK_TYPE_STREAM,
+            op: VSOCK_OP_REQUEST,
+            flags: 0,
+            buf_alloc: 65536,
+            fwd_cnt: 0,
+        };
+        let result = dev.receive_packet(&hdr, 0);
+        assert!(
+            matches!(result, Ok(RxAction::Rejected)),
+            "unbound port must be rejected"
+        );
+        assert_eq!(dev.connection_count, 0, "no connection must be created");
+    }
+
+    /// After binding a port, handle_request must accept the connection.
+    #[test]
+    fn handle_request_accepts_bound_port() {
+        let mut dev = VirtioVsock::new(0);
+        dev.initialized = true;
+        dev.guest_cid = 3;
+        dev.bind(8080).unwrap();
+
+        let hdr = VsockPacketHeader {
+            src_cid: 2,
+            dst_cid: 3,
+            src_port: 9999,
+            dst_port: 8080,
+            data_len: 0,
+            vsock_type: VSOCK_TYPE_STREAM,
+            op: VSOCK_OP_REQUEST,
+            flags: 0,
+            buf_alloc: 65536,
+            fwd_cnt: 0,
+        };
+        let result = dev.receive_packet(&hdr, 0);
+        assert!(
+            matches!(result, Ok(RxAction::NewConnection(_))),
+            "bound port must be accepted"
+        );
+        assert_eq!(dev.connection_count, 1);
     }
 }
