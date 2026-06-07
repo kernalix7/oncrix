@@ -46,6 +46,13 @@ const MAX_CONNECTORS: usize = 4;
 /// Maximum gamma LUT size (number of entries).
 const MAX_GAMMA_SIZE: usize = 256;
 
+/// Maximum valid pixel dimension for a display rectangle (64 K − 1 pixels).
+///
+/// Values at or above this limit are rejected by [`DrmRect::from_size`] to
+/// prevent signed-integer overflow when computing `x + width` and
+/// `y + height` inside the kernel.
+const MAX_DISPLAY_DIM: u32 = 65535;
+
 // ---------------------------------------------------------------------------
 // DrmPlaneType
 // ---------------------------------------------------------------------------
@@ -100,13 +107,27 @@ pub struct DrmRect {
 
 impl DrmRect {
     /// Creates a rectangle from position and size.
-    pub const fn from_size(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `width` or `height` exceed
+    /// [`MAX_DISPLAY_DIM`], or if `x + width` / `y + height` would overflow
+    /// `i32`.  This guards against ring-0 arithmetic panics when
+    /// `overflow-checks = true`.
+    pub fn from_size(x: i32, y: i32, width: u32, height: u32) -> Result<Self> {
+        // Bound raw dimensions before any arithmetic.
+        if width > MAX_DISPLAY_DIM || height > MAX_DISPLAY_DIM {
+            return Err(Error::InvalidArgument);
+        }
+        // Safe: width/height fit in u16 after the check above; cast to i32 is lossless.
+        let x2 = x.checked_add(width as i32).ok_or(Error::InvalidArgument)?;
+        let y2 = y.checked_add(height as i32).ok_or(Error::InvalidArgument)?;
+        Ok(Self {
             x1: x,
             y1: y,
-            x2: x + width as i32,
-            y2: y + height as i32,
-        }
+            x2,
+            y2,
+        })
     }
 
     /// Returns the width in pixels.
@@ -422,6 +443,25 @@ impl CommitFlags {
     /// Non-blocking commit (return immediately, complete asynchronously).
     pub const NONBLOCK: Self = Self(1 << 2);
 
+    /// Mask of all bits that are defined and valid.
+    ///
+    /// Any raw value with bits outside this mask is rejected by
+    /// [`CommitFlags::from_bits`].
+    const VALID_BITS: u32 = Self::ALLOW_MODESET.0 | Self::TEST_ONLY.0 | Self::NONBLOCK.0;
+
+    /// Construct `CommitFlags` from a raw `u32`, rejecting unknown/reserved bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `raw` contains any bit not
+    /// defined in [`VALID_BITS`].
+    pub fn from_bits(raw: u32) -> Result<Self> {
+        if raw & !Self::VALID_BITS != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self(raw))
+    }
+
     /// Returns the raw bits.
     pub fn bits(self) -> u32 {
         self.0
@@ -562,26 +602,55 @@ impl DrmAtomicSubsystem {
 
     /// Validates the pending state without touching hardware.
     ///
+    /// The caller must hold a DRM-master token (`drm_master == true`).
+    /// Until per-task credential threading is implemented this parameter
+    /// must be supplied by the dispatcher that owns the credential context.
+    ///
     /// Checks that:
-    /// - Every active plane references a valid CRTC.
+    /// - The caller holds DRM-master privilege.
+    /// - Every active plane references a valid CRTC (crtc_id 0 means
+    ///   disabled and is skipped, not mapped to slot 0).
     /// - Every active CRTC has a non-empty display mode (unless being disabled).
     /// - Modesetting changes are only present when `ALLOW_MODESET` is set.
-    pub fn atomic_check(&self, flags: CommitFlags) -> Result<()> {
-        // Validate plane → CRTC references
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] — caller does not hold DRM-master, or
+    ///   a mode change is requested without `ALLOW_MODESET`.
+    /// - [`Error::InvalidArgument`] — a plane/connector references an
+    ///   out-of-range CRTC, or an active CRTC has no display mode.
+    // SECURITY: modeset is a privileged operation. `drm_master` must be
+    // threaded from verified per-task credentials by the ioctl dispatcher.
+    // Until full credential threading lands this is fail-closed: callers
+    // without master privilege are unconditionally denied.
+    pub fn atomic_check(&self, flags: CommitFlags, drm_master: bool) -> Result<()> {
+        // Fail closed — deny any caller that does not hold DRM-master.
+        if !drm_master {
+            return Err(Error::PermissionDenied);
+        }
+
+        // Validate plane → CRTC references.
+        // crtc_id == 0 is the "disabled / no CRTC" sentinel; skip validation.
+        // A non-zero id maps to slot (id - 1); reject anything out of range.
         for i in 0..MAX_PLANES {
             if !self.pending_state.planes_dirty[i] {
                 continue;
             }
             let plane = &self.pending_state.planes[i];
             if plane.is_active() {
-                let crtc_idx = (plane.crtc_id as usize).saturating_sub(1);
+                let id = plane.crtc_id;
+                if id == 0 {
+                    // Disabled sentinel — no CRTC to validate.
+                    continue;
+                }
+                let crtc_idx = (id as usize) - 1;
                 if crtc_idx >= MAX_CRTCS {
                     return Err(Error::InvalidArgument);
                 }
             }
         }
 
-        // Validate CRTC modes
+        // Validate CRTC modes.
         for i in 0..MAX_CRTCS {
             if !self.pending_state.crtcs_dirty[i] {
                 continue;
@@ -590,20 +659,21 @@ impl DrmAtomicSubsystem {
             if crtc.active && crtc.mode.is_empty() {
                 return Err(Error::InvalidArgument);
             }
-            // Mode changes require ALLOW_MODESET
+            // Mode changes require ALLOW_MODESET.
             if crtc.mode_changed && !flags.allows_modeset() {
                 return Err(Error::PermissionDenied);
             }
         }
 
-        // Validate connector → CRTC references
+        // Validate connector → CRTC references.
+        // crtc_id == 0 means disconnected from the pipeline — skip.
         for i in 0..MAX_CONNECTORS {
             if !self.pending_state.connectors_dirty[i] {
                 continue;
             }
             let conn = &self.pending_state.connectors[i];
             if conn.crtc_id != 0 {
-                let crtc_idx = (conn.crtc_id as usize).saturating_sub(1);
+                let crtc_idx = (conn.crtc_id as usize) - 1;
                 if crtc_idx >= MAX_CRTCS {
                     return Err(Error::InvalidArgument);
                 }
@@ -617,15 +687,30 @@ impl DrmAtomicSubsystem {
 
     /// Validates and commits the pending state to hardware.
     ///
+    /// The caller must hold a DRM-master token (`drm_master == true`).
+    /// Until per-task credential threading is implemented this parameter
+    /// must be supplied by the dispatcher that owns the credential context.
+    ///
     /// If `TEST_ONLY` is set the state is validated but not applied.
     /// Returns the commit sequence number on success.
-    pub fn atomic_commit(&mut self, flags: CommitFlags) -> Result<u64> {
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::PermissionDenied`] — caller does not hold DRM-master.
+    /// - [`Error::InvalidArgument`] — no pending changes, or check failed.
+    // SECURITY: see atomic_check — same privilege requirement applies here.
+    pub fn atomic_commit(&mut self, flags: CommitFlags, drm_master: bool) -> Result<u64> {
+        // Fail closed before any state inspection.
+        if !drm_master {
+            return Err(Error::PermissionDenied);
+        }
+
         if !self.pending_state.has_changes() {
             return Err(Error::InvalidArgument);
         }
 
-        // Phase 1: check
-        self.atomic_check(flags)?;
+        // Phase 1: check (drm_master already verified above).
+        self.atomic_check(flags, drm_master)?;
 
         let seqno = self.next_seqno;
         self.next_seqno = self.next_seqno.wrapping_add(1);
