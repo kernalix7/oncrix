@@ -141,7 +141,11 @@ impl IdMapping {
     /// Returns `None` if `id` is not in this mapping's range.
     pub fn translate(&self, id: u32) -> Option<u32> {
         if self.covers_source(id) {
-            Some(self.first_out + (id - self.first_in))
+            // SECURITY: `first_out + offset` can overflow u32 for an attacker-
+            // chosen mapping placed near u32::MAX — covers_source only bounds
+            // the SOURCE range. checked_add yields None (no translation) instead
+            // of panicking in ring 0 (overflow-checks are ON).
+            self.first_out.checked_add(id - self.first_in)
         } else {
             None
         }
@@ -450,14 +454,25 @@ pub fn do_mount_idmap(
         .get_mut(mount_id)
         .ok_or(Error::InvalidArgument)?;
 
-    // Validate that all mappings are non-empty.
+    // Validate that all mappings are non-empty AND that neither the source nor
+    // the destination range wraps u32. SECURITY: rejecting a wrapping range at
+    // ingest stops a hostile idmap (e.g. first_out near u32::MAX) from being
+    // stored and later overflowing in IdMapping::translate.
     for i in 0..idmap.uid_count {
-        if idmap.uid_map[i].count == 0 {
+        let m = &idmap.uid_map[i];
+        if m.count == 0
+            || m.first_in.checked_add(m.count).is_none()
+            || m.first_out.checked_add(m.count).is_none()
+        {
             return Err(Error::InvalidArgument);
         }
     }
     for i in 0..idmap.gid_count {
-        if idmap.gid_map[i].count == 0 {
+        let m = &idmap.gid_map[i];
+        if m.count == 0
+            || m.first_in.checked_add(m.count).is_none()
+            || m.first_out.checked_add(m.count).is_none()
+        {
             return Err(Error::InvalidArgument);
         }
     }

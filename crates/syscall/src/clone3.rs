@@ -480,8 +480,16 @@ pub fn do_clone3(
 
     // Allocate PID.
     let child_pid = if args.set_tid_size > 0 {
-        // Use the first element of set_tid as the requested PID.
-        // (In a real kernel, each element corresponds to a namespace level.)
+        // SECURITY / correctness: `args.set_tid` is a USER POINTER to an array
+        // of `set_tid_size` PIDs (one per PID-namespace level), NOT a PID. The
+        // caller's marshalling layer MUST copy_from_user exactly
+        // `min(set_tid_size, CLONE_ARGS_MAX_SET_TID)` u64 entries from the
+        // validated user range into a kernel buffer and pass set_tid[0] (the
+        // current-namespace PID) here. Until that array copy is wired, the raw
+        // pointer is passed through; alloc_specific bounds it (rejects
+        // `pid >= PID_MAX_LIMIT`), so a pointer value fails closed with
+        // InvalidArgument rather than allocating an out-of-range PID — no OOB,
+        // but set_tid does not yet function until the caller threads the array.
         alloc.alloc_specific(args.set_tid)?
     } else {
         alloc.alloc()?
