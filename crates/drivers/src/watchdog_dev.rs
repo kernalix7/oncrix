@@ -216,10 +216,15 @@ impl WatchdogDevice {
         }
         self.state = WatchdogState::Active;
         self.last_ping_ns = now_ns;
-        self.expires_ns = now_ns + u64::from(self.timeout_secs) * NS_PER_SEC;
+        // SECURITY: Use saturating arithmetic so that a very large now_ns or
+        // timeout cannot wrap expires_ns back to a small value (which would
+        // make the watchdog appear to have already expired).
+        self.expires_ns =
+            now_ns.saturating_add(u64::from(self.timeout_secs).saturating_mul(NS_PER_SEC));
         self.pretimeout_ns = if self.pretimeout_secs > 0 && self.pretimeout_secs < self.timeout_secs
         {
-            self.expires_ns - u64::from(self.pretimeout_secs) * NS_PER_SEC
+            self.expires_ns
+                .saturating_sub(u64::from(self.pretimeout_secs).saturating_mul(NS_PER_SEC))
         } else {
             0
         };
@@ -253,9 +258,14 @@ impl WatchdogDevice {
     pub fn ping(&mut self, now_ns: u64) {
         if self.state == WatchdogState::Active {
             self.last_ping_ns = now_ns;
-            self.expires_ns = now_ns + u64::from(self.timeout_secs) * NS_PER_SEC;
+            // SECURITY: saturating_add/mul prevent expires_ns from wrapping to
+            // a past timestamp when now_ns is near u64::MAX.
+            self.expires_ns =
+                now_ns.saturating_add(u64::from(self.timeout_secs).saturating_mul(NS_PER_SEC));
             if self.pretimeout_secs > 0 {
-                self.pretimeout_ns = self.expires_ns - u64::from(self.pretimeout_secs) * NS_PER_SEC;
+                self.pretimeout_ns = self
+                    .expires_ns
+                    .saturating_sub(u64::from(self.pretimeout_secs).saturating_mul(NS_PER_SEC));
             }
             self.pretimeout_notified = false;
             self.ping_count += 1;
@@ -291,9 +301,16 @@ impl WatchdogDevice {
         Ok(())
     }
 
-    /// Enables or disables `nowayout` mode.
+    /// Enables `nowayout` mode (one-way latch).
+    ///
+    /// Per Linux watchdog semantics `nowayout` is write-once: once armed it can
+    /// never be cleared, so a later caller cannot disarm the safety latch before
+    /// `stop()`. This setter therefore only ever sets the flag.
     pub fn set_nowayout(&mut self, nowayout: bool) {
-        self.nowayout = nowayout;
+        // SECURITY: latch one-way — never clear an armed nowayout.
+        if nowayout {
+            self.nowayout = true;
+        }
     }
 
     /// Configures the automatic keepalive period.
@@ -337,7 +354,10 @@ impl WatchdogDevice {
             self.pretimeout_notified = true;
             return Some(WatchdogEvent::Pretimeout(self.id));
         }
-        if self.keepalive_period_ns > 0 && (now_ns - self.last_ping_ns) >= self.keepalive_period_ns
+        // SECURITY: now_ns is caller-influenced; a non-monotonic clock (now_ns <
+        // last_ping_ns) would underflow the raw subtraction and panic in ring 0.
+        if self.keepalive_period_ns > 0
+            && now_ns.saturating_sub(self.last_ping_ns) >= self.keepalive_period_ns
         {
             self.ping(now_ns);
             return Some(WatchdogEvent::Keepalive(self.id));

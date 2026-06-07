@@ -186,7 +186,11 @@ impl WatchdogDevice {
         self.state = WatchdogState::Running;
         self.start_time_ns = now_ns;
         self.last_ping_ns = now_ns;
-        self.expires_ns = now_ns + u64::from(self.info.timeout_secs) * NANOS_PER_SEC;
+        // SECURITY: timeout_secs comes from device config (clamped at new()), but now_ns is an
+        // attacker-influenced clock value; use saturating arithmetic to prevent u64 wrap-around
+        // which would cause a ring-0 panic under overflow-checks = on.
+        self.expires_ns =
+            now_ns.saturating_add(u64::from(self.info.timeout_secs).saturating_mul(NANOS_PER_SEC));
         self.magic_close = false;
         Ok(())
     }
@@ -220,7 +224,10 @@ impl WatchdogDevice {
     pub fn ping(&mut self, now_ns: u64) {
         if self.state == WatchdogState::Running {
             self.last_ping_ns = now_ns;
-            self.expires_ns = now_ns + u64::from(self.info.timeout_secs) * NANOS_PER_SEC;
+            // SECURITY: now_ns is caller-supplied (attacker-controlled in ring-0 context);
+            // saturating arithmetic prevents u64 overflow → panic under overflow-checks = on.
+            self.expires_ns = now_ns
+                .saturating_add(u64::from(self.info.timeout_secs).saturating_mul(NANOS_PER_SEC));
             self.ping_count += 1;
         }
     }
@@ -272,12 +279,17 @@ impl WatchdogDevice {
         (self.expires_ns - now_ns) / NANOS_PER_SEC
     }
 
-    /// Enables or disables the `nowayout` mode.
+    /// Enables the `nowayout` mode (one-way latch).
     ///
-    /// When enabled, the watchdog cannot be stopped unless the
-    /// magic close character is written first.
+    /// When enabled, the watchdog cannot be stopped unless the magic close
+    /// character is written first. Per Linux watchdog semantics `nowayout` is
+    /// write-once: this setter only ever sets the flag, so the safety latch can
+    /// never be disarmed by a later caller before `stop()`.
     pub fn set_nowayout(&mut self, nowayout: bool) {
-        self.nowayout = nowayout;
+        // SECURITY: latch one-way — never clear an armed nowayout.
+        if nowayout {
+            self.nowayout = true;
+        }
     }
 
     /// Scans the given data for the magic close character (`'V'`).

@@ -266,7 +266,7 @@ impl CmosRtc {
         // recent) sample which completed cleanly after UIP was clear.
         let raw = if first == second { first } else { second };
 
-        Ok(self.decode_raw(raw))
+        self.decode_raw(raw)
     }
 
     /// Reads and decodes the current time, returning `(hour, minute, second)`.
@@ -327,29 +327,34 @@ impl CmosRtc {
     }
 
     /// Decodes a raw register snapshot into a [`DateTime`].
-    fn decode_raw(&self, raw: RawTime) -> DateTime {
+    ///
+    /// Returns [`Error::IoError`] if any CMOS register contains a value
+    /// outside its valid range (e.g. malformed BCD, impossible calendar
+    /// field).
+    // SECURITY: Every field comes directly from untrusted CMOS registers.
+    // Validate all decoded values against their legal ranges before
+    // constructing DateTime; reject anything out-of-range rather than
+    // letting downstream math operate on garbage.
+    fn decode_raw(&self, raw: RawTime) -> Result<DateTime> {
         let binary_mode = self.status_b & STATUS_B_BIN != 0;
         let mode_24hr = self.status_b & STATUS_B_24HR != 0;
 
-        let second = if binary_mode {
-            raw.second
-        } else {
-            bcd_to_bin(raw.second)
+        // Helper: decode one byte from BCD or binary, returning Err on bad BCD.
+        let decode = |v: u8| -> Result<u8> {
+            if binary_mode {
+                Ok(v)
+            } else {
+                bcd_to_bin(v).ok_or(Error::IoError)
+            }
         };
-        let minute = if binary_mode {
-            raw.minute
-        } else {
-            bcd_to_bin(raw.minute)
-        };
+
+        let second = decode(raw.second)?;
+        let minute = decode(raw.minute)?;
 
         // Hours require special handling for 12hr mode PM bit.
         let hour_raw = raw.hour & !HOURS_PM_BIT;
         let pm = (!mode_24hr) && (raw.hour & HOURS_PM_BIT != 0);
-        let mut hour = if binary_mode {
-            hour_raw
-        } else {
-            bcd_to_bin(hour_raw)
-        };
+        let mut hour = decode(hour_raw)?;
         if pm {
             hour = (hour % 12) + 12;
         } else if !mode_24hr && hour == 12 {
@@ -357,42 +362,53 @@ impl CmosRtc {
             hour = 0;
         }
 
-        let day = if binary_mode {
-            raw.day
-        } else {
-            bcd_to_bin(raw.day)
-        };
-        let month = if binary_mode {
-            raw.month
-        } else {
-            bcd_to_bin(raw.month)
-        };
-        let year_2d = if binary_mode {
-            raw.year
-        } else {
-            bcd_to_bin(raw.year)
-        } as u16;
+        let day = decode(raw.day)?;
+        let month = decode(raw.month)?;
+        // Widen to u32 before arithmetic to prevent any overflow.
+        let year_2d = u32::from(decode(raw.year)?);
 
+        // SECURITY: century decoded from an 8-bit register; cast to u32 before
+        // multiplying by 100 to prevent the overflow that would occur if we
+        // stayed in u16 arithmetic (e.g. 256*100 wraps in u16).
         let century = if raw.century != 0 {
-            (if binary_mode {
-                raw.century
-            } else {
-                bcd_to_bin(raw.century)
-            }) as u16
+            u32::from(decode(raw.century)?)
         } else {
             // Heuristic: assume century 20 for years 0-99.
-            if year_2d >= 70 { 19 } else { 20 }
+            if year_2d >= 70 { 19u32 } else { 20u32 }
         };
-        let year = century * 100 + year_2d;
+        // Both operands are u32; product fits (max 255*100+99 = 25_599 < u32::MAX).
+        let year_full = century * 100 + year_2d;
+        // Truncate to u16; plausible years (1900-2555) all fit.
+        let year = year_full as u16;
 
-        DateTime {
+        // SECURITY: Validate all decoded calendar fields against their legal
+        // ranges.  Out-of-range values from a corrupt or attacker-influenced
+        // CMOS would otherwise propagate into date arithmetic and cause panics
+        // or wrong results.
+        if second > 59 {
+            return Err(Error::IoError);
+        }
+        if minute > 59 {
+            return Err(Error::IoError);
+        }
+        if hour > 23 {
+            return Err(Error::IoError);
+        }
+        if day < 1 || day > 31 {
+            return Err(Error::IoError);
+        }
+        if month < 1 || month > 12 {
+            return Err(Error::IoError);
+        }
+
+        Ok(DateTime {
             year,
             month,
             day,
             hour,
             minute,
             second,
-        }
+        })
     }
 
     /// Reads a byte from a CMOS register at the given index.
@@ -495,9 +511,20 @@ struct RawTime {
 /// Converts a Binary-Coded Decimal byte to a binary (u8) value.
 ///
 /// For example, `0x59` (BCD for 59) → `59`.
+///
+/// Returns `None` if either nibble exceeds 9 (malformed BCD from
+/// a faulty or attacker-influenced CMOS register).
+// SECURITY: Malformed BCD nibbles (>9) produce values up to 99+9=108 from a
+// naive `(hi*10)+lo`, which overflows u8 (165 for 0xFF) and panics in dev/test
+// with overflow-checks enabled.  Reject rather than wrap.
 #[inline]
-fn bcd_to_bin(bcd: u8) -> u8 {
-    (bcd >> 4) * 10 + (bcd & 0x0F)
+fn bcd_to_bin(bcd: u8) -> Option<u8> {
+    let hi = bcd >> 4;
+    let lo = bcd & 0x0F;
+    if hi > 9 || lo > 9 {
+        return None;
+    }
+    Some(hi * 10 + lo)
 }
 
 /// Converts a binary byte to BCD.
@@ -621,8 +648,18 @@ mod tests {
     #[test]
     fn bcd_conversion_roundtrip() {
         for v in 0u8..=99 {
-            assert_eq!(bcd_to_bin(bin_to_bcd(v)), v);
+            assert_eq!(bcd_to_bin(bin_to_bcd(v)), Some(v));
         }
+    }
+
+    #[test]
+    fn bcd_to_bin_rejects_bad_nibbles() {
+        // High nibble > 9
+        assert_eq!(bcd_to_bin(0xA0), None);
+        // Low nibble > 9
+        assert_eq!(bcd_to_bin(0x0A), None);
+        // Both nibbles bad
+        assert_eq!(bcd_to_bin(0xFF), None);
     }
 
     #[test]

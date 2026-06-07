@@ -293,7 +293,7 @@ impl PwmChip {
         }
         // For generic MMIO: disable all channels and clear status.
         for ch in 0..self.num_channels as usize {
-            let base = self.channel_mmio_base(ch);
+            let base = self.channel_mmio_base(ch)?;
             // SAFETY: mmio_base is checked non-zero; channel registers are within
             // the mapped region with CHANNEL_STRIDE stride per channel.
             unsafe {
@@ -306,8 +306,20 @@ impl PwmChip {
     }
 
     /// Returns the MMIO base address for channel `ch`.
-    fn channel_mmio_base(&self, ch: usize) -> usize {
-        self.mmio_base + ch * CHANNEL_STRIDE
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the computed address overflows `usize`.
+    fn channel_mmio_base(&self, ch: usize) -> Result<usize> {
+        // SECURITY: ch and CHANNEL_STRIDE are device-supplied; an attacker-controlled
+        // channel index or a mmio_base near usize::MAX can overflow the bare mul/add,
+        // producing a wildly wrong MMIO pointer.  Reject on overflow.
+        let offset = ch
+            .checked_mul(CHANNEL_STRIDE)
+            .ok_or(Error::InvalidArgument)?;
+        self.mmio_base
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Converts a period in nanoseconds to hardware counter ticks.
@@ -432,7 +444,7 @@ impl PwmChip {
         }
         self.channels[idx].state = PwmChannelState::Disabled;
         if self.initialized {
-            let base = self.channel_mmio_base(idx);
+            let base = self.channel_mmio_base(idx)?;
             // SAFETY: mmio_base and channel stride are valid; CTRL register is
             // a standard 32-bit RW register for this PWM IP block.
             unsafe {
@@ -451,7 +463,7 @@ impl PwmChip {
         let ch = &self.channels[idx];
         let period_ticks = self.ns_to_ticks(ch.period_ns);
         let duty_ticks = self.ns_to_ticks(ch.duty_ns);
-        let base = self.channel_mmio_base(idx);
+        let base = self.channel_mmio_base(idx)?;
 
         // SAFETY: mmio_base is non-zero (checked in init). Channel MMIO
         // is within the mapped region at CHANNEL_STRIDE intervals.
@@ -486,7 +498,7 @@ impl PwmChip {
         }
         self.channels[idx].capture_mode = true;
         if self.initialized {
-            let base = self.channel_mmio_base(idx);
+            let base = self.channel_mmio_base(idx)?;
             // SAFETY: PWM_REG_CTRL enables capture mode via a dedicated bit.
             unsafe {
                 let ctrl = mmio_read32(base + PWM_REG_CTRL);
@@ -513,7 +525,7 @@ impl PwmChip {
             return Ok(PwmCaptureResult::default());
         }
 
-        let base = self.channel_mmio_base(idx);
+        let base = self.channel_mmio_base(idx)?;
         // SAFETY: PWM_REG_STATUS is a read-only status register; reading it
         // is safe as long as the MMIO region is mapped.
         let status = unsafe { mmio_read32(base + PWM_REG_STATUS) };
@@ -525,16 +537,21 @@ impl PwmChip {
         let period_ticks = unsafe { mmio_read32(base + PWM_REG_PERIOD) };
         let duty_ticks = unsafe { mmio_read32(base + PWM_REG_DUTY) };
 
+        // SECURITY: the tick values are device-supplied; saturating_mul avoids a
+        // u64 overflow panic before the divide.
         let period_ns = if self.clk_hz == 0 {
             0
         } else {
-            (u64::from(period_ticks) * 1_000_000_000) / self.clk_hz
+            u64::from(period_ticks).saturating_mul(1_000_000_000) / self.clk_hz
         };
         let duty_ns = if self.clk_hz == 0 {
             0
         } else {
-            (u64::from(duty_ticks) * 1_000_000_000) / self.clk_hz
+            u64::from(duty_ticks).saturating_mul(1_000_000_000) / self.clk_hz
         };
+        // SECURITY: a device may report duty_ticks > period_ticks; clamp so the
+        // duty never exceeds the period (a nonsensical, potentially misused value).
+        let duty_ns = duty_ns.min(period_ns);
 
         Ok(PwmCaptureResult {
             period_ns,

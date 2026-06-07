@@ -416,7 +416,9 @@ impl HwmonSubsystem {
             .get_sensor(sensor_idx)
             .ok_or(Error::NotFound)?;
         let val = sensor.value;
-        self.stats.readings += 1;
+        // SECURITY: free-running counter; saturating prevents wrap-to-zero on
+        // long-lived subsystems.
+        self.stats.readings = self.stats.readings.saturating_add(1);
         Ok(val)
     }
 
@@ -442,7 +444,9 @@ impl HwmonSubsystem {
             .get_sensor_mut(sensor_idx)
             .ok_or(Error::NotFound)?;
         sensor.value = new_value;
-        self.stats.readings += 1;
+        // SECURITY: free-running counter; saturating prevents wrap-to-zero on
+        // long-lived subsystems.
+        self.stats.readings = self.stats.readings.saturating_add(1);
         Ok(())
     }
 
@@ -478,8 +482,10 @@ impl HwmonSubsystem {
         self.alarms[self.alarm_head] = alarm;
         self.alarm_head = (self.alarm_head + 1) % MAX_ALARMS;
         self.alarm_total = self.alarm_total.saturating_add(1);
-        self.stats.alarms_raised += 1;
-        self.stats.threshold_violations += 1;
+        // SECURITY: free-running counters; saturating prevents wrap-to-zero on
+        // long-lived subsystems.
+        self.stats.alarms_raised = self.stats.alarms_raised.saturating_add(1);
+        self.stats.threshold_violations = self.stats.threshold_violations.saturating_add(1);
     }
 
     /// Return the most recently written alarm, if any.
