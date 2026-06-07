@@ -278,6 +278,17 @@ unsafe fn write32(base: u64, offset: u32, val: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Minimum valid CAPLENGTH value per the EHCI spec (§2.2.1).
+/// A value below 0x10 cannot accommodate the required capability registers.
+const EHCI_MIN_CAP_LEN: u64 = 0x10;
+
+/// Maximum number of root hub ports supported by EHCI (HCSPARAMS bits [3:0]).
+const MAX_EHCI_PORTS: u8 = 15;
+
+// ---------------------------------------------------------------------------
 // EHCI Controller
 // ---------------------------------------------------------------------------
 
@@ -301,10 +312,26 @@ impl EhciController {
     pub unsafe fn new(cap_base: u64) -> Self {
         // SAFETY: Reading CAPLENGTH and HCSPARAMS from the Capability Register space.
         unsafe {
-            let cap_len = (read32(cap_base, CAP_CAPLENGTH) & 0xFF) as u64;
-            let ops_base = cap_base + cap_len;
+            let raw_cap_len = (read32(cap_base, CAP_CAPLENGTH) & 0xFF) as u64;
+            // SECURITY: A device-supplied CAPLENGTH of 0 (or any value below the EHCI
+            // minimum of 0x10) would alias ops_base onto cap_base, corrupting MMIO
+            // accesses.  Clamp to at least EHCI_MIN_CAP_LEN so ops_base is always
+            // beyond the capability register block.  saturating_add prevents a
+            // device-supplied 0xFF from wrapping a u64 base address.
+            let cap_len = raw_cap_len.max(EHCI_MIN_CAP_LEN);
+            let ops_base = cap_base.saturating_add(cap_len);
+
             let hcsparams = read32(cap_base, CAP_HCSPARAMS);
-            let num_ports = (hcsparams & 0x0F) as u8;
+            let raw_num_ports = (hcsparams & 0x0F) as u8;
+            // SECURITY: clamp the device-supplied port count to the spec maximum
+            // (MAX_EHCI_PORTS=15) only. We do NOT force a minimum: a controller
+            // advertising 0 ports genuinely has none, and the existing
+            // `port >= num_ports` guards in port_status()/reset_port() then
+            // fail-closed for every port. Fabricating a phantom port 0 would let a
+            // caller issue a volatile MMIO access to an unimplemented OPS_PORTS
+            // register, which is worse than a benign lockout.
+            let num_ports = raw_num_ports.min(MAX_EHCI_PORTS);
+
             Self {
                 cap_base,
                 ops_base,

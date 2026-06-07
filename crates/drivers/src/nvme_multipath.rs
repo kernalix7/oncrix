@@ -272,6 +272,11 @@ impl NvmeMultipathDevice {
             self.path_count -= 1;
             self.paths[self.path_count] = NvmePath::new();
         }
+        // SECURITY: rr_cursor may now be >= path_count after compaction; clamp it to
+        // avoid an out-of-bounds index on the next select_round_robin call.
+        if self.path_count > 0 && self.rr_cursor >= self.path_count {
+            self.rr_cursor = 0;
+        }
         Ok(())
     }
 
@@ -284,7 +289,8 @@ impl NvmeMultipathDevice {
                 path.ana_state = new_state;
             }
         }
-        self.stats.ana_changes += 1;
+        // SECURITY: wrapping_add — free-running telemetry counter; overflow must not panic in ring 0.
+        self.stats.ana_changes = self.stats.ana_changes.wrapping_add(1);
     }
 
     /// Select a path for the next I/O according to the active policy.
@@ -298,10 +304,10 @@ impl NvmeMultipathDevice {
     /// - [`Error::NotFound`] if no usable path is available.
     pub fn select_path(&mut self) -> Result<u32> {
         if !self.enabled {
-            self.stats.no_path_errors += 1;
+            self.stats.no_path_errors = self.stats.no_path_errors.wrapping_add(1);
             return Err(Error::Busy);
         }
-        self.stats.total_ios += 1;
+        self.stats.total_ios = self.stats.total_ios.wrapping_add(1);
 
         match self.policy {
             PathPolicy::RoundRobin => self.select_round_robin(),
@@ -318,7 +324,7 @@ impl NvmeMultipathDevice {
             if self.paths[idx].is_usable() {
                 self.rr_cursor = (idx + 1) % count;
                 self.paths[idx].pending_ios = self.paths[idx].pending_ios.saturating_add(1);
-                self.paths[idx].io_count += 1;
+                self.paths[idx].io_count = self.paths[idx].io_count.wrapping_add(1);
                 return Ok(self.paths[idx].ctrl_id);
             }
         }
@@ -344,7 +350,7 @@ impl NvmeMultipathDevice {
             }
         };
         self.paths[idx].pending_ios = self.paths[idx].pending_ios.saturating_add(1);
-        self.paths[idx].io_count += 1;
+        self.paths[idx].io_count = self.paths[idx].io_count.wrapping_add(1);
         Ok(self.paths[idx].ctrl_id)
     }
 
@@ -353,7 +359,7 @@ impl NvmeMultipathDevice {
         for i in 0..self.path_count {
             if self.paths[i].is_usable() && self.paths[i].ana_state.is_optimized() {
                 self.paths[i].pending_ios = self.paths[i].pending_ios.saturating_add(1);
-                self.paths[i].io_count += 1;
+                self.paths[i].io_count = self.paths[i].io_count.wrapping_add(1);
                 return Ok(self.paths[i].ctrl_id);
             }
         }
@@ -364,12 +370,12 @@ impl NvmeMultipathDevice {
         for i in 0..self.path_count {
             if self.paths[i].is_usable() {
                 self.paths[i].pending_ios = self.paths[i].pending_ios.saturating_add(1);
-                self.paths[i].io_count += 1;
-                self.stats.failovers += 1;
+                self.paths[i].io_count = self.paths[i].io_count.wrapping_add(1);
+                self.stats.failovers = self.stats.failovers.wrapping_add(1);
                 return Ok(self.paths[i].ctrl_id);
             }
         }
-        self.stats.no_path_errors += 1;
+        self.stats.no_path_errors = self.stats.no_path_errors.wrapping_add(1);
         Err(Error::NotFound)
     }
 
@@ -383,10 +389,10 @@ impl NvmeMultipathDevice {
         {
             path.pending_ios = path.pending_ios.saturating_sub(1);
             if success {
-                self.stats.successful_ios += 1;
+                self.stats.successful_ios = self.stats.successful_ios.wrapping_add(1);
             } else {
-                path.error_count += 1;
-                self.stats.failed_ios += 1;
+                path.error_count = path.error_count.wrapping_add(1);
+                self.stats.failed_ios = self.stats.failed_ios.wrapping_add(1);
             }
         }
     }
@@ -402,7 +408,7 @@ impl NvmeMultipathDevice {
             .find(|p| p.occupied && p.ctrl_id == ctrl_id)
             .ok_or(Error::NotFound)?;
         path.active = false;
-        self.stats.failovers += 1;
+        self.stats.failovers = self.stats.failovers.wrapping_add(1);
         Ok(())
     }
 

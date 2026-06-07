@@ -353,6 +353,9 @@ impl FabricsController {
             self.queues[i] = self.queues[i + 1];
         }
         self.queue_count = self.queue_count.saturating_sub(1);
+        // SECURITY: clear the now-unreachable tail slot so stale Live queue state
+        // cannot be reused if queue_count is later incremented again.
+        self.queues[self.queue_count] = FabricsQueuePair::new();
         Ok(())
     }
 

@@ -16,6 +16,7 @@
 //!
 //! Reference: Linux DRM/KMS Driver Writer's Guide (kernel.org).
 
+use crate::drm_gem::GemObjectPool;
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -205,22 +206,23 @@ impl DrmFb {
     /// - `id`: Unique ID for this framebuffer.
     /// - `width`, `height`: Dimensions in pixels.
     /// - `format`: DRM format fourcc.
-    /// - `handle`: GEM buffer handle. Must be a valid, looked-up handle; callers
-    ///   are responsible for resolving it before calling this function.
-    /// - `gem_size`: Byte size of the backing GEM buffer. Used to verify that
-    ///   `pitch * height` fits within the allocation, preventing OOB access.
+    /// - `handle`: GEM object ID used as the backing buffer. Must be non-zero
+    ///   and present in `pool`.
+    /// - `pool`: The GEM object pool for this device. Used to look up the real
+    ///   backing object size; the caller cannot supply a substitute value.
     ///
     /// # Errors
     /// Returns `Error::InvalidArgument` for out-of-range dimensions, unsupported
     /// format, zero `handle`, arithmetic overflow, or if `pitch * height` exceeds
-    /// `gem_size`.
+    /// the actual GEM object size.
+    /// Returns `Error::NotFound` if `handle` is not present in `pool`.
     pub fn create(
         id: u32,
         width: u32,
         height: u32,
         format: u32,
         handle: u32,
-        gem_size: usize,
+        pool: &GemObjectPool,
     ) -> Result<Self> {
         if handle == 0 {
             return Err(Error::InvalidArgument);
@@ -235,11 +237,16 @@ impl DrmFb {
         let pitch = width
             .checked_mul(info.cpp as u32)
             .ok_or(Error::InvalidArgument)?;
-        // Verify pitch * height fits within the GEM buffer.
+        // SECURITY: required size is validated against the ACTUAL GEM object size
+        // retrieved from the pool — not a caller-supplied value. A caller-supplied
+        // size would let an attacker pass a huge number and bypass this bound,
+        // causing framebuffer access to exceed the real backing allocation (OOB).
+        let gem_obj = pool.get(handle)?;
+        let real_size = gem_obj.size;
         let required = (pitch as usize)
             .checked_mul(height as usize)
             .ok_or(Error::InvalidArgument)?;
-        if required > gem_size {
+        if required > real_size {
             return Err(Error::InvalidArgument);
         }
         Ok(Self {
@@ -385,26 +392,28 @@ impl DrmFbRegistry {
     /// # Parameters
     /// - `width`, `height`: Dimensions in pixels.
     /// - `format`: DRM format fourcc.
-    /// - `handle`: GEM buffer handle (must be non-zero; caller must have
-    ///   verified it exists in the GEM table).
-    /// - `gem_size`: Byte size of the backing GEM buffer. `pitch * height`
-    ///   must not exceed this value.
+    /// - `handle`: GEM object ID for the backing buffer (must be non-zero and
+    ///   present in `pool`).
+    /// - `pool`: The GEM object pool used to look up the real backing object size.
+    ///   The required framebuffer size (`pitch * height`) is validated against the
+    ///   actual GEM object size, not a caller-supplied value.
     ///
     /// # Errors
     /// Returns `Error::InvalidArgument` if the registry is full or parameters are invalid.
+    /// Returns `Error::NotFound` if `handle` is not present in `pool`.
     pub fn create_fb(
         &mut self,
         width: u32,
         height: u32,
         format: u32,
         handle: u32,
-        gem_size: usize,
+        pool: &GemObjectPool,
     ) -> Result<u32> {
         if self.count >= MAX_FRAMEBUFFERS {
             return Err(Error::InvalidArgument);
         }
         let id = self.next_id;
-        let fb = DrmFb::create(id, width, height, format, handle, gem_size)?;
+        let fb = DrmFb::create(id, width, height, format, handle, pool)?;
         for slot in &mut self.fbs {
             if slot.is_none() {
                 *slot = Some(fb);

@@ -355,6 +355,11 @@ impl GemHandleTable {
             return Err(Error::OutOfMemory);
         }
         let handle = self.next_handle;
+        // SECURITY: wrapping_add keeps the counter free-running; skipping
+        // GEM_HANDLE_INVALID (0) ensures handle 0 always means "no handle",
+        // preventing a wrapped counter from aliasing a closed slot (latent
+        // UAF / handle-confusion).  A generation counter per slot is the
+        // robust long-term fix; this sentinel-skip is the minimal safe guard.
         self.next_handle = self.next_handle.wrapping_add(1);
         if self.next_handle == GEM_HANDLE_INVALID {
             self.next_handle = 1;
@@ -475,7 +480,16 @@ impl GemObjectPool {
             return Err(Error::OutOfMemory);
         }
         let id = self.next_id;
+        // SECURITY: wrapping_add keeps the counter free-running but id 0 is
+        // reserved as an invalid sentinel (see GEM_HANDLE_INVALID).  Skipping 0
+        // prevents a wrapped counter from aliasing a freed object slot, which
+        // would be a latent use-after-free / handle-confusion bug.  A generation
+        // counter per slot is the robust long-term fix; this skip is the minimal
+        // build-safe mitigation until that refactor lands.
         self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
         let obj = GemObject::new(id, size)?;
         for slot in self.objects.iter_mut() {
             if !slot.active {
