@@ -207,14 +207,30 @@ impl Fadt {
 /// Returns [`Error::InvalidArgument`] if `data` is too short or the
 /// signature does not match.
 pub fn parse_fadt(data: &[u8]) -> Result<Fadt> {
-    if data.len() < AcpiTableHeader::SIZE + 100 {
+    // SECURITY/correctness: the floor is the true ACPI 1.0 mandatory minimum
+    // (AcpiTableHeader::SIZE + 80 = 116), which covers the last unconditional
+    // field FLAGS at bytes 112..116. All ACPI 2.0+ fields (offset >= 140) are
+    // individually gated by `data.len() >= N` guards below, so a higher floor
+    // would wrongly reject a spec-compliant 116-byte FADT.
+    if data.len() < AcpiTableHeader::SIZE + 80 {
         return Err(Error::InvalidArgument);
     }
     // Verify signature.
     if data[..4] != FADT_SIGNATURE {
         return Err(Error::InvalidArgument);
     }
-    verify_table_checksum(data)?;
+    // SECURITY: clip the checksum window to the declared table length, not the
+    // raw buffer size.  Checksumming the entire caller-supplied buffer would allow
+    // firmware to append bytes beyond the declared length that cancel a corrupted
+    // body and still pass integrity — matching the parse_mcfg idiom.
+    {
+        let declared = read_u32(data, 4) as usize;
+        if declared < AcpiTableHeader::SIZE + 80 {
+            return Err(Error::InvalidArgument);
+        }
+        let table_end = declared.min(data.len());
+        verify_table_checksum(&data[..table_end])?;
+    }
 
     // FADT v1 fields start at offset 36 (after standard header).
     // We read offset-by-offset to handle packed misalignment.
@@ -415,7 +431,18 @@ pub fn parse_hpet_table(data: &[u8]) -> Result<HpetTable> {
     if data[..4] != HPET_TABLE_SIGNATURE {
         return Err(Error::InvalidArgument);
     }
-    verify_table_checksum(data)?;
+    // SECURITY: clip the checksum window to the declared table length, not the
+    // raw buffer size — matching the parse_mcfg idiom.  Checksumming the full
+    // caller-supplied buffer allows firmware to append cancelling bytes beyond
+    // the declared length and bypass integrity.
+    {
+        let declared = read_u32(data, 4) as usize;
+        if declared < MIN_LEN {
+            return Err(Error::InvalidArgument);
+        }
+        let table_end = declared.min(data.len());
+        verify_table_checksum(&data[..table_end])?;
+    }
     let base = AcpiTableHeader::SIZE;
     Ok(HpetTable {
         event_timer_block_id: read_u32(data, base),
@@ -462,14 +489,29 @@ impl Bgrt {
 
 /// Parse a BGRT table from raw bytes.
 pub fn parse_bgrt(data: &[u8]) -> Result<Bgrt> {
-    const MIN_LEN: usize = AcpiTableHeader::SIZE + 18;
+    // SECURITY: offset_y is read at base+16 as a u32 (bytes 52..56); MIN_LEN
+    // must cover byte index 55, i.e. AcpiTableHeader::SIZE + 20 = 56.
+    // The previous value of +18 (=54) left offset_y outside the declared minimum,
+    // meaning an undersized table would pass the length check and then index OOB.
+    const MIN_LEN: usize = AcpiTableHeader::SIZE + 20;
     if data.len() < MIN_LEN {
         return Err(Error::InvalidArgument);
     }
     if data[..4] != BGRT_SIGNATURE {
         return Err(Error::InvalidArgument);
     }
-    verify_table_checksum(data)?;
+    // SECURITY: clip the checksum window to the declared table length, not the
+    // raw buffer size — matching the parse_mcfg idiom.  Checksumming the full
+    // caller-supplied buffer allows firmware to append cancelling bytes beyond
+    // the declared length and bypass integrity.
+    {
+        let declared = read_u32(data, 4) as usize;
+        if declared < MIN_LEN {
+            return Err(Error::InvalidArgument);
+        }
+        let table_end = declared.min(data.len());
+        verify_table_checksum(&data[..table_end])?;
+    }
     let base = AcpiTableHeader::SIZE;
     Ok(Bgrt {
         version: read_u16(data, base),
@@ -1607,7 +1649,14 @@ impl Slit {
 /// Returns [`Error::InvalidArgument`] if the signature, checksum, or
 /// matrix dimensions are invalid.
 pub fn parse_slit(data: &[u8]) -> Result<Slit> {
-    validate_table_header(data, Some(&SLIT_SIGNATURE), 8)?;
+    // SECURITY: capture the declared table length returned by validate_table_header
+    // so the matrix bounds check is performed against the checksummed window, not
+    // the raw buffer.  Discarding the return value (with bare `?`) and then
+    // checking against data.len() would allow firmware to append matrix bytes
+    // beyond the declared length, outside the integrity-checked region.
+    let table_len = validate_table_header(data, Some(&SLIT_SIGNATURE), 8)? as usize;
+    // Effective buffer bound: declared length clipped to actual buffer size.
+    let table_end = table_len.min(data.len());
 
     let num_localities_raw = read_u64(data, AcpiTableHeader::SIZE) as usize;
     if num_localities_raw == 0 || num_localities_raw > SLIT_MAX_LOCALITIES {
@@ -1615,8 +1664,16 @@ pub fn parse_slit(data: &[u8]) -> Result<Slit> {
     }
 
     let matrix_start = AcpiTableHeader::SIZE + 8;
-    let matrix_size = num_localities_raw * num_localities_raw;
-    if matrix_start + matrix_size > data.len() {
+    // SECURITY: use checked arithmetic so a large firmware-supplied locality
+    // count cannot overflow the bound computation (overflow-checks ON = panic).
+    let matrix_size = num_localities_raw
+        .checked_mul(num_localities_raw)
+        .ok_or(Error::InvalidArgument)?;
+    let matrix_end = matrix_start
+        .checked_add(matrix_size)
+        .ok_or(Error::InvalidArgument)?;
+    // Bounds-check against the checksummed window, not the raw buffer.
+    if matrix_end > table_end {
         return Err(Error::InvalidArgument);
     }
 

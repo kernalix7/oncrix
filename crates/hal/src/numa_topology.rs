@@ -381,9 +381,20 @@ impl NumaTopology {
         }
 
         // Distance matrix starts at offset 44.
-        let matrix_start = 44;
-        let expected = matrix_start + localities * localities;
-        if data.len() < expected {
+        let matrix_start: usize = 44;
+        // SECURITY: use the checksummed window (length) as the bound, not the
+        // raw buffer length.  Checking against data.len() would allow firmware
+        // to place matrix bytes outside the integrity-checked region, bypassing
+        // the ACPI checksum.  Also use checked_mul/checked_add so the bound
+        // computation itself cannot overflow (overflow-checks are ON in dev/test
+        // and would panic in ring-0 if localities were attacker-supplied).
+        let matrix_size = localities
+            .checked_mul(localities)
+            .ok_or(Error::InvalidArgument)?;
+        let matrix_end = matrix_start
+            .checked_add(matrix_size)
+            .ok_or(Error::InvalidArgument)?;
+        if matrix_end > length {
             return Err(Error::InvalidArgument);
         }
 
