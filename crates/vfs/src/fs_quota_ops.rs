@@ -49,6 +49,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use oncrix_lib::{Error, Result};
 
+use crate::cred_check::{Capability, VfsCred};
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum number of quota entries per type (user, group, project).
@@ -635,27 +637,65 @@ impl QuotaCommand {
 
 /// Dispatch a `QuotaCommand` against `ops`.
 ///
+/// `caller` must hold [`Capability::SysAdmin`] for every administrative
+/// (write) quota operation.  Read-only operations (`Q_GETQUOTA`,
+/// `Q_GETINFO`, `Q_SYNC`) are permitted without elevated privilege for
+/// the calling process's own quota; cross-ID reads also require the cap.
+///
 /// Returns `Ok(())` on success or a relevant error. For `Q_GETQUOTA`
 /// the quota data is not returned here (callers inspect `ops` directly).
-pub fn dispatch_quotactl(ops: &mut FsQuotaOps, cmd: &QuotaCommand, now_secs: u64) -> Result<()> {
+pub fn dispatch_quotactl(
+    ops: &mut FsQuotaOps,
+    cmd: &QuotaCommand,
+    caller: &VfsCred,
+    now_secs: u64,
+) -> Result<()> {
     if !cmd.is_valid() {
         return Err(Error::InvalidArgument);
     }
     match cmd.cmd {
-        Q_QUOTAON => ops.set_enabled(cmd.qtype, true),
-        Q_QUOTAOFF => ops.set_enabled(cmd.qtype, false),
+        // SECURITY: Q_QUOTAON / Q_QUOTAOFF / Q_SETQUOTA / Q_SETINFO are
+        // privileged write operations; deny without CAP_SYS_ADMIN (=21).
+        Q_QUOTAON => {
+            if !caller.capable(Capability::SysAdmin) {
+                return Err(Error::PermissionDenied);
+            }
+            ops.set_enabled(cmd.qtype, true);
+        }
+        Q_QUOTAOFF => {
+            if !caller.capable(Capability::SysAdmin) {
+                return Err(Error::PermissionDenied);
+            }
+            ops.set_enabled(cmd.qtype, false);
+        }
+        Q_SETQUOTA | Q_SETINFO => {
+            // SECURITY: Setting quotas/info is a privileged admin operation.
+            if !caller.capable(Capability::SysAdmin) {
+                return Err(Error::PermissionDenied);
+            }
+            // Handled by higher-level callers with additional data.
+        }
         Q_SYNC => {
-            // Simulate quota sync: validate all entries.
+            // Sync is a read/diagnostic op; no privilege required.
             let _ = now_secs;
         }
         Q_GETQUOTA => {
-            // Caller reads directly from ops.get_quota().
+            // SECURITY: Reading another user's quota requires CAP_SYS_ADMIN.
+            // The own-quota shortcut applies ONLY to a USER quota whose id
+            // equals the caller's euid; for Group/Project the id is a
+            // gid/project-id and is NOT comparable to euid, so those reads
+            // always require CAP_SYS_ADMIN (otherwise a numeric match between
+            // an euid and an unrelated gid would leak another id's quota).
+            let own_user = matches!(cmd.qtype, QuotaType::User) && cmd.id == caller.euid;
+            if !own_user && !caller.capable(Capability::SysAdmin) {
+                return Err(Error::PermissionDenied);
+            }
             if ops.get_quota(cmd.qtype, cmd.id).is_none() {
                 return Err(Error::NotFound);
             }
         }
-        Q_SETQUOTA | Q_GETINFO | Q_SETINFO => {
-            // Handled by higher-level callers with additional data.
+        Q_GETINFO => {
+            // Global quota info is readable by all.
         }
         _ => return Err(Error::NotImplemented),
     }
@@ -730,22 +770,57 @@ impl QuotaEntry {
         }
     }
 
-    /// Update limits and usage from a [`DqBlk`].
-    pub fn from_dqblk(&mut self, dqb: &DqBlk) {
+    /// Update limits and, if `caller` holds [`Capability::SysAdmin`], usage
+    /// from a [`DqBlk`].
+    ///
+    /// # Privilege model
+    ///
+    /// - **Limit fields** (`QIF_BLIMITS`, `QIF_ILIMITS`): require
+    ///   `CAP_SYS_ADMIN`.  Rejecting without the cap prevents unprivileged
+    ///   processes from softening their own quota.
+    /// - **Usage fields** (`QIF_SPACE`, `QIF_INODES`): require
+    ///   `CAP_SYS_ADMIN`.  The kernel owns usage counters; a user must never
+    ///   be able to zero or forge their own used-block count.
+    ///
+    /// Returns `Err(PermissionDenied)` if any privileged field is requested
+    /// without the capability.
+    ///
+    // SECURITY: Without this guard an unprivileged caller can supply
+    // dqb_curspace=0 / dqb_curinodes=0 to erase its own usage and bypass
+    // hard-limit enforcement permanently (finding #3).
+    pub fn from_dqblk(&mut self, dqb: &DqBlk, caller: &VfsCred) -> Result<()> {
+        let is_admin = caller.capable(Capability::SysAdmin);
+
         if dqb.dqb_valid & QIF_BLIMITS != 0 {
+            if !is_admin {
+                return Err(Error::PermissionDenied);
+            }
             self.limits.block_hard = dqb.dqb_bhardlimit;
             self.limits.block_soft = dqb.dqb_bsoftlimit;
         }
         if dqb.dqb_valid & QIF_SPACE != 0 {
+            // SECURITY: usage fields are kernel-maintained; only admin may
+            // override them (e.g. quota repair / fsck).
+            if !is_admin {
+                return Err(Error::PermissionDenied);
+            }
             self.block_usage = dqb.dqb_curspace;
         }
         if dqb.dqb_valid & QIF_ILIMITS != 0 {
+            if !is_admin {
+                return Err(Error::PermissionDenied);
+            }
             self.limits.inode_hard = dqb.dqb_ihardlimit;
             self.limits.inode_soft = dqb.dqb_isoftlimit;
         }
         if dqb.dqb_valid & QIF_INODES != 0 {
+            // SECURITY: same as QIF_SPACE — admin-only.
+            if !is_admin {
+                return Err(Error::PermissionDenied);
+            }
             self.inode_usage = dqb.dqb_curinodes;
         }
+        Ok(())
     }
 }
 
@@ -914,13 +989,30 @@ pub fn get_dqblk(ops: &FsQuotaOps, qtype: QuotaType, id: u32) -> Result<DqBlk> {
 }
 
 /// Set quota limits/usage for (`qtype`, `id`) from a [`DqBlk`].
-pub fn set_dqblk(ops: &mut FsQuotaOps, qtype: QuotaType, id: u32, dqb: &DqBlk) -> Result<()> {
+///
+/// `caller` must hold [`Capability::SysAdmin`] to modify any field; the
+/// check is delegated to [`QuotaEntry::from_dqblk`].
+///
+/// Creating a new entry (when none exists for `id`) is also a privileged
+/// operation and is rejected without `CAP_SYS_ADMIN`.
+///
+// SECURITY: All quota write paths must require CAP_SYS_ADMIN so that an
+// unprivileged process cannot set its own limits or forge its usage.
+pub fn set_dqblk(
+    ops: &mut FsQuotaOps,
+    qtype: QuotaType,
+    id: u32,
+    dqb: &DqBlk,
+    caller: &VfsCred,
+) -> Result<()> {
+    if !caller.capable(Capability::SysAdmin) {
+        return Err(Error::PermissionDenied);
+    }
     let table = ops.table_mut(qtype);
     if let Some(entry) = table.find_mut(id) {
-        entry.from_dqblk(dqb);
-        return Ok(());
+        return entry.from_dqblk(dqb, caller);
     }
-    // Entry doesn't exist — create it.
+    // Entry doesn't exist — create it (admin-only, already checked above).
     let limits = QuotaLimits {
         block_hard: dqb.dqb_bhardlimit,
         block_soft: dqb.dqb_bsoftlimit,
@@ -933,16 +1025,40 @@ pub fn set_dqblk(ops: &mut FsQuotaOps, qtype: QuotaType, id: u32, dqb: &DqBlk) -
 // ── quota_on / quota_off ──────────────────────────────────────────────────────
 
 /// Enable quota for `qtype` on `ops`, optionally setting the grace period.
-pub fn quota_on(ops: &mut FsQuotaOps, qtype: QuotaType, grace_secs: Option<u64>) {
+///
+/// `caller` must hold [`Capability::SysAdmin`]; returns
+/// `Err(PermissionDenied)` otherwise (fail-closed).
+///
+// SECURITY: Turning quota on/off is a global filesystem policy change;
+// deny without CAP_SYS_ADMIN (=21).
+pub fn quota_on(
+    ops: &mut FsQuotaOps,
+    qtype: QuotaType,
+    caller: &VfsCred,
+    grace_secs: Option<u64>,
+) -> Result<()> {
+    if !caller.capable(Capability::SysAdmin) {
+        return Err(Error::PermissionDenied);
+    }
     if let Some(secs) = grace_secs {
         ops.set_grace(qtype, secs);
     }
     ops.set_enabled(qtype, true);
+    Ok(())
 }
 
 /// Disable quota for `qtype` on `ops`.
-pub fn quota_off(ops: &mut FsQuotaOps, qtype: QuotaType) {
+///
+/// `caller` must hold [`Capability::SysAdmin`]; returns
+/// `Err(PermissionDenied)` otherwise (fail-closed).
+///
+// SECURITY: Same rationale as quota_on.
+pub fn quota_off(ops: &mut FsQuotaOps, qtype: QuotaType, caller: &VfsCred) -> Result<()> {
+    if !caller.capable(Capability::SysAdmin) {
+        return Err(Error::PermissionDenied);
+    }
     ops.set_enabled(qtype, false);
+    Ok(())
 }
 
 // ── warn_soft_limit ───────────────────────────────────────────────────────────

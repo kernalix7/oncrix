@@ -126,12 +126,27 @@ impl DiskQuota {
     /// Charge `blocks` 512-byte units and `inodes` inodes against this entry.
     ///
     /// Updates grace state when soft limits are crossed.  Returns
-    /// [`Error::PermissionDenied`] when a hard limit would be exceeded.
+    /// [`Error::PermissionDenied`] when a hard limit would be exceeded or the
+    /// arithmetic would overflow (treating overflow as over-limit is safe because
+    /// legitimate usage can never reach `u64::MAX` blocks).
     pub fn charge(&mut self, blocks: u64, inodes: u64, now: u64) -> Result<()> {
-        self.enforce_block_limit(self.usage.blocks + blocks, now)?;
-        self.enforce_inode_limit(self.usage.inodes + inodes, now)?;
-        self.usage.blocks += blocks;
-        self.usage.inodes += inodes;
+        // SECURITY: Use checked_add so that an attacker-controlled block/inode
+        // count cannot cause a ring-0 panic under overflow-checks=on, nor silently
+        // wrap and bypass the hard-limit check.
+        let new_blocks = self
+            .usage
+            .blocks
+            .checked_add(blocks)
+            .ok_or(Error::PermissionDenied)?;
+        let new_inodes = self
+            .usage
+            .inodes
+            .checked_add(inodes)
+            .ok_or(Error::PermissionDenied)?;
+        self.enforce_block_limit(new_blocks, now)?;
+        self.enforce_inode_limit(new_inodes, now)?;
+        self.usage.blocks = new_blocks;
+        self.usage.inodes = new_inodes;
         self.update_grace(now);
         Ok(())
     }

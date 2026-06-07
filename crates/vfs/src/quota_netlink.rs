@@ -39,8 +39,15 @@ use oncrix_lib::{Error, Result};
 /// Maximum events held in the global ring buffer before oldest are dropped.
 pub const MAX_EVENTS: usize = 256;
 
-/// Maximum number of concurrent quota listeners.
+/// Maximum number of concurrent quota listeners (kernel-wide).
 pub const MAX_LISTENERS: usize = 32;
+
+/// Maximum quota-event listeners a single process (pid) may register.
+///
+/// Bounding this prevents an unprivileged process from exhausting the
+/// global listener table and starving other processes of event delivery
+/// (ring-buffer drain DoS, finding #4).
+pub const MAX_LISTENERS_PER_PID: usize = 4;
 
 /// Maximum events queued per listener before the oldest is dropped.
 pub const MAX_LISTENER_QUEUE: usize = 64;
@@ -200,6 +207,8 @@ pub struct QuotaListener {
     pub id: u32,
     /// Whether this listener is active.
     active: bool,
+    /// PID of the registering process (for per-process accounting).
+    pub pid: u32,
     /// Subscription filter.
     pub filter: ListenerFilter,
     /// Ring buffer of pending events for this listener.
@@ -219,6 +228,7 @@ impl Default for QuotaListener {
         Self {
             id: 0,
             active: false,
+            pid: 0,
             filter: ListenerFilter::default(),
             queue: [const { None }; MAX_LISTENER_QUEUE],
             write_idx: 0,
@@ -334,9 +344,28 @@ impl QuotaNotifier {
 
     /// Register a new listener with the given filter.
     ///
-    /// Returns the listener ID on success, or [`Error::OutOfMemory`] when the
-    /// listener table is full.
-    pub fn subscribe(&mut self, filter: ListenerFilter) -> Result<u32> {
+    /// `caller_pid` identifies the registering process and is used to
+    /// enforce [`MAX_LISTENERS_PER_PID`].  Returns [`Error::PermissionDenied`]
+    /// when the per-process limit is reached, or [`Error::OutOfMemory`] when
+    /// the global listener table is full.
+    ///
+    // SECURITY: Without a per-process cap an unprivileged process can fill the
+    // entire listener table (MAX_LISTENERS slots) by registering repeatedly,
+    // starving other processes of quota notifications and potentially causing a
+    // DoS via ring-buffer drain (finding #4).  Each pid is limited to
+    // MAX_LISTENERS_PER_PID concurrent subscriptions.
+    pub fn subscribe(&mut self, filter: ListenerFilter, caller_pid: u32) -> Result<u32> {
+        // Count existing listeners owned by this pid.
+        let pid_count = self
+            .listeners
+            .iter()
+            .flatten()
+            .filter(|l| l.active && l.pid == caller_pid)
+            .count();
+        if pid_count >= MAX_LISTENERS_PER_PID {
+            return Err(Error::PermissionDenied);
+        }
+
         let slot = self
             .listeners
             .iter()
@@ -349,6 +378,7 @@ impl QuotaNotifier {
         let mut listener = QuotaListener::default();
         listener.id = id;
         listener.active = true;
+        listener.pid = caller_pid;
         listener.filter = filter;
         self.listeners[slot] = Some(listener);
         Ok(id)
@@ -433,8 +463,15 @@ pub struct NetlinkQuotaSocket {
 
 impl NetlinkQuotaSocket {
     /// Open a new quota netlink socket with the given filter.
-    pub fn open(notifier: &mut QuotaNotifier, filter: ListenerFilter) -> Result<Self> {
-        let listener_id = notifier.subscribe(filter)?;
+    ///
+    /// `caller_pid` is the PID of the opening process; it is forwarded to
+    /// [`QuotaNotifier::subscribe`] for per-process listener accounting.
+    pub fn open(
+        notifier: &mut QuotaNotifier,
+        filter: ListenerFilter,
+        caller_pid: u32,
+    ) -> Result<Self> {
+        let listener_id = notifier.subscribe(filter, caller_pid)?;
         Ok(Self {
             listener_id,
             open: true,
