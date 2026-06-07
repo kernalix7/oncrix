@@ -342,33 +342,56 @@ pub fn build_identify_ns(nsid: u32, prp1: u64) -> AdminSqe {
 ///
 /// `prp1` — physical address of the CQ memory.
 /// `qid` — queue identifier (1-based).
-/// `qsize` — number of entries minus one (0-based).
+/// `qsize` — number of entries; must be >= 1 (the NVMe spec encodes QSIZE as
+///   entries-minus-one, so `qsize == 0` would produce a malformed zero-entry queue).
 /// `irq_vector` — MSI/MSI-X vector for this CQ.
-pub fn build_create_io_cq(prp1: u64, qid: u16, qsize: u16, irq_vector: u16) -> AdminSqe {
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `qsize` is zero.
+pub fn build_create_io_cq(prp1: u64, qid: u16, qsize: u16, irq_vector: u16) -> Result<AdminSqe> {
+    // SECURITY: qsize is caller-supplied and could be attacker-controlled if the
+    // queue configuration path is reachable from untrusted input. A zero qsize
+    // would encode QSIZE=0xFFFF (wrap) or create a zero-entry queue, both of
+    // which are malformed per NVMe spec §5.3 and could corrupt queue state.
+    if qsize == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let mut sqe = AdminSqe::default();
     sqe.cdw0 = u32::from(ADMIN_CREATE_IO_CQ);
     sqe.prp1 = prp1;
-    // CDW10: QID[15:0] | QSIZE[31:16]
-    sqe.cdw10 = u32::from(qid) | (u32::from(qsize) << 16);
+    // CDW10: QID[15:0] | QSIZE[31:16] (QSIZE = number of entries minus one)
+    sqe.cdw10 = u32::from(qid) | (u32::from(qsize - 1) << 16);
     // CDW11: PC=1 (physically contiguous), IEN=1, IV=irq_vector
     sqe.cdw11 = 0x0003 | (u32::from(irq_vector) << 16);
-    sqe
+    Ok(sqe)
 }
 
 /// Build a Create I/O Submission Queue SQE.
 ///
 /// `prp1` — physical address of the SQ memory.
 /// `qid` — queue identifier (1-based).
-/// `qsize` — number of entries minus one.
+/// `qsize` — number of entries; must be >= 1 (the NVMe spec encodes QSIZE as
+///   entries-minus-one, so `qsize == 0` would produce a malformed zero-entry queue).
 /// `cqid` — associated completion queue identifier.
-pub fn build_create_io_sq(prp1: u64, qid: u16, qsize: u16, cqid: u16) -> AdminSqe {
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `qsize` is zero.
+pub fn build_create_io_sq(prp1: u64, qid: u16, qsize: u16, cqid: u16) -> Result<AdminSqe> {
+    // SECURITY: same rationale as build_create_io_cq — qsize == 0 encodes an
+    // invalid NVMe queue size (QSIZE field = entries-minus-one; zero is malformed).
+    if qsize == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let mut sqe = AdminSqe::default();
     sqe.cdw0 = u32::from(ADMIN_CREATE_IO_SQ);
     sqe.prp1 = prp1;
-    sqe.cdw10 = u32::from(qid) | (u32::from(qsize) << 16);
+    // CDW10: QID[15:0] | QSIZE[31:16] (QSIZE = number of entries minus one)
+    sqe.cdw10 = u32::from(qid) | (u32::from(qsize - 1) << 16);
     // CDW11: PC=1, QPRIO=00 (urgent), CQID
     sqe.cdw11 = 0x0001 | (u32::from(cqid) << 16);
-    sqe
+    Ok(sqe)
 }
 
 /// Build a Delete I/O Submission Queue SQE.

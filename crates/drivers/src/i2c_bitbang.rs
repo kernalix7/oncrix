@@ -227,8 +227,15 @@ impl<SDA: GpioPin, SCL: GpioPin> I2cBitbang<SDA, SCL> {
 
     /// Write `data` to the slave at 7-bit `addr`.
     ///
-    /// Returns `Ok(())` on success, `Err(Error::IoError)` on NACK.
+    /// Returns `Ok(())` on success, `Err(Error::IoError)` on NACK,
+    /// or `Err(Error::InvalidArgument)` if `addr` exceeds 0x7F.
     pub fn write(&mut self, addr: u8, data: &[u8]) -> Result<()> {
+        // SECURITY: addr is caller-supplied. A value >= 128 would cause `addr << 1`
+        // to overflow a u8, triggering a panic (ring-0 halt) with overflow-checks ON.
+        // Reject out-of-range addresses at the public boundary before any retry loop.
+        if addr > 0x7F {
+            return Err(Error::InvalidArgument);
+        }
         let mut last_err = Ok(());
         for _ in 0..ARB_RETRIES {
             last_err = self.do_write(addr, data);
@@ -242,7 +249,9 @@ impl<SDA: GpioPin, SCL: GpioPin> I2cBitbang<SDA, SCL> {
     fn do_write(&mut self, addr: u8, data: &[u8]) -> Result<()> {
         self.start()?;
         // Address byte: 7-bit addr + write bit (0).
-        let addr_byte = (addr << 1) & 0xFE;
+        // SECURITY: addr <= 0x7F is guaranteed by the public entry points; widen to
+        // u16 before shifting to be safe under all arithmetic check modes.
+        let addr_byte = ((addr as u16) << 1) as u8 & 0xFE;
         if !self.write_byte(addr_byte)? {
             let _ = self.stop();
             return Err(Error::IoError);
@@ -258,11 +267,18 @@ impl<SDA: GpioPin, SCL: GpioPin> I2cBitbang<SDA, SCL> {
 
     /// Read `buf.len()` bytes from the slave at 7-bit `addr`.
     ///
-    /// Returns `Ok(())` on success, `Err(Error::IoError)` on NACK.
+    /// Returns `Ok(())` on success, `Err(Error::IoError)` on NACK,
+    /// or `Err(Error::InvalidArgument)` if `addr` exceeds 0x7F.
     pub fn read(&mut self, addr: u8, buf: &mut [u8]) -> Result<()> {
+        // SECURITY: addr is caller-supplied. A value >= 128 would cause `addr << 1`
+        // to overflow a u8, triggering a panic (ring-0 halt) with overflow-checks ON.
+        if addr > 0x7F {
+            return Err(Error::InvalidArgument);
+        }
         self.start()?;
         // Address byte: 7-bit addr + read bit (1).
-        let addr_byte = (addr << 1) | 0x01;
+        // SECURITY: addr <= 0x7F guaranteed above; widen before shift.
+        let addr_byte = ((addr as u16) << 1) as u8 | 0x01;
         if !self.write_byte(addr_byte)? {
             let _ = self.stop();
             return Err(Error::IoError);
@@ -278,11 +294,18 @@ impl<SDA: GpioPin, SCL: GpioPin> I2cBitbang<SDA, SCL> {
     /// Write then read (combined write-read with repeated-start).
     ///
     /// Writes `write_data` then issues a repeated START, reads `read_buf.len()` bytes.
+    /// Returns `Err(Error::InvalidArgument)` if `addr` exceeds 0x7F.
     pub fn write_read(&mut self, addr: u8, write_data: &[u8], read_buf: &mut [u8]) -> Result<()> {
+        // SECURITY: addr is caller-supplied. A value >= 128 would cause `addr << 1`
+        // to overflow a u8, triggering a panic (ring-0 halt) with overflow-checks ON.
+        if addr > 0x7F {
+            return Err(Error::InvalidArgument);
+        }
         self.start()?;
 
         // Write phase.
-        let wr_addr = (addr << 1) & 0xFE;
+        // SECURITY: addr <= 0x7F guaranteed above; widen before shift.
+        let wr_addr = ((addr as u16) << 1) as u8 & 0xFE;
         if !self.write_byte(wr_addr)? {
             let _ = self.stop();
             return Err(Error::IoError);
@@ -298,7 +321,8 @@ impl<SDA: GpioPin, SCL: GpioPin> I2cBitbang<SDA, SCL> {
         self.repeated_start()?;
 
         // Read phase.
-        let rd_addr = (addr << 1) | 0x01;
+        // SECURITY: addr <= 0x7F guaranteed above; widen before shift.
+        let rd_addr = ((addr as u16) << 1) as u8 | 0x01;
         if !self.write_byte(rd_addr)? {
             let _ = self.stop();
             return Err(Error::IoError);
@@ -327,10 +351,18 @@ impl<SDA: GpioPin, SCL: GpioPin> I2cBitbang<SDA, SCL> {
 
     /// Probe a single address — START, send addr+W, check ACK, STOP.
     ///
-    /// Returns `Ok(())` if the device ACKed, `Err(Error::NotFound)` otherwise.
+    /// Returns `Ok(())` if the device ACKed, `Err(Error::NotFound)` otherwise,
+    /// or `Err(Error::InvalidArgument)` if `addr` exceeds 0x7F.
     pub fn probe(&mut self, addr: u8) -> Result<()> {
+        // SECURITY: addr is caller-supplied. A value >= 128 would cause `addr << 1`
+        // to overflow a u8, triggering a panic (ring-0 halt) with overflow-checks ON.
+        // scan() only passes 0x08..=0x77 so it is safe, but probe() is also public.
+        if addr > 0x7F {
+            return Err(Error::InvalidArgument);
+        }
         self.start()?;
-        let addr_byte = (addr << 1) & 0xFE;
+        // SECURITY: addr <= 0x7F guaranteed above; widen before shift.
+        let addr_byte = ((addr as u16) << 1) as u8 & 0xFE;
         let acked = self.write_byte(addr_byte)?;
         let _ = self.stop();
         if acked { Ok(()) } else { Err(Error::NotFound) }

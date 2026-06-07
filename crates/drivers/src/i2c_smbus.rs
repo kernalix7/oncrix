@@ -120,7 +120,11 @@ impl I2cAddress {
     /// Build the first address byte for a 7-bit address on the bus.
     pub fn first_byte(&self, read: bool) -> u8 {
         match self {
-            I2cAddress::SevenBit(a) => (a << 1) | if read { I2C_READ_FLAG } else { I2C_WRITE_FLAG },
+            // SECURITY: widen before the shift — a SevenBit value >= 0x80 would
+            // overflow the u8 `a << 1` and panic in ring 0 under overflow-checks.
+            I2cAddress::SevenBit(a) => {
+                ((*a as u16) << 1) as u8 | if read { I2C_READ_FLAG } else { I2C_WRITE_FLAG }
+            }
             I2cAddress::TenBit(a) => {
                 let high = ((a >> 7) & 0x06) as u8;
                 I2C_10BIT_PREFIX | high | if read { I2C_READ_FLAG } else { I2C_WRITE_FLAG }

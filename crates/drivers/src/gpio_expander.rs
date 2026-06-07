@@ -277,15 +277,38 @@ impl GpioExpanderRegistry {
     }
 
     /// Register a new expander. Returns the assigned base GPIO number.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::OutOfMemory`] if the registry is full.
+    /// - [`Error::InvalidArgument`] if `count` is zero or if the resulting
+    ///   global pin range would overflow `usize`.
     pub fn register(&mut self, count: usize, name: &'static str) -> Result<usize> {
         if self.count >= MAX_EXPANDERS {
             return Err(Error::OutOfMemory);
         }
+        // SECURITY: count is caller-supplied and may be attacker-controlled.
+        // Reject zero (meaningless expander) to avoid degenerate state.
+        if count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Compute the next free base pin by finding the highest (base + count)
+        // across all registered expanders.  Each x.base + x.count was itself
+        // checked_add-validated at registration time, so the only new overflow
+        // risk is the addition of the current entry's `count` to that high-water mark.
         let base = self.entries[..self.count]
             .iter()
-            .filter_map(|e| e.as_ref().map(|x| x.base + x.count))
+            .filter_map(|e| {
+                // SECURITY: use checked_add here too; a corrupted/large stored
+                // count would otherwise overflow usize (ring-0 panic).
+                e.as_ref().and_then(|x| x.base.checked_add(x.count))
+            })
             .max()
             .unwrap_or(0);
+        // SECURITY: verify base + count does not overflow usize before storing.
+        // An attacker-supplied large count would otherwise cause a panic when this
+        // value is later read back and used as a base for the next registration.
+        let _ = base.checked_add(count).ok_or(Error::InvalidArgument)?;
         self.entries[self.count] = Some(GpioExpanderEntry { base, count, name });
         self.count += 1;
         Ok(base)

@@ -520,11 +520,18 @@ impl I2cController {
                 mmio_write32(base, DW_IC_TAR, tar);
             }
 
+            // SECURITY: msg.len is a pub field and may be set by untrusted/device-DMA
+            // code to a value exceeding MAX_MSG_DATA (64).  Clamp here at the transfer
+            // boundary so that both the read and write loops below never index past
+            // msg.data[MAX_MSG_DATA - 1].  The constructors (I2cMsg::read/write) also
+            // clamp, but a caller can bypass them by writing the pub field directly.
+            let safe_len = msg.len.min(MAX_MSG_DATA);
+
             if msg.is_read() {
                 // Issue READ commands
-                for i in 0..msg.len {
+                for i in 0..safe_len {
                     let cmd = DW_IC_DATA_CMD_READ
-                        | if i == msg.len.saturating_sub(1) {
+                        | if i == safe_len.saturating_sub(1) {
                             DW_IC_DATA_CMD_STOP
                         } else {
                             0
@@ -535,7 +542,7 @@ impl I2cController {
                     }
                 }
                 // Poll RX FIFO for received bytes (simplified busy-poll)
-                for i in 0..msg.len {
+                for i in 0..safe_len {
                     let mut timeout = 10_000u32;
                     loop {
                         // SAFETY: DW_IC_RXFLR gives the RX FIFO fill level.
@@ -556,9 +563,9 @@ impl I2cController {
                 }
             } else {
                 // Issue WRITE commands
-                for i in 0..msg.len {
+                for i in 0..safe_len {
                     let cmd = u32::from(msg.data[i])
-                        | if i == msg.len.saturating_sub(1) {
+                        | if i == safe_len.saturating_sub(1) {
                             DW_IC_DATA_CMD_STOP
                         } else {
                             0

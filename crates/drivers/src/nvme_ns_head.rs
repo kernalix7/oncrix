@@ -224,13 +224,19 @@ impl NvmeNsHead {
         if self.path_count >= MAX_PATHS {
             return Err(Error::OutOfMemory);
         }
-        let dup = self.paths[..self.path_count]
+        // SECURITY: Scan the FULL paths array for duplicate ctrl_id, not just
+        // paths[..path_count]. After detach_path trims path_count from the tail,
+        // a previously-removed path's slot becomes invisible to a [..path_count]
+        // scan, allowing the same ctrl_id to be re-inserted as a duplicate.
+        let dup = self
+            .paths
             .iter()
             .filter_map(|p| p.as_ref())
             .any(|p| p.ctrl_id == path.ctrl_id);
         if dup {
             return Err(Error::AlreadyExists);
         }
+        // Find the first free slot in the full array (consistent with above scan).
         let slot = self
             .paths
             .iter()
@@ -299,6 +305,12 @@ impl NvmeNsHead {
     fn rr_select(&mut self) -> Result<&mut NvmePath> {
         let start = self.rr_cursor;
         let count = self.path_count;
+        // SECURITY: path_count is attacker-influenced (driven by host commands).
+        // A zero count would cause a division-by-zero panic (ring-0 halt) on the
+        // modulo operations below. Reject early so % count is always safe.
+        if count == 0 {
+            return Err(Error::Busy);
+        }
         for i in 0..count {
             let idx = (start + i) % count;
             if self.paths[idx].as_ref().map_or(false, |p| p.is_live()) {

@@ -184,6 +184,13 @@ impl I2cMaster {
 
     /// Initialize the I2C master controller.
     pub fn init(&mut self, speed: I2cSpeed) -> Result<()> {
+        // SECURITY: clk_hz == 0 would produce period = 0, yielding SCL high/low
+        // counts of 0 (hardware misconfig) and, on any future division that uses
+        // the period as a denominator, a div-by-zero kernel panic.  Reject early.
+        if self.clk_hz == 0 {
+            return Err(Error::InvalidArgument);
+        }
+
         self.speed = speed;
 
         // SAFETY: I2C MMIO initialization sequence.

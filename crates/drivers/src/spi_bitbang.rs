@@ -277,6 +277,13 @@ impl SpiBitbang {
         if self.cfg.word_bits == 0 || self.cfg.word_bits > 32 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: cs_count is a pub field on BitbangConfig and may be set to a value
+        // greater than MAX_CS by attacker-controlled input.  Indexing self.cfg.cs[i] for
+        // i >= MAX_CS would panic (ring-0 = machine halt).  Reject before entering the
+        // de-assert loop so every cs[i] access is guaranteed in-bounds.
+        if self.cfg.cs_count > MAX_CS {
+            return Err(Error::InvalidArgument);
+        }
         self.set_sclk(self.clock_idle_level());
         self.set_mosi(0);
         // De-assert all chip-selects.

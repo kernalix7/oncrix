@@ -273,10 +273,18 @@ impl BitBangAdapter {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidArgument`] if `addr` exceeds the 7-bit range (> 0x7F).
     /// - [`Error::IoError`] if the slave NAKs the address or any data byte.
     /// - [`Error::WouldBlock`] if arbitration is lost.
     /// - [`Error::Busy`] on clock-stretch timeout.
     pub fn write(&mut self, addr: u8, data: &[u8]) -> Result<()> {
+        // SECURITY: addr is caller-supplied. A value >= 128 would cause `addr << 1`
+        // to overflow a u8, triggering a panic (ring-0 halt) with overflow-checks ON.
+        // Reject out-of-range addresses at the public boundary.
+        if addr > 0x7F {
+            return Err(Error::InvalidArgument);
+        }
+
         for attempt in 0..=ARB_RETRIES {
             match self.start() {
                 Ok(()) => break,
@@ -286,7 +294,9 @@ impl BitBangAdapter {
         }
 
         // Address byte: 7-bit addr shifted left, bit 0 = 0 (write).
-        let addr_byte = (addr << 1) & 0xFE;
+        // SECURITY: addr <= 0x7F is guaranteed above; widen to u16 before shifting
+        // to make the invariant explicit and safe under all arithmetic modes.
+        let addr_byte = ((addr as u16) << 1) as u8 & 0xFE;
         if !self.send_byte(addr_byte)? {
             let _ = self.stop();
             return Err(Error::IoError);
@@ -308,18 +318,26 @@ impl BitBangAdapter {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] if `buf.len() < len`.
+    /// - [`Error::InvalidArgument`] if `addr` exceeds the 7-bit range (> 0x7F).
     /// - [`Error::IoError`] if the slave NAKs the address.
     /// - [`Error::WouldBlock`] on arbitration loss.
     /// - [`Error::Busy`] on clock-stretch timeout.
     pub fn read(&mut self, addr: u8, buf: &mut [u8]) -> Result<()> {
+        // SECURITY: addr is caller-supplied. A value >= 128 would cause `addr << 1`
+        // to overflow a u8, triggering a panic (ring-0 halt) with overflow-checks ON.
+        // Reject out-of-range addresses at the public boundary.
+        if addr > 0x7F {
+            return Err(Error::InvalidArgument);
+        }
         if buf.is_empty() {
             return Ok(());
         }
         self.start()?;
 
         // Address byte: 7-bit addr shifted left, bit 0 = 1 (read).
-        let addr_byte = ((addr << 1) & 0xFE) | 0x01;
+        // SECURITY: addr <= 0x7F is guaranteed above; widen to u16 before shifting
+        // to make the invariant explicit and safe under all arithmetic modes.
+        let addr_byte = ((addr as u16) << 1) as u8 | 0x01;
         if !self.send_byte(addr_byte)? {
             let _ = self.stop();
             return Err(Error::IoError);
