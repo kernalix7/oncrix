@@ -476,7 +476,14 @@ impl MremapTable {
         let vma = &self.vmas[vma_idx];
 
         // Verify old_addr + old_size falls within the VMA.
-        let old_end = req.old_addr + req.old_size;
+        // SECURITY: `old_addr + old_size` is an attacker-controlled sum; under
+        // overflow-checks an oversized old_size would panic in ring 0 (DoS).
+        // Compute the end with checked_add and reject overflow before the
+        // bound comparison.
+        let old_end = req
+            .old_addr
+            .checked_add(req.old_size)
+            .ok_or(Error::InvalidArgument)?;
         if old_end > vma.end {
             return Err(Error::InvalidArgument);
         }
@@ -493,7 +500,14 @@ impl MremapTable {
 
         // Case 3: Grow.
         // Try in-place first.
-        let new_end = req.old_addr + req.new_size;
+        // SECURITY: `old_addr + new_size` is attacker-controlled; compute the
+        // end with checked_add so an oversized new_size is rejected instead of
+        // panicking in ring 0 (DoS). The `<= USER_ADDR_LIMIT` bound below then
+        // keeps the grown range inside user space.
+        let new_end = req
+            .old_addr
+            .checked_add(req.new_size)
+            .ok_or(Error::InvalidArgument)?;
         let growth = req.new_size - req.old_size;
         if new_end <= USER_ADDR_LIMIT && self.is_range_free(old_end, new_end) {
             return self.do_grow_in_place(vma_idx, req, new_end);
@@ -515,7 +529,14 @@ impl MremapTable {
 
     /// Shrink in place.
     fn do_shrink(&mut self, vma_idx: usize, req: &MremapRequest) -> Result<MremapResult> {
-        let new_end = req.old_addr + req.new_size;
+        // SECURITY: checked_add for defence-in-depth. is_shrink() guarantees
+        // new_size < old_size and the caller already proved old_addr+old_size
+        // does not overflow, so this cannot wrap in practice; the checked form
+        // keeps it panic-proof if that invariant ever changes.
+        let new_end = req
+            .old_addr
+            .checked_add(req.new_size)
+            .ok_or(Error::InvalidArgument)?;
         self.vmas[vma_idx].end = new_end;
         self.shrinks_in_place = self.shrinks_in_place.saturating_add(1);
         let result = MremapResult {
@@ -557,7 +578,12 @@ impl MremapTable {
         // Create new VMA at new_addr.
         let mut new_vma = self.vmas[vma_idx];
         new_vma.start = new_addr;
-        new_vma.end = new_addr + req.new_size;
+        // SECURITY: checked_add for defence-in-depth. new_addr comes from
+        // find_gap(req.new_size), which only returns a base with room for
+        // new_size below USER_ADDR_LIMIT, so this cannot wrap in practice.
+        new_vma.end = new_addr
+            .checked_add(req.new_size)
+            .ok_or(Error::InvalidArgument)?;
         // Adjust offset for file-backed.
         // (offset stays relative to the mapping start)
 
@@ -582,7 +608,13 @@ impl MremapTable {
     /// Fixed relocation (MREMAP_FIXED).
     fn do_fixed_relocate(&mut self, vma_idx: usize, req: &MremapRequest) -> Result<MremapResult> {
         let new_addr = req.new_addr;
-        let new_end = new_addr + req.new_size;
+        // SECURITY: `new_addr + new_size` is attacker-controlled (MREMAP_FIXED
+        // destination); compute the end with checked_add so overflow is
+        // rejected instead of panicking in ring 0 (DoS), then bound the range
+        // to the user window before any VMA placement (escalation guard).
+        let new_end = new_addr
+            .checked_add(req.new_size)
+            .ok_or(Error::InvalidArgument)?;
 
         if new_addr < MMAP_MIN_ADDR || new_end > USER_ADDR_LIMIT {
             return Err(Error::InvalidArgument);
@@ -852,8 +884,12 @@ pub fn pages_to_copy(old_size: u64, new_size: u64) -> u64 {
 }
 
 /// Align a value up to the nearest page boundary.
+///
+// SECURITY: saturating_add so this public helper cannot panic in ring 0 on a
+// near-u64::MAX value (overflow-checks are ON). Saturating to u64::MAX then
+// masking yields the page-aligned max, which any caller bounds-checks anyway.
 pub fn page_align_up(val: u64) -> u64 {
-    (val + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    val.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
 /// Align a value down to the nearest page boundary.

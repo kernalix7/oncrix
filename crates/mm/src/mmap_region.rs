@@ -631,7 +631,18 @@ impl MmapRegionTable {
         if size == 0 || start % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
         }
-        let freed = self.unmap_range(start, start + size)?;
+        // SECURITY: `start + size` is attacker-controlled. With
+        // overflow-checks on, a raw add of a near-u64::MAX `start` would
+        // panic in ring 0 (DoS); an unbounded range would also let
+        // munmap reach into the kernel half / non-canonical space.
+        // Use a checked add and bound the whole range to the user
+        // window BEFORE walking any VMA, mirroring the MAP_FIXED path
+        // above.
+        let end = start.checked_add(size).ok_or(Error::InvalidArgument)?;
+        if start < MMAP_MIN_ADDR || end > USER_ADDR_LIMIT {
+            return Err(Error::InvalidArgument);
+        }
+        let freed = self.unmap_range(start, end)?;
         self.munmap_count = self.munmap_count.saturating_add(1);
         Ok(freed)
     }

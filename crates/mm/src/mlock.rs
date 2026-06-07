@@ -529,7 +529,14 @@ impl MlockManager {
         }
 
         let parsed_flags = MlockFlags::from_raw(flags)?;
+        // SECURITY: `len` is non-zero here, so a zero rounded length means
+        // the page round-up overflowed `u64`; reject rather than treating
+        // it as a zero-length lock (mirrors `madvise::do_madvise`).
         let aligned_len = page_align_up(len);
+        if aligned_len == 0 {
+            self.stats.other_failures += 1;
+            return Err(Error::InvalidArgument);
+        }
 
         self.lock_vma_range(addr, aligned_len, pid, parsed_flags.on_fault())
     }
@@ -617,7 +624,14 @@ impl MlockManager {
             return Err(Error::InvalidArgument);
         }
 
+        // SECURITY: as in `do_mlock`, a zero rounded length for a non-zero
+        // `len` indicates the page round-up overflowed `u64`; reject it as
+        // an invalid argument instead of silently unlocking nothing.
         let aligned_len = page_align_up(len);
+        if aligned_len == 0 {
+            self.stats.other_failures += 1;
+            return Err(Error::InvalidArgument);
+        }
         self.unlock_vma_range(addr, aligned_len, pid)
     }
 
@@ -888,6 +902,18 @@ impl MlockManager {
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Align a value up to the next page boundary.
+///
+/// Returns `0` for a `val` so large that rounding up would overflow
+/// `u64`; callers must reject a zero result for a non-zero input as
+/// [`Error::InvalidArgument`] rather than treating it as a valid
+/// zero-length operation.
+// SECURITY: a raw `val + PAGE_SIZE - 1` overflows (and panics under
+// overflow-checks) for an attacker-supplied `len` near u64::MAX. The
+// checked add mirrors `madvise::page_align_up` so `mlock` / `munlock`
+// cannot be turned into a ring-0 panic (DoS).
 const fn page_align_up(val: u64) -> u64 {
-    (val + PAGE_SIZE - 1) & PAGE_MASK
+    match val.checked_add(PAGE_SIZE - 1) {
+        Some(v) => v & PAGE_MASK,
+        None => 0,
+    }
 }
