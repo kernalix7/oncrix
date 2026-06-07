@@ -188,41 +188,44 @@ impl IpvlanStats {
         }
     }
 
+    // SECURITY: all counters use saturating_add. Under overflow-checks a plain
+    // `+= 1` panics (ring-0 halt) when a u64 counter wraps; saturating keeps the
+    // statistics path total, consistent with the rx_bytes/tx_bytes accumulators.
     /// Record a received packet.
     pub fn record_rx(&mut self, bytes: u64) {
-        self.rx_packets += 1;
+        self.rx_packets = self.rx_packets.saturating_add(1);
         self.rx_bytes = self.rx_bytes.saturating_add(bytes);
     }
 
     /// Record a transmitted packet.
     pub fn record_tx(&mut self, bytes: u64) {
-        self.tx_packets += 1;
+        self.tx_packets = self.tx_packets.saturating_add(1);
         self.tx_bytes = self.tx_bytes.saturating_add(bytes);
     }
 
     /// Record a receive error.
     pub fn record_rx_error(&mut self) {
-        self.rx_errors += 1;
+        self.rx_errors = self.rx_errors.saturating_add(1);
     }
 
     /// Record a transmit error.
     pub fn record_tx_error(&mut self) {
-        self.tx_errors += 1;
+        self.tx_errors = self.tx_errors.saturating_add(1);
     }
 
     /// Record a receive drop.
     pub fn record_rx_drop(&mut self) {
-        self.rx_dropped += 1;
+        self.rx_dropped = self.rx_dropped.saturating_add(1);
     }
 
     /// Record a transmit drop.
     pub fn record_tx_drop(&mut self) {
-        self.tx_dropped += 1;
+        self.tx_dropped = self.tx_dropped.saturating_add(1);
     }
 
     /// Record a multicast receive.
     pub fn record_multicast(&mut self) {
-        self.multicast += 1;
+        self.multicast = self.multicast.saturating_add(1);
     }
 
     /// Reset all counters.
@@ -505,7 +508,10 @@ impl IpvlanPort {
         self.mode = mode;
         self.active = true;
         self.slave_count = 0;
-        self.next_ifindex = ifindex + 1;
+        // SECURITY: ifindex is caller-supplied; saturating_add avoids ring-0
+        // overflow panic at ifindex == u32::MAX. next_ifindex only stamps
+        // slave ifindex values, so saturating at u32::MAX is acceptable.
+        self.next_ifindex = ifindex.saturating_add(1);
         Ok(())
     }
 
@@ -554,7 +560,9 @@ impl IpvlanPort {
         slave.ifname[..len].copy_from_slice(&ifname[..len]);
         slave.ifname_len = len;
         slave.ifindex = self.next_ifindex;
-        self.next_ifindex += 1;
+        // SECURITY: saturating_add avoids ring-0 overflow panic when
+        // next_ifindex reaches u32::MAX; it only stamps slave ifindex values.
+        self.next_ifindex = self.next_ifindex.saturating_add(1);
         slave.mtu = DEFAULT_MTU;
         slave.active = true;
         slave.link_up = true;
@@ -692,15 +700,17 @@ impl IpvlanPort {
         for i in 0..self.slave_count {
             if self.slaves[i].active {
                 let s = &self.slaves[i].stats;
-                agg.rx_packets += s.rx_packets;
-                agg.rx_bytes += s.rx_bytes;
-                agg.tx_packets += s.tx_packets;
-                agg.tx_bytes += s.tx_bytes;
-                agg.rx_errors += s.rx_errors;
-                agg.tx_errors += s.tx_errors;
-                agg.rx_dropped += s.rx_dropped;
-                agg.tx_dropped += s.tx_dropped;
-                agg.multicast += s.multicast;
+                // SECURITY: saturating_add — summing per-slave u64 counters with a
+                // plain += can overflow and panic in ring 0 under overflow-checks.
+                agg.rx_packets = agg.rx_packets.saturating_add(s.rx_packets);
+                agg.rx_bytes = agg.rx_bytes.saturating_add(s.rx_bytes);
+                agg.tx_packets = agg.tx_packets.saturating_add(s.tx_packets);
+                agg.tx_bytes = agg.tx_bytes.saturating_add(s.tx_bytes);
+                agg.rx_errors = agg.rx_errors.saturating_add(s.rx_errors);
+                agg.tx_errors = agg.tx_errors.saturating_add(s.tx_errors);
+                agg.rx_dropped = agg.rx_dropped.saturating_add(s.rx_dropped);
+                agg.tx_dropped = agg.tx_dropped.saturating_add(s.tx_dropped);
+                agg.multicast = agg.multicast.saturating_add(s.multicast);
             }
         }
         agg

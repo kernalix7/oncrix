@@ -411,7 +411,13 @@ impl SpiController {
             mmio_write32(base, DWSSI_CTRLR0, ctrlr0);
         }
 
-        // Default baud = ref_clk / 2
+        // SECURITY: Reject a zero max_speed_hz before dividing; a pub field set to
+        // 0 would cause a divide-by-zero panic (overflow-checks are on in all
+        // profiles) crashing the kernel in ring 0.
+        if self.max_speed_hz == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Default baud = ref_clk / max_speed (DWSSI requires even divisor ≥ 2)
         let baud = (self.ref_clk_hz / self.max_speed_hz).max(2) & !1u32;
         // SAFETY: DWSSI_BAUDR sets the clock divider for the SPI bus.
         unsafe {
@@ -519,11 +525,23 @@ impl SpiController {
     fn dwssi_transfer_message(&mut self, msg: &mut SpiMessage, dev_mode: SpiMode) -> Result<()> {
         let base = self.mmio_base;
 
-        for idx in 0..msg.transfer_count {
+        // SECURITY: Clamp transfer_count to the fixed array bound before indexing.
+        // transfer_count is a pub field; a caller can set it > MAX_XFERS_PER_MSG
+        // without using add_transfer(), which would cause an OOB index on
+        // msg.transfers[idx].  The clamp ensures every index is valid.
+        let count = msg.transfer_count.min(MAX_XFERS_PER_MSG);
+
+        for idx in 0..count {
             let xfer = match &mut msg.transfers[idx] {
                 Some(x) => x,
                 None => continue,
             };
+
+            // SECURITY: Clamp xfer.len to the fixed buffer bound before indexing.
+            // xfer.len is a pub field; it can be set > MAX_XFER_BYTES (=256) after
+            // construction, making the per-byte loops below index past the end of
+            // tx_buf/rx_buf ([u8; 256]).  The clamped local is used for all loops.
+            let len = xfer.len.min(MAX_XFER_BYTES);
 
             // Determine transfer mode bits for CTRLR0
             let tmod = match xfer.dir {
@@ -547,7 +565,7 @@ impl SpiController {
                 // CTRLR1 holds NDF (number of data frames - 1) for RX mode
                 // SAFETY: DWSSI_CTRLR1 is safe to write while SSI is disabled.
                 unsafe {
-                    mmio_write32(base, DWSSI_CTRLR1, (xfer.len as u32).saturating_sub(1));
+                    mmio_write32(base, DWSSI_CTRLR1, (len as u32).saturating_sub(1));
                 }
             }
 
@@ -565,7 +583,7 @@ impl SpiController {
 
             match xfer.dir {
                 SpiTransferDir::TxOnly | SpiTransferDir::FullDuplex => {
-                    for i in 0..xfer.len {
+                    for i in 0..len {
                         // Wait until TX FIFO is not full (TFE = TX FIFO empty, use
                         // SR busy bit as a simple "space available" indicator)
                         let mut timeout = 100_000u32;
@@ -589,7 +607,7 @@ impl SpiController {
                     }
                     if xfer.dir == SpiTransferDir::FullDuplex {
                         // Collect RX bytes
-                        for i in 0..xfer.len {
+                        for i in 0..len {
                             let mut timeout = 100_000u32;
                             loop {
                                 // SAFETY: DWSSI_SR RFNE indicates RX FIFO has data.
@@ -610,7 +628,7 @@ impl SpiController {
                     }
                 }
                 SpiTransferDir::RxOnly => {
-                    for i in 0..xfer.len {
+                    for i in 0..len {
                         let mut timeout = 100_000u32;
                         loop {
                             // SAFETY: DWSSI_SR RFNE indicates RX FIFO has data.
@@ -633,7 +651,7 @@ impl SpiController {
             }
 
             // Deassert CS if cs_change or last transfer
-            if xfer.cs_change || idx == msg.transfer_count.saturating_sub(1) {
+            if xfer.cs_change || idx == count.saturating_sub(1) {
                 // SAFETY: DWSSI_SER: clear bit N to deassert slave N CS.
                 unsafe {
                     mmio_write32(base, DWSSI_SER, 0);
@@ -645,9 +663,18 @@ impl SpiController {
 
     /// Software-simulation transfer (no real hardware).
     fn sw_transfer_message(&self, msg: &mut SpiMessage) -> Result<()> {
-        for idx in 0..msg.transfer_count {
+        // SECURITY: Clamp transfer_count to the fixed array bound before indexing.
+        // transfer_count is a pub field; a caller can set it > MAX_XFERS_PER_MSG
+        // without using add_transfer(), which would cause an OOB index on
+        // msg.transfers[idx].  The clamp ensures every index is valid.
+        let count = msg.transfer_count.min(MAX_XFERS_PER_MSG);
+        for idx in 0..count {
             if let Some(xfer) = &msg.transfers[idx] {
-                msg.bytes_xferred += xfer.len;
+                // SECURITY: xfer.len is a pub field that can exceed MAX_XFER_BYTES;
+                // accumulating it raw into a usize can overflow (ring-0 panic under
+                // overflow-checks).  Clamp to the real buffer bound, then saturate.
+                let len = xfer.len.min(MAX_XFER_BYTES);
+                msg.bytes_xferred = msg.bytes_xferred.saturating_add(len);
             }
         }
         Ok(())
