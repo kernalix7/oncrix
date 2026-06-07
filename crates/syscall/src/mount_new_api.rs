@@ -141,7 +141,11 @@ impl IdMapping {
     /// Returns `None` if `id` is not in this mapping's range.
     pub fn translate(&self, id: u32) -> Option<u32> {
         if self.covers_source(id) {
-            Some(self.first_out + (id - self.first_in))
+            // SECURITY: `first_out + offset` can overflow u32 for an attacker-
+            // chosen mapping placed near u32::MAX — covers_source only bounds
+            // the SOURCE range. checked_add yields None (no translation) instead
+            // of panicking in ring 0 (overflow-checks are ON).
+            self.first_out.checked_add(id - self.first_in)
         } else {
             None
         }
@@ -434,7 +438,8 @@ pub fn do_fspick(mount_registry: &MountRegistry, mount_id: u32, flags: u32) -> R
 /// # Errors
 ///
 /// * [`Error::PermissionDenied`] — Caller is not root (uid != 0).
-/// * [`Error::InvalidArgument`]  — Mount not found or mapping overlaps.
+/// * [`Error::InvalidArgument`]  — Mount not found, an empty (`count == 0`)
+///   mapping, or a mapping whose source or destination range wraps `u32`.
 pub fn do_mount_idmap(
     mount_registry: &mut MountRegistry,
     mount_id: u32,
@@ -450,14 +455,25 @@ pub fn do_mount_idmap(
         .get_mut(mount_id)
         .ok_or(Error::InvalidArgument)?;
 
-    // Validate that all mappings are non-empty.
+    // Validate that all mappings are non-empty AND that neither the source nor
+    // the destination range wraps u32. SECURITY: rejecting a wrapping range at
+    // ingest stops a hostile idmap (e.g. first_out near u32::MAX) from being
+    // stored and later overflowing in IdMapping::translate.
     for i in 0..idmap.uid_count {
-        if idmap.uid_map[i].count == 0 {
+        let m = &idmap.uid_map[i];
+        if m.count == 0
+            || m.first_in.checked_add(m.count).is_none()
+            || m.first_out.checked_add(m.count).is_none()
+        {
             return Err(Error::InvalidArgument);
         }
     }
     for i in 0..idmap.gid_count {
-        if idmap.gid_map[i].count == 0 {
+        let m = &idmap.gid_map[i];
+        if m.count == 0
+            || m.first_in.checked_add(m.count).is_none()
+            || m.first_out.checked_add(m.count).is_none()
+        {
             return Err(Error::InvalidArgument);
         }
     }
@@ -790,5 +806,41 @@ mod tests {
             do_mount_idmap(&mut reg, 9999, &idmap, 0),
             Err(Error::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn mount_idmap_wrapping_dest_rejected() {
+        let (mut reg, id) = make_registry_with_mount();
+        let mut idmap = IdMap::default();
+        // first_out + count wraps u32 -> must be rejected at ingest so it can
+        // never reach translate() and overflow in ring 0.
+        idmap
+            .add_uid_mapping(IdMapping {
+                first_in: 0,
+                first_out: 0xFFFF_FFFF,
+                count: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            do_mount_idmap(&mut reg, id, &idmap, 0),
+            Err(Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn mount_idmap_realistic_map_accepted_and_translates() {
+        let (mut reg, id) = make_registry_with_mount();
+        let mut idmap = IdMap::default();
+        idmap
+            .add_uid_mapping(IdMapping {
+                first_in: 0,
+                first_out: 100_000,
+                count: 65_536,
+            })
+            .unwrap();
+        // A realistic (non-wrapping) map is accepted and translates correctly.
+        assert!(do_mount_idmap(&mut reg, id, &idmap, 0).is_ok());
+        assert_eq!(idmap.translate_uid(5), Some(100_005));
+        assert_eq!(idmap.translate_uid(65_536), None);
     }
 }
