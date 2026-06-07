@@ -382,6 +382,9 @@ impl ScsiCommand {
     }
 
     /// Build a READ(16) command.
+    ///
+    /// `sector_count` must satisfy `sector_count * SECTOR_SIZE <= u32::MAX`;
+    /// callers are responsible for validating this before calling.
     pub fn read_16(lba: u64, sector_count: u32) -> Self {
         let mut cmd = Self::empty();
         cmd.cdb[0] = SCSI_READ_16;
@@ -399,11 +402,19 @@ impl ScsiCommand {
         cmd.cdb[13] = sector_count as u8;
         cmd.cdb_len = 16;
         cmd.direction = DataDirection::FromDevice;
-        cmd.transfer_len = sector_count * SECTOR_SIZE;
+        // SECURITY: read_16 is pub and reachable from outside the crate, so it
+        // cannot assume callers pre-validate sector_count. saturating_mul keeps
+        // the bare-Self signature (no caller breakage) while making the transfer
+        // length computation panic-free under overflow-checks; an out-of-range
+        // sector_count saturates to a length the DMA layer then rejects.
+        cmd.transfer_len = sector_count.saturating_mul(SECTOR_SIZE);
         cmd
     }
 
     /// Build a WRITE(16) command.
+    ///
+    /// `sector_count` must satisfy `sector_count * SECTOR_SIZE <= u32::MAX`;
+    /// callers are responsible for validating this before calling.
     pub fn write_16(lba: u64, sector_count: u32) -> Self {
         let mut cmd = Self::empty();
         cmd.cdb[0] = SCSI_WRITE_16;
@@ -421,7 +432,10 @@ impl ScsiCommand {
         cmd.cdb[13] = sector_count as u8;
         cmd.cdb_len = 16;
         cmd.direction = DataDirection::ToDevice;
-        cmd.transfer_len = sector_count * SECTOR_SIZE;
+        // SECURITY: write_16 is pub and reachable from outside the crate; use
+        // saturating_mul so the transfer-length computation is panic-free for any
+        // sector_count without changing the bare-Self signature (see read_16).
+        cmd.transfer_len = sector_count.saturating_mul(SECTOR_SIZE);
         cmd
     }
 
@@ -608,7 +622,12 @@ impl ScsiDisk {
             return Err(Error::InvalidArgument);
         }
 
-        if lba + u64::from(sector_count) > self.geometry.total_sectors {
+        // SECURITY: lba and sector_count are caller-supplied; plain addition wraps when
+        // lba is near u64::MAX, bypassing the capacity bound.
+        let end_lba = lba
+            .checked_add(u64::from(sector_count))
+            .ok_or(Error::InvalidArgument)?;
+        if end_lba > self.geometry.total_sectors {
             return Err(Error::InvalidArgument);
         }
 
@@ -645,7 +664,12 @@ impl ScsiDisk {
             return Err(Error::InvalidArgument);
         }
 
-        if lba + u64::from(sector_count) > self.geometry.total_sectors {
+        // SECURITY: lba and sector_count are caller-supplied; plain addition wraps when
+        // lba is near u64::MAX, bypassing the capacity bound.
+        let end_lba = lba
+            .checked_add(u64::from(sector_count))
+            .ok_or(Error::InvalidArgument)?;
+        if end_lba > self.geometry.total_sectors {
             return Err(Error::InvalidArgument);
         }
 
@@ -697,8 +721,13 @@ impl ScsiDisk {
         } else {
             SECTOR_SIZE
         };
-        self.geometry.capacity_bytes =
-            self.geometry.total_sectors * u64::from(self.geometry.sector_size);
+        // SECURITY: device-supplied total_sectors * sector_size; use checked_mul to prevent
+        // overflow on attacker-controlled values.
+        self.geometry.capacity_bytes = self
+            .geometry
+            .total_sectors
+            .checked_mul(u64::from(self.geometry.sector_size))
+            .ok_or(Error::InvalidArgument)?;
         self.geometry.physical_block_size = self.geometry.sector_size;
 
         self.state = DiskState::Online;
@@ -720,19 +749,34 @@ impl ScsiDisk {
         ]);
         let block_size = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
 
-        self.geometry.total_sectors = last_lba + 1;
+        // SECURITY: last_lba is device-supplied; last_lba == u64::MAX would wrap to 0.
+        self.geometry.total_sectors = last_lba.checked_add(1).ok_or(Error::InvalidArgument)?;
         self.geometry.sector_size = if block_size > 0 {
             block_size
         } else {
             SECTOR_SIZE
         };
-        self.geometry.capacity_bytes =
-            self.geometry.total_sectors * u64::from(self.geometry.sector_size);
+        // SECURITY: device-supplied total_sectors * sector_size; use checked_mul to prevent
+        // overflow on attacker-controlled values.
+        self.geometry.capacity_bytes = self
+            .geometry
+            .total_sectors
+            .checked_mul(u64::from(self.geometry.sector_size))
+            .ok_or(Error::InvalidArgument)?;
         self.geometry.use_16byte_cmds = true;
 
-        // Physical block exponent at byte 13 bits 3:0.
+        // Physical block exponent at byte 13 bits 3:0 (valid range: 0–15).
         let phys_exp = data[13] & 0x0F;
-        self.geometry.physical_block_size = self.geometry.sector_size << phys_exp;
+        // SECURITY: phys_exp is device-supplied; shift >= 32 would overflow u32 in ring 0.
+        // The nibble mask limits phys_exp to 0–15, so this check is a defence-in-depth guard.
+        if u32::from(phys_exp) >= 32 {
+            return Err(Error::InvalidArgument);
+        }
+        self.geometry.physical_block_size = self
+            .geometry
+            .sector_size
+            .checked_shl(u32::from(phys_exp))
+            .ok_or(Error::InvalidArgument)?;
 
         // Alignment offset at bytes 14-15 bits 13:0.
         let align_raw = u16::from_be_bytes([data[14], data[15]]) & 0x3FFF;

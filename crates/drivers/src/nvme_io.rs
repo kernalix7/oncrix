@@ -325,11 +325,20 @@ impl IoQueuePair {
     ///
     /// # Errors
     /// Returns `Error::Busy` if the SQ is full.
+    /// Returns `Error::InvalidArgument` if the queue depth is zero.
     ///
     /// # Safety
     /// `sq_virt` must point to valid DMA-accessible memory of sufficient size.
     pub unsafe fn submit_io(&mut self, cmd: &NvmeIoCmd) -> Result<u16> {
-        let next_tail = (self.sq_tail + 1) % self.sq_depth;
+        // SECURITY: sq_depth is a device-reported value; a zero depth causes
+        // division-by-zero (panic in ring 0) on the modulo below.  Reject it
+        // at the boundary so no hardware-controlled value can trigger a halt.
+        if self.sq_depth == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Use wrapping_add so sq_tail == u16::MAX does not overflow before the
+        // modulo; the modulo then wraps the index into [0, sq_depth).
+        let next_tail = self.sq_tail.wrapping_add(1) % self.sq_depth;
         // Check if SQ is full (tail+1 would equal head)
         // We detect full queue via the CQ — if no space, return Busy
         // Simplified: trust the caller to not overfill; check wrap
@@ -380,22 +389,33 @@ impl IoQueuePair {
                 let entry = core::ptr::read_volatile(entry_addr as *const CqEntry);
                 // Phase bit indicates this entry is fresh
                 if entry.phase() == self.cq_phase {
-                    // Advance CQ head
+                    // SECURITY/correctness: consume EVERY phase-correct CQE by
+                    // advancing the head, ringing the doorbell, and toggling the
+                    // phase on wrap.  NVMe permits out-of-order completion and
+                    // submit_io allows multiple commands in flight, so the entry
+                    // at the head may belong to a different in-flight command
+                    // than the one awaited; draining it (rather than erroring or
+                    // refusing to advance) is required to reach our completion
+                    // and to avoid stalling the CQ ring.  The unconditional
+                    // spin-counter decrement above bounds a malicious device
+                    // that floods phase-correct CQEs (DoS guard); cq_head stays
+                    // in [0, cq_depth) so the `+= 1` cannot overflow.
+                    let matched = entry.cid == cid;
                     self.cq_head += 1;
                     if self.cq_head >= self.cq_depth {
                         self.cq_head = 0;
                         self.cq_phase = !self.cq_phase;
                     }
-                    // Ring CQ head doorbell
                     write_doorbell(self.cq_doorbell, self.cq_head as u32);
-                    if entry.cid == cid {
+
+                    if matched {
                         if entry.is_success() {
                             return Ok(entry);
-                        } else {
-                            return Err(Error::IoError);
                         }
+                        return Err(Error::IoError);
                     }
-                    // Different CID: continue polling (spin already decremented above)
+                    // Completion for another in-flight command: drained, keep
+                    // scanning for the awaited CID.
                     continue;
                 }
                 core::hint::spin_loop();
@@ -434,8 +454,17 @@ impl IoQueuePair {
 /// - `cid`: Command ID for this admin command.
 /// - `cq_id`: The queue ID to create.
 /// - `cq_phys`: Physical address of the CQ ring.
-/// - `cq_depth`: Queue depth (0-indexed, so depth-1 is the value).
-pub fn build_create_io_cq(cid: u16, cq_id: u16, cq_phys: u64, cq_depth: u16) -> SqEntry {
+/// - `cq_depth`: Queue depth (must be >= 1; NVMe QSIZE field = depth-1).
+///
+/// # Errors
+/// Returns `Error::InvalidArgument` if `cq_depth` is zero.
+pub fn build_create_io_cq(cid: u16, cq_id: u16, cq_phys: u64, cq_depth: u16) -> Result<SqEntry> {
+    // SECURITY: cq_depth is caller/device-supplied; subtracting 1 from 0
+    // underflows (wraps to u16::MAX / panics with overflow-checks=on).
+    // Reject zero at the boundary before any arithmetic.
+    if cq_depth == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let mut sqe = SqEntry::default();
     sqe.cdw0 = make_cdw0(ADMIN_CREATE_IO_CQ, cid);
     sqe.prp1 = cq_phys;
@@ -443,7 +472,7 @@ pub fn build_create_io_cq(cid: u16, cq_id: u16, cq_phys: u64, cq_depth: u16) -> 
     sqe.cdw10 = (cq_depth as u32 - 1) | ((cq_id as u32) << 16);
     // CDW11: bit 1 = IEN (interrupt enable), bit 0 = PC (physically contiguous)
     sqe.cdw11 = 0x03;
-    sqe
+    Ok(sqe)
 }
 
 /// Builds the SQ entry to create an I/O Submission Queue via the admin queue.
@@ -452,15 +481,24 @@ pub fn build_create_io_cq(cid: u16, cq_id: u16, cq_phys: u64, cq_depth: u16) -> 
 /// - `cid`: Command ID.
 /// - `sq_id`: Queue ID to create.
 /// - `sq_phys`: Physical address of the SQ ring.
-/// - `sq_depth`: Queue depth.
+/// - `sq_depth`: Queue depth (must be >= 1; NVMe QSIZE field = depth-1).
 /// - `cq_id`: The associated completion queue ID.
+///
+/// # Errors
+/// Returns `Error::InvalidArgument` if `sq_depth` is zero.
 pub fn build_create_io_sq(
     cid: u16,
     sq_id: u16,
     sq_phys: u64,
     sq_depth: u16,
     cq_id: u16,
-) -> SqEntry {
+) -> Result<SqEntry> {
+    // SECURITY: sq_depth is caller/device-supplied; subtracting 1 from 0
+    // underflows (wraps to u16::MAX / panics with overflow-checks=on).
+    // Reject zero at the boundary before any arithmetic.
+    if sq_depth == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let mut sqe = SqEntry::default();
     sqe.cdw0 = make_cdw0(ADMIN_CREATE_IO_SQ, cid);
     sqe.prp1 = sq_phys;
@@ -468,7 +506,7 @@ pub fn build_create_io_sq(
     sqe.cdw10 = (sq_depth as u32 - 1) | ((sq_id as u32) << 16);
     // CDW11: CQID (31:16), priority MEDIUM (bits 2:1 = 10), PC (bit 0)
     sqe.cdw11 = ((cq_id as u32) << 16) | 0x05;
-    sqe
+    Ok(sqe)
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +544,11 @@ impl IoQueueRegistry {
 
     /// Returns a mutable reference to the queue pair at `index`.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut IoQueuePair> {
+        // SECURITY: index is caller-supplied; without this guard an out-of-bounds
+        // value causes a panic (OOB index) in ring 0.  Clamp to MAX_IO_QUEUES.
+        if index >= MAX_IO_QUEUES {
+            return None;
+        }
         self.queues[index].as_mut()
     }
 
