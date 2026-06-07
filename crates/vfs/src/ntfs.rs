@@ -513,7 +513,16 @@ impl RunList {
                 // Sparse run — no LCN.
                 0u64
             } else {
-                prev_lcn += lcn_delta;
+                // SECURITY: the run-list LCN delta is attacker-controlled on-disk
+                // data; a bare `+=` panics in ring 0 on overflow, and a negative
+                // absolute LCN would wrap to a huge u64 that bypasses later bounds
+                // checks. checked_add + non-negative guard (mirrors ntfs_attr.rs).
+                prev_lcn = prev_lcn
+                    .checked_add(lcn_delta)
+                    .ok_or(Error::InvalidArgument)?;
+                if prev_lcn < 0 {
+                    return Err(Error::InvalidArgument);
+                }
                 prev_lcn as u64
             };
 

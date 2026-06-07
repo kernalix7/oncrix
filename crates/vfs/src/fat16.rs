@@ -153,10 +153,27 @@ fn parse_bpb(sector: &[u8; 512]) -> Result<Bpb> {
         return Err(Error::InvalidArgument);
     }
     let reserved_sectors = u16::from_le_bytes([sector[14], sector[15]]);
+    // SECURITY: reserved_sectors==0 would place the FAT at sector 0 (the boot
+    // sector itself), making fat_start=0 and all subsequent geometry wrong.
+    if reserved_sectors == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let num_fats = sector[16];
+    // SECURITY: num_fats==0 makes fats_sectors==0 in FatGeometry::from_bpb,
+    // collapsing root_dir_start onto the reserved region; reject early.
+    if num_fats == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let root_entry_count = u16::from_le_bytes([sector[17], sector[18]]);
     let total_sectors_16 = u16::from_le_bytes([sector[19], sector[20]]);
     let fat_size = u16::from_le_bytes([sector[22], sector[23]]);
+    // SECURITY: fat_size==0 makes the FAT region zero sectors wide; the
+    // fat_read_entry bounds check (sector >= fat_end) becomes sector >= fat_start
+    // which is always true, so every FAT read is rejected as out-of-bounds —
+    // but worse, FatGeometry arithmetic produces a corrupt layout.  Reject here.
+    if fat_size == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let total_sectors_32 = u32::from_le_bytes([sector[32], sector[33], sector[34], sector[35]]);
     let volume_id = u32::from_le_bytes([sector[39], sector[40], sector[41], sector[42]]);
 
@@ -362,15 +379,22 @@ fn cluster_chain(
 ) -> Result<ClusterChain> {
     let mut chain = ClusterChain::new();
     let mut current = start_cluster;
+    let mut terminated = false;
     for _ in 0..MAX_CHAIN_LEN {
         if current < FIRST_DATA_CLUSTER || current == BAD_CLUSTER {
             return Err(Error::IoError);
         }
         if current >= EOC_MIN {
+            terminated = true;
             break;
         }
         chain.push(current)?;
         current = fat_read_entry(reader, geo, bpb, current)?;
+    }
+    // SECURITY: a chain that never reaches EOC within MAX_CHAIN_LEN is cyclic or
+    // corrupt — return an error instead of a silent partial/looped chain.
+    if !terminated {
+        return Err(Error::IoError);
     }
     Ok(chain)
 }

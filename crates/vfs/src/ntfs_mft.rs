@@ -225,9 +225,32 @@ fn apply_usa_fixups(
     usa_off: usize,
     usa_count: usize,
 ) -> Result<()> {
-    if usa_off + usa_count * 2 > MFT_RECORD_SIZE {
+    // SECURITY: require the exact USA geometry for this record size.  A value of
+    // usa_count == 0 or 1 would make the loop a no-op, silently accepting a corrupt
+    // or attacker-crafted record without verifying any sector-end words.
+    // SECTORS_PER_RECORD == MFT_RECORD_SIZE / SECTOR_SIZE == 2, so the correct
+    // usa_count is SECTORS_PER_RECORD + 1 == 3 (one sequence word + two fixups).
+    if usa_count != SECTORS_PER_RECORD + 1 {
         return Err(Error::InvalidArgument);
     }
+
+    // SECURITY: guard the sequence-number read before indexing data[usa_off].
+    // An on-disk usa_off near MFT_RECORD_SIZE with a low usa_count (e.g. 0)
+    // would pass the array-size guard above but read usa_off..usa_off+2 OOB.
+    // checked_add prevents wrap; the +2 covers the two bytes of the u16 read.
+    let seq_end = usa_off.checked_add(2).ok_or(Error::InvalidArgument)?;
+    if seq_end > MFT_RECORD_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Also verify the entire USA array fits inside the record.
+    let usa_array_end = usa_off
+        .checked_add(usa_count.checked_mul(2).ok_or(Error::InvalidArgument)?)
+        .ok_or(Error::InvalidArgument)?;
+    if usa_array_end > MFT_RECORD_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+
     // USA[0] is the sequence number; USA[1..] are the sector fixups.
     let seq = u16::from_le_bytes([data[usa_off], data[usa_off + 1]]);
     for i in 1..usa_count {

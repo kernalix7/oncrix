@@ -52,6 +52,34 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use oncrix_lib::{Error, Result};
 
+// ── CRC32 (zlib / ISO 3309, reflected poly 0xEDB88320) ──────────────────────
+
+/// Software CRC32 using the zlib / ISO 3309 polynomial (reflected bit order).
+///
+/// Feeds three separate byte slices in sequence (used to zero the crc field
+/// during computation without heap allocation).  The reflected polynomial
+/// 0xEDB8_8320 is the standard for zlib, cramfs, and PNG.
+///
+/// # SECURITY
+///
+/// Do NOT substitute a weaker hash — the integrity check would become
+/// forgeable by an attacker who controls the filesystem image.
+fn crc32_zlib_parts(a: &[u8], b: &[u8], c: &[u8]) -> u32 {
+    const POLY: u32 = 0xEDB8_8320;
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in a.iter().chain(b.iter()).chain(c.iter()) {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// cramfs magic number (`0x28cd3d45`).
@@ -160,7 +188,10 @@ impl CramfsSuperblock {
         }
     }
 
-    /// Validate superblock fields.
+    /// Validate superblock structural fields (magic, signature, size).
+    ///
+    /// For full integrity verification including CRC32, use
+    /// [`validate_with_image`](Self::validate_with_image).
     pub fn validate(&self) -> Result<()> {
         if self.magic != CRAMFS_MAGIC {
             return Err(Error::InvalidArgument);
@@ -171,6 +202,49 @@ impl CramfsSuperblock {
         if self.size == 0 {
             return Err(Error::InvalidArgument);
         }
+        Ok(())
+    }
+
+    /// Validate superblock fields AND verify the CRC32 over the entire image.
+    ///
+    /// Per the cramfs specification, the CRC is computed over the whole image
+    /// with the four `crc` bytes (at offset 8) zeroed.  A mismatch means the
+    /// image is corrupt or has been tampered with — reject it.
+    ///
+    /// # SECURITY
+    ///
+    /// A mounted filesystem image is fully attacker-controlled.  Skipping this
+    /// check allows a malicious image to pass `validate()` with a forged
+    /// superblock.  Always call this function (not `validate()`) at mount time
+    /// when the raw image bytes are available.
+    pub fn validate_with_image(&self, image: &[u8]) -> Result<()> {
+        // Structural checks first.
+        self.validate()?;
+
+        // The cramfs superblock `crc` field sits at byte offset 8 within the
+        // 76-byte superblock.  The spec zeroes the crc field during computation.
+        const CRC_FIELD_OFFSET: usize = 8;
+        const CRC_FIELD_LEN: usize = 4;
+
+        // SECURITY: reject images smaller than the superblock — an undersized
+        // image cannot contain a valid CRC field and must not be accepted.
+        if image.len() < SUPERBLOCK_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Compute CRC32 over the full image with the crc field zeroed.
+        // Split into: bytes before crc | zeroed crc | bytes after crc.
+        let before_crc = &image[..CRC_FIELD_OFFSET];
+        let zero_crc = [0u8; CRC_FIELD_LEN];
+        let after_crc = &image[CRC_FIELD_OFFSET + CRC_FIELD_LEN..];
+        let computed = crc32_zlib_parts(before_crc, &zero_crc, after_crc);
+
+        // SECURITY: reject on CRC mismatch — a corrupt or forged image must
+        // not be mounted.
+        if computed != self.crc {
+            return Err(Error::InvalidArgument);
+        }
+
         Ok(())
     }
 

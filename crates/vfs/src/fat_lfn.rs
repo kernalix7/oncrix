@@ -89,17 +89,28 @@ pub fn assemble_lfn(
     if entries.is_empty() {
         return Err(Error::InvalidArgument);
     }
+    // SECURITY: cap entry count to LFN_MAX_ENTRIES (20).  An attacker-supplied
+    // directory region can present more than 20 LFN entries; without this guard
+    // `entry_count - i` overflows u8 (wraps), `expected_seq as usize - 1`
+    // underflows usize, and the subsequent slice index panics in ring 0.
+    if entries.len() > LFN_MAX_ENTRIES {
+        return Err(Error::InvalidArgument);
+    }
     let mut total = 0usize;
     // Entries arrive in reverse ordinal order (highest-ordinal first from disk).
-    let entry_count = entries.len();
+    let entry_count = entries.len(); // now guaranteed <= LFN_MAX_ENTRIES (20)
     for (i, entry) in entries.iter().enumerate() {
         if entry.checksum != checksum {
             return Err(Error::InvalidArgument);
         }
+        // entry_count <= 20, i < entry_count, so entry_count - i is in [1..=20];
+        // fits in u8 without wrapping.
         let expected_seq = (entry_count - i) as u8;
         if entry.seq_num() != expected_seq {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: expected_seq is 1-based and <= 20; subtract 1 before
+        // multiplying so the minimum is 0 (no underflow).
         let offset = (expected_seq as usize - 1) * LFN_CHARS_PER_ENTRY;
         if offset + LFN_CHARS_PER_ENTRY > LFN_MAX_LEN {
             return Err(Error::InvalidArgument);
