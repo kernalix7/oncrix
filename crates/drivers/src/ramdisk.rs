@@ -210,13 +210,15 @@ impl RamDisk {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `buf.len() != block_size`.
+    /// Returns [`Error::InvalidArgument`] if `buf.len() != block_size` or
+    /// if the byte offset overflows `u64`.
     pub fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<()> {
         let bs = self.config.block_size as usize;
         if buf.len() != bs {
             return Err(Error::InvalidArgument);
         }
-        self.read(lba * bs as u64, buf)
+        let byte_offset = lba.checked_mul(bs as u64).ok_or(Error::InvalidArgument)?;
+        self.read(byte_offset, buf)
     }
 
     /// Write one block at LBA `lba` from `buf`.
@@ -225,13 +227,15 @@ impl RamDisk {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `buf.len() != block_size`.
+    /// Returns [`Error::InvalidArgument`] if `buf.len() != block_size` or
+    /// if the byte offset overflows `u64`.
     pub fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<()> {
         let bs = self.config.block_size as usize;
         if buf.len() != bs {
             return Err(Error::InvalidArgument);
         }
-        self.write(lba * bs as u64, buf)
+        let byte_offset = lba.checked_mul(bs as u64).ok_or(Error::InvalidArgument)?;
+        self.write(byte_offset, buf)
     }
 
     /// Flush — no-op for RAM disk.
