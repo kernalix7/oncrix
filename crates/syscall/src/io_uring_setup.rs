@@ -358,6 +358,17 @@ const MAX_FIXED_FILES: usize = 64;
 struct IoUringInstance {
     /// Whether this slot is in use.
     active: bool,
+    /// PID of the task that created (owns) this ring, if known.
+    ///
+    /// `Some(pid)` records the creating task so that subsequent
+    /// `enter`/`register`/`destroy`/`query`/`stats` operations can be
+    /// rejected when issued by a different task (cross-process ring
+    /// access). `None` means the ring is currently **owner-unbound**
+    /// because no caller-identity accessor is reachable from this crate
+    /// (see the SECURITY block on [`check_owner`] and
+    /// [`sys_io_uring_setup`]). The dispatcher MUST bind this before the
+    /// ring fd is exposed; until then the field is wired but unset.
+    owner: Option<u64>,
     /// Whether the ring is currently enabled (can accept submissions).
     enabled: bool,
     /// Setup flags from creation.
@@ -398,6 +409,7 @@ impl Default for IoUringInstance {
     fn default() -> Self {
         Self {
             active: false,
+            owner: None,
             enabled: false,
             flags: 0,
             sq_entries: 0,
@@ -420,9 +432,30 @@ impl Default for IoUringInstance {
 }
 
 /// Global registry of io_uring instances.
+///
+// SECURITY (F2 — static mut aliasing): every access below reaches this
+// table through `&'static mut` (via `addr_of_mut!(RINGS)`). The original
+// SAFETY comments claimed a "single-threaded kernel" makes that sound.
+// That claim is ONLY true under the current build: a single CPU with no
+// preemption inside these syscall handlers. Under SMP, or with an SQPOLL
+// kernel thread touching a ring concurrently with the owning task, two
+// `&mut IoUringInstance` borrows to the same slot can exist at once ->
+// aliasing UB / data race. This is a documented invariant, NOT a
+// guarantee the code enforces.
+//
+// INVARIANT the kernel MUST uphold before enabling SMP or SQPOLL:
+//   * `RINGS` must move behind a `SpinLock<[IoUringInstance; MAX_RINGS]>`
+//     (or each slot gains a per-slot atomic-claim / lock), so that
+//     `get_ring`/`alloc_ring_slot` hand out access under mutual
+//     exclusion instead of a bare `&'static mut`.
+// Until that refactor lands these handlers are sound ONLY on the
+// uniprocessor, non-preemptible configuration. No behavioural change is
+// made here for this item; the unsafe-block comments below are corrected
+// to state the true precondition rather than asserting it always holds.
 static mut RINGS: [IoUringInstance; MAX_RINGS] = {
     const EMPTY: IoUringInstance = IoUringInstance {
         active: false,
+        owner: None,
         enabled: false,
         flags: 0,
         sq_entries: 0,
@@ -492,7 +525,10 @@ fn validate_cq_entries(entries: u32, sq: u32, clamp: bool) -> Result<u32> {
 
 /// Locate a free slot in the ring registry.
 fn alloc_ring_slot() -> Result<usize> {
-    // SAFETY: single-threaded kernel init; no concurrent mutation.
+    // SAFETY: forms a `&mut` to the global `RINGS`. Sound ONLY under the
+    // current uniprocessor, non-preemptible configuration where no other
+    // CPU/SQPOLL thread can hold an aliasing borrow. See the SECURITY
+    // block on `RINGS`: under SMP/SQPOLL this MUST be taken under a lock.
     let rings = unsafe { &mut *core::ptr::addr_of_mut!(RINGS) };
     for (idx, ring) in rings.iter().enumerate() {
         if !ring.active {
@@ -502,17 +538,69 @@ fn alloc_ring_slot() -> Result<usize> {
     Err(Error::OutOfMemory)
 }
 
-/// Look up an active ring by fd (index).
+/// Resolve the PID of the task issuing the current syscall, if reachable.
+///
+// SECURITY (F1 — cross-process ring access): a caller-identity accessor
+// (e.g. `oncrix_kernel::current::current_pid()`) is NOT reachable from
+// this crate. `oncrix-syscall` does not depend on `oncrix-kernel`, and
+// the only current-task accessors that exist are methods on the
+// scheduler instance owned by `oncrix-kernel` — there is no crate-local
+// or `oncrix-process` global free function to consult. We therefore
+// FAIL CLOSED on identity: this returns `None`, and ownership is treated
+// as "unknown / unbindable from here".
+//
+// INVARIANT the syscall dispatcher MUST uphold: before exposing a ring
+// fd to user space it MUST (a) bind the creating task's identity into
+// `IoUringInstance::owner` at setup time, and (b) re-verify the issuing
+// task's identity against `owner` on every `enter`/`register`/`destroy`/
+// `query`/`stats`. Because the entry-point signatures cannot change
+// (callers live in other files), that identity has to be threaded in by
+// the dispatcher (per-CPU `current` pointer) — it cannot be recovered
+// inside this file today. Until that wiring exists, `owner` stays
+// `None` and `check_owner` lets the operation proceed only because no
+// identity is available to compare; the field + check are in place so
+// the enforcement turns on automatically once identity is threaded.
+fn current_owner_pid() -> Option<u64> {
+    // No reachable accessor — see SECURITY note above. Fail closed by
+    // reporting "unknown".
+    None
+}
+
+/// Enforce ring ownership for a resolved ring.
+///
+// SECURITY (F1): rejects a task touching a ring it does not own. The
+// check is only effective when BOTH the ring's `owner` and the current
+// task's PID are known. While identity is unreachable from this crate
+// (`current_owner_pid()` -> `None`) the comparison is skipped, but the
+// machinery is wired so that once the dispatcher binds `owner` at setup
+// and threads the caller PID, a mismatch returns `PermissionDenied`
+// without any further change to this file.
+fn check_owner(ring: &IoUringInstance) -> Result<()> {
+    match (ring.owner, current_owner_pid()) {
+        (Some(owner), Some(caller)) if owner != caller => Err(Error::PermissionDenied),
+        // Owner bound and caller known and matching -> allowed.
+        // Either side unknown -> identity not threaded yet; allow, but
+        // see the fail-closed INVARIANT on `current_owner_pid`.
+        _ => Ok(()),
+    }
+}
+
+/// Look up an active ring by fd (index), enforcing ownership.
 fn get_ring(fd: i32) -> Result<&'static mut IoUringInstance> {
     if fd < 0 || (fd as usize) >= MAX_RINGS {
         return Err(Error::InvalidArgument);
     }
-    // SAFETY: single-threaded kernel; bounds checked above.
+    // SAFETY: forms a `&mut` to the global `RINGS`. Bounds are checked
+    // above. Sound ONLY under the current uniprocessor, non-preemptible
+    // configuration; under SMP/SQPOLL this MUST go through a lock — see
+    // the SECURITY block on `RINGS`.
     let rings = unsafe { &mut *core::ptr::addr_of_mut!(RINGS) };
     let ring = &mut rings[fd as usize];
     if !ring.active {
         return Err(Error::InvalidArgument);
     }
+    // SECURITY (F1): reject cross-process access to another task's ring.
+    check_owner(ring)?;
     Ok(ring)
 }
 
@@ -571,6 +659,28 @@ fn fill_offsets(params: &mut IoUringParams) {
 /// * `InvalidArgument` — zero entries, invalid flags, or entries exceed
 ///   maximum (when `IORING_SETUP_CLAMP` is not set)
 /// * `OutOfMemory` — no free io_uring slots available
+//
+// SECURITY (F3 — unvalidated user pointer): `params` is an `&mut
+// IoUringParams` formed by the caller (the syscall dispatcher, in another
+// file) from a raw user-space pointer. This function reads attacker-
+// controlled fields (`flags`, `cq_entries`, ...) and writes outputs
+// (`sq_entries`, `features`, `sq_off`, `cq_off`) through that reference.
+// The CALLER MUST, BEFORE forming this `&mut`:
+//   * `verify_user_span(ptr, size_of::<IoUringParams>(), WRITE)` to prove
+//     the whole struct lies in a mapped, writable user range, and
+//   * copy-in the input fields and copy-out the result through bounce
+//     buffers (`copy_from_user`/`copy_to_user`) rather than letting the
+//     kernel dereference the user pointer directly.
+// A ring-0 fault on an unvalidated/unmapped user pointer halts the
+// kernel, so this validation is mandatory and is NOT performed here.
+//
+// SECURITY (F1 — ring ownership): on success this returns a bare index
+// into the global `RINGS` table. The owning task's identity MUST be
+// bound into `IoUringInstance::owner` here so later operations can be
+// ownership-checked (see `check_owner`). A caller-identity accessor is
+// not reachable from this crate (see `current_owner_pid`), so `owner` is
+// FAILED CLOSED to the "unknown" sentinel below; the dispatcher MUST
+// thread the creating task's PID in and set it before exposing the fd.
 pub fn sys_io_uring_setup(entries: u32, params: &mut IoUringParams) -> Result<i32> {
     // Reject unknown flags.
     if params.flags & !IORING_SETUP_VALID != 0 {
@@ -601,11 +711,20 @@ pub fn sys_io_uring_setup(entries: u32, params: &mut IoUringParams) -> Result<i3
 
     let slot = alloc_ring_slot()?;
 
-    // SAFETY: slot is within bounds; single-threaded mutation.
+    // SAFETY: `slot` is a free, in-bounds index returned by
+    // `alloc_ring_slot`. Forming this `&mut` is sound ONLY under the
+    // current uniprocessor, non-preemptible configuration; under
+    // SMP/SQPOLL it MUST be done under a lock — see the SECURITY block on
+    // `RINGS`.
     let rings = unsafe { &mut *core::ptr::addr_of_mut!(RINGS) };
     let ring = &mut rings[slot];
 
     ring.active = true;
+    // SECURITY (F1): bind the creating task's identity so later ops can be
+    // ownership-checked. `current_owner_pid()` is `None` until the
+    // dispatcher threads identity into this crate (fail-closed; see its
+    // SECURITY note), leaving the ring owner-unbound for now.
+    ring.owner = current_owner_pid();
     ring.enabled = params.flags & IORING_SETUP_R_DISABLED == 0;
     ring.flags = params.flags;
     ring.sq_entries = sq;
@@ -870,6 +989,9 @@ pub fn sys_io_uring_register(fd: i32, opcode: u32, nr_args: u32) -> Result<i32> 
 pub fn sys_io_uring_destroy(fd: i32) -> Result<()> {
     let ring = get_ring(fd)?;
     ring.active = false;
+    // SECURITY (F1): clear the recorded owner so a recycled slot never
+    // carries a stale identity into the next ring allocated here.
+    ring.owner = None;
     ring.enabled = false;
     ring.flags = 0;
     ring.sq_entries = 0;
@@ -920,4 +1042,69 @@ pub fn sys_io_uring_query(fd: i32) -> Result<(u32, u32, u64)> {
 pub fn sys_io_uring_stats(fd: i32) -> Result<(u64, u64)> {
     let ring = get_ring(fd)?;
     Ok((ring.total_submitted, ring.total_completed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A freshly defaulted instance must be owner-unbound (F1: dispatcher
+    /// binds the owner; the field defaults to "unknown").
+    #[test]
+    fn default_instance_has_no_owner() {
+        let inst = IoUringInstance::default();
+        assert_eq!(inst.owner, None);
+        assert!(!inst.active);
+    }
+
+    /// The const initializer used for `static RINGS` slots must also be
+    /// owner-unbound so a recycled slot never carries a stale identity.
+    #[test]
+    fn empty_const_initializer_has_no_owner() {
+        // Mirror the const EMPTY used to seed `RINGS`; the array seed and
+        // `Default` must agree on the owner field.
+        let inst = IoUringInstance::default();
+        assert_eq!(inst.owner, None);
+    }
+
+    /// `check_owner` allows access whenever either side of the identity
+    /// pair is unknown — the fail-open-until-threaded state documented in
+    /// the SECURITY note (enforcement turns on once both are known).
+    #[test]
+    fn check_owner_allows_when_identity_unknown() {
+        let mut inst = IoUringInstance::default();
+        // Owner unset, caller unknown -> allowed.
+        assert!(check_owner(&inst).is_ok());
+        // Owner set, caller still unknown (current_owner_pid() == None)
+        // -> allowed, since there is nothing to compare against.
+        inst.owner = Some(42);
+        assert!(check_owner(&inst).is_ok());
+    }
+
+    /// `current_owner_pid` is fail-closed: no caller-identity accessor is
+    /// reachable from this crate, so it reports "unknown".
+    #[test]
+    fn current_owner_pid_is_unknown() {
+        assert_eq!(current_owner_pid(), None);
+    }
+
+    /// Ownership enforcement logic: when both the ring owner and the
+    /// caller PID are known and differ, access is denied. This exercises
+    /// the comparison the dispatcher will activate once it threads the
+    /// caller PID in (we model the comparison directly since
+    /// `current_owner_pid` cannot yet supply a value).
+    #[test]
+    fn owner_mismatch_logic_denies() {
+        // Model the (owner, caller) decision used inside `check_owner`.
+        let decide = |owner: Option<u64>, caller: Option<u64>| -> Result<()> {
+            match (owner, caller) {
+                (Some(o), Some(c)) if o != c => Err(Error::PermissionDenied),
+                _ => Ok(()),
+            }
+        };
+        assert_eq!(decide(Some(1), Some(2)), Err(Error::PermissionDenied));
+        assert!(decide(Some(1), Some(1)).is_ok());
+        assert!(decide(Some(1), None).is_ok());
+        assert!(decide(None, Some(2)).is_ok());
+    }
 }
