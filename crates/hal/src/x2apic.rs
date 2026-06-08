@@ -118,16 +118,20 @@ const IPI_LEVEL_ASSERT: u64 = 1 << 14;
 #[cfg(target_arch = "x86_64")]
 pub fn cpuid_has_x2apic() -> bool {
     let ecx: u32;
-    // SAFETY: CPUID is always safe to execute on x86_64.
+    // SAFETY: CPUID is always safe to execute on x86_64. RBX is preserved via
+    // the mov/xchg idiom: save rbx into a compiler-allocated tmp register
+    // before CPUID, then xchg restores rbx (tmp holds the unused EBX output).
+    // RSP is never touched, so options(nostack) is correct.
     unsafe {
         core::arch::asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
-            "pop rbx",
+            "xchg {tmp:r}, rbx",
             inout("eax") 1u32 => _,
             out("ecx") ecx,
+            tmp = out(reg) _,
             out("edx") _,
-            options(nostack, preserves_flags),
+            options(nostack, nomem, preserves_flags),
         );
     }
     ecx & (1 << 21) != 0
