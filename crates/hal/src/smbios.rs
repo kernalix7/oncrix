@@ -660,14 +660,29 @@ fn parse_string_table(data: &[u8]) -> StringTable {
         }
 
         if offset == start {
-            // Empty string means end of string section.
-            // Consume the final NUL.
+            // Empty string (NUL at start) means end of string section.
+            // Consume the terminating NUL and stop.
             offset += 1;
             break;
         }
 
-        // Copy string bytes into the fixed buffer.
-        let str_len = (offset - start).min(MAX_STRING_LEN);
+        // SECURITY: Compute the actual string length bounded by both
+        // MAX_STRING_LEN and the number of bytes actually present in
+        // the buffer.  `offset` is the position of the NUL terminator
+        // (or data.len() if the section is unterminated), so
+        // `offset - start` is always <= data.len() - start.
+        // The explicit cap on data.len() is belt-and-suspenders to
+        // guard against any future refactoring that relaxes the inner
+        // loop's stop condition.
+        let raw_len = offset - start;
+        // SECURITY: Require forward progress — raw_len must be > 0 (the
+        // `offset == start` branch already handled the zero case above).
+        // Verify the entire string lies within the buffer before copying.
+        if start + raw_len > data.len() {
+            // Malformed / truncated string section: stop walking.
+            break;
+        }
+        let str_len = raw_len.min(MAX_STRING_LEN);
         let mut s = SmbiosString::empty();
         let mut i = 0;
         while i < str_len {

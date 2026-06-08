@@ -164,9 +164,15 @@ impl VgicHyp {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `idx >= num_lr`.
+    /// Returns [`Error::InvalidArgument`] if `idx` is out of the
+    /// implemented or physically present List Register range.
     pub fn clear_lr(&mut self, idx: usize) -> Result<()> {
-        if idx >= self.num_lr {
+        // SECURITY: Guard against both the firmware-reported num_lr and the
+        // compile-time array bound VGIC_MAX_LR.  A num_lr value > VGIC_MAX_LR
+        // (e.g., from a malformed hypervisor configuration) would otherwise
+        // allow idx == VGIC_MAX_LR to pass the num_lr check and index OOB.
+        // load() and inject_irq() already use .min(VGIC_MAX_LR); mirror that here.
+        if idx >= self.num_lr.min(VGIC_MAX_LR) {
             return Err(Error::InvalidArgument);
         }
         self.lr[idx] = 0;
