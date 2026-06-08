@@ -477,12 +477,22 @@ impl BatteryRegistry {
 
     /// Returns a mutable reference to the battery at `index`.
     pub fn get_mut(&mut self, index: usize) -> Result<&mut BatteryDevice> {
-        self.batteries[index].as_mut().ok_or(Error::NotFound)
+        // SECURITY: index is caller-supplied; guard against out-of-bounds access
+        // into the fixed-size batteries array before indexing.
+        self.batteries
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or(Error::NotFound)
     }
 
     /// Returns a reference to the battery at `index`.
     pub fn get(&self, index: usize) -> Result<&BatteryDevice> {
-        self.batteries[index].as_ref().ok_or(Error::NotFound)
+        // SECURITY: index is caller-supplied; guard against out-of-bounds access
+        // into the fixed-size batteries array before indexing.
+        self.batteries
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::NotFound)
     }
 
     /// Returns the number of registered batteries.
