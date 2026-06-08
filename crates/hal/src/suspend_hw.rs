@@ -166,7 +166,10 @@ impl HwSuspendState {
             // is permitted at CPL 0. We restore values that were valid at
             // suspend time, so the system state remains coherent.
             unsafe {
-                core::arch::asm!("mov cr3, {}", in(reg) self.cr3, options(nostack, nomem));
+                // No `nomem` on the control-register restores: mov cr3 flushes
+                // the TLB and mov cr0/cr4 change paging/protection — each must
+                // order the surrounding state restore (compiler memory barrier).
+                core::arch::asm!("mov cr3, {}", in(reg) self.cr3, options(nostack, preserves_flags));
                 core::arch::asm!(
                     "lgdt [{0}]",
                     in(reg) &self.gdtr as *const DescTablePtr,
@@ -177,8 +180,8 @@ impl HwSuspendState {
                     in(reg) &self.idtr as *const DescTablePtr,
                     options(nostack),
                 );
-                core::arch::asm!("mov cr0, {}", in(reg) self.cr0, options(nostack, nomem));
-                core::arch::asm!("mov cr4, {}", in(reg) self.cr4, options(nostack, nomem));
+                core::arch::asm!("mov cr0, {}", in(reg) self.cr0, options(nostack, preserves_flags));
+                core::arch::asm!("mov cr4, {}", in(reg) self.cr4, options(nostack, preserves_flags));
             }
         }
         Ok(())
