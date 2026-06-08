@@ -286,7 +286,12 @@ impl HidReport {
 
         let end_bit = bit_offset as usize + bit_size as usize;
         let end_byte = end_bit.div_ceil(8);
-        if end_byte > self.data_len {
+        // SECURITY: `data_len` is a public field; reject the parse if the
+        // field would extend past either the declared length OR the physical
+        // backing array.  A malicious device (or caller who wrote data_len >
+        // MAX_REPORT_DATA) cannot push `byte_idx` out of bounds.  Legitimate
+        // descriptors always satisfy end_byte <= data_len <= data.len().
+        if end_byte > self.data_len.min(self.data.len()) {
             return Err(Error::InvalidArgument);
         }
 

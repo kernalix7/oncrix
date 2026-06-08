@@ -283,7 +283,10 @@ impl EventBuffer {
     /// If the buffer is full, the event is dropped and a SYN_DROPPED is injected.
     pub fn post(&mut self, event: InputEvent) {
         if self.is_full() {
-            self.dropped += 1;
+            // SECURITY: Use saturating_add to prevent the dropped counter from
+            // wrapping back to 0 under sustained overflow traffic from a malicious
+            // device, which would cause the caller to undercount lost events.
+            self.dropped = self.dropped.saturating_add(1);
             // Overwrite the oldest event with SYN_DROPPED.
             self.buf[self.tail] = InputEvent::new(EV_SYN, SYN_DROPPED, 0);
             self.tail = (self.tail + 1) % EVENT_RING_SIZE;
