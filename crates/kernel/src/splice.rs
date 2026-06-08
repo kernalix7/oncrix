@@ -83,7 +83,7 @@ impl PipeBuffer {
 
     /// Returns the number of bytes that can still be written.
     pub fn remaining(&self) -> usize {
-        4096 - (self.offset as usize + self.len as usize)
+        4096usize.saturating_sub((self.offset as usize).saturating_add(self.len as usize))
     }
 
     /// Consumes `n` bytes from the front of the buffer.
