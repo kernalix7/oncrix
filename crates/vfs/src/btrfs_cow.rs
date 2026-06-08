@@ -217,7 +217,8 @@ impl LeafNode {
     /// Returns `Ok(idx)` if an exact match exists; `Err(idx)` gives the
     /// position at which `key` should be inserted.
     pub fn search(&self, key: &CowKey) -> core::result::Result<usize, usize> {
-        let live: &[_] = &self.items[..self.nritems];
+        let count = self.nritems.min(MAX_LEAF_ITEMS);
+        let live: &[_] = &self.items[..count];
         live.binary_search_by(|item| item.key.cmp(key))
     }
 
@@ -363,7 +364,7 @@ impl InternalNode {
         }
         // Binary search for the rightmost slot whose key ≤ target.
         let mut lo = 0usize;
-        let mut hi = self.nritems;
+        let mut hi = self.nritems.min(MAX_INTERNAL_KEYS);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if self.ptrs[mid].key <= *key {

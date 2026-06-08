@@ -233,7 +233,10 @@ impl CompressedExtent {
         if self.uncompressed_len == 0 {
             return 100;
         }
-        ((self.compressed_len * 100) / self.uncompressed_len) as usize
+        self.compressed_len
+            .saturating_mul(100)
+            .checked_div(self.uncompressed_len)
+            .unwrap_or(100) as usize
     }
 
     /// Returns `true` if the ratio is good enough to be worth storing.
