@@ -226,8 +226,10 @@ impl LapicTimer {
             unsafe {
                 let lvt = LVT_TIMER_TSCDEADLINE | (self.vector as u32);
                 write_apic(self.apic_base, REG_LVT_TIMER, lvt);
-                // Serialise before writing the MSR.
-                core::arch::asm!("mfence", options(nostack, nomem, preserves_flags));
+                // Serialise before writing the MSR. No `nomem`: mfence is a
+                // memory-ordering fence — with nomem the compiler could reorder
+                // the surrounding APIC/MSR accesses across it, neutering it.
+                core::arch::asm!("mfence", options(nostack, preserves_flags));
                 // Write IA32_TSC_DEADLINE MSR
                 let lo = tsc_deadline as u32;
                 let hi = (tsc_deadline >> 32) as u32;
