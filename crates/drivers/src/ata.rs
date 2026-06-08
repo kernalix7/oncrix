@@ -682,8 +682,19 @@ impl AtaDrive {
     }
 
     /// Return the drive capacity in bytes.
+    ///
+    /// Uses saturating multiplication so that an astronomically large (but
+    /// already LBA28-clamped) sector count cannot overflow a `u64` and produce
+    /// a falsely small capacity figure.  In practice `total_sectors` is capped
+    /// at `LBA28_MAX_SECTORS` (2^28) during `parse_identify`, so overflow is
+    /// impossible with the standard 512-byte sector size; this guard is
+    /// defense-in-depth against future code changes.
     pub const fn capacity_bytes(&self) -> u64 {
-        self.info.total_sectors * SECTOR_SIZE as u64
+        // SECURITY: Saturating multiply prevents a u64 wrap-around if
+        // total_sectors were ever inflated beyond the LBA28 cap.  The result
+        // saturates at u64::MAX rather than wrapping to a small value that
+        // could mislead callers about available capacity.
+        self.info.total_sectors.saturating_mul(SECTOR_SIZE as u64)
     }
 
     // -- private helpers --------------------------------------------------

@@ -263,38 +263,64 @@ impl SlotCapabilities {
 
 /// Read a 16-bit value from MMIO at `base + offset`.
 ///
+/// Returns `0` if `base + offset` overflows `usize`, which would indicate an
+/// invalid MMIO mapping; a zero status word is the safe fail-closed sentinel
+/// (no interrupt bits asserted).
+///
 /// # Safety
 ///
 /// `base + offset` must be a valid, mapped MMIO address aligned to 2 bytes.
 #[inline]
 unsafe fn read_mmio16(base: usize, offset: u16) -> u16 {
+    // SECURITY: Use checked_add to guard against a crafted cap_base near
+    // usize::MAX that would wrap around and produce a bogus MMIO pointer.
+    // Returning 0 on overflow is safe — the caller treats 0 as "no events".
+    let Some(addr) = base.checked_add(offset as usize) else {
+        return 0;
+    };
     // SAFETY: Caller guarantees the address is valid mapped MMIO space,
     // properly aligned for a 16-bit volatile read.
-    unsafe { core::ptr::read_volatile((base + offset as usize) as *const u16) }
+    unsafe { core::ptr::read_volatile(addr as *const u16) }
 }
 
 /// Write a 16-bit value to MMIO at `base + offset`.
+///
+/// No-op if `base + offset` overflows `usize` (fail-closed: the write is
+/// silently dropped rather than performed at a wrapped address).
 ///
 /// # Safety
 ///
 /// `base + offset` must be a valid, mapped MMIO address aligned to 2 bytes.
 #[inline]
 unsafe fn write_mmio16(base: usize, offset: u16, val: u16) {
+    // SECURITY: Use checked_add to guard against a crafted cap_base near
+    // usize::MAX.  Skipping the write on overflow is safe — failing to assert
+    // a register change is preferable to writing to an aliased address.
+    let Some(addr) = base.checked_add(offset as usize) else {
+        return;
+    };
     // SAFETY: Caller guarantees the address is valid mapped MMIO space,
     // properly aligned for a 16-bit volatile write.
-    unsafe { core::ptr::write_volatile((base + offset as usize) as *mut u16, val) }
+    unsafe { core::ptr::write_volatile(addr as *mut u16, val) }
 }
 
 /// Read a 32-bit value from MMIO at `base + offset`.
+///
+/// Returns `0` if `base + offset` overflows `usize` (fail-closed sentinel).
 ///
 /// # Safety
 ///
 /// `base + offset` must be a valid, mapped MMIO address aligned to 4 bytes.
 #[inline]
 unsafe fn read_mmio32(base: usize, offset: u16) -> u32 {
+    // SECURITY: Use checked_add to guard against a crafted cap_base near
+    // usize::MAX that would wrap around and produce a bogus MMIO pointer.
+    let Some(addr) = base.checked_add(offset as usize) else {
+        return 0;
+    };
     // SAFETY: Caller guarantees the address is valid mapped MMIO space,
     // properly aligned for a 32-bit volatile read.
-    unsafe { core::ptr::read_volatile((base + offset as usize) as *const u32) }
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
 // ---------------------------------------------------------------------------

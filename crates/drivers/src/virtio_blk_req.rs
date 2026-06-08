@@ -284,6 +284,15 @@ pub struct BlkRequestQueue {
     mmio_base: u64,
     /// Whether the queue is active.
     active: bool,
+    /// Per-descriptor in-flight bitmap.
+    ///
+    /// `desc_inflight[i]` is `true` while descriptor `i` is the head of a
+    /// chain currently submitted to the device.  A device-supplied used-ring
+    /// `id` that is NOT set here is either a spurious or replayed completion
+    /// from a malicious/buggy device and is silently dropped after advancing
+    /// `last_used_idx` (no descriptor is freed for it — the driver never
+    /// allocated a chain for that index in this cycle).
+    desc_inflight: [bool; QUEUE_DEPTH],
 }
 
 impl BlkRequestQueue {
@@ -310,6 +319,7 @@ impl BlkRequestQueue {
             last_used_idx: 0,
             mmio_base,
             active: false,
+            desc_inflight: [false; QUEUE_DEPTH],
         }
     }
 
@@ -451,6 +461,10 @@ impl BlkRequestQueue {
             sector_count,
             active: true,
         };
+        // SECURITY: Mark this descriptor head as in-flight so that a replayed
+        // used-ring entry from a malicious device is detected and dropped in
+        // poll_completion (mirrors the VirtioBlk reference pattern).
+        self.desc_inflight[d0 as usize] = true;
 
         // Publish to the available ring.
         self.avail.push(d0);
@@ -469,65 +483,119 @@ impl BlkRequestQueue {
     ///
     /// Returns `Some(status)` where status is the device-written status byte,
     /// or `None` if the slot has no completion yet.
+    ///
+    /// # Security hardening
+    ///
+    /// ## Used-ring-id replay / double-free defence
+    ///
+    /// `elem.id` in the used ring is device-DMA-writable and can be replayed
+    /// by a malicious backend.  Before freeing any descriptors we do an atomic
+    /// test-and-clear of `desc_inflight[head]`.  A head that is not set in the
+    /// bitmap means the completion is spurious (already processed or never
+    /// submitted); we advance `last_used_idx` and skip descriptor freeing for
+    /// that entry.  This prevents the free-stack from receiving the same index
+    /// twice, which would allow a subsequent alloc to hand out the same
+    /// descriptor to two concurrent requests.
+    ///
+    /// ## u16-wrap livelock defence
+    ///
+    /// The drain loop is bounded by `used_idx.wrapping_sub(last_used_idx)`
+    /// capped at `QUEUE_DEPTH`.  Without this cap, a device that advances
+    /// `used.idx` by 65535 before the driver processes any entry would cause
+    /// the loop to run 65535 iterations in IRQ context (livelock / stall).
+    ///
+    /// ## Descriptor-chain aliasing / out-of-range `.next` defence
+    ///
+    /// The `.next` fields inside descriptors are also device-DMA-writable.
+    /// Each hop is bounds-checked against `QUEUE_DEPTH` and checked for
+    /// aliasing against all previously seen indices in the chain before being
+    /// used as an array index.
     pub fn poll_completion(&mut self, slot: usize) -> Option<u8> {
         if slot >= MAX_INFLIGHT || !self.inflight[slot].active {
             return None;
         }
-        // Scan new used-ring entries.
-        // SAFETY: Reading the device-written used ring index with volatile.
-        // SAFETY: Reading the used ring idx field written by the device. Volatile
-        // read ensures we see the device's latest update.
+
+        // SAFETY: Reading the device-written used ring index with volatile to
+        // ensure we observe the device's latest write without compiler reordering.
         let used_idx = unsafe { core::ptr::read_volatile(&self.used.idx as *const u16) };
-        let expected_head = self.inflight[slot].head;
+
+        // SECURITY: Bound the drain loop by the number of entries the device
+        // has produced since we last checked, capped at QUEUE_DEPTH.  A raw
+        // `while last != used_idx` loop wraps after 65535 increments; capping
+        // at QUEUE_DEPTH prevents a malicious device from stalling the IRQ
+        // handler with a near-u16::MAX difference.
+        let pending = used_idx.wrapping_sub(self.last_used_idx) as usize;
+        let drain_count = pending.min(QUEUE_DEPTH);
+
         let mut found = false;
 
-        while self.last_used_idx != used_idx {
+        for _ in 0..drain_count {
             let ring_slot = (self.last_used_idx as usize) % QUEUE_DEPTH;
             // SAFETY: `ring_slot` is bounded by QUEUE_DEPTH via modular arithmetic;
             // the used ring is part of the virtqueue DMA region set up during init.
             let elem =
                 unsafe { core::ptr::read_volatile(&self.used.ring[ring_slot] as *const UsedElem) };
+            // Advance unconditionally — every entry must be consumed regardless
+            // of whether it belongs to the requested slot, to keep the shadow
+            // index in sync with the device.
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
-            if elem.id as u16 == expected_head {
-                found = true;
-                // Free the 3-descriptor chain.
-                let d0 = expected_head;
-                // SECURITY: `d1` and `d2` are the `.next` fields of device-DMA-writable
-                // descriptors.  A malicious or buggy device can write any u16 value here.
-                // Validate each index against QUEUE_DEPTH before using it as an array
-                // index; an out-of-range value would panic (OOB) in ring 0 with
-                // overflow-checks ON.  Mirror the pattern in virtio.rs Virtqueue::free_desc.
-                let d1 = self.descs[d0 as usize].next;
-                if (d1 as usize) >= QUEUE_DEPTH {
-                    self.free_desc(d0);
-                    self.inflight[slot].active = false;
-                    break;
-                }
-                let d2 = self.descs[d1 as usize].next;
-                if (d2 as usize) >= QUEUE_DEPTH {
-                    self.free_desc(d1);
-                    self.free_desc(d0);
-                    self.inflight[slot].active = false;
-                    break;
-                }
-                // SECURITY: the device-supplied .next fields can alias (e.g.
-                // descs[d1].next == d1), which would double-free the same index
-                // and corrupt the free stack (a later alloc hands the same
-                // descriptor out twice). A valid 3-descriptor chain visits three
-                // DISTINCT indices; on any self-reference free only the known-good
-                // driver-allocated head and stop.
-                if d1 == d0 || d2 == d0 || d2 == d1 {
-                    self.free_desc(d0);
-                    self.inflight[slot].active = false;
-                    break;
-                }
-                self.free_desc(d2);
-                self.free_desc(d1);
-                self.free_desc(d0);
-                self.inflight[slot].active = false;
-                break;
+            // SECURITY: Truncate the 32-bit device-supplied id to u16 to match
+            // the descriptor-table index width used throughout this driver.
+            let head = elem.id as u16;
+
+            // SECURITY: Atomic test-and-clear on the in-flight bitmap.  If
+            // `head` is not currently marked as in-flight the completion is
+            // spurious or replayed; we skip descriptor freeing entirely for
+            // this entry so the free stack cannot receive a duplicated index.
+            // We still advance `last_used_idx` (done above) to avoid stalling.
+            if (head as usize) >= QUEUE_DEPTH || !self.desc_inflight[head as usize] {
+                // Spurious or replayed completion — drop silently.
+                continue;
             }
+            // Clear the bitmap exactly once (test-and-clear).
+            self.desc_inflight[head as usize] = false;
+
+            // Find the in-flight slot for this head and free its chain.
+            // We search all slots rather than only `slot` so that completions
+            // for other in-flight requests that happen to appear in the same
+            // drain window are also retired correctly, preventing descriptor
+            // leaks when a foreign-id entry would otherwise be silently skipped.
+            let owner_slot = self.inflight[..MAX_INFLIGHT]
+                .iter()
+                .position(|e| e.active && e.head == head);
+
+            if let Some(s) = owner_slot {
+                // Free the 3-descriptor chain starting at `head`.
+                // SECURITY: d1 and d2 are device-DMA-writable `.next` fields.
+                // Validate bounds AND aliasing before using as indices.
+                let d0 = head;
+                let d1 = self.descs[d0 as usize].next;
+                if (d1 as usize) >= QUEUE_DEPTH || d1 == d0 {
+                    // Chain is corrupt — free only the known-good head.
+                    self.free_desc(d0);
+                    self.inflight[s].active = false;
+                } else {
+                    let d2 = self.descs[d1 as usize].next;
+                    if (d2 as usize) >= QUEUE_DEPTH || d2 == d0 || d2 == d1 {
+                        // SECURITY: d2 out-of-range or aliasing — free d0+d1 only.
+                        self.free_desc(d1);
+                        self.free_desc(d0);
+                        self.inflight[s].active = false;
+                    } else {
+                        self.free_desc(d2);
+                        self.free_desc(d1);
+                        self.free_desc(d0);
+                        self.inflight[s].active = false;
+                    }
+                }
+
+                if s == slot {
+                    found = true;
+                }
+            }
+            // If no owner slot is found the bitmap entry was already cleared
+            // above, so no further action is needed.
         }
 
         if found { Some(self.status[slot]) } else { None }
