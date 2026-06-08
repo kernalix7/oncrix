@@ -466,6 +466,116 @@ impl Default for PtraceRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Address-space and register sanitization invariants
+// ---------------------------------------------------------------------------
+
+/// Exclusive upper bound of the x86_64 user address range.
+///
+/// The 48-bit canonical address space is split in half: user addresses live in
+/// `[0, USER_ADDR_MAX)` and kernel addresses begin at `0xffff_8000_0000_0000`.
+/// Everything at or above `USER_ADDR_MAX` (the non-canonical hole AND the entire
+/// kernel half) is off-limits to a tracer.
+///
+/// SECURITY: a ptrace peek/poke address is fully attacker-controlled. Rejecting
+/// only the non-canonical hole would still accept every kernel address, turning
+/// PEEK/POKE into an arbitrary kernel read/write primitive. We therefore bound
+/// strictly to `< USER_ADDR_MAX`. Mirrors `oncrix_mm::gup::USER_ADDR_MAX`.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// User-mode 64-bit code segment selector (`(4 << 3) | RPL 3`).
+///
+/// SECURITY: must equal `oncrix_hal::arch::x86_64::gdt::selector::USER_CODE`.
+/// Loading any other selector into `cs` on return-to-user would run the tracee
+/// at a privileged CPL, so SetRegs forces this exact value.
+const USER_CODE_SELECTOR: u64 = (4 << 3) | 3;
+
+/// User-mode data/stack segment selector (`(3 << 3) | RPL 3`).
+///
+/// SECURITY: must equal `oncrix_hal::arch::x86_64::gdt::selector::USER_DATA`.
+const USER_DATA_SELECTOR: u64 = (3 << 3) | 3;
+
+/// RFLAGS bits a user context is permitted to carry (allowlist).
+///
+/// SECURITY: any tracer-supplied register set is masked down to exactly these
+/// bits before it can reach the tracee. Everything else — IOPL (12-13), IF (9),
+/// VM (17), AC (18), VIF (19), VIP (20), ID (21), and all reserved bits — is
+/// privilege- or model-sensitive and is therefore dropped. An allowlist (rather
+/// than a denylist) fails closed: a newly defined or reserved flag stays cleared
+/// by default. The permitted bits are the benign condition/arithmetic/control
+/// flags: CF(0) PF(2) AF(4) ZF(6) SF(7) TF(8) DF(10) OF(11) NT(14) RF(16).
+const EFLAGS_USER_ALLOWED: u64 = 1        // CF  (bit 0)
+    | (1 << 2)  // PF
+    | (1 << 4)  // AF
+    | (1 << 6)  // ZF
+    | (1 << 7)  // SF
+    | (1 << 8)  // TF (trap)
+    | (1 << 10) // DF
+    | (1 << 11) // OF
+    | (1 << 14) // NT
+    | (1 << 16); // RF
+
+/// RFLAGS bits that are architecturally always set (reserved bit 1 reads as 1).
+const EFLAGS_ALWAYS_SET: u64 = 1 << 1;
+
+/// Reject a tracee memory access whose address (or address+size window) falls
+/// outside the user half of the address space.
+///
+/// SECURITY: callers MUST run this before any read of / write to tracee memory.
+/// It rejects `addr >= USER_ADDR_MAX` (the non-canonical hole and the kernel
+/// half) and any window `addr + size` that wraps `u64` or crosses into
+/// `USER_ADDR_MAX`, so a multi-byte access cannot straddle the user/kernel split.
+fn check_user_addr_range(addr: u64, size: u64) -> Result<()> {
+    if addr >= USER_ADDR_MAX {
+        return Err(Error::InvalidArgument);
+    }
+    match addr.checked_add(size) {
+        Some(end) if end <= USER_ADDR_MAX => Ok(()),
+        _ => Err(Error::InvalidArgument),
+    }
+}
+
+/// Sanitize a tracer-supplied register set so a later load into the tracee can
+/// never produce a privileged or out-of-bounds CPU context.
+///
+/// SECURITY INVARIANT: the ptrace SetRegs path must call this on any
+/// [`UserRegs`] materialized from the (untrusted) tracer before it is stored or
+/// applied. Mirrors Linux `arch_ptrace`/`putreg` register sanitization:
+///   * `cs` is forced to the user code selector and `ss` to the user data
+///     selector — a tracer may not pick an arbitrary descriptor (e.g. a
+///     kernel/CPL-0 selector or a call gate);
+///   * `rip` and `rsp` must be canonical and below `USER_ADDR_MAX`, so control
+///     flow and the stack cannot be redirected into the kernel half;
+///   * privileged / reserved RFLAGS bits (IOPL, IF, VM, VIF, VIP, AC, ID, and
+///     all reserved bits) are masked off, and the always-one bit is restored.
+///
+/// Returns [`Error::InvalidArgument`] if `rip`/`rsp` are not valid user
+/// addresses; segment and flag fields are coerced in place rather than rejected
+/// so debuggers that echo back a full register block still work.
+pub fn sanitize_user_regs(regs: &mut UserRegs) -> Result<()> {
+    // Control flow and stack must stay strictly within the user half. Reject
+    // (rather than truncate) so a bad request fails loudly instead of silently
+    // landing the tracee at an unintended address.
+    if regs.rip >= USER_ADDR_MAX {
+        return Err(Error::InvalidArgument);
+    }
+    if regs.rsp >= USER_ADDR_MAX {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Force user-mode segment selectors. RPL=3 / the user descriptors are the
+    // only legal values for a user context; anything else is a privilege bug.
+    regs.cs = USER_CODE_SELECTOR;
+    regs.ss = USER_DATA_SELECTOR;
+
+    // Reduce RFLAGS to the benign user-allowed bits (allowlist => privileged
+    // and reserved bits like IOPL/IF/VM/VIF/VIP/AC/ID are dropped), then
+    // restore the architecturally always-set bit.
+    regs.eflags = (regs.eflags & EFLAGS_USER_ALLOWED) | EFLAGS_ALWAYS_SET;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Ptrace Operations
 // ---------------------------------------------------------------------------
 
@@ -512,10 +622,12 @@ pub fn ptrace_resume(
 /// In a real kernel this would use `copy_from_user` on the tracee's
 /// address space. This is a placeholder that validates the address.
 pub fn ptrace_peek(_tracee: Pid, addr: u64) -> Result<u64> {
-    // Validate user-space address range (canonical form check)
-    if (0x0000_8000_0000_0000..0xffff_8000_0000_0000).contains(&addr) {
-        return Err(Error::InvalidArgument);
-    }
+    // SECURITY: bound the access strictly to the tracee USER range. The old
+    // check rejected only the non-canonical hole, leaving the ENTIRE kernel
+    // half (>= 0xffff_8000_0000_0000) readable -> arbitrary kernel read. A
+    // peek reads one 64-bit word, so the whole 8-byte window must lie below
+    // USER_ADDR_MAX and must not wrap into the kernel half.
+    check_user_addr_range(addr, core::mem::size_of::<u64>() as u64)?;
     // In a real implementation: read from tracee's address space
     // using copy_from_user/page table walk.
     Ok(0)
@@ -526,9 +638,12 @@ pub fn ptrace_peek(_tracee: Pid, addr: u64) -> Result<u64> {
 /// In a real kernel this would use `copy_to_user` on the tracee's
 /// address space. This is a placeholder that validates the address.
 pub fn ptrace_poke(_tracee: Pid, addr: u64, _value: u64) -> Result<()> {
-    if (0x0000_8000_0000_0000..0xffff_8000_0000_0000).contains(&addr) {
-        return Err(Error::InvalidArgument);
-    }
+    // SECURITY: bound the access strictly to the tracee USER range. The old
+    // check rejected only the non-canonical hole, leaving the ENTIRE kernel
+    // half (>= 0xffff_8000_0000_0000) writable -> arbitrary kernel write. A
+    // poke writes one 64-bit word, so the whole 8-byte window must lie below
+    // USER_ADDR_MAX and must not wrap into the kernel half.
+    check_user_addr_range(addr, core::mem::size_of::<u64>() as u64)?;
     // In a real implementation: write to tracee's address space.
     Ok(())
 }
@@ -588,9 +703,20 @@ pub fn do_ptrace(
 ) -> Result<u64> {
     match request {
         PtraceRequest::TraceMe => {
-            // `tracee_pid` is the caller in this case, `caller`
-            // is the parent.
-            registry.traceme(caller, tracee_pid)?;
+            // SECURITY: for PTRACE_TRACEME the tracee is ALWAYS the calling
+            // process itself; `tracee_pid` is attacker-controlled and must not
+            // be allowed to register some other process as a tracee. The
+            // dispatcher passes the authenticated invoker as `caller`, so the
+            // tracee MUST equal `caller`. Reject a forged `tracee_pid` rather
+            // than trusting it. The tracer is the invoker's parent, which the
+            // syscall layer threads via the registry below.
+            //
+            // SECURITY INVARIANT: `caller` must be the kernel-resolved current
+            // PID, never a user-supplied value, for this gate to hold.
+            if tracee_pid != caller {
+                return Err(Error::InvalidArgument);
+            }
+            registry.traceme(caller, caller)?;
             Ok(0)
         }
 
@@ -642,8 +768,29 @@ pub fn do_ptrace(
 
         PtraceRequest::SetRegs => {
             validate_tracer(registry, caller, tracee_pid)?;
-            // In real kernel: copy registers from `data` address to
-            // tracee's saved register state.
+            // In real kernel: copy registers from the `data` address (a tracer
+            // pointer to a `UserRegs` block) into the tracee's saved register
+            // state, where they are reloaded on the next return-to-user.
+            //
+            // SECURITY INVARIANT: the register block is fully attacker
+            // controlled. Before it is stored or applied it MUST be passed
+            // through `sanitize_user_regs`, which forces cs/ss to the user
+            // selectors, requires canonical user-half rip/rsp, and masks
+            // privileged RFLAGS bits (IOPL/IF/VM/...). Without this a tracer
+            // could hijack control flow into the kernel half or run the tracee
+            // at CPL 0 / with port-I/O privilege. This placeholder enforces the
+            // gate now so a future `copy_from_user` load is safe by
+            // construction: a malformed rip/rsp is rejected before any store.
+            let mut regs = UserRegs {
+                // A real implementation fills every field via copy_from_user
+                // from `data`; the addressing fields below are the ones the
+                // sanitizer validates/coerces. `data` is the source pointer.
+                rip: addr,
+                rsp: data,
+                ..UserRegs::default()
+            };
+            sanitize_user_regs(&mut regs)?;
+            // In real kernel: store the now-sanitized `regs` into the tracee.
             Ok(0)
         }
 
