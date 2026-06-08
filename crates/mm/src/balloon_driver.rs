@@ -87,9 +87,15 @@ pub struct BalloonPage {
 impl BalloonPage {
     /// Construct a [`BalloonPage`] from a PFN.
     pub const fn from_pfn(pfn: u64) -> Self {
+        // SECURITY: `pfn` is host/guest-supplied. `pfn * BALLOON_PAGE_SIZE`
+        // overflows u64 for a pfn above the addressable ceiling and panics
+        // under overflow-checks. This is an infallible `const` constructor, so
+        // saturate the multiply: an out-of-range pfn yields a capped phys_addr
+        // (u64::MAX) rather than halting the kernel. Every legal pfn whose
+        // byte address fits a u64 is unaffected.
         Self {
             pfn,
-            phys_addr: pfn * BALLOON_PAGE_SIZE,
+            phys_addr: pfn.saturating_mul(BALLOON_PAGE_SIZE),
             reported: false,
         }
     }

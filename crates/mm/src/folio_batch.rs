@@ -93,7 +93,14 @@ impl FolioRef {
 
     /// Returns the number of pages in this folio.
     pub const fn nr_pages(&self) -> usize {
-        1 << self.order
+        // SECURITY: `1 << order` panics (overflow-checks) once
+        // `order >= usize::BITS`. Reject out-of-range orders before the
+        // shift and return a saturated count; every legitimate folio
+        // order is far below the bit width and is unaffected.
+        if self.order as u32 >= usize::BITS {
+            return usize::MAX;
+        }
+        1usize << self.order
     }
 
     /// Returns the reference count.

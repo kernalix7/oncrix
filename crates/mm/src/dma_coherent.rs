@@ -272,12 +272,31 @@ impl CoherentAllocator {
         if size == 0 {
             return Err(Error::InvalidArgument);
         }
-        let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // SECURITY: round size up to a page with checked math. A `size`
+        // near usize::MAX would otherwise wrap the page round-up to a
+        // tiny value, handing the device a buffer far smaller than the
+        // caller (potentially driver/device-controlled) requested.
+        let aligned = size
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(Error::InvalidArgument)?
+            & !(PAGE_SIZE - 1);
+        let aligned_u64 = aligned as u64;
 
-        // Check if the DMA address fits within the mask.
-        if !mask.contains(self.next_dma_addr + aligned as u64 - 1) {
-            self.stats.failures = self.stats.failures.saturating_add(1);
-            return Err(Error::OutOfMemory);
+        // SECURITY: compute the top DMA byte (base + aligned - 1) with
+        // checked math so a high `next_dma_addr` plus a large request
+        // cannot wrap to a small value that spuriously passes the mask
+        // test. Any overflow means the range exceeds the address space,
+        // so treat it as out-of-range and fail the allocation.
+        let dma_top = self
+            .next_dma_addr
+            .checked_add(aligned_u64)
+            .and_then(|end| end.checked_sub(1));
+        match dma_top {
+            Some(top) if mask.contains(top) => {}
+            _ => {
+                self.stats.failures = self.stats.failures.saturating_add(1);
+                return Err(Error::OutOfMemory);
+            }
         }
 
         // Find a free slot.
@@ -296,6 +315,25 @@ impl CoherentAllocator {
         let cpu_addr = self.next_cpu_addr;
         let dma_addr = self.next_dma_addr;
 
+        // SECURITY: advance both address hints with checked math BEFORE
+        // mutating any allocator state. If either cumulative add would
+        // overflow, fail the allocation without recording the region or
+        // bumping the count, leaving the allocator consistent.
+        let next_cpu = match self.next_cpu_addr.checked_add(aligned_u64) {
+            Some(v) => v,
+            None => {
+                self.stats.failures = self.stats.failures.saturating_add(1);
+                return Err(Error::OutOfMemory);
+            }
+        };
+        let next_dma = match self.next_dma_addr.checked_add(aligned_u64) {
+            Some(v) => v,
+            None => {
+                self.stats.failures = self.stats.failures.saturating_add(1);
+                return Err(Error::OutOfMemory);
+            }
+        };
+
         self.regions[slot] = CoherentRegion {
             cpu_addr,
             dma_addr,
@@ -305,13 +343,13 @@ impl CoherentAllocator {
             in_use: true,
         };
 
-        self.next_cpu_addr += aligned as u64;
-        self.next_dma_addr += aligned as u64;
+        self.next_cpu_addr = next_cpu;
+        self.next_dma_addr = next_dma;
         self.count += 1;
 
         self.stats.allocs = self.stats.allocs.saturating_add(1);
         self.stats.active = self.count;
-        self.stats.bytes_allocated = self.stats.bytes_allocated.saturating_add(aligned as u64);
+        self.stats.bytes_allocated = self.stats.bytes_allocated.saturating_add(aligned_u64);
         if self.stats.bytes_allocated > self.stats.peak_bytes {
             self.stats.peak_bytes = self.stats.bytes_allocated;
         }

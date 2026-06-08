@@ -27,6 +27,14 @@ use oncrix_lib::{Error, Result};
 /// Page size (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
+/// Exclusive upper bound of the canonical user-space address range on
+/// x86_64 (48-bit). A mirrored range describes user virtual addresses
+/// that get page-walked into device PFNs, so the whole [start, end)
+/// span must lie inside this window before the walk.
+// SECURITY: bound device-supplied range addresses to the user window;
+// mirrors `USER_ADDR_MAX` in `gup.rs::pin_user_pages`.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
 /// Maximum PFN entries per range snapshot.
 const MAX_PFN_ENTRIES: usize = 256;
 
@@ -374,12 +382,47 @@ impl HmmManager {
             return Err(Error::NotFound);
         }
 
+        // SECURITY: `HmmRange` exposes `start`, `end`, `nr_entries` and
+        // `pfns` as public mutable fields, so a caller can hand us a range
+        // whose `nr_entries` exceeds the `pfns` capacity (`MAX_PFN_ENTRIES`)
+        // or whose addresses point at the kernel half. Validate the window
+        // and the entry count BEFORE the loop, otherwise `range.pfns[i]`
+        // would index out of bounds (a ring-0 panic) and the walk could
+        // fault in non-user memory.
+        if range.start >= range.end || range.start % PAGE_SIZE != 0 || range.end % PAGE_SIZE != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if range.start >= USER_ADDR_MAX || range.end > USER_ADDR_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        if range.nr_entries > MAX_PFN_ENTRIES {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: cross-check `nr_entries` against the page count implied
+        // by the validated span so the loop can never write more PFNs than
+        // the range actually covers. `checked_sub` cannot underflow here
+        // (start < end enforced above) but stays robust.
+        let span = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(Error::InvalidArgument)?;
+        let span_pages = (span / PAGE_SIZE) as usize;
+        if range.nr_entries > span_pages {
+            return Err(Error::InvalidArgument);
+        }
+
         self.stats.range_faults += 1;
 
         // Simulate populating PFN entries.
         let base_pfn = range.start / PAGE_SIZE;
         for i in 0..range.nr_entries {
-            range.pfns[i] = HmmPfnEntry::valid(base_pfn + i as u64, range.write);
+            // SECURITY: derive each PFN with checked_add so an attacker-set
+            // `start` near the top of the user window cannot wrap the PFN
+            // arithmetic into a ring-0 panic; the range is bounded above.
+            let pfn = base_pfn
+                .checked_add(i as u64)
+                .ok_or(Error::InvalidArgument)?;
+            range.pfns[i] = HmmPfnEntry::valid(pfn, range.write);
         }
 
         self.stats.fault_success += 1;

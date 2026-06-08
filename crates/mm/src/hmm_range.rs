@@ -41,6 +41,14 @@ const PAGE_SIZE: u64 = 4096;
 /// Maximum number of pages in a single HMM range fault.
 const MAX_RANGE_PAGES: usize = 1024;
 
+/// Exclusive upper bound of the canonical user-space address range on
+/// x86_64 (48-bit). An HMM range describes user virtual addresses that
+/// will be page-walked, so the whole [start, end) span must lie inside
+/// this window before any walk populates device-visible PFNs.
+// SECURITY: bound device-supplied range addresses to the user window;
+// mirrors `USER_ADDR_MAX` in `gup.rs::pin_user_pages`.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
 // -------------------------------------------------------------------
 // HmmPfnFlags
 // -------------------------------------------------------------------
@@ -226,7 +234,22 @@ impl HmmRange {
         if (self.start % PAGE_SIZE) != 0 || (self.end % PAGE_SIZE) != 0 {
             return Err(Error::InvalidArgument);
         }
-        let pages = ((self.end - self.start) / PAGE_SIZE) as usize;
+        // SECURITY: confine the whole [start, end) range to the canonical
+        // user window before any page-table walk derives PFNs from these
+        // addresses. `start` must be strictly-user and the exclusive `end`
+        // must not spill past the user/kernel boundary, so a device can
+        // never fault in kernel or non-canonical memory.
+        if self.start >= USER_ADDR_MAX || self.end > USER_ADDR_MAX {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: derive the page count with checked_sub so the span
+        // computation can never underflow (start < end is enforced above,
+        // so this cannot fail, but keep it checked for robustness).
+        let pages = (self
+            .end
+            .checked_sub(self.start)
+            .ok_or(Error::InvalidArgument)?
+            / PAGE_SIZE) as usize;
         if pages > MAX_RANGE_PAGES {
             return Err(Error::InvalidArgument);
         }
@@ -340,14 +363,30 @@ pub fn create_range(start: u64, end: u64, write: bool) -> Result<HmmRange> {
 /// In a real implementation this walks CPU page tables; here we
 /// simulate by marking pages as needing fault or valid.
 pub fn range_fault(range: &mut HmmRange) -> Result<HmmRangeResult> {
+    // SECURITY: `validate` confines [start, end) to the user window and
+    // bounds the page count to `MAX_RANGE_PAGES`, so the derivations below
+    // (page count, per-page address) cannot wrap or run past `pfns`.
     range.validate()?;
-    let nr_pages = ((range.end - range.start) / PAGE_SIZE) as usize;
+    let nr_pages = (range
+        .end
+        .checked_sub(range.start)
+        .ok_or(Error::InvalidArgument)?
+        / PAGE_SIZE) as usize;
     range.nr_pages = nr_pages;
 
     let mut state = HmmRangeState::new(nr_pages);
 
     for i in 0..nr_pages {
-        let vaddr = range.start + (i as u64) * PAGE_SIZE;
+        // SECURITY: derive each page address with checked steps; the range
+        // is bounded `<= USER_ADDR_MAX`, so every `vaddr` is a valid user
+        // address and no add can wrap into a ring-0 panic.
+        let offset = (i as u64)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        let vaddr = range
+            .start
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)?;
         // Simulate: generate a PFN from the virtual address.
         let pfn = vaddr / PAGE_SIZE;
         let mut flags = HmmPfnFlags::from_bits(HmmPfnFlags::VALID);

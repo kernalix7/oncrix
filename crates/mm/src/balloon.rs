@@ -103,12 +103,22 @@ impl BalloonPage {
 
     /// Returns the number of base (4 KiB) pages represented.
     pub fn base_pages(&self) -> u64 {
+        // SECURITY: `order` is a u8 and may exceed the bit width of u64.
+        // `1u64 << order` for order >= 64 is undefined-shift and panics
+        // under overflow-checks. Saturate out-of-range orders here so this
+        // diagnostic accessor can never panic; the inflate paths reject
+        // such orders with an error before a page is ever tracked.
+        if self.order >= u64::BITS as u8 {
+            return u64::MAX;
+        }
         1u64 << self.order
     }
 
     /// Returns the size in bytes of this balloon page.
     pub fn size_bytes(&self) -> u64 {
-        self.base_pages() * PAGE_SIZE
+        // SECURITY: saturate the multiply so an out-of-range `order`
+        // cannot overflow the byte count under overflow-checks.
+        self.base_pages().saturating_mul(PAGE_SIZE)
     }
 }
 
@@ -406,6 +416,13 @@ impl BalloonManager {
         if self.state == BalloonState::Error {
             return Err(Error::IoError);
         }
+        // SECURITY: `order` is host/caller-controlled. A `base_pages()` /
+        // `size_bytes()` computed from a stored page does `1u64 << order`;
+        // reject any order that does not fit a u64 shift up front so no
+        // out-of-range order is ever recorded (all legal orders 0..=63 pass).
+        if order >= u64::BITS as u8 {
+            return Err(Error::InvalidArgument);
+        }
         if pfns.is_empty() {
             return Ok(0);
         }
@@ -469,6 +486,11 @@ impl BalloonManager {
         if self.state == BalloonState::Error {
             return Err(Error::IoError);
         }
+        // SECURITY: reject an out-of-range shift order before any page is
+        // tracked (mirrors `inflate`); all legal orders 0..=63 still pass.
+        if order >= u64::BITS as u8 {
+            return Err(Error::InvalidArgument);
+        }
         if count == 0 {
             return Ok(0);
         }
@@ -487,13 +509,21 @@ impl BalloonManager {
         let mut inflated = 0;
 
         for i in 0..to_process {
+            // SECURITY: `start_pfn + i` is caller-controlled and can wrap
+            // past u64::MAX. Use checked_add and stop the range at the
+            // overflow boundary instead of panicking under overflow-checks.
+            let pfn = match start_pfn.checked_add(i as u64) {
+                Some(p) => p,
+                None => break,
+            };
+
             let slot = match self.pages.iter_mut().find(|p| !p.active) {
                 Some(s) => s,
                 None => break,
             };
 
             *slot = BalloonPage {
-                pfn: start_pfn + i as u64,
+                pfn,
                 order,
                 state: BalloonPageState::Inflated,
                 active: true,

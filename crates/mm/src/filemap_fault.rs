@@ -470,7 +470,12 @@ impl FilemapFaultHandler {
     /// file offset and the file's EOF. Both are computed with `checked_add`
     /// so a crafted `vma_pgoff` cannot wrap and widen the window.
     fn speculation_limit(ctx: &FilemapFaultContext) -> u64 {
-        let vma_pages = (ctx.vma_end - ctx.vma_start) / PAGE_SIZE;
+        // SECURITY: a malformed context with `vma_end < vma_start` would
+        // underflow this subtraction and panic. `saturating_sub` clamps to
+        // 0, yielding a zero-page (empty) speculation window — the safe and
+        // correct bound. Well-formed VMAs (`vma_end >= vma_start`) compute
+        // the same value as before.
+        let vma_pages = ctx.vma_end.saturating_sub(ctx.vma_start) / PAGE_SIZE;
         let vma_end_pgoff = ctx.vma_pgoff.checked_add(vma_pages).unwrap_or(u64::MAX);
         vma_end_pgoff.min(ctx.file_pages)
     }

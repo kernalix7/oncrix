@@ -187,7 +187,10 @@ impl DeviceMirror {
 
     /// Mirrored memory in bytes.
     pub const fn mirrored_bytes(&self) -> u64 {
-        self.mirrored_pages * PAGE_SIZE
+        // SECURITY: `mirrored_pages` is accumulated from device-supplied
+        // range-fault counts; use saturating_mul so a large page count
+        // cannot wrap this diagnostic byte figure into a ring-0 panic.
+        self.mirrored_pages.saturating_mul(PAGE_SIZE)
     }
 }
 
@@ -321,8 +324,12 @@ impl HmmDeviceManager {
         for idx in 0..self.count {
             if self.mirrors[idx].mirror_id() == mirror_id && self.mirrors[idx].active() {
                 self.mirrors[idx].record_invalidation(pages);
-                self.stats.total_invalidations += 1;
-                self.stats.total_pages_invalidated += pages;
+                self.stats.total_invalidations = self.stats.total_invalidations.saturating_add(1);
+                // SECURITY: `pages` is device-supplied; accumulate this
+                // running stat with saturating_add so a malicious/buggy
+                // count cannot overflow the counter into a ring-0 panic.
+                self.stats.total_pages_invalidated =
+                    self.stats.total_pages_invalidated.saturating_add(pages);
                 return Ok(());
             }
         }
@@ -337,8 +344,12 @@ impl HmmDeviceManager {
         for idx in 0..self.count {
             if self.mirrors[idx].mirror_id() == mirror_id && self.mirrors[idx].active() {
                 self.mirrors[idx].record_range_fault(pages);
-                self.stats.total_range_faults += 1;
-                self.stats.total_pages_mirrored += pages;
+                self.stats.total_range_faults = self.stats.total_range_faults.saturating_add(1);
+                // SECURITY: `pages` is device-supplied; accumulate this
+                // running stat with saturating_add so repeated faults
+                // cannot overflow the counter into a ring-0 panic.
+                self.stats.total_pages_mirrored =
+                    self.stats.total_pages_mirrored.saturating_add(pages);
                 return Ok(());
             }
         }
