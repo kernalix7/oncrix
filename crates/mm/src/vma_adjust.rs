@@ -137,8 +137,15 @@ impl VmaRegion {
     }
 
     /// Return the size in bytes.
+    ///
+    /// Saturates rather than subtracting raw: there is no enforced
+    /// `end >= start` invariant on the public `set_start`/`set_end`
+    /// setters, so an inverted range must never panic in ring 0 under
+    /// `overflow-checks`. An inverted range yields a size of 0.
+    // SECURITY: saturating_sub guards against a poisoned/inverted VMA
+    // (e.g. set_start(x) with x > end) panicking the kernel.
     pub const fn size(&self) -> u64 {
-        self.end - self.start
+        self.end.saturating_sub(self.start)
     }
 
     /// Return the size in pages.
@@ -350,7 +357,10 @@ impl VmaAdjuster {
         if addr % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
         }
-        let end = addr + len;
+        // SECURITY: `addr` and `len` are attacker-influenced (mprotect args).
+        // A raw `addr + len` overflows -> ring-0 panic under overflow-checks
+        // (DoS). Bound the end via checked_add and reject on wrap.
+        let end = addr.checked_add(len).ok_or(Error::InvalidArgument)?;
         for idx in 0..self.count {
             if self.vmas[idx].is_active() && self.vmas[idx].overlaps(addr, end) {
                 self.vmas[idx].set_flags(new_flags);

@@ -37,11 +37,20 @@ use oncrix_lib::{Error, Result};
 // Constants
 // -------------------------------------------------------------------
 
-/// Standard page size (4 KiB).
-const PAGE_SIZE: usize = 4096;
-
 /// Maximum number of iovecs per call (matches Linux UIO_MAXIOV = 1024).
 const MAX_IOV_COUNT: usize = 1024;
+
+/// Minimum user-space virtual address (64 KiB null-deref guard zone).
+///
+/// Mirrors the sibling mm modules (`mmap_region.rs`, `mremap_grow.rs`).
+const MMAP_MIN_ADDR: u64 = 0x1_0000;
+
+/// User-space virtual address limit (canonical x86_64 lower half).
+///
+/// Any remote segment must lie entirely below this bound; addresses at or
+/// above it reference the kernel half and must never be accepted from an
+/// unprivileged caller. Mirrors the sibling mm modules.
+const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
 
 /// Maximum total bytes that can be transferred in one request.
 const MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
@@ -203,7 +212,10 @@ impl ProcessVmRequest {
     /// Compute the total bytes in all local iovecs.
     pub fn local_total_bytes(&self) -> usize {
         let mut total = 0usize;
-        for i in 0..self.local_iov_count {
+        // SECURITY: `local_iov_count` is `pub` and unbounded; clamp the loop
+        // to the fixed array capacity so a hostile count cannot index
+        // `local_iov` out of bounds even if this is called before validate().
+        for i in 0..self.local_iov_count.min(MAX_IOV_COUNT) {
             total = total.saturating_add(self.local_iov[i].len);
         }
         total
@@ -212,7 +224,9 @@ impl ProcessVmRequest {
     /// Compute the total bytes in all remote iovecs.
     pub fn remote_total_bytes(&self) -> usize {
         let mut total = 0usize;
-        for i in 0..self.remote_iov_count {
+        // SECURITY: `remote_iov_count` is `pub` and unbounded; clamp the loop
+        // to the fixed array capacity (see `local_total_bytes`).
+        for i in 0..self.remote_iov_count.min(MAX_IOV_COUNT) {
             total = total.saturating_add(self.remote_iov[i].len);
         }
         total
@@ -221,6 +235,15 @@ impl ProcessVmRequest {
     /// Validate the request structure.
     pub fn validate(&self) -> Result<()> {
         if self.local_iov_count == 0 || self.remote_iov_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: `local_iov_count` / `remote_iov_count` are `pub` and may
+        // be set directly (bypassing add_local_iov/add_remote_iov), so a
+        // hostile count > MAX_IOV_COUNT would index the fixed
+        // `[IoVec; MAX_IOV_COUNT]` arrays out of bounds in the byte-sum loops
+        // below and in `do_transfer`. Reject an over-large count BEFORE any
+        // loop walks the array.
+        if self.local_iov_count > MAX_IOV_COUNT || self.remote_iov_count > MAX_IOV_COUNT {
             return Err(Error::InvalidArgument);
         }
         if self.local_total_bytes() > MAX_TRANSFER_BYTES {
@@ -398,20 +421,35 @@ impl ProcessVmSubsystem {
     /// Check if `caller_pid` is permitted to access `remote_pid`.
     ///
     /// In a real kernel this would check `ptrace_may_access()`.
+    ///
+    // SECURITY INVARIANT: This routine MUST NOT return `Allowed` for a
+    // foreign process (`remote_pid != caller_pid`) until the syscall
+    // dispatcher threads an *authenticated* caller credential into this
+    // subsystem and performs a `ptrace_may_access`-equivalent check —
+    // i.e. the caller's real/effective UID matches the target's, OR the
+    // caller holds `CAP_SYS_PTRACE`, subject to the active Yama
+    // `ptrace_scope` policy and the target not being a privileged/zombie
+    // task. Because no per-process credential is wired here, this routine
+    // FAILS CLOSED: only self-access is permitted. Returning `Allowed`
+    // for an arbitrary `(caller, remote)` pair would let any process read
+    // or write any other process's address space (full escalation), which
+    // is exactly the bug this guard replaces. Do NOT relax this to
+    // allow-all and do NOT synthesize a fake credential; wire the real
+    // authenticated cred at the dispatcher and check it here instead.
     pub fn check_access(&self, caller_pid: u32, remote_pid: u32) -> AccessCheck {
+        // PID 0 is invalid / the idle task — never a valid target.
+        if remote_pid == 0 {
+            return AccessCheck::NoSuchProcess;
+        }
         // A process may always access itself.
         if caller_pid == remote_pid {
             return AccessCheck::Allowed;
         }
-        // PID 0 is invalid.
-        if remote_pid == 0 {
-            return AccessCheck::NoSuchProcess;
-        }
-        // Placeholder policy: process 1 (init) can access anyone;
-        // other processes require explicit capability (always allowed
-        // here for simulation purposes).
-        let _ = caller_pid;
-        AccessCheck::Allowed
+        // SECURITY: fail closed for every foreign process. `caller_pid` is
+        // retained (not discarded) so that, once credentials are threaded
+        // through, the ptrace_may_access-equivalent decision can be made
+        // here. Until then, deny.
+        AccessCheck::Denied
     }
 
     /// Execute a `process_vm_readv` request.
@@ -484,7 +522,15 @@ impl ProcessVmSubsystem {
         // Simulate segment-by-segment transfer.
         // In a full implementation each remote iovec segment would be
         // resolved to physical pages via GUP, then data copied.
-        let seg_count = req.remote_iov_count.min(req.local_iov_count);
+        //
+        // SECURITY: clamp the loop bound to the fixed array capacity in
+        // addition to the iovec counts, so a hostile `*_iov_count` that
+        // somehow reached here (e.g. caller skipped `validate`) cannot
+        // index `remote_iov` / `local_iov` out of bounds.
+        let seg_count = req
+            .remote_iov_count
+            .min(req.local_iov_count)
+            .min(MAX_IOV_COUNT);
         for i in 0..seg_count {
             let remote = req.remote_iov[i];
             let local = req.local_iov[i];
@@ -492,10 +538,29 @@ impl ProcessVmSubsystem {
                 result.record_segment(remote.base, 0, true);
                 continue;
             }
-            // Check alignment and page boundaries.
-            let remote_page = remote.base / PAGE_SIZE as u64;
             let bytes = remote.len.min(local.len);
-            let ok = remote_page > 0 && bytes > 0;
+            // SECURITY: bound the remote segment to the user address window
+            // before it is treated as a target VA. The previous check only
+            // required `remote_page > 0`, which accepted any kernel-half or
+            // unmapped address and would yield an OOB read/write of kernel or
+            // physical memory. Require:
+            //   * base >= MMAP_MIN_ADDR  (keep the null-deref / zero-page guard)
+            //   * base + bytes does not wrap (checked_add is Some)
+            //   * base + bytes <= USER_ADDR_LIMIT (stay in the user half)
+            //
+            // SECURITY: this is the *floor*, not the full check. A complete
+            // implementation MUST additionally walk the target process's VMAs
+            // to confirm the segment is mapped and that the requested
+            // direction (read vs. write) is permitted by the VMA protection
+            // bits before any byte is copied. Until that walk is reachable,
+            // the user-range bound here plus the fail-closed permission check
+            // in `check_access` are the security floor.
+            let in_user_window = remote.base >= MMAP_MIN_ADDR
+                && remote
+                    .base
+                    .checked_add(bytes as u64)
+                    .is_some_and(|end| end <= USER_ADDR_LIMIT);
+            let ok = in_user_window && bytes > 0;
             result.record_segment(remote.base, if ok { bytes } else { 0 }, ok);
         }
         result

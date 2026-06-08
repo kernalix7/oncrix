@@ -523,6 +523,18 @@ impl DamonVaddrOps {
 
                 // Split at midpoint (page-aligned).
                 let mid = target.ranges[i].start + (pages / 2) * PAGE_SIZE;
+                // SECURITY: guard the midpoint BEFORE mutating the live range.
+                // For a 1-page range, pages / 2 == 0 so mid == start, and the
+                // truncation below would zero the current range (start == end)
+                // while the upper-half insert covers the whole range — an empty
+                // active range that breaks the start < end invariant every
+                // size()/nr_pages() caller assumes. Skip any split that would
+                // not yield two non-empty halves. Defends against a config
+                // whose max_region_pages slipped past validation as well.
+                if mid <= target.ranges[i].start || mid >= target.ranges[i].end {
+                    i += 1;
+                    continue;
+                }
                 let old_end = target.ranges[i].end;
                 target.ranges[i].end = mid;
 
@@ -620,8 +632,25 @@ impl DamonVaddrOps {
     }
 
     /// Updates the backend configuration.
-    pub fn set_config(&mut self, config: DamonOpsConfig) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `max_region_pages` is zero or
+    /// less than `min_region_pages`.
+    pub fn set_config(&mut self, config: DamonOpsConfig) -> Result<()> {
+        // SECURITY: DamonOpsConfig's fields are public, so a caller can bypass
+        // the Default values and hand us max_region_pages == 0. split_large_
+        // regions splits any range whose page count exceeds max_region_pages;
+        // a zero threshold would mark every range (down to a single page) as
+        // over-size and drive degenerate splits, and a 1-page split computes
+        // mid == start, producing an empty active range. Reject a zero or
+        // inverted (max < min) page bound here so the splitter always has a
+        // sane threshold.
+        if config.max_region_pages == 0 || config.max_region_pages < config.min_region_pages {
+            return Err(Error::InvalidArgument);
+        }
         self.config = config;
+        Ok(())
     }
 
     /// Returns backend statistics.
@@ -731,8 +760,28 @@ impl DamonPaddrOps {
         if index >= self.range_count || !self.ranges[index].active {
             return Err(Error::InvalidArgument);
         }
-        self.ranges[index].active = false;
-        self.range_count = self.range_count.saturating_sub(1);
+        // SECURITY: compacting removal keeps the [0, range_count) prefix dense.
+        // add_range writes the next entry at idx == range_count, so a sparse
+        // array (deactivating a middle slot and only decrementing the count)
+        // lets a later add_range overwrite a still-live range at a lower index,
+        // clobbering its access_counts/ages and silently dropping a monitored
+        // range (OOB-by-aliasing within the fixed arrays). Swap the last active
+        // tail and decrement, so every active range stays in the dense prefix.
+        // Shift the tail down by one (order-preserving) rather than swapping the
+        // last entry in: merge_similar_regions and the sampling passes assume
+        // the active prefix stays sorted by ascending start address, so a
+        // swap-in would let a higher-address range sit at a lower index and
+        // defeat adjacent-range merging.
+        for i in index..self.range_count - 1 {
+            self.ranges[i] = self.ranges[i + 1];
+            self.access_counts[i] = self.access_counts[i + 1];
+            self.ages[i] = self.ages[i + 1];
+        }
+        let last = self.range_count - 1;
+        self.ranges[last] = DamonAddrRange::empty();
+        self.access_counts[last] = 0;
+        self.ages[last] = 0;
+        self.range_count -= 1;
         Ok(())
     }
 

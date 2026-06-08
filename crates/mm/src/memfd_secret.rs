@@ -422,7 +422,11 @@ impl SecretMemManager {
 
         let slot_idx = self.find_free_fd_slot().ok_or(Error::OutOfMemory)?;
         let fd = self.next_fd;
-        self.next_fd += 1;
+        // SECURITY: non-wrapping `+= 1` panics in ring 0 at u32::MAX
+        // (overflow-checks on) after enough create/destroy cycles, a
+        // remotely reachable DoS. Wrap like memfd.rs; uniqueness among
+        // *live* fds is still guaranteed by `find_fd_index`.
+        self.next_fd = self.next_fd.wrapping_add(1);
 
         self.fds[slot_idx] = SecretFd {
             fd,
@@ -449,11 +453,17 @@ impl SecretMemManager {
     /// Pages are reserved but not yet mapped. The fd transitions to
     /// the `Sized` state.
     ///
+    /// Calling this again on an already-`Sized` fd is idempotent: only
+    /// the page-count delta is accounted, so quotas are never
+    /// double-counted.
+    ///
     /// # Errors
     ///
     /// - [`Error::NotFound`] if `fd` is not registered.
     /// - [`Error::InvalidArgument`] if `size_bytes` is zero or not
     ///   page-aligned.
+    /// - [`Error::Busy`] if the fd is already mapped (or closing) and
+    ///   can no longer be resized.
     /// - [`Error::OutOfMemory`] if the per-fd, per-process, or
     ///   system-wide page limit would be exceeded.
     pub fn set_size(&mut self, fd: u32, size_bytes: usize) -> Result<()> {
@@ -465,32 +475,77 @@ impl SecretMemManager {
         if page_count > MAX_PAGES_PER_FD {
             return Err(Error::OutOfMemory);
         }
-        if self.total_pages + page_count > MAX_TOTAL_SECRET_PAGES {
-            return Err(Error::OutOfMemory);
-        }
 
         let idx = self.find_fd_index(fd)?;
         let owner = self.fds[idx].owner_pid;
 
-        // Per-process quota check.
-        let proc_pages = self.pages_for_process(owner);
-        if proc_pages + page_count > MAX_PAGES_PER_PROCESS {
-            return Err(Error::OutOfMemory);
+        // SECURITY: only an unsized (`Open`) or already-sized (`Sized`)
+        // fd may be resized. Once pages are `Mapped` (or `Closing`),
+        // their PFNs and direct-map tracker entries are live; resizing
+        // would orphan those entries and leak secret pages, so reject.
+        match self.fds[idx].state {
+            SecretFdState::Open | SecretFdState::Sized => {}
+            _ => return Err(Error::Busy),
+        }
+
+        // SECURITY: previously `set_size` unconditionally added
+        // `page_count` to the per-fd / per-process / system quotas and
+        // re-marked pages on EVERY call. A second `ftruncate` therefore
+        // double-counted the quota (overflowing `total_pages` toward a
+        // checked-arithmetic panic) and corrupted page state. Make the
+        // operation idempotent by accounting only the DELTA versus the
+        // fd's current page count, with checked arithmetic throughout.
+        let old_count = self.fds[idx].page_count;
+
+        // Quota checks are evaluated against the *new* totals using the
+        // signed delta; checked arithmetic guards every step.
+        if page_count > old_count {
+            let delta = page_count - old_count;
+
+            // System-wide quota (checked, no wrap/panic).
+            let new_total = self
+                .total_pages
+                .checked_add(delta)
+                .ok_or(Error::OutOfMemory)?;
+            if new_total > MAX_TOTAL_SECRET_PAGES {
+                return Err(Error::OutOfMemory);
+            }
+
+            // Per-process quota. `pages_for_process` already includes
+            // this fd's `old_count`, so add only the delta.
+            let proc_new = self
+                .pages_for_process(owner)
+                .checked_add(delta)
+                .ok_or(Error::OutOfMemory)?;
+            if proc_new > MAX_PAGES_PER_PROCESS {
+                return Err(Error::OutOfMemory);
+            }
+
+            // Newly reserved pages enter the `Allocated` state.
+            for page in &mut self.pages[idx][old_count..page_count] {
+                page.state = SecretPageState::Allocated;
+            }
+
+            self.total_pages = new_total;
+            self.info.pages_allocated = self.info.pages_allocated.saturating_add(delta as u64);
+        } else if page_count < old_count {
+            // Shrink: release the trailing reserved pages. These are in
+            // `Allocated` state (state guard above forbids `Mapped`), so
+            // no direct-map restoration is required.
+            let delta = old_count - page_count;
+            for page in &mut self.pages[idx][page_count..old_count] {
+                *page = SecretPage::empty();
+            }
+            self.total_pages = self.total_pages.saturating_sub(delta);
+            self.info.pages_freed = self.info.pages_freed.saturating_add(delta as u64);
         }
 
         self.fds[idx].page_count = page_count;
         self.fds[idx].size_bytes = size_bytes;
         self.fds[idx].state = SecretFdState::Sized;
 
-        // Mark pages as allocated.
-        for page in &mut self.pages[idx][..page_count] {
-            page.state = SecretPageState::Allocated;
-        }
-
-        self.total_pages += page_count;
         self.info.total_pages = self.total_pages;
-        self.info.total_bytes = self.total_pages * PAGE_SIZE;
-        self.info.pages_allocated += page_count as u64;
+        self.info.total_bytes = self.total_pages.saturating_mul(PAGE_SIZE);
 
         Ok(())
     }
@@ -815,20 +870,28 @@ impl SecretMemManager {
         write: bool,
         pfn_for_page: &dyn Fn(usize) -> u64,
     ) -> SecretFaultResult {
-        // Scan fds to find one that covers the faulting address.
-        // The virtual address range for fd index `idx` is
-        // simulated as [idx * MAX_PAGES_PER_FD * PAGE_SIZE, ...).
-        // In a real kernel, the VMA would provide this mapping.
-        // Here we search page arrays for a matching PFN or by
-        // page-index heuristic.
+        // SECURITY: there is no real VMA lookup wired here, so the
+        // faulting fd cannot be authenticated against the faulter's
+        // address space. The previous implementation scanned ALL fds
+        // and, for any non-exclusive fd, resolved the page purely from
+        // the attacker-controlled `vaddr` (`page_offset = vaddr /
+        // PAGE_SIZE`) and would lazily allocate + remove-from-direct-map
+        // a page. That let an unrelated process B fault in and map
+        // process A's non-exclusive secret pages, defeating the entire
+        // purpose of secret memory.
+        //
+        // FAIL CLOSED until a per-VMA lookup exists: only serve a fault
+        // for an fd the faulting process actually OWNS (`owner_pid ==
+        // pid`). The dispatcher MUST eventually thread the faulting
+        // VMA / authenticated owner so a shared (fd-passed) secret fd
+        // can be faulted by a legitimately-mapped non-owner; do NOT
+        // relax this to an allow-all scan.
         let _ = write; // reserved for future CoW support
+
+        let mut denied = false;
 
         for (idx, fd_slot) in self.fds.iter().enumerate() {
             if fd_slot.is_inactive() {
-                continue;
-            }
-            // Check ownership for exclusive fds.
-            if fd_slot.flags & secret_mem_flags::EXCLUSIVE != 0 && fd_slot.owner_pid != pid {
                 continue;
             }
 
@@ -837,12 +900,24 @@ impl SecretMemManager {
                 continue;
             }
 
-            // Convert vaddr to a page offset.  In a real kernel
-            // the VMA start would be used; here we check if vaddr
-            // is page-aligned and within the fd's page count as
-            // a simplified model.
+            // Convert vaddr to a page offset. In a real kernel the VMA
+            // start would be used; here we check if vaddr maps within
+            // the fd's page count as a simplified model. The index is
+            // bounded against `count` before it touches the fixed page
+            // array, so an out-of-range `vaddr` cannot OOB-index.
             let page_offset = (vaddr as usize) / PAGE_SIZE;
             if page_offset >= count {
+                continue;
+            }
+
+            // SECURITY: ownership gate. Without an authenticated VMA we
+            // refuse to serve (and especially to lazily map) any fd not
+            // owned by the faulter. This also subsumes the EXCLUSIVE
+            // flag — a non-owner is denied regardless. Record the denial
+            // but keep scanning so a *different*, owned fd covering the
+            // same offset can still be served.
+            if fd_slot.owner_pid != pid {
+                denied = true;
                 continue;
             }
 
@@ -867,7 +942,7 @@ impl SecretMemManager {
                     };
                     // Register direct-map removal.
                     if self.direct_map_count < MAX_DIRECT_MAP_ENTRIES {
-                        self.generation += 1;
+                        self.generation = self.generation.wrapping_add(1);
                         let cur_gen = self.generation;
                         self.direct_map[self.direct_map_count] = DirectMapEntry {
                             pfn,
@@ -883,15 +958,8 @@ impl SecretMemManager {
             }
         }
 
-        // Check ownership denial separately (for non-exclusive
-        // fds we would have continued above).
-        for fd_slot in &self.fds {
-            if fd_slot.is_inactive() {
-                continue;
-            }
-            if fd_slot.flags & secret_mem_flags::EXCLUSIVE != 0 && fd_slot.owner_pid != pid {
-                return SecretFaultResult::Denied;
-            }
+        if denied {
+            return SecretFaultResult::Denied;
         }
 
         SecretFaultResult::NotSecret
