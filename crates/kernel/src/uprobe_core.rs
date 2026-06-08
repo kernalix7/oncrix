@@ -175,7 +175,10 @@ impl UprobeManager {
         }
         // Check for existing probe at same location, increment ref.
         if let Some(idx) = self.find_probe(inode, offset) {
-            self.probes[idx].refcount += 1;
+            self.probes[idx].refcount = self.probes[idx]
+                .refcount
+                .checked_add(1)
+                .ok_or(Error::OutOfMemory)?;
             return Ok(idx);
         }
         let slot = self

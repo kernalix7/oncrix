@@ -71,6 +71,9 @@ const CHACHA_BLOCK_SIZE: usize = 64;
 ///
 /// Advances `*pos` by 8, wrapping around the 256-byte pool.
 pub fn mix_u64(pool: &mut [u8], pos: &mut usize, val: u64) {
+    if pool.is_empty() {
+        return;
+    }
     let bytes = val.to_le_bytes();
     for &b in &bytes {
         pool[*pos % pool.len()] ^= b;
