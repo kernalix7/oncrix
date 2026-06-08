@@ -528,15 +528,18 @@ impl Default for TscDeadline {
 fn cpuid_ecx(leaf: u32, subleaf: u32) -> u32 {
     let ecx: u32;
     // SAFETY: CPUID is a read-only instruction available at all privilege
-    // levels. It never faults on supported leaves. rbx is preserved via
-    // push/pop because LLVM reserves it for internal use.
+    // levels. It never faults on supported leaves. RBX is preserved via the
+    // mov/xchg idiom: save rbx into a compiler-allocated tmp register before
+    // CPUID, then xchg restores rbx and places CPUID's EBX output into tmp.
+    // RSP is never touched, so options(nostack) is correct.
     unsafe {
         core::arch::asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
-            "pop rbx",
+            "xchg {tmp:r}, rbx",
             inout("eax") leaf => _,
             inout("ecx") subleaf => ecx,
+            tmp = out(reg) _,
             out("edx") _,
             options(nostack, nomem, preserves_flags),
         );
@@ -549,15 +552,18 @@ fn cpuid_ecx(leaf: u32, subleaf: u32) -> u32 {
 fn cpuid_edx(leaf: u32, subleaf: u32) -> u32 {
     let edx: u32;
     // SAFETY: CPUID is a read-only instruction available at all privilege
-    // levels. It never faults on supported leaves. rbx is preserved via
-    // push/pop because LLVM reserves it for internal use.
+    // levels. It never faults on supported leaves. RBX is preserved via the
+    // mov/xchg idiom: save rbx into a compiler-allocated tmp register before
+    // CPUID, then xchg restores rbx and places CPUID's EBX output into tmp.
+    // RSP is never touched, so options(nostack) is correct.
     unsafe {
         core::arch::asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
-            "pop rbx",
+            "xchg {tmp:r}, rbx",
             inout("eax") leaf => _,
             inout("ecx") subleaf => _,
+            tmp = out(reg) _,
             out("edx") edx,
             options(nostack, nomem, preserves_flags),
         );
@@ -573,17 +579,19 @@ fn cpuid_all(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let ecx: u32;
     let edx: u32;
     // SAFETY: CPUID is a read-only instruction available at all privilege
-    // levels. It never faults on supported leaves. rbx is saved to a
-    // temporary register (rsi) then restored because LLVM reserves rbx.
+    // levels. It never faults on supported leaves. RBX is preserved via the
+    // mov/xchg idiom: save rbx into a compiler-allocated tmp register before
+    // CPUID, then xchg swaps rbx back with the original value — rbx is
+    // restored and tmp holds CPUID's EBX output, which is captured into ebx.
+    // RSP is never touched, so options(nostack) is correct.
     unsafe {
         core::arch::asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
-            "mov {ebx_out:e}, ebx",
-            "pop rbx",
+            "xchg {tmp:r}, rbx",
             inout("eax") leaf => eax,
             inout("ecx") subleaf => ecx,
-            ebx_out = out(reg) ebx,
+            tmp = out(reg) ebx,
             out("edx") edx,
             options(nostack, nomem, preserves_flags),
         );
