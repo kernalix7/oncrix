@@ -256,8 +256,16 @@ impl Default for TssManager {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn load_tss_hw(selector: u16) {
     // SAFETY: Caller guarantees selector is a valid TSS descriptor.
+    // SECURITY: `nomem` is intentionally absent. LTR dereferences the GDT to read
+    // the TSS descriptor and writes the descriptor's busy bit — both are memory
+    // operations. Omitting `nomem` forces the compiler to treat this asm block as
+    // a memory barrier, ensuring all prior writes to the TSS and its GDT descriptor
+    // are visible to the CPU before the instruction executes. Including `nomem`
+    // would be incorrect and could allow the compiler to reorder or eliminate those
+    // stores, producing a silent use-before-write hardware fault. This matches the
+    // pattern used for other memory-dereferencing instructions (lidt, lgdt).
     unsafe {
-        core::arch::asm!("ltr {0:x}", in(reg) selector, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("ltr {0:x}", in(reg) selector, options(nostack, preserves_flags));
     }
 }
 

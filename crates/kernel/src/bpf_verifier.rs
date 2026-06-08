@@ -1053,7 +1053,20 @@ fn structural_check(prog: &[BpfInsn]) -> Result<(), VerifierError> {
                 reg: dst,
             });
         }
-        if insn.src() == BPF_X && src as usize >= NUM_REGS {
+        // SECURITY: bound the SRC register nibble UNCONDITIONALLY for every
+        // decoded instruction — do NOT gate it on `insn.src() == BPF_X`.
+        // `insn.src()` reads opcode bit 3 (0x08), which is the BPF_X source
+        // modifier ONLY for ALU/JMP classes. For the memory classes
+        // BPF_LDX / BPF_ST / BPF_STX that same bit is the LOW bit of the SIZE
+        // field (decoded by `access_width_from_opcode`): e.g. width-W
+        // (0x61/0x63) and width-B (0x71/0x73) have bit 3 clear, so `src()`
+        // reads 0 even though those ops carry a real source register in the
+        // high nibble of `regs`. Gating the bound on BPF_X therefore left the
+        // src nibble (range 0..15) unchecked for LDX/STX, and the state_track
+        // LDX/STX arms index `state.regs[src]` ([RegState; NUM_REGS]) directly
+        // — an out-of-range nibble (11..=15) is a ring-0 OOB. Reject it here,
+        // before any register-state index, regardless of opcode-bit aliasing.
+        if src as usize >= NUM_REGS {
             return Err(VerifierError::InvalidRegister {
                 insn_idx: i,
                 reg: src,
@@ -1371,6 +1384,22 @@ fn state_track(
                 BPF_LDX => {
                     let dst = insn.dst_reg() as usize;
                     let sr = insn.src_reg() as usize;
+                    // SECURITY (defence-in-depth): structural_check already
+                    // bounds dst/src for every instruction, but `sr` is the
+                    // raw 4-bit src nibble (0..15) and `state.regs` has only
+                    // NUM_REGS entries. Re-check here so the `state.regs[sr]`
+                    // indices below are provably in range regardless of any
+                    // opcode-bit aliasing in an earlier phase.
+                    if dst >= NUM_REGS || sr >= NUM_REGS {
+                        return Err(VerifierError::InvalidRegister {
+                            insn_idx: pc,
+                            reg: if dst >= NUM_REGS {
+                                insn.dst_reg()
+                            } else {
+                                insn.src_reg()
+                            },
+                        });
+                    }
                     // Source must be a pointer type.
                     if state.regs[sr].reg_type == RegType::NotInit {
                         return Err(VerifierError::UninitializedReg {
@@ -1411,6 +1440,22 @@ fn state_track(
                     // must be initialized.
                     let dst = insn.dst_reg() as usize;
                     let sr = insn.src_reg() as usize;
+                    // SECURITY (defence-in-depth): mirror the LDX arm. `dst`
+                    // and `sr` are raw 4-bit nibbles (0..15); `state.regs`
+                    // holds NUM_REGS entries. structural_check rejects
+                    // out-of-range registers up front, but re-check here so
+                    // every `state.regs[..]` index below is in range by
+                    // construction.
+                    if dst >= NUM_REGS || sr >= NUM_REGS {
+                        return Err(VerifierError::InvalidRegister {
+                            insn_idx: pc,
+                            reg: if dst >= NUM_REGS {
+                                insn.dst_reg()
+                            } else {
+                                insn.src_reg()
+                            },
+                        });
+                    }
                     match state.regs[dst].reg_type {
                         RegType::PtrToStack | RegType::PtrToCtx | RegType::PtrToMap => {}
                         RegType::NotInit => {
