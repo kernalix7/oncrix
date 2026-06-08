@@ -164,6 +164,9 @@ impl XaNode {
         if mark >= XA_MAX_MARKS {
             return None;
         }
+        if start >= XA_CHUNK_SIZE {
+            return None;
+        }
         let mask = self.marks[mark] >> start;
         if mask == 0 {
             return None;

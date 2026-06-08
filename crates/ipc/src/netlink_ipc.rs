@@ -273,7 +273,7 @@ impl NlAttr {
     /// Create a new attribute header.
     pub const fn new(attr_type: u16, value_len: u16) -> Self {
         Self {
-            nla_len: Self::HEADER_SIZE as u16 + value_len,
+            nla_len: (Self::HEADER_SIZE as u16).saturating_add(value_len),
             nla_type: attr_type,
         }
     }
@@ -852,6 +852,9 @@ where
             if value_end <= remaining.len() {
                 callback(&attr, &remaining[value_start..value_end]);
                 count += 1;
+            }
+            if aligned > remaining.len() {
+                break;
             }
             offset += aligned;
         } else {
