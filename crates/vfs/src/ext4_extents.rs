@@ -135,14 +135,28 @@ impl ExtentHeader {
             return Err(Error::InvalidArgument);
         }
         let magic = read_u16(buf, 0);
+        // SECURITY: reject any buffer whose magic does not match; all remaining
+        // fields are untrusted and must not be used without a valid magic.
         if magic != EXT4_EXT_MAGIC {
+            return Err(Error::InvalidArgument);
+        }
+        let entries = read_u16(buf, 2);
+        let max_entries = read_u16(buf, 4);
+        let depth = read_u16(buf, 6);
+        // SECURITY: reject on-disk headers where eh_entries > eh_max or
+        // eh_depth > MAX_DEPTH; a crafted image can set these to arbitrary
+        // values, causing OOB reads or unbounded tree walks.
+        if entries > max_entries {
+            return Err(Error::InvalidArgument);
+        }
+        if depth > MAX_DEPTH {
             return Err(Error::InvalidArgument);
         }
         Ok(Self {
             magic,
-            entries: read_u16(buf, 2),
-            max_entries: read_u16(buf, 4),
-            depth: read_u16(buf, 6),
+            entries,
+            max_entries,
+            depth,
             generation: read_u32(buf, 8),
         })
     }
@@ -240,13 +254,33 @@ impl Extent {
     }
 
     /// Last logical block covered by this extent (inclusive).
+    ///
+    /// Returns `self.logical_block` when `actual_length()` is 0 (zero-length
+    /// extents are degenerate; callers should reject them separately).
     pub fn last_logical_block(&self) -> u32 {
-        self.logical_block + self.actual_length() - 1
+        let len = self.actual_length();
+        if len == 0 {
+            // SECURITY: `logical_block + 0 - 1` would wrap to u32::MAX;
+            // return logical_block as a safe sentinel for zero-length extents.
+            return self.logical_block;
+        }
+        // SECURITY: `logical_block + len` could overflow when both fields come
+        // from untrusted on-disk data; use saturating_add so the result is
+        // bounded, then subtract 1 (safe because len > 0 so the saturated sum
+        // is at least logical_block + 1 >= 1).
+        self.logical_block.saturating_add(len).saturating_sub(1)
     }
 
     /// Whether a given logical block falls within this extent.
     pub fn contains_block(&self, block: u32) -> bool {
-        block >= self.logical_block && block < self.logical_block + self.actual_length()
+        // SECURITY: `self.logical_block + self.actual_length()` overflows when
+        // both come from untrusted on-disk data.  Rewrite as a subtraction:
+        // after the `block >= self.logical_block` guard, `block - logical_block`
+        // cannot underflow and we compare against `actual_length()` directly.
+        if self.actual_length() == 0 {
+            return false;
+        }
+        block >= self.logical_block && (block - self.logical_block) < self.actual_length()
     }
 
     /// Map a logical block to its physical block address.
@@ -263,8 +297,23 @@ impl Extent {
     /// Whether this extent can be merged with the given extent
     /// (contiguous in both logical and physical space).
     pub fn can_merge_with(&self, other: &Extent) -> bool {
-        let self_end_logical = self.logical_block + self.actual_length();
-        let self_end_physical = self.physical_block() + self.actual_length() as u64;
+        // SECURITY: `self.logical_block + self.actual_length()` overflows when
+        // both fields come from untrusted on-disk data.  Use checked_add and
+        // treat any overflow as non-mergeable (the extent is degenerate).
+        let self_end_logical = match self.logical_block.checked_add(self.actual_length()) {
+            Some(v) => v,
+            None => return false,
+        };
+        // SECURITY: same risk for the physical end address (u64, but physical_hi
+        // is only 16 bits so the real concern is actual_length cast to u64 which
+        // is safe, but check anyway for correctness).
+        let self_end_physical = match self
+            .physical_block()
+            .checked_add(self.actual_length() as u64)
+        {
+            Some(v) => v,
+            None => return false,
+        };
 
         self_end_logical == other.logical_block
             && self_end_physical == other.physical_block()
@@ -539,11 +588,22 @@ impl ExtentTree {
         }
 
         // Check for overlap with existing extents.
+        // SECURITY: `existing.logical_block + existing.actual_length()` and
+        // `extent.logical_block + extent.actual_length()` both overflow when
+        // the on-disk fields are crafted near u32::MAX.  Use checked_add and
+        // treat an overflowing end address as an unconditional overlap rejection
+        // (degenerate extents from a hostile image must not be accepted).
         for i in 0..self.extent_count {
             let existing = &self.extents[i];
-            if extent.logical_block < existing.logical_block + existing.actual_length()
-                && existing.logical_block < extent.logical_block + extent.actual_length()
-            {
+            let existing_end = existing
+                .logical_block
+                .checked_add(existing.actual_length())
+                .ok_or(Error::InvalidArgument)?;
+            let new_end = extent
+                .logical_block
+                .checked_add(extent.actual_length())
+                .ok_or(Error::InvalidArgument)?;
+            if extent.logical_block < existing_end && existing.logical_block < new_end {
                 return Err(Error::AlreadyExists);
             }
         }
@@ -771,7 +831,10 @@ impl ExtentTree {
         if self.block_size == 0 {
             return 0;
         }
-        (self.file_size + self.block_size - 1) / self.block_size
+        // SECURITY: `self.file_size + self.block_size - 1` overflows when
+        // file_size is near u64::MAX (e.g. a crafted inode i_size).
+        // Use the overflow-free formulation: `a/b + (a%b != 0) as u64`.
+        self.file_size / self.block_size + (self.file_size % self.block_size != 0) as u64
     }
 
     /// Number of holes (unmapped blocks) in the file.

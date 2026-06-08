@@ -506,7 +506,21 @@ pub fn inline_data_set(
     };
 
     let capacity = table.entries[idx].data.capacity();
-    let end = offset + buf.len();
+
+    // SECURITY: `offset` and `buf.len()` both derive from caller-supplied (and
+    // potentially on-disk) values.  A raw `offset + buf.len()` overflows `usize`
+    // when an attacker crafts a large offset, producing a small `end` that would
+    // bypass the `end > capacity` guard below and allow writes into arbitrary
+    // positions of the fixed-size arrays.  Use checked_add and reject on overflow.
+    let end = offset
+        .checked_add(buf.len())
+        .ok_or(Error::InvalidArgument)?;
+
+    // SECURITY: Also reject a non-zero-length write that starts beyond capacity
+    // so that the subsequent slice arithmetic cannot underflow.
+    if offset > capacity {
+        return Err(Error::InvalidArgument);
+    }
     if end > capacity {
         return Err(Error::InvalidArgument);
     }
