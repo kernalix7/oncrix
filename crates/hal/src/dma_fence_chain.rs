@@ -154,10 +154,18 @@ impl DmaFenceChain {
     /// # Errors
     ///
     /// - [`Error::OutOfMemory`] if the chain is full.
-    /// - [`Error::InvalidArgument`] if `seqno` is not strictly monotonically increasing.
+    /// - [`Error::InvalidArgument`] if `seqno` is not strictly monotonically
+    ///   increasing, equals [`INVALID_SEQNO`] (`u64::MAX`), or would cause the
+    ///   internal `next_seqno` counter to overflow.
     pub fn push(&mut self, fence_id: u32, seqno: u64) -> Result<()> {
         if self.count >= MAX_NODES_PER_CHAIN {
             return Err(Error::OutOfMemory);
+        }
+        // SECURITY: reject the sentinel value — INVALID_SEQNO (u64::MAX) is
+        // used to mark unused nodes; accepting it as a real seqno would corrupt
+        // chain state and, on the line `seqno + 1` below, would overflow u64.
+        if seqno == INVALID_SEQNO {
+            return Err(Error::InvalidArgument);
         }
         // Enforce monotonic seqno.
         if self.count > 0 {
@@ -169,7 +177,9 @@ impl DmaFenceChain {
         self.nodes[self.count] = ChainNode::with_fence(fence_id, seqno);
         self.count += 1;
         if seqno >= self.next_seqno {
-            self.next_seqno = seqno + 1;
+            // SECURITY: seqno < INVALID_SEQNO (checked above), so seqno + 1
+            // fits in u64 without overflow.  Use checked_add defensively.
+            self.next_seqno = seqno.checked_add(1).ok_or(Error::InvalidArgument)?;
         }
         Ok(())
     }

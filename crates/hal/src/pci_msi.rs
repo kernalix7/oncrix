@@ -159,28 +159,44 @@ impl MsiSetup {
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] if the device has no MSI capability.
+/// Returns [`Error::InvalidArgument`] if the capability pointer is too close
+/// to the end of the standard 256-byte config space to hold all MSI registers.
 pub fn pci_msi_enable<C: PciConfigAccess>(cfg: &C, bdf: u16, setup: &MsiSetup) -> Result<()> {
-    let cap = find_capability(cfg, bdf, PCI_CAP_ID_MSI).ok_or(Error::NotFound)?;
+    let cap_raw = find_capability(cfg, bdf, PCI_CAP_ID_MSI).ok_or(Error::NotFound)?;
+
+    // SECURITY: widen to u16 before all offset arithmetic so that a device
+    // advertising a cap pointer near 0xFF (e.g. 0xFC) cannot cause the u8
+    // addition to wrap back into the low config space and corrupt unintended
+    // registers.  The MSI capability needs cap+12 (64-bit) or cap+8 (32-bit)
+    // as its last register; reject any pointer that would exceed the 256-byte
+    // standard PCI config window.
+    let cap = cap_raw as u16;
+    if cap + 12 > 0xFF {
+        return Err(Error::InvalidArgument);
+    }
 
     // Read Message Control.
-    let ctrl = cfg.read_u16(bdf, cap + 2);
+    // SAFETY: cap + 2 <= 0xFF (validated above) so the offset is within the
+    // standard config space.
+    let ctrl = cfg.read_u16(bdf, (cap + 2) as u8);
     let is_64bit = ctrl & MSI_CTRL_64BIT != 0;
 
     let addr_lo = setup.message_address();
     let data = setup.message_data();
 
     // Write address and data.
-    cfg.write_u32(bdf, cap + 4, addr_lo);
+    // All offsets (cap+4, cap+8, cap+12) are within 0xFF (validated above).
+    cfg.write_u32(bdf, (cap + 4) as u8, addr_lo);
     if is_64bit {
-        cfg.write_u32(bdf, cap + 8, 0); // addr_hi = 0 (below 4 GiB)
-        cfg.write_u16(bdf, cap + 12, data);
+        cfg.write_u32(bdf, (cap + 8) as u8, 0); // addr_hi = 0 (below 4 GiB)
+        cfg.write_u16(bdf, (cap + 12) as u8, data);
     } else {
-        cfg.write_u16(bdf, cap + 8, data);
+        cfg.write_u16(bdf, (cap + 8) as u8, data);
     }
 
     // Enable MSI (clear multi-message enable to 1 vector, set enable bit).
     let new_ctrl = (ctrl & !0x0070) | MSI_CTRL_ENABLE;
-    cfg.write_u16(bdf, cap + 2, new_ctrl);
+    cfg.write_u16(bdf, (cap + 2) as u8, new_ctrl);
     Ok(())
 }
 
@@ -188,9 +204,15 @@ pub fn pci_msi_enable<C: PciConfigAccess>(cfg: &C, bdf: u16, setup: &MsiSetup) -
 ///
 /// Clears the enable bit in Message Control.
 pub fn pci_msi_disable<C: PciConfigAccess>(cfg: &C, bdf: u16) {
-    if let Some(cap) = find_capability(cfg, bdf, PCI_CAP_ID_MSI) {
-        let ctrl = cfg.read_u16(bdf, cap + 2);
-        cfg.write_u16(bdf, cap + 2, ctrl & !MSI_CTRL_ENABLE);
+    if let Some(cap_raw) = find_capability(cfg, bdf, PCI_CAP_ID_MSI) {
+        // SECURITY: widen to u16 to prevent u8 wrap; Message Control is at
+        // cap+2; silently ignore a malformed pointer that would overflow.
+        let cap = cap_raw as u16;
+        if cap + 2 > 0xFF {
+            return;
+        }
+        let ctrl = cfg.read_u16(bdf, (cap + 2) as u8);
+        cfg.write_u16(bdf, (cap + 2) as u8, ctrl & !MSI_CTRL_ENABLE);
     }
 }
 
@@ -252,20 +274,37 @@ pub fn pci_msix_enable<C: PciConfigAccess>(
     if vectors.is_empty() {
         return Err(Error::InvalidArgument);
     }
-    let cap = find_capability(cfg, bdf, PCI_CAP_ID_MSIX).ok_or(Error::NotFound)?;
+    let cap_raw = find_capability(cfg, bdf, PCI_CAP_ID_MSIX).ok_or(Error::NotFound)?;
 
-    let ctrl = cfg.read_u16(bdf, cap + 2);
+    // SECURITY: widen to u16; MSI-X Message Control lives at cap+2.
+    // Reject a cap pointer that would place it beyond the config window.
+    let cap = cap_raw as u16;
+    if cap + 2 > 0xFF {
+        return Err(Error::InvalidArgument);
+    }
+
+    let ctrl = cfg.read_u16(bdf, (cap + 2) as u8);
     let table_size = (ctrl & MSIX_CTRL_TABLE_SIZE) as usize + 1;
     if vectors.len() > table_size || vectors.len() > MSIX_MAX_TRACKED {
         return Err(Error::InvalidArgument);
     }
 
     // Set Function Mask to avoid spurious interrupts during programming.
-    cfg.write_u16(bdf, cap + 2, ctrl | MSIX_CTRL_FUNC_MASK);
+    cfg.write_u16(bdf, (cap + 2) as u8, ctrl | MSIX_CTRL_FUNC_MASK);
 
     for (i, v) in vectors.iter().enumerate() {
-        let base = table_vaddr + (i * MSIX_ENTRY_SIZE) as u64;
+        // SECURITY: i < vectors.len() <= table_size <= MSIX_MAX_TRACKED (64),
+        // so i * MSIX_ENTRY_SIZE <= 63 * 16 = 1008, well within usize range.
+        // Use checked_mul to be explicit; treat overflow as a logic error.
+        let entry_offset = i
+            .checked_mul(MSIX_ENTRY_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        let base = table_vaddr
+            .checked_add(entry_offset as u64)
+            .ok_or(Error::InvalidArgument)?;
         // SAFETY: table_vaddr is a caller-mapped MMIO region of the MSI-X table.
+        // base is within the table because i < vectors.len() <= table_size and
+        // entry_offset was bounds-checked above.
         unsafe {
             core::ptr::write_volatile(base as *mut u32, v.addr_lo());
             core::ptr::write_volatile((base + 4) as *mut u32, 0u32);
@@ -277,15 +316,20 @@ pub fn pci_msix_enable<C: PciConfigAccess>(
 
     // Clear Function Mask, set MSI-X Enable.
     let new_ctrl = (ctrl & !MSIX_CTRL_FUNC_MASK) | MSIX_CTRL_ENABLE;
-    cfg.write_u16(bdf, cap + 2, new_ctrl);
+    cfg.write_u16(bdf, (cap + 2) as u8, new_ctrl);
     Ok(())
 }
 
 /// Disable MSI-X on a PCI device.
 pub fn pci_msix_disable<C: PciConfigAccess>(cfg: &C, bdf: u16) {
-    if let Some(cap) = find_capability(cfg, bdf, PCI_CAP_ID_MSIX) {
-        let ctrl = cfg.read_u16(bdf, cap + 2);
-        cfg.write_u16(bdf, cap + 2, ctrl & !MSIX_CTRL_ENABLE);
+    if let Some(cap_raw) = find_capability(cfg, bdf, PCI_CAP_ID_MSIX) {
+        // SECURITY: widen to u16; silently ignore a malformed cap pointer.
+        let cap = cap_raw as u16;
+        if cap + 2 > 0xFF {
+            return;
+        }
+        let ctrl = cfg.read_u16(bdf, (cap + 2) as u8);
+        cfg.write_u16(bdf, (cap + 2) as u8, ctrl & !MSIX_CTRL_ENABLE);
     }
 }
 
@@ -295,9 +339,27 @@ pub fn pci_msix_disable<C: PciConfigAccess>(cfg: &C, bdf: u16) {
 ///
 /// `table_vaddr` must be the virtual address of the mapped MSI-X table.
 /// `entry` must be < the table size.
+///
+/// On an out-of-range `entry` whose offset arithmetic overflows `usize` (a
+/// precondition violation) the write is skipped rather than performed; the
+/// function never panics. Callers should prefer
+/// [`pci_msix_mask_vector_checked`].
 pub unsafe fn pci_msix_mask_vector(table_vaddr: u64, entry: usize) {
-    let ctrl_addr = table_vaddr + (entry * MSIX_ENTRY_SIZE + 12) as u64;
-    // SAFETY: Caller guarantees valid MMIO table address and entry bounds.
+    // SECURITY: use checked arithmetic so a device-supplied entry index cannot
+    // wrap the usize multiply and land the MMIO write at an arbitrary address.
+    // On overflow (a caller violating the `entry < table size` precondition)
+    // skip the write rather than panic in ring 0.
+    let Some(offset) = entry
+        .checked_mul(MSIX_ENTRY_SIZE)
+        .and_then(|o| o.checked_add(12))
+    else {
+        return;
+    };
+    let Some(ctrl_addr) = table_vaddr.checked_add(offset as u64) else {
+        return;
+    };
+    // SAFETY: Caller guarantees valid MMIO table address and entry bounds;
+    // offset arithmetic was verified not to overflow above.
     unsafe {
         let v = core::ptr::read_volatile(ctrl_addr as *const u32);
         core::ptr::write_volatile(ctrl_addr as *mut u32, v | MSIX_VEC_MASKED);
@@ -308,10 +370,23 @@ pub unsafe fn pci_msix_mask_vector(table_vaddr: u64, entry: usize) {
 ///
 /// # Safety
 ///
-/// Same as [`pci_msix_mask_vector`].
+/// Same as [`pci_msix_mask_vector`]: an `entry` whose offset arithmetic
+/// overflows `usize` skips the write rather than panicking. Callers should
+/// prefer [`pci_msix_unmask_vector_checked`].
 pub unsafe fn pci_msix_unmask_vector(table_vaddr: u64, entry: usize) {
-    let ctrl_addr = table_vaddr + (entry * MSIX_ENTRY_SIZE + 12) as u64;
-    // SAFETY: Caller guarantees valid MMIO table address and entry bounds.
+    // SECURITY: same overflow guard as pci_msix_mask_vector — skip the write
+    // on overflow rather than panic in ring 0.
+    let Some(offset) = entry
+        .checked_mul(MSIX_ENTRY_SIZE)
+        .and_then(|o| o.checked_add(12))
+    else {
+        return;
+    };
+    let Some(ctrl_addr) = table_vaddr.checked_add(offset as u64) else {
+        return;
+    };
+    // SAFETY: Caller guarantees valid MMIO table address and entry bounds;
+    // offset arithmetic was verified not to overflow above.
     unsafe {
         let v = core::ptr::read_volatile(ctrl_addr as *const u32);
         core::ptr::write_volatile(ctrl_addr as *mut u32, v & !MSIX_VEC_MASKED);

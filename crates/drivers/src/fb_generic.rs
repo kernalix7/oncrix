@@ -151,8 +151,18 @@ pub struct FbGenericInfo {
 
 impl FbGenericInfo {
     /// Return the total framebuffer size in bytes.
-    pub fn size_bytes(&self) -> u64 {
-        self.stride as u64 * self.height as u64
+    ///
+    /// Returns `Err(InvalidArgument)` if `stride * height` overflows `u64` or if `stride`
+    /// is zero (a degenerate mode where every pixel maps to the same address).
+    // SECURITY: firmware/GOP may supply crafted stride and height values; reject zero stride
+    // (degenerate — all pixels alias offset 0, masking OOB writes) and overflow.
+    pub fn size_bytes(&self) -> Result<u64> {
+        if self.stride == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        (self.stride as u64)
+            .checked_mul(self.height as u64)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Return true if the given (x, y) pixel coordinate is within bounds.
@@ -161,8 +171,21 @@ impl FbGenericInfo {
     }
 
     /// Compute the byte offset of pixel `(x, y)`.
-    pub fn pixel_offset(&self, x: u32, y: u32) -> u64 {
-        y as u64 * self.stride as u64 + x as u64 * self.format.bytes_per_pixel() as u64
+    ///
+    /// Returns `Err(InvalidArgument)` on arithmetic overflow or if `(x, y)` is out of bounds.
+    // SECURITY: y*stride and x*bpp are independent u64 products that can overflow for
+    // firmware-supplied stride values even when x < width and y < height.
+    pub fn pixel_offset(&self, x: u32, y: u32) -> Result<u64> {
+        if !self.in_bounds(x, y) {
+            return Err(Error::InvalidArgument);
+        }
+        let row = (y as u64)
+            .checked_mul(self.stride as u64)
+            .ok_or(Error::InvalidArgument)?;
+        let col = (x as u64)
+            .checked_mul(self.format.bytes_per_pixel() as u64)
+            .ok_or(Error::InvalidArgument)?;
+        row.checked_add(col).ok_or(Error::InvalidArgument)
     }
 }
 
@@ -189,13 +212,19 @@ impl FbGeneric {
 
     /// Write a single pixel at `(x, y)` with the given `color`.
     pub fn write_pixel(&self, x: u32, y: u32, color: Color) -> Result<()> {
-        if !self.info.in_bounds(x, y) {
-            return Err(Error::InvalidArgument);
-        }
-        let offset = self.info.pixel_offset(x, y);
+        // pixel_offset checks in_bounds internally and returns Err on overflow.
+        let offset = self.info.pixel_offset(x, y)?;
         let encoded = color.encode(self.info.format);
-        // SAFETY: `offset` is within the mapped framebuffer region.
-        unsafe { self.write_encoded(self.info.base + offset, encoded) };
+        // SECURITY: base + offset must not overflow u64; pixel_offset guarantees offset is within
+        // the framebuffer region for valid (x, y), so the add cannot overflow for sane base
+        // addresses.  Use checked_add to remain defensive.
+        let addr = self
+            .info
+            .base
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)?;
+        // SAFETY: `addr` is within the mapped framebuffer region (bounds-checked via pixel_offset).
+        unsafe { self.write_encoded(addr, encoded) };
         Ok(())
     }
 
@@ -206,9 +235,16 @@ impl FbGeneric {
         let encoded = color.encode(self.info.format);
         for y in y0..y1 {
             for x in x0..x1 {
-                let off = self.info.pixel_offset(x, y);
-                // SAFETY: x and y are bounded by display dimensions.
-                unsafe { self.write_encoded(self.info.base + off, encoded) };
+                // pixel_offset checks in_bounds and returns Err on overflow.
+                let off = self.info.pixel_offset(x, y)?;
+                let addr = self
+                    .info
+                    .base
+                    .checked_add(off)
+                    .ok_or(Error::InvalidArgument)?;
+                // SAFETY: x and y are bounded by display dimensions; addr is within the mapped
+                // framebuffer region.
+                unsafe { self.write_encoded(addr, encoded) };
             }
         }
         Ok(())
@@ -227,9 +263,14 @@ impl FbGeneric {
         let x1 = x0.saturating_add(len).min(self.info.width);
         let encoded = color.encode(self.info.format);
         for x in x0..x1 {
-            let off = self.info.pixel_offset(x, y);
-            // SAFETY: x and y are within display bounds.
-            unsafe { self.write_encoded(self.info.base + off, encoded) };
+            let off = self.info.pixel_offset(x, y)?;
+            let addr = self
+                .info
+                .base
+                .checked_add(off)
+                .ok_or(Error::InvalidArgument)?;
+            // SAFETY: x and y are within display bounds; addr is within the mapped framebuffer.
+            unsafe { self.write_encoded(addr, encoded) };
         }
         Ok(())
     }
@@ -242,9 +283,14 @@ impl FbGeneric {
         let y1 = y0.saturating_add(len).min(self.info.height);
         let encoded = color.encode(self.info.format);
         for y in y0..y1 {
-            let off = self.info.pixel_offset(x, y);
-            // SAFETY: x and y are within display bounds.
-            unsafe { self.write_encoded(self.info.base + off, encoded) };
+            let off = self.info.pixel_offset(x, y)?;
+            let addr = self
+                .info
+                .base
+                .checked_add(off)
+                .ok_or(Error::InvalidArgument)?;
+            // SAFETY: x and y are within display bounds; addr is within the mapped framebuffer.
+            unsafe { self.write_encoded(addr, encoded) };
         }
         Ok(())
     }
@@ -252,6 +298,7 @@ impl FbGeneric {
     /// Copy `src_fb` content to `self` (front-buffer blit from back buffer).
     ///
     /// Both framebuffers must have identical dimensions and format.
+    /// Returns `Err(InvalidArgument)` if dimensions mismatch or if the byte count overflows.
     pub fn blit_from(&self, src: &FbGeneric) -> Result<()> {
         if self.info.width != src.info.width
             || self.info.height != src.info.height
@@ -259,7 +306,10 @@ impl FbGeneric {
         {
             return Err(Error::InvalidArgument);
         }
-        let bytes = self.info.size_bytes() as usize;
+        // SECURITY: size_bytes() now returns Result; the cast to usize would silently truncate
+        // on 32-bit if size_bytes() returned u64 directly — cap at usize::MAX via try conversion.
+        let bytes_u64 = self.info.size_bytes()?;
+        let bytes = usize::try_from(bytes_u64).map_err(|_| Error::InvalidArgument)?;
         // SAFETY: Both base addresses map display-sized regions of compatible layout.
         unsafe {
             core::ptr::copy_nonoverlapping(

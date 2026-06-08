@@ -511,10 +511,16 @@ impl LinearFramebuffer {
     /// the mapping covers at least `pitch * height` bytes and that
     /// the memory is valid for the lifetime of this struct.
     ///
-    /// Returns `Err(InvalidArgument)` if the mode has zero
-    /// dimensions or does not support a linear framebuffer.
+    /// Returns `Err(InvalidArgument)` if the mode has zero dimensions, zero pitch,
+    /// or does not support a linear framebuffer.
     pub fn from_mode_info(mode: &VbeModeInfo, base_vaddr: usize) -> Result<Self> {
         if mode.width == 0 || mode.height == 0 || mode.bpp == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: a zero pitch is a degenerate mode — every pixel_offset computation would
+        // yield 0 (all pixels alias the same address) and any bytes-per-row division would
+        // divide by zero.  Firmware or a malicious GOP may supply pitch=0; reject it here.
+        if mode.pitch == 0 {
             return Err(Error::InvalidArgument);
         }
         if !mode.has_linear_framebuffer() {
@@ -562,21 +568,48 @@ impl LinearFramebuffer {
 
     /// Write a single pixel at `(x, y)` using an RGBA-packed color.
     ///
-    /// The color is encoded as `0xRRGGBBAA`. Out-of-bounds
-    /// coordinates are silently ignored.
+    /// The color is encoded as `0xRRGGBBAA`. Out-of-bounds coordinates or arithmetic
+    /// overflow in the offset computation cause a silent no-op return (never an OOB write).
     pub fn put_pixel(&mut self, x: u32, y: u32, color: u32) {
         if x >= self.width || y >= self.height {
             return;
         }
         let bytes_pp = self.format.bytes_per_pixel() as usize;
-        let offset = (y as usize)
-            .saturating_mul(self.pitch as usize)
-            .saturating_add((x as usize).saturating_mul(bytes_pp));
+        // SECURITY: saturating_mul/saturating_add would silently cap at usize::MAX, producing a
+        // pointer well outside the framebuffer.  Use checked arithmetic instead; if any step
+        // overflows we return without writing rather than writing to an arbitrary address.
+        let row_off = match (y as usize).checked_mul(self.pitch as usize) {
+            Some(v) => v,
+            None => return,
+        };
+        let col_off = match (x as usize).checked_mul(bytes_pp) {
+            Some(v) => v,
+            None => return,
+        };
+        let offset = match row_off.checked_add(col_off) {
+            Some(v) => v,
+            None => return,
+        };
+        // SECURITY: validate offset + bytes_pp <= total buffer size before dereferencing.
+        // Without this check a crafted-but-in-bounds (x,y) with a large pitch could still
+        // produce an offset that exceeds the actual mapped region.
+        let buf_size = match (self.pitch as usize).checked_mul(self.height as usize) {
+            Some(v) => v,
+            None => return,
+        };
+        if offset.saturating_add(bytes_pp) > buf_size {
+            return;
+        }
+        // SECURITY: base + offset must not overflow usize; use checked_add.
+        let addr = match self.base.checked_add(offset) {
+            Some(v) => v,
+            None => return,
+        };
 
-        // SAFETY: The caller of `from_mode_info` guarantees that the
-        // base address is a valid mapping covering pitch * height
-        // bytes. We have bounds-checked (x, y) above.
-        let ptr = self.base.saturating_add(offset) as *mut u8;
+        // SAFETY: The caller of `from_mode_info` guarantees that the base address is a valid
+        // mapping covering pitch * height bytes.  We have bounds-checked (x, y), validated
+        // offset < buf_size, and confirmed base + offset does not overflow.
+        let ptr = addr as *mut u8;
 
         match self.format {
             VbePixelFormat::Rgb888 =>
@@ -667,7 +700,10 @@ impl LinearFramebuffer {
                     .saturating_mul(src_width as usize)
                     .saturating_add(sx as usize))
                 .saturating_mul(4);
-                if let Some(px) = src.get(src_off..src_off + 4) {
+                // SECURITY: src_off is saturating-capped, so a bare `src_off + 4`
+                // could overflow usize and panic in ring 0; saturating_add keeps
+                // the range well-formed (an out-of-range start yields None).
+                if let Some(px) = src.get(src_off..src_off.saturating_add(4)) {
                     let c = (px[0] as u32) << 24
                         | (px[1] as u32) << 16
                         | (px[2] as u32) << 8
