@@ -682,7 +682,13 @@ impl SemRegistry {
         } else {
             // In a real kernel we would enqueue on the wait queue.
             // Increment waiter count for sem_getvalue reporting.
-            slot.waiter_count += 1;
+            // SECURITY: waiter_count is a u32 informational counter; use
+            // saturating_add so that an artificial storm of sem_wait calls
+            // (e.g. from a rogue process filling the wait queue before the
+            // slot is wired to a real scheduler) cannot wrap the counter to
+            // zero and make sem_getvalue report no waiters, nor trigger a
+            // ring-0 overflow panic under overflow-checks = on.
+            slot.waiter_count = slot.waiter_count.saturating_add(1);
             Err(Error::WouldBlock)
         }
     }
@@ -722,7 +728,10 @@ impl SemRegistry {
             slot.value -= 1;
             Ok(())
         } else {
-            slot.waiter_count += 1;
+            // SECURITY: same saturating_add guard as sem_wait — waiter_count
+            // is informational; capping at u32::MAX is correct and prevents a
+            // ring-0 overflow panic under overflow-checks = on.
+            slot.waiter_count = slot.waiter_count.saturating_add(1);
             Err(Error::WouldBlock)
         }
     }
@@ -767,7 +776,13 @@ impl SemRegistry {
         let slot = self.get_slot(sem_id)?;
         if slot.waiter_count > 0 {
             // Negative = number of blocked waiters.
-            Ok(-(slot.waiter_count as i32))
+            // SECURITY: waiter_count is u32; casting directly to i32 before
+            // negating would panic (overflow-checks = on) when waiter_count >
+            // i32::MAX (2_147_483_647).  Clamp to i32::MAX first so the cast
+            // is always in range, then negate.  The sentinel i32::MIN
+            // (-(2^31)) is never produced, which is correct because POSIX
+            // only requires a negative magnitude — not a specific value.
+            Ok(-(slot.waiter_count.min(i32::MAX as u32) as i32))
         } else {
             Ok(slot.value as i32)
         }

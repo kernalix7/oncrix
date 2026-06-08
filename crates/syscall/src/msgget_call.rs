@@ -133,6 +133,14 @@ impl MsgQueue {
             None
         } else {
             // Lowest type ≤ |msgtyp|.
+            //
+            // SECURITY: `msgtyp` is attacker-controlled. Negating `i64::MIN` panics
+            // under overflow-checks (ring-0 DoS). `i64::MIN` has no representable
+            // positive magnitude; no valid mtype (always > 0) can satisfy the bound,
+            // so returning None is correct. Match the guard in ipc_msg::find_message.
+            if msgtyp == i64::MIN {
+                return None;
+            }
             let limit = (-msgtyp) as i64;
             let mut best_idx = None;
             let mut best_type = i64::MAX;

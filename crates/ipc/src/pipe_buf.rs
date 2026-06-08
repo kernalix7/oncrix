@@ -313,14 +313,34 @@ impl PipeInode {
     /// The caller must ensure that each `IoVec::base` points to a
     /// valid, readable region of at least `IoVec::len` bytes.  This
     /// function performs the raw pointer dereference internally.
+    ///
+    /// # SECURITY INVARIANT
+    /// The syscall dispatcher MUST validate `iov.base`/`iov.len` as a
+    /// backed user range (via `copy_from_user` or `validate_user_range`)
+    /// BEFORE calling this function.  The in-crate bound check below caps
+    /// the slice length to at most the pipe's total capacity
+    /// (`PIPE_BUF * MAX_PIPE_BUFS`) to prevent a user-supplied
+    /// `iov.len == u64::MAX` from producing a 2^64-byte slice; it does
+    /// NOT substitute for pointer-range validation by the dispatcher.
     pub fn writev(&mut self, iovs: &[IoVec]) -> Result<usize> {
+        /// Maximum sane per-vector byte length: the entire pipe capacity.
+        const MAX_IOV_LEN: u64 = (PIPE_BUF * MAX_PIPE_BUFS) as u64;
+
         let mut total = 0usize;
         for iov in iovs {
             if iov.len == 0 || iov.base == 0 {
                 continue;
             }
+            // SECURITY: reject absurdly large user-supplied lengths before
+            // constructing the slice; a value > MAX_IOV_LEN cannot
+            // meaningfully fit in the pipe and would create an OOB slice.
+            if iov.len > MAX_IOV_LEN {
+                return Err(Error::InvalidArgument);
+            }
             // SAFETY: caller guarantees base is a valid kernel
             // pointer with at least `len` readable bytes.
+            // iov.len is bounded above by MAX_IOV_LEN (checked above),
+            // so the cast to usize is safe on all supported targets.
             let slice =
                 unsafe { core::slice::from_raw_parts(iov.base as *const u8, iov.len as usize) };
             match self.write_data(slice) {
@@ -348,14 +368,34 @@ impl PipeInode {
     /// # Safety caveat
     /// The caller must ensure that each `IoVec::base` points to a
     /// valid, writable region of at least `IoVec::len` bytes.
+    ///
+    /// # SECURITY INVARIANT
+    /// The syscall dispatcher MUST validate `iov.base`/`iov.len` as a
+    /// backed user range (via `copy_from_user` or `validate_user_range`)
+    /// BEFORE calling this function.  The in-crate bound check below caps
+    /// the slice length to at most the pipe's total capacity
+    /// (`PIPE_BUF * MAX_PIPE_BUFS`) to prevent a user-supplied
+    /// `iov.len == u64::MAX` from producing a 2^64-byte slice; it does
+    /// NOT substitute for pointer-range validation by the dispatcher.
     pub fn readv(&mut self, iovs: &mut [IoVec]) -> Result<usize> {
+        /// Maximum sane per-vector byte length: the entire pipe capacity.
+        const MAX_IOV_LEN: u64 = (PIPE_BUF * MAX_PIPE_BUFS) as u64;
+
         let mut total = 0usize;
         for iov in iovs.iter() {
             if iov.len == 0 || iov.base == 0 {
                 continue;
             }
+            // SECURITY: reject absurdly large user-supplied lengths before
+            // constructing the slice; a value > MAX_IOV_LEN cannot
+            // meaningfully fit in the pipe and would create an OOB slice.
+            if iov.len > MAX_IOV_LEN {
+                return Err(Error::InvalidArgument);
+            }
             // SAFETY: caller guarantees base is a valid kernel
             // pointer with at least `len` writable bytes.
+            // iov.len is bounded above by MAX_IOV_LEN (checked above),
+            // so the cast to usize is safe on all supported targets.
             let slice =
                 unsafe { core::slice::from_raw_parts_mut(iov.base as *mut u8, iov.len as usize) };
             match self.read_data(slice) {
@@ -484,7 +524,12 @@ impl PipeRegistry {
         while i < MAX_PIPES {
             if !self.pipes[i].active {
                 let id = self.next_id;
-                self.next_id = self.next_id.wrapping_add(1);
+                // SECURITY: use checked_add so that a wrapping counter
+                // never recycles a live pipe ID and causes segment/
+                // transaction confusion.  Exhausting u32 IDs is
+                // operationally impossible, but the kernel must not
+                // silently alias an active pipe.
+                self.next_id = self.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
                 let pipe = &mut self.pipes[i];
                 *pipe = PipeInode::new();
                 pipe.id = id;

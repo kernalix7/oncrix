@@ -562,7 +562,10 @@ pub fn mq_open(
 
     let generation = registry.slots[idx].generation;
     registry.slots[idx].queue = Some(queue);
-    registry.count += 1;
+    // Defence-in-depth: the real capacity guard is find_free() returning None
+    // once all slots are occupied; saturating_add prevents a theoretical
+    // counter overflow if count ever diverges from the slot occupancy.
+    registry.count = registry.count.saturating_add(1);
 
     Ok(MqDescriptor::new(idx, generation, flags))
 }

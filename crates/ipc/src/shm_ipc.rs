@@ -463,7 +463,11 @@ impl ShmRegistry {
 
         let slot = self.alloc_slot().ok_or(Error::OutOfMemory)?;
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        // SECURITY: use checked_add to prevent ID counter wrap-around. If next_id
+        // overflowed with wrapping_add, the registry would hand out an i32 ID that
+        // matches an already-live segment, causing segment confusion and cross-process
+        // descriptor aliasing. Fail the allocation instead of recycling a live ID.
+        self.next_id = self.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
 
         self.segments[slot] = ShmSegment::new(key, id, size, flags.mode())?;
         Ok(id)

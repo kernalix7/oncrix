@@ -166,7 +166,11 @@ impl RpmsgMessage {
 
     /// Return a slice of the payload data.
     pub fn payload(&self) -> &[u8] {
-        &self.data[..self.data_len]
+        // SECURITY: `data_len` is a public field that can be set past the
+        // fixed `data` capacity (bypassing `RpmsgMessage::new` /
+        // `RpmsgHeader::validate`), so clamp it to the backing array length
+        // before slicing — otherwise this is an OOB slice / ring-0 panic.
+        &self.data[..self.data_len.min(self.data.len())]
     }
 }
 
