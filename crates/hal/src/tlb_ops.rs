@@ -60,7 +60,8 @@ pub fn flush_all_local() {
                 "mov {cr3}, cr3",
                 "mov cr3, {cr3}",
                 cr3 = out(reg) cr3,
-                options(nostack, nomem)
+                // No nomem: writing CR3 has ordering effects on memory accesses via paging.
+                options(nostack)
             );
             let _ = cr3;
         }
@@ -210,7 +211,9 @@ pub fn flush_global() {
                 cr4  = out(reg) cr4,
                 mask = const !0x80u64,
                 pge  = const 0x80u64,
-                options(nostack, nomem)
+                // No nomem: CR4.PGE writes affect global TLB and have
+                // memory-ordering effects the compiler must not reorder.
+                options(nostack)
             );
             let _ = cr4;
         }

@@ -85,8 +85,10 @@ pub fn flush_all() {
     {
         // SAFETY: WBINVD writes back and invalidates all caches. Requires privilege level 0.
         // This is a serializing instruction that stalls the pipeline.
+        // No nomem: wbinvd is a global writeback+invalidate — its entire effect is a memory
+        // operation; nomem would let the compiler reorder stores across it.
         unsafe {
-            core::arch::asm!("wbinvd", options(nostack, nomem));
+            core::arch::asm!("wbinvd", options(nostack));
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -104,8 +106,10 @@ pub fn dmb() {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: MFENCE is a full memory barrier on x86. Safe at any privilege level.
+        // No nomem: mfence is a memory-ordering fence; nomem would let the compiler reorder
+        // Rust loads/stores across it, completely defeating its purpose.
         unsafe {
-            core::arch::asm!("mfence", options(nostack, nomem));
+            core::arch::asm!("mfence", options(nostack));
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -131,8 +135,10 @@ pub fn dsb() {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: MFENCE + LFENCE provides DSB-equivalent ordering on x86.
+        // No nomem: both mfence and lfence are memory-ordering fences; nomem would let the
+        // compiler reorder Rust loads/stores across them, defeating the barrier entirely.
         unsafe {
-            core::arch::asm!("mfence", "lfence", options(nostack, nomem));
+            core::arch::asm!("mfence", "lfence", options(nostack));
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -249,8 +255,10 @@ fn cache_op_range(vaddr: usize, size: usize, op: CacheOp) {
             addr += line_size;
         }
         // SAFETY: MFENCE ensures all clflush operations complete.
+        // No nomem: this fence must order the preceding clflush operations against subsequent
+        // memory accesses; nomem would let the compiler hoist stores past it.
         unsafe {
-            core::arch::asm!("mfence", options(nostack, nomem));
+            core::arch::asm!("mfence", options(nostack));
         }
     }
 

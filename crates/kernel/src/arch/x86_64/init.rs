@@ -460,11 +460,16 @@ pub unsafe fn install_user_pt(pt_phys: u64) {
     // side-effect-free; no in-flight memory access depends on a stale
     // TLB while interrupts are off.
     unsafe {
+        // No nomem: `mov cr3` flushes the TLB — a compiler-invisible
+        // translation barrier that must order the preceding PTE stores
+        // (*pml4, *pdpt_low, *pd[2]). `nomem` would let the compiler
+        // reorder/drop those stores across the flush. CR3 write does not
+        // modify RFLAGS, so `preserves_flags` is correct.
         core::arch::asm!(
             "mov {tmp}, cr3",
             "mov cr3, {tmp}",
             tmp = out(reg) _,
-            options(nomem, nostack),
+            options(nostack, preserves_flags),
         );
     }
 }
@@ -522,11 +527,15 @@ pub unsafe fn install_user_mmap_pt(pt_phys: Option<u64>) {
     // Full TLB flush — same rationale as `install_user_pt`.
     // SAFETY: see `install_user_pt`.
     unsafe {
+        // No nomem: `mov cr3` flushes the TLB and must order the
+        // preceding PD[3] store (*pd[3]); `nomem` would let the
+        // compiler reorder/drop it across the flush. CR3 write does not
+        // modify RFLAGS, so `preserves_flags` is correct.
         core::arch::asm!(
             "mov {tmp}, cr3",
             "mov cr3, {tmp}",
             tmp = out(reg) _,
-            options(nomem, nostack),
+            options(nostack, preserves_flags),
         );
     }
 }

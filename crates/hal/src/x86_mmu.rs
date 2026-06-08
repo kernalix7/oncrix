@@ -162,7 +162,9 @@ impl X86Mmu {
             // a valid PML4 with required kernel mappings. This immediately flushes
             // non-global TLB entries unless the no_flush bit is set with PCID.
             unsafe {
-                core::arch::asm!("mov cr3, {val}", val = in(reg) raw, options(nostack, nomem));
+                // No nomem: writing CR3 switches address-space and has ordering
+                // effects on all subsequent memory accesses through paging.
+                core::arch::asm!("mov cr3, {val}", val = in(reg) raw, options(nostack));
             }
         }
         let _ = raw;
@@ -201,7 +203,9 @@ impl X86Mmu {
             // SAFETY: Rewriting CR3 with the flush bit clear invalidates all
             // non-global TLB entries. Safe when the current CR3 is still valid.
             unsafe {
-                core::arch::asm!("mov cr3, {val}", val = in(reg) raw, options(nostack, nomem));
+                // No nomem: writing CR3 invalidates TLB entries and has ordering
+                // effects on memory accesses the compiler must not elide.
+                core::arch::asm!("mov cr3, {val}", val = in(reg) raw, options(nostack));
             }
         }
     }
@@ -219,7 +223,9 @@ impl X86Mmu {
                     "mov cr0, {tmp}",
                     tmp = out(reg) _,
                     wp  = const 0x10000u64,
-                    options(nostack, nomem)
+                    // No nomem: writing CR0.WP changes memory-access semantics;
+                    // the compiler must not reorder loads/stores around this.
+                    options(nostack)
                 );
             }
         }
@@ -249,7 +255,9 @@ impl X86Mmu {
                     in("ecx") EFER_MSR,
                     in("eax") (val & 0xFFFF_FFFF) as u32,
                     in("edx") (val >> 32) as u32,
-                    options(nostack, nomem)
+                    // No nomem: WRMSR to EFER.NXE changes execute-disable semantics;
+                    // the compiler must treat this as a memory barrier.
+                    options(nostack)
                 );
             }
         }

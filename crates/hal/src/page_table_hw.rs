@@ -98,7 +98,9 @@ pub unsafe fn write_cr3(cr3: u64) {
         core::arch::asm!(
             "mov cr3, {val}",
             val = in(reg) cr3,
-            options(nomem, nostack, preserves_flags),
+            // No nomem: writing CR3 changes address-space and has
+            // memory-ordering effects across the paging hardware.
+            options(nostack, preserves_flags),
         );
     }
 }
