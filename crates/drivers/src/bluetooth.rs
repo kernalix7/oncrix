@@ -437,11 +437,13 @@ impl BtDevice {
     /// controller-supplied length that exceeds the 248-byte buffer, and
     /// an unclamped slice would panic in ring 0 (overflow-checks on).
     pub fn name(&self) -> &[u8] {
+        // SECURITY: Removed the debug_assert! that preceded the safe clamp.
+        // A controller-supplied name_len > 248 arriving via HCI would panic
+        // under overflow-checks in a debug build before reaching the .min()
+        // guard below.  The assert provided no safety value; the clamp is the
+        // correct unconditional defence.  Normal names (len <= 248) are
+        // unaffected.
         let len = self.name_len.min(self.name.len());
-        debug_assert!(
-            self.name_len <= self.name.len(),
-            "name_len exceeds name buffer"
-        );
         &self.name[..len]
     }
 }
@@ -475,11 +477,15 @@ impl BtPeerInfo {
     /// length greater than 248 cannot slice out of bounds (which would
     /// panic in ring 0 with overflow-checks enabled).
     pub fn name(&self) -> &[u8] {
+        // SECURITY: Removed the debug_assert! that fired before the safe clamp.
+        // An inquiry response or Remote-Name-Request reply from a malicious
+        // Bluetooth peer can carry name_len > 248.  Under overflow-checks the
+        // assert would panic in ring-0 inside a debug/test build, before the
+        // .min() guard below had any effect.  The clamp is the unconditional
+        // defence; the assert was redundant and created a panic vector on
+        // attacker-adjacent data.  Legitimate peer names (len <= 248) are
+        // unaffected.
         let len = self.name_len.min(self.name.len());
-        debug_assert!(
-            self.name_len <= self.name.len(),
-            "name_len exceeds name buffer"
-        );
         &self.name[..len]
     }
 }

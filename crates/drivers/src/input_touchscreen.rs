@@ -141,6 +141,13 @@ impl TouchscreenDevice {
     /// - `max_slots`: Number of simultaneous contacts supported (capped at `MAX_SLOTS`).
     pub fn new(max_x: u32, max_y: u32, max_slots: u8) -> Self {
         let max_slots = max_slots.min(MAX_SLOTS as u8);
+        // SECURITY: Cap device-supplied max_x/max_y at i32::MAX so the `as i32` cast
+        // in report_x/report_y always produces a non-negative value. Without this cap,
+        // a malicious USB/HID descriptor with max_x > i32::MAX would make the upper
+        // bound of clamp() negative, causing a panic on every normal touch event.
+        // Legitimate touchscreens (max_x/max_y well within i32 range) are unaffected.
+        let max_x = max_x.min(i32::MAX as u32);
+        let max_y = max_y.min(i32::MAX as u32);
         let mut s = Self {
             max_x,
             max_y,
@@ -238,7 +245,10 @@ impl TouchscreenDevice {
     pub fn sync(&mut self) -> SyncResult {
         let mut events = [TouchEvent::default(); MAX_SLOTS];
         let mut count = 0usize;
-        for i in 0..self.max_slots as usize {
+        // SECURITY: Bound the loop by the physical array length in addition to
+        // max_slots so a direct write to the pub field cannot index past slots[].
+        let limit = (self.max_slots as usize).min(MAX_SLOTS);
+        for i in 0..limit {
             if self.slots[i].dirty {
                 let s = &self.slots[i];
                 events[count] = TouchEvent {
@@ -258,7 +268,10 @@ impl TouchscreenDevice {
 
     /// Returns the current contact count (number of active slots).
     pub fn contact_count(&self) -> usize {
-        self.slots[..self.max_slots as usize]
+        // SECURITY: Bound the slice by the physical array length in addition to
+        // max_slots so a direct write to the pub field cannot index past slots[].
+        let limit = (self.max_slots as usize).min(MAX_SLOTS);
+        self.slots[..limit]
             .iter()
             .filter(|s| s.tracking_id != TRACKING_ID_LIFTED)
             .count()
@@ -284,7 +297,10 @@ impl TouchscreenDevice {
 
     /// Releases all active contacts (e.g., on driver unload or suspend).
     pub fn release_all(&mut self) {
-        for i in 0..self.max_slots as usize {
+        // SECURITY: Bound the loop by the physical array length in addition to
+        // max_slots so a direct write to the pub field cannot index past slots[].
+        let limit = (self.max_slots as usize).min(MAX_SLOTS);
+        for i in 0..limit {
             if self.slots[i].tracking_id != TRACKING_ID_LIFTED {
                 self.slots[i].tracking_id = TRACKING_ID_LIFTED;
                 self.slots[i].dirty = true;
@@ -303,6 +319,11 @@ pub struct SyncResult {
 impl SyncResult {
     /// Returns the slice of valid events.
     pub fn events(&self) -> &[TouchEvent] {
-        &self.events[..self.count]
+        // SECURITY: Clamp count against the physical array length so an external
+        // write to the pub `count` field cannot produce an out-of-bounds slice.
+        // Internally count is always <= MAX_SLOTS; this guard covers the case where
+        // a caller mutates the pub field directly.
+        let safe_count = self.count.min(self.events.len());
+        &self.events[..safe_count]
     }
 }

@@ -513,7 +513,12 @@ impl HidReport {
 
     /// Returns the report data as a slice.
     pub fn data(&self) -> &[u8] {
-        &self.data[..self.data_len]
+        // SECURITY: `data_len` is a public field; a caller could write a value
+        // larger than the backing array after construction.  Clamp here so a
+        // field-bypass cannot produce an out-of-bounds slice (which panics in
+        // ring-0 with overflow-checks enabled).  Legitimate reports always have
+        // data_len <= MAX_REPORT_DATA, so this has no effect for normal traffic.
+        &self.data[..self.data_len.min(self.data.len())]
     }
 }
 
@@ -627,7 +632,11 @@ impl HidDevice {
         if !self.active {
             return Err(Error::Busy);
         }
-        self.report_count += 1;
+        // SECURITY: Use saturating_add so a flood of USB/HID reports from a
+        // malicious device cannot wrap the counter and cause UB on
+        // overflow-checks builds.  The counter saturates at u64::MAX rather
+        // than panicking.
+        self.report_count = self.report_count.saturating_add(1);
         let mut event_count = 0;
 
         // Collect events from descriptor fields before mutating self (push_event).
