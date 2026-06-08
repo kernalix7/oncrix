@@ -583,7 +583,11 @@ impl PerfReadResult {
         if self.time_running == 0 || self.time_running >= self.time_enabled {
             self.value
         } else {
-            self.value * self.time_enabled / self.time_running
+            // Widen to u128 to avoid overflow: two u64s always fit in u128,
+            // and time_running != 0 is guaranteed by the guard above.
+            let scaled =
+                (self.value as u128 * self.time_enabled as u128) / self.time_running as u128;
+            scaled.min(u64::MAX as u128) as u64
         }
     }
 }

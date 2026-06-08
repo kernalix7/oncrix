@@ -435,14 +435,23 @@ impl SkcipherSubsystem {
         }
 
         self.contexts[slot].state = CipherState::Active;
-        self.contexts[slot].bytes_processed += data_len as u64;
+        self.contexts[slot].bytes_processed = self.contexts[slot]
+            .bytes_processed
+            .checked_add(data_len as u64)
+            .ok_or(Error::InvalidArgument)?;
 
         if self.contexts[slot].encrypting {
             self.stats.total_encrypts += 1;
-            self.stats.total_bytes_encrypted += data_len as u64;
+            self.stats.total_bytes_encrypted = self
+                .stats
+                .total_bytes_encrypted
+                .saturating_add(data_len as u64);
         } else {
             self.stats.total_decrypts += 1;
-            self.stats.total_bytes_decrypted += data_len as u64;
+            self.stats.total_bytes_decrypted = self
+                .stats
+                .total_bytes_decrypted
+                .saturating_add(data_len as u64);
         }
         Ok(())
     }

@@ -21,6 +21,9 @@ const MAX_RETURN_INSTANCES: usize = 64;
 /// Default number of pre-allocated return instances.
 const DEFAULT_MAXACTIVE: u32 = 16;
 
+/// Maximum accepted value for the `maxactive` parameter in [`KretprobeManager::register`].
+const MAX_KRETPROBE_MAXACTIVE: u32 = 4096;
+
 /// Kretprobe instance state flags.
 const INSTANCE_STATE_FREE: u8 = 0;
 const INSTANCE_STATE_ACTIVE: u8 = 1;
@@ -223,6 +226,9 @@ impl KretprobeManager {
         }
         if self.probe_count >= MAX_KRETPROBES {
             return Err(Error::OutOfMemory);
+        }
+        if maxactive > MAX_KRETPROBE_MAXACTIVE {
+            return Err(Error::InvalidArgument);
         }
         let effective_max = if maxactive == 0 {
             DEFAULT_MAXACTIVE

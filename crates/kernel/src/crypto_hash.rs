@@ -376,9 +376,12 @@ impl CryptoHashSubsystem {
             return Err(Error::InvalidArgument);
         }
 
-        self.contexts[slot].bytes_processed += data_len as u64;
+        self.contexts[slot].bytes_processed = self.contexts[slot]
+            .bytes_processed
+            .checked_add(data_len as u64)
+            .ok_or(Error::InvalidArgument)?;
         self.stats.total_updates += 1;
-        self.stats.total_bytes += data_len as u64;
+        self.stats.total_bytes = self.stats.total_bytes.saturating_add(data_len as u64);
         Ok(())
     }
 
