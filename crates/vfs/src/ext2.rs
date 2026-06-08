@@ -409,12 +409,24 @@ impl<R: BlockReader> Ext2Fs<R> {
         // SECURITY: use checked arithmetic so that a large bg_count (bounded
         // to MAX_BLOCK_GROUPS=64) combined with a large bgd_offset cannot
         // silently overflow to a wrong device offset.
+        //
+        // SECURITY: also bound entry_off + 32 against the total filesystem
+        // size (s_blocks_count * block_size).  A malformed superblock with a
+        // huge s_blocks_count / s_first_data_block could otherwise push the
+        // BGD read past the end of the image.
+        let fs_bytes = (sb.s_blocks_count as u64)
+            .checked_mul(block_size)
+            .ok_or(Error::InvalidArgument)?;
         let mut bgd_buf = [0u8; 32];
         for (i, slot) in bgd.iter_mut().enumerate().take(bg_count) {
             let entry_off = (i as u64)
                 .checked_mul(32)
                 .and_then(|o| bgd_offset.checked_add(o))
                 .ok_or(Error::InvalidArgument)?;
+            let entry_end = entry_off.checked_add(32).ok_or(Error::InvalidArgument)?;
+            if entry_end > fs_bytes {
+                return Err(Error::InvalidArgument);
+            }
             reader.read_bytes(entry_off, &mut bgd_buf)?;
             *slot = Some(BlockGroupDesc::from_bytes(&bgd_buf)?);
         }
@@ -466,7 +478,9 @@ impl<R: BlockReader> Ext2Fs<R> {
 
     /// Read an inode by number.
     pub fn read_inode(&self, ino: u32) -> Result<Ext2Inode> {
-        if ino == 0 {
+        // SECURITY: inode numbers are 1-based; ino == 0 is invalid, and any
+        // ino > s_inodes_count is out of range on the on-disk inode table.
+        if ino == 0 || ino > self.sb.s_inodes_count {
             return Err(Error::InvalidArgument);
         }
         // Inode numbers are 1-based.
@@ -508,6 +522,20 @@ impl<R: BlockReader> Ext2Fs<R> {
 
         let mut buf = [0u8; 256]; // max inode size we handle
         let read_len = (inode_size as usize).min(buf.len());
+
+        // SECURITY: bound the read against the total filesystem image size so
+        // that a crafted bg_inode_table / local_idx cannot push the read past
+        // the end of the device (OOB read).
+        let end = offset
+            .checked_add(read_len as u64)
+            .ok_or(Error::InvalidArgument)?;
+        let fs_bytes = (self.sb.s_blocks_count as u64)
+            .checked_mul(block_size)
+            .ok_or(Error::InvalidArgument)?;
+        if end > fs_bytes {
+            return Err(Error::InvalidArgument);
+        }
+
         self.reader.read_bytes(offset, &mut buf[..read_len])?;
         Ext2Inode::from_bytes(&buf[..read_len])
     }
@@ -670,7 +698,15 @@ impl<R: BlockReader> Ext2Fs<R> {
                 _ => break, // would overflow or exceed directory data
             };
 
-            if entry_inode != 0 && name_len > 0 {
+            // SECURITY: name_len must fit within THIS directory entry.
+            // rec_len >= 8 is guaranteed by the guard above, so rec_len - 8
+            // cannot wrap.  A malformed image with name_len > rec_len - 8 would
+            // read name bytes that belong to the following entry (content
+            // confusion / over-read).  Skip the name rather than returning
+            // attacker-controlled data from an adjacent entry.
+            let name_fits = (name_len as u64) <= rec_len - 8;
+
+            if entry_inode != 0 && name_len > 0 && name_fits {
                 let mut entry = Ext2DirEntry {
                     inode: entry_inode,
                     name: [0u8; EXT2_NAME_LEN],
