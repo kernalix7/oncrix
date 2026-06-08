@@ -161,7 +161,11 @@ impl DefragRun {
             self.progress.finish();
             return Ok(false);
         }
-        if candidate.offset + candidate.len <= self.args.start {
+        let end = candidate
+            .offset
+            .checked_add(candidate.len)
+            .ok_or(Error::InvalidArgument)?;
+        if end <= self.args.start {
             return Ok(false);
         }
         if candidate.should_defrag(self.args.extent_thresh) {

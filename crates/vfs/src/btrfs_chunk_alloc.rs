@@ -256,7 +256,7 @@ impl Chunk {
     ///
     /// - `InvalidArgument` if `offset >= self.length` or no stripes exist.
     pub fn map_to_physical(&self, offset: u64) -> Result<(u32, u64)> {
-        if offset >= self.length || self.stripe_count == 0 {
+        if offset >= self.length || self.stripe_count == 0 || self.stripe_count > MAX_STRIPES {
             return Err(Error::InvalidArgument);
         }
         match self.profile {

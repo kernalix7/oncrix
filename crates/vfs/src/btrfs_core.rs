@@ -299,7 +299,8 @@ impl LeafNode {
     /// Returns `Ok(idx)` for an exact match, `Err(idx)` for the
     /// insertion point.
     pub fn search(&self, key: &BtrfsKey) -> core::result::Result<usize, usize> {
-        self.items[..self.nritems].binary_search_by(|item| item.key.cmp(key))
+        let count = self.nritems.min(MAX_LEAF_ITEMS);
+        self.items[..count].binary_search_by(|item| item.key.cmp(key))
     }
 
     /// Insert an item in sorted order.
@@ -437,7 +438,7 @@ impl InternalNode {
             return 0;
         }
         let mut lo = 0usize;
-        let mut hi = self.nritems;
+        let mut hi = self.nritems.min(MAX_INTERNAL_KEYS);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if self.ptrs[mid].key <= *key {
