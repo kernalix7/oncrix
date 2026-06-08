@@ -464,10 +464,26 @@ impl IommuDomain {
         if length == 0 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: cap `length` at the total IOVA space size so that a
+        // device-supplied near-u64::MAX value is rejected before the checked
+        // round-up arithmetic below. This also prevents nonsensical mappings
+        // that would consume the entire IOVA address space.
+        let iova_space_size = IOVA_SPACE_END - IOVA_SPACE_START;
+        if length > iova_space_size {
+            return Err(Error::InvalidArgument);
+        }
         if self.mapping_count >= DOMAIN_MAX_MAPPINGS {
             return Err(Error::OutOfMemory);
         }
-        let npages = ((length + IOMMU_PAGE_SIZE - 1) / IOMMU_PAGE_SIZE) as usize;
+        // SECURITY: checked_add prevents u64 overflow when rounding `length`
+        // up to a page boundary. `length + (IOMMU_PAGE_SIZE - 1)` wraps on
+        // near-u64::MAX inputs; the cap above makes this unreachable for
+        // realistic values, but we keep checked_add as defence-in-depth.
+        let rounded = length
+            .checked_add(IOMMU_PAGE_SIZE - 1)
+            .ok_or(Error::InvalidArgument)?;
+        let npages =
+            usize::try_from(rounded / IOMMU_PAGE_SIZE).map_err(|_| Error::InvalidArgument)?;
         let iova = match self.domain_type {
             DomainType::Identity => phys,
             DomainType::Dma | DomainType::Unmanaged => self.iova_alloc.alloc(npages)?,
@@ -482,7 +498,15 @@ impl IommuDomain {
         for i in 0..self.mapping_count {
             if let Some(m) = self.mappings[i] {
                 if m.iova == iova {
-                    let npages = ((m.length + IOMMU_PAGE_SIZE - 1) / IOMMU_PAGE_SIZE) as usize;
+                    // SECURITY: same checked round-up as in `map`. Although
+                    // m.length was validated on the way in, defence-in-depth
+                    // ensures no overflow path exists here either.
+                    let rounded = m
+                        .length
+                        .checked_add(IOMMU_PAGE_SIZE - 1)
+                        .ok_or(Error::InvalidArgument)?;
+                    let npages = usize::try_from(rounded / IOMMU_PAGE_SIZE)
+                        .map_err(|_| Error::InvalidArgument)?;
                     if self.domain_type == DomainType::Dma {
                         self.iova_alloc.free(iova, npages)?;
                     }
@@ -585,8 +609,13 @@ impl FaultLog {
     }
 
     /// Returns a reference to the fault entry at `index`.
+    ///
+    /// Returns `None` if `index` is out of bounds or the slot is empty.
     pub fn get(&self, index: usize) -> Option<&IommuFault> {
-        self.entries[index].as_ref()
+        // SECURITY: use .get() to prevent a panic on caller-supplied
+        // out-of-bounds index. Direct indexing `self.entries[index]`
+        // panics (ring-0 abort) when index >= FAULT_LOG_SIZE.
+        self.entries.get(index)?.as_ref()
     }
 }
 

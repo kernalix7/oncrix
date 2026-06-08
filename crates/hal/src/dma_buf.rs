@@ -21,7 +21,7 @@
 //!
 //! ```ignore
 //! let mut registry = DmaBufRegistry::new();
-//! let buf = DmaBuf::new(0, 4096, DmaBufFlags::READ_WRITE);
+//! let buf = DmaBuf::new(0, 4096, DmaBufFlags::READ_WRITE)?;
 //! registry.register(buf)?;
 //! let att = registry.attach(0, 1)?;
 //! ```
@@ -191,7 +191,10 @@ impl ScatterGatherList {
         if self.count >= MAX_SG_ENTRIES {
             return Err(Error::OutOfMemory);
         }
-        let offset = self.total_size() as u32;
+        // SECURITY: total_size() as u32 silently truncates when the running
+        // offset exceeds 4 GiB; use checked conversion to reject overflow.
+        let offset_usize = self.total_size_checked().ok_or(Error::InvalidArgument)?;
+        let offset = u32::try_from(offset_usize).map_err(|_| Error::InvalidArgument)?;
         self.entries[self.count] = ScatterGatherEntry::from_phys(phys_addr, length, offset);
         self.count += 1;
         Ok(())
@@ -216,13 +219,31 @@ impl ScatterGatherList {
         }
     }
 
+    /// Returns the total size in bytes across all segments, or `None` if
+    /// the sum would overflow `usize`.
+    ///
+    /// Callers that need a plain `usize` should unwrap only after verifying
+    /// the individual segment lengths are bounded.
+    pub fn total_size_checked(&self) -> Option<usize> {
+        // SECURITY: wrapping_add silently returns a wrong (small) total when
+        // segment lengths sum past usize::MAX, undermining SG-list validation.
+        // Use checked_add so overflow is detectable by callers.
+        self.entries[..self.count]
+            .iter()
+            .try_fold(0usize, |acc, e| acc.checked_add(e.length as usize))
+    }
+
     /// Returns the total size in bytes across all segments.
+    ///
+    /// Saturates at `usize::MAX` if the sum overflows (safe for size
+    /// comparisons; use `total_size_checked` for exact arithmetic).
     pub fn total_size(&self) -> usize {
-        let mut total: usize = 0;
-        for i in 0..self.count {
-            total = total.wrapping_add(self.entries[i].length as usize);
-        }
-        total
+        // SECURITY: the original wrapping_add could return a falsely small
+        // total, causing validate_sg to miss under-populated SG lists.
+        // Saturating is correct for callers that only need an upper bound.
+        self.entries[..self.count]
+            .iter()
+            .fold(0usize, |acc, e| acc.saturating_add(e.length as usize))
     }
 
     /// Returns an iterator over valid entries.
@@ -573,9 +594,21 @@ impl DmaBuf {
     /// Creates a new DMA buffer with the given id, size, and flags.
     ///
     /// The size is rounded up to the nearest page boundary.
-    pub fn new(id: u32, size: usize, flags: DmaBufFlags) -> Self {
-        let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` if `size` is zero or if the page-alignment
+    /// round-up would overflow (i.e., `size` is near `usize::MAX`).
+    pub fn new(id: u32, size: usize, flags: DmaBufFlags) -> Result<Self> {
+        if size == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: (size + PAGE_SIZE - 1) overflows when size is near
+        // usize::MAX; a device-supplied size that passes only the == 0 guard
+        // can trigger a ring-0 panic under overflow-checks ON.
+        let mask = PAGE_SIZE - 1;
+        let aligned_size = size.checked_add(mask).ok_or(Error::InvalidArgument)? & !mask;
+        Ok(Self {
             id,
             size: aligned_size,
             flags,
@@ -587,7 +620,7 @@ impl DmaBuf {
             fences: [const { DmaBufFence::new() }; MAX_FENCES],
             fence_count: 0,
             mmap: MmapRegion::new(),
-        }
+        })
     }
 
     /// Returns `true` if this buffer slot is unused.

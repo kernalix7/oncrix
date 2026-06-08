@@ -124,11 +124,19 @@ impl DmaRemapTable {
     }
 
     /// Allocates an IOVA range aligned to `DMA_PAGE_SIZE`.
-    fn alloc_iova(&mut self, size: u64) -> u64 {
-        let aligned_size = size.next_multiple_of(DMA_PAGE_SIZE);
+    ///
+    /// Returns `None` if the alignment round-up or cursor advance would
+    /// overflow; callers must propagate as `OutOfMemory`.
+    fn alloc_iova(&mut self, size: u64) -> Option<u64> {
+        // SECURITY: next_multiple_of panics on overflow with overflow-checks ON
+        // when size is near u64::MAX.  Use checked arithmetic instead.
+        let mask = DMA_PAGE_SIZE - 1;
+        let aligned_size = size.checked_add(mask)? & !mask;
         let iova = self.next_iova;
+        // Saturating add is safe here: the caller's size guard (size == 0 check
+        // in map()) prevents zero-size, and overflow means IOVA space exhausted.
         self.next_iova = self.next_iova.saturating_add(aligned_size);
-        iova
+        Some(iova)
     }
 
     /// Creates a DMA mapping for a physical buffer.
@@ -150,6 +158,13 @@ impl DmaRemapTable {
         if size == 0 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: reject near-u64::MAX sizes before the alignment round-up
+        // in alloc_iova; an absurd size passes the == 0 guard but overflows.
+        // The IOVA window starts at 4 MiB; a mapping larger than the remaining
+        // 64-bit address space is definitively invalid.
+        if size > u64::MAX - self.next_iova {
+            return Err(Error::InvalidArgument);
+        }
         // Find a free slot.
         let slot = self
             .mappings
@@ -157,7 +172,7 @@ impl DmaRemapTable {
             .position(|m| !m.active)
             .ok_or(Error::OutOfMemory)?;
 
-        let iova = self.alloc_iova(size);
+        let iova = self.alloc_iova(size).ok_or(Error::OutOfMemory)?;
         self.mappings[slot] = DmaMapping {
             phys_addr,
             iova,
@@ -191,8 +206,15 @@ impl DmaRemapTable {
     pub fn lookup_phys(&self, iova: u64) -> Option<u64> {
         self.mappings
             .iter()
-            .find(|m| m.active && iova >= m.iova && iova < m.iova + m.size)
-            .map(|m| m.phys_addr + (iova - m.iova))
+            // SECURITY: m.iova + m.size may overflow if a corrupted/crafted
+            // mapping has a near-u64::MAX size; use checked_add to guard the
+            // range test, and checked_add again for the phys translation.
+            .find(|m| {
+                m.active
+                    && iova >= m.iova
+                    && m.iova.checked_add(m.size).map_or(false, |end| iova < end)
+            })
+            .and_then(|m| m.phys_addr.checked_add(iova - m.iova))
     }
 
     /// Returns a reference to a mapping by IOVA.

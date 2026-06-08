@@ -203,7 +203,14 @@ impl IovaAllocator {
         if size == 0 {
             return Err(Error::InvalidArgument);
         }
-        let aligned_size = (size + IOMMU_PAGE_MASK) & !IOMMU_PAGE_MASK;
+        // SECURITY: checked_add prevents u64 overflow when rounding `size` up
+        // to a page boundary. Without this, a size near u64::MAX wraps to a
+        // small aligned_size, defeating the `next > self.limit` guard below
+        // and allowing IOVA aliasing on subsequent allocations.
+        let aligned_size = size
+            .checked_add(IOMMU_PAGE_MASK)
+            .ok_or(Error::OutOfMemory)?
+            & !IOMMU_PAGE_MASK;
         let iova = self.next;
         let next = iova.checked_add(aligned_size).ok_or(Error::OutOfMemory)?;
         if next > self.limit {
@@ -384,7 +391,12 @@ impl DmaDomain {
     /// - [`Error::OutOfMemory`] if the IOVA space or mapping table is
     ///   exhausted.
     pub fn map_single(&mut self, phys: u64, size: u64, direction: DmaDirection) -> Result<u64> {
-        if phys == 0 || size == 0 || phys & IOMMU_PAGE_MASK != 0 {
+        // SECURITY: reject sizes that exceed the total IOVA window. A device-
+        // supplied size near u64::MAX passes the `== 0` check but overflows
+        // the page-align rounding in IovaAllocator::alloc, potentially wrapping
+        // to a small value and bypassing exhaustion detection.
+        let iova_window = IOVA_LIMIT - IOVA_BASE;
+        if phys == 0 || size == 0 || size > iova_window || phys & IOMMU_PAGE_MASK != 0 {
             return Err(Error::InvalidArgument);
         }
         let iova = if self.iommu_backed {

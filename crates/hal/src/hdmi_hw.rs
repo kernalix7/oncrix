@@ -273,12 +273,19 @@ impl HdmiTx {
         self.current_mode = mode;
         self.colorspace = colorspace;
         self.color_depth = color_depth;
-        // SAFETY: MMIO writes to HDMI video configuration registers. base_addr is non-zero.
+        // SECURITY: MMIO writes to HDMI video configuration registers. base_addr is non-zero.
         unsafe {
             let vcfg = (self.base_addr + 0x10) as *mut u32;
             vcfg.write_volatile(mode.pixelclk_khz);
             let hv = (self.base_addr + 0x14) as *mut u32;
-            hv.write_volatile(mode.h_active | (mode.v_active << 16));
+            // SECURITY: mode.v_active is a u32 supplied by the caller; a plain
+            // `v_active << 16` overflows (and panics with overflow-checks ON) for
+            // any value > 0xFFFF.  Clamp to the 16-bit field width before shifting
+            // so the register write is always in-range and never panics.  Values
+            // above 65535 lines are not valid HDMI resolutions; hardware will
+            // reject the resulting timing descriptor.
+            let v_field = mode.v_active.min(0xFFFF) << 16;
+            hv.write_volatile(mode.h_active | v_field);
             let cs = (self.base_addr + 0x18) as *mut u32;
             let cs_val = match colorspace {
                 HdmiColorspace::RgbFull => 0u32,
@@ -446,8 +453,13 @@ impl Default for HdmiTxRegistry {
 /// Computes the required TMDS clock for a given HDMI mode and color depth.
 ///
 /// TMDS clock = pixel_clock * color_depth / 8
+///
+/// Returns 0 if the multiplication would overflow (should not occur for any
+/// real HDMI pixel clock, but the input is caller-supplied).
 pub fn compute_tmds_clock_khz(pixelclk_khz: u32, color_depth: HdmiColorDepth) -> u32 {
-    pixelclk_khz * color_depth.bits() as u32 / 8
+    // SECURITY: pixel clock and color depth are caller-supplied; use
+    // saturating_mul so an extreme value does not panic with overflow-checks ON.
+    pixelclk_khz.saturating_mul(color_depth.bits() as u32) / 8
 }
 
 /// Returns whether a given HDMI mode requires HDMI 2.0.

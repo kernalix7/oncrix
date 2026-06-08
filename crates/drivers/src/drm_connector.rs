@@ -415,12 +415,18 @@ fn parse_dtd(dtd: &[u8]) -> Option<DisplayMode> {
     }
     flags |= MODE_FLAG_PREFERRED;
 
-    let htotal = hdisplay + hblank;
-    let vtotal = vdisplay + vblank;
-    let hsync_start = hdisplay + hsync_off;
-    let hsync_end = hsync_start + hsync_width;
-    let vsync_start = vdisplay + vsync_off;
-    let vsync_end = vsync_start + vsync_width;
+    // SECURITY: all timing values are EDID-supplied (monitor-controlled) u16
+    // fields.  Plain u16 addition wraps in release builds and panics with
+    // overflow-checks ON.  Use checked_add and return None on overflow so
+    // a malformed EDID block is silently rejected instead of causing a kernel
+    // panic.  is_valid() below catches any remaining coherence violations, but
+    // it cannot guard against the overflow itself.
+    let htotal = hdisplay.checked_add(hblank)?;
+    let vtotal = vdisplay.checked_add(vblank)?;
+    let hsync_start = hdisplay.checked_add(hsync_off)?;
+    let hsync_end = hsync_start.checked_add(hsync_width)?;
+    let vsync_start = vdisplay.checked_add(vsync_off)?;
+    let vsync_end = vsync_start.checked_add(vsync_width)?;
 
     let mode = DisplayMode {
         hdisplay,
