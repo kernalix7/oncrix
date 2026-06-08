@@ -195,6 +195,48 @@ impl AmdgpuCore {
         if fb.width == 0 || fb.height == 0 {
             return Err(Error::InvalidArgument);
         }
+
+        // SECURITY: Reject zero bpp and unsupported bpp values.  Supported
+        // depths are 8, 16, 24, and 32 bits.  An unsupported value would make
+        // the cpp computation meaningless and could be used to bypass the
+        // pitch/VRAM-range checks below.
+        let cpp: u32 = match fb.bpp {
+            8 => 1,
+            16 => 2,
+            24 => 3,
+            32 => 4,
+            _ => return Err(Error::InvalidArgument),
+        };
+
+        // SECURITY: Require pitch >= width * cpp.  A pitch smaller than the
+        // minimum required by the pixel format allows a crafted framebuffer to
+        // reference memory outside the intended scanout region when the display
+        // engine walks rows.  Both operands fit in u32, so promote to u64 for
+        // the multiplication to prevent overflow before comparing.
+        let min_pitch: u64 = (fb.width as u64)
+            .checked_mul(cpp as u64)
+            .ok_or(Error::InvalidArgument)?;
+        if (fb.pitch as u64) < min_pitch {
+            return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: Require gpu_addr + pitch * height <= vram_size.  Without
+        // this check a crafted pitch or height could make the scanout window
+        // extend beyond the VRAM aperture, producing an OOB GPU memory access.
+        // All arithmetic is done in u64 with checked_mul/checked_add so that
+        // overflow (e.g. pitch = u32::MAX, height = u32::MAX) is caught and
+        // rejected rather than wrapping to a spuriously in-range value.
+        let fb_size: u64 = (fb.pitch as u64)
+            .checked_mul(fb.height as u64)
+            .ok_or(Error::InvalidArgument)?;
+        let fb_end: u64 = fb
+            .gpu_addr
+            .checked_add(fb_size)
+            .ok_or(Error::InvalidArgument)?;
+        if fb_end > self.vram_size {
+            return Err(Error::InvalidArgument);
+        }
+
         self.fb = Some(fb);
         Ok(())
     }

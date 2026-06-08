@@ -170,18 +170,56 @@ pub struct DrmDisplayMode {
 
 impl DrmDisplayMode {
     /// Creates a mode with the given active resolution and refresh rate.
-    pub const fn new(hdisplay: u16, vdisplay: u16, refresh_rate: u8) -> Self {
-        // Approximate pixel clock: W × H × refresh × 1.35 (blanking factor)
-        let pixel_clock_khz =
-            (hdisplay as u32) * (vdisplay as u32) * (refresh_rate as u32) * 135 / 100 / 1000;
-        Self {
+    ///
+    /// All three inputs come from userspace.  The function validates that
+    /// intermediate products and totals fit in their target types before
+    /// constructing the mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if:
+    /// - The pixel-clock intermediate product would overflow `u32`.
+    /// - `htotal` (`hdisplay + hdisplay/5`) would exceed `u16::MAX`.
+    /// - `vtotal` (`vdisplay + vdisplay/10`) would exceed `u16::MAX`.
+    pub fn new(hdisplay: u16, vdisplay: u16, refresh_rate: u8) -> Result<Self> {
+        // SECURITY: hdisplay, vdisplay, refresh_rate are userspace-supplied.
+        // Compute the pixel-clock intermediate in u64 so that the full
+        // W×H×refresh×135 product cannot silently wrap before the /100/1000
+        // reduction; reject if the final value exceeds u32::MAX.
+        let pixel_clock_khz: u32 = (hdisplay as u64)
+            .checked_mul(vdisplay as u64)
+            .and_then(|v| v.checked_mul(refresh_rate as u64))
+            .and_then(|v| v.checked_mul(135))
+            .map(|v| v / 100 / 1000)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(Error::InvalidArgument)?;
+
+        // SECURITY: htotal = hdisplay + hdisplay/5 is computed in u32 to
+        // avoid a u16 wrap for hdisplay > 54612 (54613 + 10922 > u16::MAX).
+        let htotal: u16 = {
+            let h = hdisplay as u32;
+            h.checked_add(h / 5)
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or(Error::InvalidArgument)?
+        };
+
+        // SECURITY: vtotal = vdisplay + vdisplay/10 is computed in u32 to
+        // avoid a u16 wrap for vdisplay > 59577 (59578 + 5957 > u16::MAX).
+        let vtotal: u16 = {
+            let v = vdisplay as u32;
+            v.checked_add(v / 10)
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or(Error::InvalidArgument)?
+        };
+
+        Ok(Self {
             hdisplay,
             vdisplay,
             refresh_rate,
             pixel_clock_khz,
-            htotal: hdisplay + hdisplay / 5,
-            vtotal: vdisplay + vdisplay / 10,
-        }
+            htotal,
+            vtotal,
+        })
     }
 
     /// Returns `true` if this mode has no resolution set.

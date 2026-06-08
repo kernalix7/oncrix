@@ -234,8 +234,22 @@ impl DrmPlane {
         }
 
         // Check CRTC is allowed.
+        //
+        // SECURITY: crtc_id is userspace-supplied.  crtc_id == 0 is rejected
+        // above by is_enabled().  Map id → bit = id-1.
+        //
+        // If crtc_bit >= 32 the hardware possible_crtcs bitmask (u32) has no
+        // bit for it, so the CRTC is definitively not in the allowed set.
+        // Hard-reject here BEFORE any shift: a too-large shift on a u32 would
+        // be UB / panic under overflow-checks=on, and the old short-circuit
+        // `crtc_bit < 32 && …` silently let crtc_id >= 33 pass as "valid".
         let crtc_bit = new_state.crtc_id.saturating_sub(1);
-        if crtc_bit < 32 && self.possible_crtcs & (1 << crtc_bit) == 0 {
+        if crtc_bit >= 32 {
+            // SECURITY: crtc_id maps to a bit position beyond the 32-bit
+            // possible_crtcs mask — definitively not in the allowed set.
+            return Err(Error::InvalidArgument);
+        }
+        if self.possible_crtcs & (1u32 << crtc_bit) == 0 {
             return Err(Error::InvalidArgument);
         }
 
