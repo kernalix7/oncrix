@@ -291,7 +291,11 @@ impl PowerMgmt {
                 in("eax") core::ptr::addr_of!(dummy),
                 in("ecx") 0u32,
                 in("edx") 0u32,
-                options(nomem, nostack, preserves_flags),
+                // No `nomem`: MONITOR arms a hardware write-watch on the cache
+                // line at the EAX linear address (`dummy`). The compiler must
+                // keep `dummy` materialized and must not reorder stores to it
+                // across the MONITOR; `nomem` would permit both.
+                options(nostack, preserves_flags),
             );
             core::arch::asm!(
                 "mwait",

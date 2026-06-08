@@ -315,7 +315,11 @@ pub unsafe fn load_gdt(gdtr: &GdtDescriptor) {
             kcs  = in(reg) kcs,
             kds  = in(reg) kds,
             tmp  = out(reg) _,
-            options(nostack),
+            // `mov ax, {kds:x}` writes AX (RAX low 16) as scratch — declare it
+            // clobbered so LLVM does not place a live `in(reg)` value in RAX.
+            out("rax") _,
+            // No `nostack`: the block executes `push`/`push`/`retfq`, which
+            // modify RSP and write the stack, so it genuinely uses the stack.
         );
     }
 }
