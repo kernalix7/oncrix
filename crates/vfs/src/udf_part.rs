@@ -189,7 +189,9 @@ impl PartitionDescriptor {
         if lba >= self.partition_length {
             return Err(Error::InvalidArgument);
         }
-        Ok(self.partition_starting_location + lba)
+        self.partition_starting_location
+            .checked_add(lba)
+            .ok_or(Error::InvalidArgument)
     }
 }
 

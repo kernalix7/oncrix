@@ -554,6 +554,13 @@ impl FileEntry {
         // Extended attribute length at offset 168.
         let ea_length = read_u32_le(&data[168..172]) as usize;
         let alloc_descs_length = read_u32_le(&data[172..176]);
+        let alloc_end = 176usize
+            .checked_add(ea_length)
+            .and_then(|x| x.checked_add(alloc_descs_length as usize))
+            .ok_or(Error::InvalidArgument)?;
+        if alloc_end > data.len() {
+            return Err(Error::InvalidArgument);
+        }
         let alloc_descs_offset = 176 + ea_length;
 
         Ok(Self {
@@ -695,6 +702,13 @@ impl ExtendedFileEntry {
 
         let ea_length = read_u32_le(&data[208..212]) as usize;
         let alloc_descs_length = read_u32_le(&data[212..216]);
+        let alloc_end = 216usize
+            .checked_add(ea_length)
+            .and_then(|x| x.checked_add(alloc_descs_length as usize))
+            .ok_or(Error::InvalidArgument)?;
+        if alloc_end > data.len() {
+            return Err(Error::InvalidArgument);
+        }
         let alloc_descs_offset = 216 + ea_length;
 
         Ok(Self {
@@ -969,8 +983,14 @@ impl<'a> UdfFs<'a> {
 
         // Locate the File Set Descriptor (FSD).
         let fsd_lbn = logical_volume.fsd_location;
-        let fsd_abs = (partition.partition_start + fsd_lbn) as usize * UDF_SECTOR_SIZE;
-        if fsd_abs + UDF_SECTOR_SIZE > data.len() {
+        let fsd_abs = (partition.partition_start as usize)
+            .checked_add(fsd_lbn as usize)
+            .and_then(|s| s.checked_mul(UDF_SECTOR_SIZE))
+            .ok_or(Error::InvalidArgument)?;
+        if fsd_abs
+            .checked_add(UDF_SECTOR_SIZE)
+            .map_or(true, |e| e > data.len())
+        {
             return Err(Error::IoError);
         }
 
@@ -998,13 +1018,18 @@ impl<'a> UdfFs<'a> {
 
     /// Convert a logical block number within the partition to an
     /// absolute byte offset in the image.
-    pub fn lbn_to_offset(&self, lbn: u32) -> usize {
-        (self.partition.partition_start + lbn) as usize * UDF_SECTOR_SIZE
+    ///
+    /// Returns [`Error::InvalidArgument`] if the arithmetic overflows.
+    pub fn lbn_to_offset(&self, lbn: u32) -> Result<usize> {
+        (self.partition.partition_start as usize)
+            .checked_add(lbn as usize)
+            .and_then(|s| s.checked_mul(UDF_SECTOR_SIZE))
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Read a File Entry (tag 261) at the given logical block.
     pub fn read_file_entry(&self, lbn: u32) -> Result<FileEntry> {
-        let offset = self.lbn_to_offset(lbn);
+        let offset = self.lbn_to_offset(lbn)?;
         if offset + UDF_SECTOR_SIZE > self.data.len() {
             return Err(Error::IoError);
         }
@@ -1013,7 +1038,7 @@ impl<'a> UdfFs<'a> {
 
     /// Read an Extended File Entry (tag 266) at the given logical block.
     pub fn read_extended_file_entry(&self, lbn: u32) -> Result<ExtendedFileEntry> {
-        let offset = self.lbn_to_offset(lbn);
+        let offset = self.lbn_to_offset(lbn)?;
         if offset + UDF_SECTOR_SIZE > self.data.len() {
             return Err(Error::IoError);
         }
@@ -1025,7 +1050,7 @@ impl<'a> UdfFs<'a> {
     /// The directory data is located by reading the file entry at `lbn`
     /// and following its allocation descriptors.
     pub fn readdir(&self, dir_lbn: u32) -> Result<([FileIdentifier; MAX_DIR_ENTRIES], usize)> {
-        let fe_offset = self.lbn_to_offset(dir_lbn);
+        let fe_offset = self.lbn_to_offset(dir_lbn)?;
         if fe_offset + UDF_SECTOR_SIZE > self.data.len() {
             return Err(Error::IoError);
         }
@@ -1073,10 +1098,11 @@ impl<'a> UdfFs<'a> {
                     if ad.length() == 0 {
                         break;
                     }
-                    let ext_off = self.lbn_to_offset(ad.extent_position);
-                    let ext_end = ext_off + ad.length() as usize;
-                    if ext_end <= self.data.len() {
-                        self.parse_fids(&self.data[ext_off..ext_end], &mut entries, &mut count);
+                    if let Ok(ext_off) = self.lbn_to_offset(ad.extent_position) {
+                        let ext_end = ext_off.saturating_add(ad.length() as usize);
+                        if ext_end <= self.data.len() {
+                            self.parse_fids(&self.data[ext_off..ext_end], &mut entries, &mut count);
+                        }
                     }
                 }
                 pos += 8;
@@ -1091,10 +1117,11 @@ impl<'a> UdfFs<'a> {
                     if ad.length() == 0 {
                         break;
                     }
-                    let ext_off = self.lbn_to_offset(ad.extent_location);
-                    let ext_end = ext_off + ad.length() as usize;
-                    if ext_end <= self.data.len() {
-                        self.parse_fids(&self.data[ext_off..ext_end], &mut entries, &mut count);
+                    if let Ok(ext_off) = self.lbn_to_offset(ad.extent_location) {
+                        let ext_end = ext_off.saturating_add(ad.length() as usize);
+                        if ext_end <= self.data.len() {
+                            self.parse_fids(&self.data[ext_off..ext_end], &mut entries, &mut count);
+                        }
                     }
                 }
                 pos += 16;
@@ -1131,7 +1158,7 @@ impl<'a> UdfFs<'a> {
     /// Copies up to `buf.len()` bytes starting at `offset` within
     /// the file. Returns the number of bytes copied.
     pub fn read_file(&self, file_lbn: u32, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let fe_offset = self.lbn_to_offset(file_lbn);
+        let fe_offset = self.lbn_to_offset(file_lbn)?;
         if fe_offset + UDF_SECTOR_SIZE > self.data.len() {
             return Err(Error::IoError);
         }
@@ -1208,7 +1235,10 @@ impl<'a> UdfFs<'a> {
                 };
                 let avail = ext_len - skip;
                 let copy_len = avail.min(to_read - buf_pos);
-                let abs_off = self.lbn_to_offset(ext_lbn) + skip;
+                let abs_off = self
+                    .lbn_to_offset(ext_lbn)?
+                    .checked_add(skip)
+                    .ok_or(Error::InvalidArgument)?;
                 if abs_off + copy_len > self.data.len() {
                     return Err(Error::IoError);
                 }
