@@ -141,7 +141,10 @@ pub unsafe fn read_cr0() -> u64 {
 pub unsafe fn write_cr0(val: u64) {
     // SAFETY: Caller is responsible for the correctness of `val`.
     unsafe {
-        core::arch::asm!("mov cr0, {0}", in(reg) val, options(nomem, nostack, preserves_flags));
+        // No `nomem`: writing CR0 can flip WP/PG/CD, changing the memory-access
+        // semantics of surrounding code, so the block must act as a compiler
+        // memory barrier and not let loads/stores be reordered across it.
+        core::arch::asm!("mov cr0, {0}", in(reg) val, options(nostack, preserves_flags));
     }
 }
 
@@ -221,7 +224,11 @@ pub unsafe fn read_cr3() -> u64 {
 pub unsafe fn write_cr3(val: u64) {
     // SAFETY: Caller guarantees val is a valid PML4 physical address.
     unsafe {
-        core::arch::asm!("mov cr3, {0}", in(reg) val, options(nomem, nostack, preserves_flags));
+        // No `nomem`: writing CR3 flushes the TLB and changes how every
+        // subsequent virtual-memory access resolves, so it must act as a
+        // compiler memory barrier (loads/stores must not be reordered across
+        // the address-space switch). Same class as the lidt/lgdt/ltr fixes.
+        core::arch::asm!("mov cr3, {0}", in(reg) val, options(nostack, preserves_flags));
     }
 }
 
@@ -263,7 +270,10 @@ pub unsafe fn read_cr4() -> u64 {
 pub unsafe fn write_cr4(val: u64) {
     // SAFETY: Caller is responsible for the correctness of `val`.
     unsafe {
-        core::arch::asm!("mov cr4, {0}", in(reg) val, options(nomem, nostack, preserves_flags));
+        // No `nomem`: writing CR4 can change SMEP/SMAP/PGE/PCIDE, affecting TLB
+        // validity and memory protection, so it must act as a compiler memory
+        // barrier and not allow loads/stores to be reordered across it.
+        core::arch::asm!("mov cr4, {0}", in(reg) val, options(nostack, preserves_flags));
     }
 }
 
