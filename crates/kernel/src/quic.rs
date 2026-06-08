@@ -513,7 +513,9 @@ impl QuicConnection {
                     // Store remote CID from the header.
                     let len = (header.scid_len as usize).min(CID_MAX_LEN);
                     self.remote_cid[..len].copy_from_slice(&header.scid[..len]);
-                    self.cid_len = header.scid_len;
+                    // Clamp to the backing-array length: the raw wire CID length
+                    // can be up to 255 but local/remote_cid are CID_MAX_LEN bytes.
+                    self.cid_len = len as u8;
                 }
             }
             QuicPacketType::Handshake => {
@@ -566,7 +568,9 @@ impl QuicConnection {
     pub fn build_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
         // Minimum space: form(1) + version(4) + dcid_len(1) + dcid +
         // scid_len(1) + scid.
-        let cid_len = self.cid_len as usize;
+        // Defense in depth: clamp to the backing-array length so a CID length
+        // that somehow exceeds CID_MAX_LEN can never OOB-index local/remote_cid.
+        let cid_len = (self.cid_len as usize).min(CID_MAX_LEN);
         let header_size = LONG_HEADER_MIN + cid_len + cid_len;
         if buf.len() < header_size {
             return Err(Error::InvalidArgument);
@@ -582,13 +586,14 @@ impl QuicConnection {
         buf[3] = ver[2];
         buf[4] = ver[3];
 
-        // DCID.
-        buf[5] = self.cid_len;
+        // DCID. Write the clamped length so the advertised CID length always
+        // matches the number of bytes actually copied below.
+        buf[5] = cid_len as u8;
         let dcid_end = 6 + cid_len;
         buf[6..dcid_end].copy_from_slice(&self.remote_cid[..cid_len]);
 
         // SCID.
-        buf[dcid_end] = self.cid_len;
+        buf[dcid_end] = cid_len as u8;
         let scid_end = dcid_end + 1 + cid_len;
         buf[dcid_end + 1..scid_end].copy_from_slice(&self.local_cid[..cid_len]);
 
@@ -732,7 +737,9 @@ impl QuicRegistry {
         self.connections[slot].local_cid[..dcid_len].copy_from_slice(&header.dcid[..dcid_len]);
         let scid_len = (header.scid_len as usize).min(CID_MAX_LEN);
         self.connections[slot].remote_cid[..scid_len].copy_from_slice(&header.scid[..scid_len]);
-        self.connections[slot].cid_len = header.dcid_len.max(header.scid_len);
+        // Clamp to the backing-array length (raw wire CID length can be 0..=255,
+        // the cid backing arrays are CID_MAX_LEN bytes).
+        self.connections[slot].cid_len = dcid_len.max(scid_len) as u8;
 
         self.count = self.count.saturating_add(1);
         Ok(conn_id)
