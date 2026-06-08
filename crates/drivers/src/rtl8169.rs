@@ -479,12 +479,20 @@ impl Rtl8169 {
         }
 
         let pkt_len = (opts1 & 0x3FFF) as usize;
-        // SECURITY: pkt_len is a device-DMA-controlled field. Validate both the
-        // lower bound (must hold at least the 4-byte Ethernet CRC) and the upper
-        // bound (must not exceed the fixed RX_BUF_SIZE DMA buffer) before slicing.
-        // Without this guard, a malicious/faulty device could cause an OOB slice
-        // panic (ring-0 halt) or a wrapping underflow on the CRC subtraction.
-        if pkt_len < 4 || pkt_len > RX_BUF_SIZE {
+        // SECURITY: pkt_len is a device-DMA-controlled field. Enforce full
+        // Ethernet on-wire frame bounds BEFORE stripping the 4-byte CRC:
+        //   • minimum 64  = 60-byte minimum payload + 4-byte CRC.
+        //     Accepting pkt_len == 4 would strip the CRC and deliver a
+        //     zero-length frame upstream, triggering a downstream parser panic
+        //     or OOB — the same class of bug fixed in e1000e. The previous
+        //     guard (pkt_len < 4) was insufficient; a device can trivially
+        //     supply pkt_len == 4.
+        //   • maximum 1518 = 1514-byte maximum Ethernet payload + 4-byte CRC.
+        //     RX_BUF_SIZE (2048) is intentionally larger than this to provide
+        //     DMA headroom; the wire-level cap is the correct upper bound here.
+        //     Frames above 1518 are malformed/jumbo and must not be forwarded.
+        // After this guard data_len = pkt_len - 4 is guaranteed in 60..=1514.
+        if pkt_len < 64 || pkt_len > 1518 {
             // Recycle the descriptor back to the NIC and skip this packet.
             let eor = self.rx_head == RX_RING_SIZE - 1;
             let buf_addr = self.rx_buf[self.rx_head].as_ptr() as u64;
@@ -493,7 +501,7 @@ impl Rtl8169 {
             self.rx_head = (self.rx_head + 1) % RX_RING_SIZE;
             return Err(Error::IoError);
         }
-        // strip 4-byte CRC; subtraction is safe: pkt_len >= 4 guaranteed above.
+        // Strip 4-byte CRC; subtraction is safe: pkt_len >= 64 guaranteed above.
         let data_len = pkt_len - 4;
         if buf.len() < data_len {
             return Err(Error::InvalidArgument);

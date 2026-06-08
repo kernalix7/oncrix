@@ -477,7 +477,13 @@ impl UsbMscDevice {
 
         if csw.phase_error() {
             // BOT reset recovery per §5.3.4.
-            self.reset_count += 1;
+            // SECURITY: use saturating_add so that a device that continuously
+            // returns phase-error CSWs cannot overflow reset_count and wrap it
+            // back to 0, which would bypass the MAX_RESET_RETRIES gate and
+            // allow the counter to drive reset operations forever.  Saturating
+            // at usize::MAX keeps the value strictly > MAX_RESET_RETRIES so the
+            // offline transition is taken on the very next call.
+            self.reset_count = self.reset_count.saturating_add(1);
             if self.reset_count > MAX_RESET_RETRIES {
                 self.online = false;
                 return Err(Error::IoError);
@@ -497,6 +503,11 @@ impl UsbMscDevice {
 
     /// Issue TEST UNIT READY to a specific LUN.
     pub fn test_unit_ready(&mut self, lun: u8) -> Result<()> {
+        // SECURITY: reject a caller- or device-supplied LUN that falls outside
+        // the fixed luns[] array, mirroring the guard in read_blocks/write_blocks.
+        if lun as usize >= MAX_LUNS {
+            return Err(Error::InvalidArgument);
+        }
         let cdb = [
             SCSI_OP_TEST_UNIT_READY,
             0,
@@ -524,6 +535,11 @@ impl UsbMscDevice {
 
     /// Issue REQUEST SENSE to a specific LUN.
     pub fn request_sense(&mut self, lun: u8) -> Result<SenseData> {
+        // SECURITY: reject a caller- or device-supplied LUN that falls outside
+        // the fixed luns[] array, mirroring the guard in read_blocks/write_blocks.
+        if lun as usize >= MAX_LUNS {
+            return Err(Error::InvalidArgument);
+        }
         let cdb = [
             SCSI_OP_REQUEST_SENSE,
             0,
@@ -563,6 +579,11 @@ impl UsbMscDevice {
 
     /// Issue INQUIRY to a specific LUN.
     pub fn inquiry(&mut self, lun: u8) -> Result<InquiryData> {
+        // SECURITY: reject a caller- or device-supplied LUN that falls outside
+        // the fixed luns[] array, mirroring the guard in read_blocks/write_blocks.
+        if lun as usize >= MAX_LUNS {
+            return Err(Error::InvalidArgument);
+        }
         let cdb = [
             SCSI_OP_INQUIRY,
             0,
@@ -601,6 +622,11 @@ impl UsbMscDevice {
 
     /// Issue READ CAPACITY(10) to a specific LUN.
     pub fn read_capacity10(&mut self, lun: u8) -> Result<(u64, u32)> {
+        // SECURITY: reject a caller- or device-supplied LUN that falls outside
+        // the fixed luns[] array, mirroring the guard in read_blocks/write_blocks.
+        if lun as usize >= MAX_LUNS {
+            return Err(Error::InvalidArgument);
+        }
         let cdb = [
             SCSI_OP_READ_CAPACITY10,
             0,
@@ -644,6 +670,11 @@ impl UsbMscDevice {
 
     /// Issue SYNCHRONIZE CACHE(10) to flush the device write cache.
     pub fn sync_cache(&mut self, lun: u8) -> Result<()> {
+        // SECURITY: reject a caller- or device-supplied LUN that falls outside
+        // the fixed luns[] array, mirroring the guard in read_blocks/write_blocks.
+        if lun as usize >= MAX_LUNS {
+            return Err(Error::InvalidArgument);
+        }
         let cdb = [
             SCSI_OP_SYNCHRONIZE_CACHE10,
             0,
