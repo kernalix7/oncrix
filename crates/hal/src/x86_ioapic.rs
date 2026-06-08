@@ -185,11 +185,17 @@ impl X86Ioapic {
 
         let ver_reg = self.read_reg(IOAPIC_VER);
         let max_redir = ((ver_reg >> 16) & 0xFF) as u8;
-        self.num_entries = max_redir + 1;
-
-        if (self.num_entries as usize) > IOAPIC_MAX_ENTRIES {
+        // SECURITY: max_redir is firmware-supplied (bits 23:16 of the version
+        // register).  If firmware reports 0xFF, adding 1 as u8 wraps to 0,
+        // making num_entries appear zero and silently skipping the mask loop —
+        // all pins remain unmasked.  Compute in usize to avoid the overflow,
+        // then reject values that exceed IOAPIC_MAX_ENTRIES.
+        let entry_count = (max_redir as usize).checked_add(1).unwrap_or(usize::MAX);
+        if entry_count > IOAPIC_MAX_ENTRIES {
             return Err(Error::InvalidArgument);
         }
+        // entry_count <= IOAPIC_MAX_ENTRIES <= 24, fits in u8.
+        self.num_entries = entry_count as u8;
 
         // Mask all entries
         for i in 0..self.num_entries {

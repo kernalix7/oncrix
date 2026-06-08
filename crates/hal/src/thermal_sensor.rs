@@ -15,6 +15,15 @@ pub const MAX_THERMAL_SENSORS: usize = 16;
 /// Maximum number of trip points per sensor.
 pub const MAX_TRIP_POINTS: usize = 4;
 
+/// Maximum plausible raw ADC value from a thermal sensor register.
+///
+/// Encoding is raw * 0.5°C - 40°C; raw=3000 => 1460°C, well above any
+/// real hardware limit. Values above this indicate firmware corruption or
+/// an unmapped MMIO page returning 0xFFFF_FFFF.
+// SECURITY: Reject firmware-supplied raw values that would overflow i32
+// arithmetic in the (raw as i32) * 500 - 40_000 + calibration_offset path.
+const MAX_RAW_TEMP: u32 = 3_000;
+
 /// Type of thermal sensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensorType {
@@ -152,9 +161,20 @@ impl ThermalSensor {
             let temp_reg = self.base_addr as *const u32;
             temp_reg.read_volatile()
         };
+        // SECURITY: Reject firmware-supplied raw values above the plausible
+        // hardware maximum before the scaling arithmetic to prevent i32 overflow.
+        if raw > MAX_RAW_TEMP {
+            return Err(Error::IoError);
+        }
         // Convert raw register value to milli-Celsius.
         // Encoding: raw value in units of 0.5°C, offset from -40°C.
-        let temp_mc = (raw as i32) * 500 - 40_000 + self.calibration_offset;
+        // Use checked arithmetic; the bounds above make overflow impossible for
+        // valid data, but defend in depth against calibration_offset extremes.
+        let scaled = (raw as i32).checked_mul(500).ok_or(Error::IoError)?;
+        let base = scaled.checked_sub(40_000).ok_or(Error::IoError)?;
+        let temp_mc = base
+            .checked_add(self.calibration_offset)
+            .ok_or(Error::IoError)?;
         Ok(temp_mc)
     }
 

@@ -142,10 +142,19 @@ impl AcpiCpuFreq {
     /// Returns [`Error::InvalidArgument`] if `idx >= num_pstates`.
     /// Returns [`Error::PermissionDenied`] if `idx > max_pstate` (_PPC limit).
     pub fn set_pstate(&mut self, idx: usize) -> Result<()> {
-        if idx >= self.num_pstates {
+        // SECURITY: also bound idx by the physical array size — `num_pstates`
+        // is a pub field that could be poked above ACPI_CPUFREQ_MAX_PSTATES,
+        // which would let `idx < num_pstates` still index `pstates[idx]` out
+        // of bounds below.
+        if idx >= self.num_pstates || idx >= ACPI_CPUFREQ_MAX_PSTATES {
             return Err(Error::InvalidArgument);
         }
-        if idx > self.max_pstate {
+        // SECURITY: max_pstate is pub and sourced from the firmware _PPC
+        // object, which may supply a value >= num_pstates.  Clamp the
+        // effective ceiling so a stale or adversarial _PPC cannot bypass
+        // the num_pstates bound and reach an uninitialised pstates slot.
+        let cap = self.max_pstate.min(self.num_pstates.saturating_sub(1));
+        if idx > cap {
             return Err(Error::PermissionDenied);
         }
         let ctrl_val = self.pstates[idx].control;
@@ -157,7 +166,12 @@ impl AcpiCpuFreq {
     /// Reads the current effective P-state from the status register.
     pub fn read_current_pstate(&self) -> Result<usize> {
         let status = self.read_perf_status()?;
-        for (i, ps) in self.pstates[..self.num_pstates].iter().enumerate() {
+        // SECURITY: clamp the slice bound to the physical array size (pub
+        // `num_pstates` could exceed ACPI_CPUFREQ_MAX_PSTATES).
+        for (i, ps) in self.pstates[..self.num_pstates.min(ACPI_CPUFREQ_MAX_PSTATES)]
+            .iter()
+            .enumerate()
+        {
             if ps.status == status {
                 return Ok(i);
             }
@@ -167,7 +181,13 @@ impl AcpiCpuFreq {
 
     /// Returns the frequency of the current P-state in MHz.
     pub fn current_freq_mhz(&self) -> u32 {
-        if self.num_pstates == 0 {
+        // SECURITY: current_pstate and num_pstates are pub and may be set by
+        // firmware-supplied ACPI _PSS data; guard all three bounds before
+        // indexing the fixed-size array to prevent out-of-bounds access.
+        if self.num_pstates == 0
+            || self.current_pstate >= self.num_pstates
+            || self.current_pstate >= ACPI_CPUFREQ_MAX_PSTATES
+        {
             return 0;
         }
         self.pstates[self.current_pstate].freq_mhz
@@ -183,10 +203,14 @@ impl AcpiCpuFreq {
 
     /// Returns the minimum frequency in MHz (last P-state).
     pub fn min_freq_mhz(&self) -> u32 {
+        // SECURITY: num_pstates is pub; a firmware or caller could set it
+        // beyond ACPI_CPUFREQ_MAX_PSTATES, making `num_pstates - 1` an
+        // out-of-bounds index on the fixed-size array.  Clamp before use.
         if self.num_pstates == 0 {
             return 0;
         }
-        self.pstates[self.num_pstates - 1].freq_mhz
+        let last = self.num_pstates.min(ACPI_CPUFREQ_MAX_PSTATES) - 1;
+        self.pstates[last].freq_mhz
     }
 
     // ---- private helpers ----
@@ -280,7 +304,9 @@ impl Default for AcpiCpuFreq {
 /// Selects the lowest-numbered (highest-performance) P-state whose frequency
 /// does not exceed `target_mhz`. Returns `num_pstates - 1` if none qualifies.
 pub fn select_pstate(driver: &AcpiCpuFreq, target_mhz: u32) -> usize {
-    let n = driver.num_pstates;
+    // SECURITY: clamp to the physical array size (pub `num_pstates` could
+    // exceed ACPI_CPUFREQ_MAX_PSTATES and OOB-slice `pstates` below).
+    let n = driver.num_pstates.min(ACPI_CPUFREQ_MAX_PSTATES);
     if n == 0 {
         return 0;
     }

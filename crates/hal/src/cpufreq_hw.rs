@@ -193,14 +193,25 @@ impl CpufreqHw {
         self.min_ratio =
             ((platform & PLATFORM_INFO_MIN_RATIO_MASK) >> PLATFORM_INFO_MIN_RATIO_SHIFT) as u8;
 
-        // Check HWP capability via CPUID leaf 6.EAX bit 7
+        // Check HWP capability via CPUID leaf 6.EAX bit 7.
         let cpuid6_eax: u32;
         // SAFETY: CPUID is always available on x86_64.
+        // SECURITY: CPUID writes all four of EAX, EBX, ECX, EDX.  LLVM
+        // reserves RBX and forbids `out("ebx")` as a direct constraint.
+        // Use the project-standard xchg idiom (see cpuid_hw.rs): swap RBX
+        // into a general-purpose temporary before CPUID and swap back after,
+        // so the compiler does not keep a live value in EBX/RBX across the
+        // instruction (soundness fix — the original asm declared only ECX as
+        // clobbered; EDX was silently overwritten, producing potential UB).
         unsafe {
             core::arch::asm!(
+                "xchg {tmp:r}, rbx",
                 "cpuid",
+                "xchg {tmp:r}, rbx",
                 inout("eax") 6u32 => cpuid6_eax,
+                tmp = out(reg) _,
                 out("ecx") _,
+                out("edx") _,
                 options(nomem, nostack, preserves_flags),
             );
         }

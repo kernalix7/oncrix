@@ -465,8 +465,14 @@ impl IoApicDriver {
     }
 
     /// Return the highest GSI served (exclusive).
+    ///
+    /// Returns `u32::MAX` (saturating) if the range would overflow, which
+    /// prevents wrap-around from making a partial APIC appear to cover GSI 0.
     pub fn gsi_end(&self) -> u32 {
-        self.gsi_base + self.pin_count as u32
+        // SECURITY: gsi_base and pin_count are firmware-supplied; a crafted
+        // base + count could wrap u32 and falsely claim to cover low GSIs.
+        // Saturate on overflow so the result stays out of any legitimate range.
+        self.gsi_base.saturating_add(self.pin_count as u32)
     }
 
     /// Return the number of IRQ pins.
@@ -585,7 +591,14 @@ impl IoapicManager {
             if !slot.active {
                 continue;
             }
-            let end = slot.gsi_base + slot.pin_count as u32;
+            // SECURITY: gsi_base and pin_count originate from firmware (ACPI MADT).
+            // A maliciously crafted MADT could set gsi_base near u32::MAX so that
+            // gsi_base + pin_count wraps to a small value, falsely matching low GSIs
+            // that belong to a different I/O APIC.  Skip any slot whose end overflows.
+            let end = match slot.gsi_base.checked_add(slot.pin_count as u32) {
+                Some(e) => e,
+                None => continue,
+            };
             if gsi >= slot.gsi_base && gsi < end {
                 return Ok((i, (gsi - slot.gsi_base) as u8));
             }

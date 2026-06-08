@@ -752,7 +752,14 @@ impl Timer for Hpet {
 
         // Use timer 0 for the Timer trait's one-shot mode.
         // Compute the absolute comparator value = counter + ticks.
-        let target = self.read_counter().wrapping_add(ticks);
+        // SECURITY: `ticks` is caller-supplied; a malicious or oversized value
+        // could wrap the u64 counter and program a comparator in the past,
+        // causing an immediate or delayed spurious interrupt.  Use checked_add
+        // and reject the request if the absolute deadline overflows.
+        let target = self
+            .read_counter()
+            .checked_add(ticks)
+            .ok_or(Error::InvalidArgument)?;
 
         // Read existing config to preserve the route, then set
         // one-shot + interrupt enable.

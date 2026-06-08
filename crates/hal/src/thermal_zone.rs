@@ -215,9 +215,16 @@ impl ThermalGovernor {
                 if trip_temp_mc == 0 || current_mc <= trip_temp_mc {
                     return 0;
                 }
-                let overshoot = (current_mc - trip_temp_mc) as u32;
+                // SECURITY: current_mc - trip_temp_mc is i32 subtraction that
+                // can overflow when firmware supplies extreme sensor values.
+                // Use checked_sub and treat overflow as maximum cooling state.
+                let overshoot_i = current_mc.checked_sub(trip_temp_mc).unwrap_or(i32::MAX);
+                // Clamp to u32 range before further arithmetic.
+                let overshoot = overshoot_i.max(0) as u32;
                 let range = trip_temp_mc.unsigned_abs().max(1);
-                let ratio = (overshoot * max_state) / range;
+                // SECURITY: overshoot * max_state can overflow u32; use
+                // saturating_mul so the result stays within [0, u32::MAX].
+                let ratio = overshoot.saturating_mul(max_state) / range;
                 ratio.min(max_state)
             }
             ThermalGovernorType::UserSpace => {

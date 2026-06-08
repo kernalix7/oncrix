@@ -262,7 +262,13 @@ impl HpetHw {
             let cfg = cfg | TIMER_PERIODIC | TIMER_INT_ENABLE | TIMER_VAL_SET;
             write64(self.base, off, cfg);
             let now = read64(self.base, REG_MAIN_COUNTER);
-            write64(self.base, timer_comp_offset(n), now + period_ticks);
+            // SECURITY: period_ticks is a firmware/caller-supplied value; use
+            // checked_add to reject a malicious oversized period that would wrap
+            // the u64 comparator and program a near-immediate spurious interrupt.
+            let first_tick = now
+                .checked_add(period_ticks)
+                .ok_or(Error::InvalidArgument)?;
+            write64(self.base, timer_comp_offset(n), first_tick);
             // Writing period value (VAL_SET must be set)
             write64(self.base, timer_comp_offset(n), period_ticks);
         }
@@ -284,9 +290,23 @@ impl HpetHw {
     }
 
     /// Clear the interrupt status flag for timer `n`.
-    pub fn clear_interrupt(&self, n: u8) {
+    ///
+    /// Returns `Err(InvalidArgument)` if `n` is out of range (>= num_timers or >= 64)
+    /// so a firmware-supplied timer index cannot cause undefined behaviour via an
+    /// out-of-range shift.
+    pub fn clear_interrupt(&self, n: u8) -> Result<()> {
+        // SECURITY: Reject out-of-range `n` before the shift. A shift of 1u64 << n
+        // with n >= 64 is undefined behaviour in Rust (overflow-checks ON = panic;
+        // release = wraps / produces wrong value). Firmware-controlled num_timers()
+        // is bounded to bits 12:8 of CAP_ID (max 0x1F = 31), but we explicitly
+        // check both conditions so that a caller cannot bypass the guard.
+        if n >= 64 || n > self.num_timers() {
+            return Err(Error::InvalidArgument);
+        }
         // SAFETY: Writing 1 to the timer's bit in INT_STATUS to clear it (W1C).
+        // n < 64 is verified above, so the shift is well-defined.
         unsafe { write64(self.base, REG_INT_STATUS, 1u64 << n) };
+        Ok(())
     }
 
     /// Return the HPET MMIO base address.
