@@ -142,13 +142,25 @@ impl ExfatBootSector {
 
     /// Returns the byte offset of the FAT for `cluster`.
     pub fn fat_entry_offset(&self, cluster: u32) -> Result<u64> {
-        if cluster < EXFAT_FIRST_CLUSTER {
+        // SECURITY: enforce both lower and upper bounds against on-disk cluster_count
+        // before using `cluster` as a device offset.  An attacker-controlled value
+        // of e.g. u32::MAX would otherwise compute an offset far past the FAT region,
+        // reading arbitrary kernel memory.  cluster_count + EXFAT_FIRST_CLUSTER - 1
+        // can overflow u32 (cluster_count up to 0xFFFFFFF5, +1 wraps), so use
+        // checked_add.
+        let max_cluster = self
+            .cluster_count
+            .checked_add(EXFAT_FIRST_CLUSTER - 1)
+            .ok_or(Error::InvalidArgument)?;
+        if cluster < EXFAT_FIRST_CLUSTER || cluster > max_cluster {
             return Err(Error::InvalidArgument);
         }
         // SECURITY: use checked_shl for the bytes_per_sector_shift (on-disk u8).
         let fat_base = (self.fat_offset as u64)
             .checked_shl(self.bytes_per_sector_shift as u32)
             .ok_or(Error::InvalidArgument)?;
+        // SECURITY: use checked_add for the cluster-to-byte offset; cluster fits in
+        // u32 so cluster * 4 fits in u64, but we stay explicit.
         fat_base
             .checked_add(cluster as u64 * 4)
             .ok_or(Error::InvalidArgument)
@@ -362,15 +374,14 @@ impl AllocationBitmap {
         if self.cluster_count == 0 {
             return Err(Error::OutOfMemory);
         }
-        let start = self.next_hint;
+        // SECURITY: the previous unbounded `loop` with termination guard
+        // `c == start && c != 0` never fires when start == 0 (the default value
+        // of next_hint, or after wrapping), causing an infinite ring-0 loop on a
+        // full volume — a DoS from a crafted image.  Replace with a bounded scan
+        // over exactly `cluster_count` candidates so termination is unconditional.
+        let start = self.next_hint % self.cluster_count; // clamp stale hint to range
         let mut c = start;
-        loop {
-            if c >= self.cluster_count {
-                c = 0;
-            }
-            if c == start && c != 0 {
-                return Err(Error::OutOfMemory);
-            }
+        for _ in 0..self.cluster_count {
             if !self.is_allocated(c) {
                 self.set_allocated(c, true);
                 // SECURITY: cluster_count != 0 (checked above); modulo is safe.
@@ -378,7 +389,12 @@ impl AllocationBitmap {
                 return Ok(c + EXFAT_FIRST_CLUSTER);
             }
             c += 1;
+            if c >= self.cluster_count {
+                c = 0;
+            }
         }
+        // Exhausted all cluster_count candidates without finding a free cluster.
+        Err(Error::OutOfMemory)
     }
 
     /// Frees a cluster.

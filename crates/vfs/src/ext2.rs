@@ -151,6 +151,14 @@ impl Ext2Superblock {
             return Err(Error::InvalidArgument);
         }
 
+        // SECURITY: s_blocks_count == 0 is a degenerate superblock — every
+        // `blk < s_blocks_count` block-range guard downstream would reject all
+        // blocks (an unmountable image). Reject it here in the LIVE mount
+        // parser so the block-bound checks operate on a real total.
+        if read_u32(buf, 4) == 0 {
+            return Err(Error::InvalidArgument);
+        }
+
         let s_rev_level = read_u32(buf, 76);
         let s_inode_size = if s_rev_level >= 1 {
             // [HIGH] rev >= 1 carries inode size at offset 88.
@@ -398,10 +406,16 @@ impl<R: BlockReader> Ext2Fs<R> {
         let mut bgd = [NONE_BGD; MAX_BLOCK_GROUPS];
 
         // Read each 32-byte BGD entry.
+        // SECURITY: use checked arithmetic so that a large bg_count (bounded
+        // to MAX_BLOCK_GROUPS=64) combined with a large bgd_offset cannot
+        // silently overflow to a wrong device offset.
         let mut bgd_buf = [0u8; 32];
         for (i, slot) in bgd.iter_mut().enumerate().take(bg_count) {
-            let offset = bgd_offset + (i as u64 * 32);
-            reader.read_bytes(offset, &mut bgd_buf)?;
+            let entry_off = (i as u64)
+                .checked_mul(32)
+                .and_then(|o| bgd_offset.checked_add(o))
+                .ok_or(Error::InvalidArgument)?;
+            reader.read_bytes(entry_off, &mut bgd_buf)?;
             *slot = Some(BlockGroupDesc::from_bytes(&bgd_buf)?);
         }
 
@@ -427,7 +441,22 @@ impl<R: BlockReader> Ext2Fs<R> {
     ///
     /// `buf` must be at least `block_size()` bytes.
     pub fn read_block(&self, block_num: u32, buf: &mut [u8]) -> Result<()> {
-        let offset = block_num as u64 * self.block_size();
+        // SECURITY: block_num == 0 is a hole/unallocated sentinel in ext2;
+        // reject rather than reading the boot sector at offset 0.
+        if block_num == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: bound block_num against the superblock total before
+        // converting to a byte offset.  An attacker-controlled block number
+        // >= s_blocks_count would produce an OOB read of kernel memory.
+        if block_num >= self.sb.s_blocks_count {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: use checked_mul so that a crafted block_size (bounded to
+        // <= 64 KiB) combined with a large block_num cannot overflow u64.
+        let offset = (block_num as u64)
+            .checked_mul(self.block_size())
+            .ok_or(Error::InvalidArgument)?;
         let len = self.block_size() as usize;
         if buf.len() < len {
             return Err(Error::InvalidArgument);
@@ -458,7 +487,14 @@ impl<R: BlockReader> Ext2Fs<R> {
         let inode_size = self.sb.s_inode_size as u64;
         let block_size = self.block_size();
 
-        // [HIGH] Use checked arithmetic to prevent wrap-around on
+        // SECURITY: bg_inode_table is an attacker-supplied u32 block number.
+        // Validate it against s_blocks_count before using as a device offset.
+        // A value of 0 or >= s_blocks_count means a corrupt/malicious image.
+        if bgd.bg_inode_table == 0 || bgd.bg_inode_table >= self.sb.s_blocks_count {
+            return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: use checked arithmetic to prevent wrap-around on
         // attacker-controlled on-disk fields.
         let table_offset = (bgd.bg_inode_table as u64)
             .checked_mul(block_size)
@@ -491,8 +527,14 @@ impl<R: BlockReader> Ext2Fs<R> {
         }
 
         if fb < EXT2_NDIR_BLOCKS {
-            // Direct block.
-            return Ok(inode.i_block[fb]);
+            // Direct block — validate before returning to callers.
+            let blk = inode.i_block[fb];
+            // SECURITY: block 0 is a valid sparse-file hole; any non-zero
+            // block number must be within the filesystem's total block count.
+            if blk != 0 && blk >= self.sb.s_blocks_count {
+                return Err(Error::InvalidArgument);
+            }
+            return Ok(blk);
         }
 
         // Single-indirect block.
@@ -502,6 +544,13 @@ impl<R: BlockReader> Ext2Fs<R> {
             return Ok(0); // hole
         }
 
+        // SECURITY: validate the indirect block pointer itself before using it
+        // as a device offset.  An attacker-controlled value >= s_blocks_count
+        // would produce an OOB read of kernel memory.
+        if indirect_block >= self.sb.s_blocks_count {
+            return Err(Error::InvalidArgument);
+        }
+
         // Read the indirect block (array of u32 block numbers).
         let bs = self.block_size() as usize;
         let ptrs_per_block = bs / 4;
@@ -509,11 +558,27 @@ impl<R: BlockReader> Ext2Fs<R> {
             return Err(Error::InvalidArgument);
         }
 
-        // We only need 4 bytes at the right offset within the indirect block.
-        let offset = indirect_block as u64 * self.block_size() + indirect_idx as u64 * 4;
+        // SECURITY: use checked arithmetic for the indirect block byte offset.
+        let indirect_byte_off = (indirect_block as u64)
+            .checked_mul(self.block_size())
+            .ok_or(Error::InvalidArgument)?;
+        let ptr_byte_off = (indirect_idx as u64)
+            .checked_mul(4)
+            .ok_or(Error::InvalidArgument)?;
+        let offset = indirect_byte_off
+            .checked_add(ptr_byte_off)
+            .ok_or(Error::InvalidArgument)?;
         let mut buf = [0u8; 4];
         self.reader.read_bytes(offset, &mut buf)?;
-        Ok(u32::from_le_bytes(buf))
+        let data_block = u32::from_le_bytes(buf);
+
+        // SECURITY: validate the resolved data block pointer against
+        // s_blocks_count before returning it to callers that will use it as a
+        // device offset.  Block 0 is a valid sparse hole and is allowed.
+        if data_block != 0 && data_block >= self.sb.s_blocks_count {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(data_block)
     }
 
     /// Read file data from an inode.
@@ -547,7 +612,14 @@ impl<R: BlockReader> Ext2Fs<R> {
                     *b = 0;
                 }
             } else {
-                let disk_offset = disk_block as u64 * bs + block_offset as u64;
+                // SECURITY: disk_block is already validated < s_blocks_count by
+                // resolve_block; use checked arithmetic here to guard against
+                // any future regression and to prevent overflow on the final
+                // byte offset (disk_block * block_size + block_offset).
+                let disk_offset = (disk_block as u64)
+                    .checked_mul(bs)
+                    .and_then(|o| o.checked_add(block_offset as u64))
+                    .ok_or(Error::InvalidArgument)?;
                 self.reader
                     .read_bytes(disk_offset, &mut buf[bytes_read..bytes_read + chunk])?;
             }

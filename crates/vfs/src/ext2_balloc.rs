@@ -155,27 +155,62 @@ pub struct Ext2Balloc {
 
 impl Ext2Balloc {
     /// Create a new allocator for `group_count` block groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if any parameter is out of range or
+    /// would cause an arithmetic overflow when computing derived values from
+    /// on-disk fields.
     pub fn new(group_count: usize, blocks_per_group: u64, first_data_block: u64) -> Result<Self> {
         if group_count > MAX_BLOCK_GROUPS || group_count == 0 {
             return Err(Error::InvalidArgument);
         }
-        let total_blocks = group_count as u64 * blocks_per_group;
-        let reserved_blocks = total_blocks * RESERVED_PERCENT / 100;
+        // SECURITY: blocks_per_group == 0 would cause divide-by-zero in
+        // alloc_block, free_block, and block_group when computing
+        // `offset / blocks_per_group`.  Reject it here so every downstream
+        // divide is unconditionally safe.
+        if blocks_per_group == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: use checked_mul to reject on-disk fields that would
+        // overflow a u64 total_blocks computation.
+        let total_blocks = (group_count as u64)
+            .checked_mul(blocks_per_group)
+            .ok_or(Error::InvalidArgument)?;
+        // SECURITY: checked multiply before dividing to avoid overflow in the
+        // reserved-block calculation (total_blocks * RESERVED_PERCENT can
+        // overflow for a maximally crafted filesystem image).
+        let reserved_blocks = total_blocks
+            .checked_mul(RESERVED_PERCENT)
+            .ok_or(Error::InvalidArgument)?
+            / 100;
+        let free_blocks = total_blocks.saturating_sub(reserved_blocks);
         let mut alloc = Self {
             groups: [BlockGroupDesc::default(); MAX_BLOCK_GROUPS],
             bitmaps: [BlockBitmap::free(); MAX_BLOCK_GROUPS],
             group_count,
             total_blocks,
-            free_blocks: total_blocks - reserved_blocks,
+            free_blocks,
             reserved_blocks,
             blocks_per_group,
             first_data_block,
         };
         // Initialise group descriptors.
+        // SECURITY: use checked_mul for i * blocks_per_group so a crafted
+        // image with enormous blocks_per_group cannot overflow the block
+        // descriptor address computation.
         for i in 0..group_count {
             alloc.groups[i].free_blocks_count = blocks_per_group as u32;
-            alloc.groups[i].block_bitmap = first_data_block + i as u64 * blocks_per_group;
-            alloc.groups[i].inode_table = first_data_block + i as u64 * blocks_per_group + 1;
+            let group_start = first_data_block
+                .checked_add(
+                    (i as u64)
+                        .checked_mul(blocks_per_group)
+                        .ok_or(Error::InvalidArgument)?,
+                )
+                .ok_or(Error::InvalidArgument)?;
+            alloc.groups[i].block_bitmap = group_start;
+            alloc.groups[i].inode_table =
+                group_start.checked_add(1).ok_or(Error::InvalidArgument)?;
         }
         Ok(alloc)
     }
@@ -192,9 +227,14 @@ pub fn alloc_block(balloc: &mut Ext2Balloc, goal: u64) -> Result<u64> {
     if balloc.free_blocks == 0 {
         return Err(Error::OutOfMemory);
     }
+    // SECURITY: blocks_per_group is guaranteed non-zero by Ext2Balloc::new, so
+    // the divides below are safe.  Guard the subtraction against underflow from
+    // a goal block that precedes first_data_block (e.g. goal == 0 on a
+    // crafted image where first_data_block == 1).
+    let goal_offset_abs = goal.saturating_sub(balloc.first_data_block);
     // Determine goal group and offset within group.
-    let goal_group = ((goal - balloc.first_data_block) / balloc.blocks_per_group) as usize;
-    let goal_offset = ((goal - balloc.first_data_block) % balloc.blocks_per_group) as usize;
+    let goal_group = (goal_offset_abs / balloc.blocks_per_group) as usize;
+    let goal_offset = (goal_offset_abs % balloc.blocks_per_group) as usize;
 
     // Try goal group first.
     let groups_to_try = [goal_group];
@@ -266,6 +306,9 @@ pub fn free_block(balloc: &mut Ext2Balloc, block: u64) -> Result<()> {
     if block < balloc.first_data_block {
         return Err(Error::InvalidArgument);
     }
+    // SECURITY: subtraction is safe — guarded by the check above.
+    // blocks_per_group is guaranteed non-zero by Ext2Balloc::new, so the
+    // divides below cannot panic.
     let offset = block - balloc.first_data_block;
     let group = (offset / balloc.blocks_per_group) as usize;
     let bit = (offset % balloc.blocks_per_group) as usize;
@@ -312,6 +355,9 @@ pub fn block_group(balloc: &Ext2Balloc, block: u64) -> Option<usize> {
     if block < balloc.first_data_block {
         return None;
     }
+    // SECURITY: subtraction is safe — guarded by the check above.
+    // blocks_per_group is guaranteed non-zero by Ext2Balloc::new, so the
+    // divide below cannot panic.
     let offset = block - balloc.first_data_block;
     let group = (offset / balloc.blocks_per_group) as usize;
     if group < balloc.group_count {

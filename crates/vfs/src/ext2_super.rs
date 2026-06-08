@@ -197,6 +197,15 @@ pub fn parse_super(buf: &[u8; SUPERBLOCK_SIZE]) -> Result<ParsedSuper> {
     let blocks_per_group = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
     let inodes_per_group = u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]);
 
+    // SECURITY: s_blocks_count == 0 would make later bounds checks
+    // (block_num < s_blocks_count) accept every block number, turning the
+    // guard into a no-op.  Reject the image immediately.
+    if blocks_count_lo == 0 {
+        return Err(Error::InvalidArgument);
+    }
+
+    // SECURITY: both fields are used as divisors (inode-group calculation and
+    // group-count calculation); a zero value causes a kernel-halt divide trap.
     if blocks_per_group == 0 || inodes_per_group == 0 {
         return Err(Error::InvalidArgument);
     }
@@ -208,8 +217,21 @@ pub fn parse_super(buf: &[u8; SUPERBLOCK_SIZE]) -> Result<ParsedSuper> {
         .map(|v| v / blocks_per_group)
         .ok_or(Error::InvalidArgument)?;
 
+    // SECURITY: inode_size must be a power-of-two in [128, 1024].
+    // Values outside this range indicate a corrupt or malicious image and
+    // would cause OOB reads when computing inode byte offsets.  The zero
+    // sentinel is treated as the legacy default (128) only when the image
+    // was created by an old tool; other out-of-range values are rejected.
     let inode_size = u16::from_le_bytes([buf[88], buf[89]]);
-    let inode_size = if inode_size == 0 { 128 } else { inode_size };
+    let inode_size = if inode_size == 0 {
+        128u16
+    } else {
+        // Must be power-of-two and in [128, 1024].
+        if !(128u16..=1024).contains(&inode_size) || !inode_size.is_power_of_two() {
+            return Err(Error::InvalidArgument);
+        }
+        inode_size
+    };
     let first_ino = u32::from_le_bytes([buf[84], buf[85], buf[86], buf[87]]);
     let first_ino = if first_ino == 0 { 11 } else { first_ino };
 
@@ -252,7 +274,10 @@ pub fn validate_super(sb: &ParsedSuper) -> Result<()> {
     if sb.group_count == 0 {
         return Err(Error::InvalidArgument);
     }
-    if sb.inode_size < 128 || sb.inode_size > 1024 {
+    // SECURITY: enforce the same inode_size constraints that parse_super does:
+    // power-of-two in [128, 1024].  This guards callers that construct a
+    // ParsedSuper directly rather than through parse_super.
+    if !(128u16..=1024).contains(&sb.inode_size) || !sb.inode_size.is_power_of_two() {
         return Err(Error::InvalidArgument);
     }
     Ok(())

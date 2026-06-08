@@ -90,9 +90,23 @@ impl ExtentHeader {
         }
     }
 
-    /// Return `true` if the magic field is valid.
+    /// Return `true` if this header is structurally valid.
+    ///
+    /// Checks:
+    /// - `eh_magic == EXT4_EXT_MAGIC`
+    /// - `eh_entries <= eh_max` (entry count must not exceed capacity)
+    /// - `eh_depth <= EXT_MAX_LEVELS` (tree depth is bounded)
+    ///
+    /// # Security
+    ///
+    /// SECURITY: a crafted filesystem image can set `eh_entries` > `eh_max`
+    /// or `eh_depth` > `EXT_MAX_LEVELS` to cause OOB reads or unbounded
+    /// tree traversals in the kernel.  All three conditions must be checked
+    /// before trusting any other field.
     pub fn is_valid(&self) -> bool {
         self.eh_magic == EXT4_EXT_MAGIC
+            && self.eh_entries <= self.eh_max
+            && self.eh_depth <= EXT_MAX_LEVELS
     }
 
     /// Return `true` if this is a leaf node.

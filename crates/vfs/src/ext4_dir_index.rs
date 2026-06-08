@@ -187,6 +187,19 @@ impl DirIndex {
     /// Look up a filename in the HTree, returning the target leaf block.
     ///
     /// `read_block` is a callback that reads a directory block by its index.
+    ///
+    /// # Security — caller MUST bound-check the returned block
+    ///
+    /// `DxLookupResult::block` is derived directly from on-disk HTree entries
+    /// and is therefore attacker-controlled.  The `read_block` callback receives
+    /// HTree-sourced block numbers at two points during the walk (see inline
+    /// `// SECURITY` comments below); if `read_block` maps block numbers to
+    /// device offsets without first checking that the block number is less than
+    /// the filesystem's total block count (`s_blocks_count` from the superblock),
+    /// an attacker can craft an HTree image that causes an OOB device read or a
+    /// ring-0 panic.  Additionally, the `DxLookupResult::block` value returned
+    /// to the ultimate caller carries the same risk and must be validated before
+    /// use as a device offset.
     pub fn lookup<F>(&self, name: &[u8], mut read_block: F) -> Result<DxLookupResult>
     where
         F: FnMut(u32) -> Result<DxNode>,
@@ -209,9 +222,18 @@ impl DirIndex {
         let leaf_block = dx_node_search(&root, hash)?;
 
         let target_block = if self.indirect_levels > 0 {
+            // SECURITY: `leaf_block` comes from an on-disk HTree entry (via
+            // dx_node_search).  The `read_block` implementation MUST validate
+            // that leaf_block < fs_block_count before mapping it to a device
+            // offset; otherwise an attacker can read arbitrary kernel memory.
             let level2 = read_block(leaf_block)?;
+            // SECURITY: same requirement applies to the block number returned
+            // by the second-level dx_node_search.
             dx_node_search(&level2, hash)?
         } else {
+            // SECURITY: `leaf_block` is attacker-controlled (see above).  The
+            // caller of `lookup` must validate DxLookupResult::block <
+            // fs_block_count before using it as a device offset.
             leaf_block
         };
 
@@ -300,6 +322,20 @@ fn dx_node_search(node: &DxNode, hash: u32) -> Result<u32> {
 
     // `lo` is the first entry with hash > target; use lo-1 (or entry 0).
     let idx = if lo == 0 { 0 } else { lo - 1 };
+
+    // SECURITY: `DxEntry::block` is a raw u32 read directly from an
+    // attacker-controlled on-disk HTree block.  This function does not have
+    // access to the filesystem's total block count (s_blocks_count), so it
+    // cannot perform the bound check here.
+    //
+    // MANDATORY caller contract: every caller that converts the returned block
+    // number to a device I/O offset MUST validate:
+    //   returned_block < fs_block_count (from the validated superblock)
+    // and reject (return Err(IoError)) if the check fails.  Failure to do so
+    // allows an attacker to craft an HTree image that causes an OOB read of
+    // kernel memory or a ring-0 panic via an out-of-range block device access.
+    //
+    // See: DirIndex::lookup — it documents the same requirement on its callers.
     Ok(node.entries[idx].block)
 }
 
