@@ -227,7 +227,15 @@ impl Sdhci {
         while div < 2048 && (self.base_clock_hz / (div * 2)) > freq_hz {
             div *= 2;
         }
-        let div_val = (div as u16) << CLKCTRL_FREQ_SEL_SHIFT;
+        // SECURITY: The legacy SDHCI FREQ_SEL field is 8 bits wide [15:8].
+        // A malicious/emulated controller can supply a base-clock value that
+        // drives `div` up to 2048 via the loop above; casting 512..2048 to u16
+        // and shifting left by 8 overflows u16 (overflow-checks ON -> ring-0
+        // panic).  Clamp to 255 (the maximum 8-bit divisor) before the cast.
+        // A legitimate base clock (25–208 MHz) targeting ≥400 kHz will never
+        // produce div > 255, so this clamp is a no-op for real hardware.
+        let prog_div = div.min(255);
+        let div_val = (prog_div as u16) << CLKCTRL_FREQ_SEL_SHIFT;
         self.write16(REG_CLK_CTRL, div_val | CLKCTRL_INTERNAL_CLK_EN);
         // Wait for internal clock stable.
         let mut tries = 0u32;
@@ -244,7 +252,10 @@ impl Sdhci {
         // Enable SD clock output.
         let clk = self.read16(REG_CLK_CTRL);
         self.write16(REG_CLK_CTRL, clk | CLKCTRL_SD_CLK_EN);
-        self.sd_clock_hz = self.base_clock_hz / (div * 2);
+        // SECURITY: report the clock for the divisor actually programmed
+        // (clamped), not the unclamped `div`, so a cached sd_clock_hz cannot
+        // disagree with the hardware when the clamp engaged.
+        self.sd_clock_hz = self.base_clock_hz / (prog_div * 2);
         Ok(())
     }
 

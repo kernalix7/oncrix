@@ -217,7 +217,18 @@ impl EhciHcd {
     pub fn init(&mut self) -> Result<()> {
         // Read the capability registers length to find the operational base.
         let cap_len = self.read_cap8(CAP_CAPLENGTH) as usize;
-        self.op_base = self.cap_base + cap_len;
+        // SECURITY: cap_len comes directly from a hardware MMIO register.
+        // A malicious/emulated device can supply an arbitrary byte value that,
+        // when added to cap_base (a kernel virtual address), overflows usize
+        // (overflow-checks ON -> ring-0 panic, or silent wrap to a bogus
+        // address on release builds).  Use checked_add and reject the device
+        // if the result would wrap.  Legitimate EHCI controllers have
+        // CAP_CAPLENGTH in the range 0x10–0x20, so this is a no-op for real
+        // hardware.
+        self.op_base = self
+            .cap_base
+            .checked_add(cap_len)
+            .ok_or(Error::InvalidArgument)?;
         // Parse HCSPARAMS for the number of ports.
         let hcsparams = self.read_cap32(CAP_HCSPARAMS);
         self.num_ports = (hcsparams & 0x0F) as usize;

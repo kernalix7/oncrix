@@ -911,7 +911,17 @@ impl SdHostController {
         // Block address: SDHC uses block LBA directly; SDv1 uses byte address.
         let arg = match self.card.card_type {
             CardType::Sdhc | CardType::Sdxc => lba as u32,
-            _ => (lba * SD_BLOCK_SIZE as u64) as u32,
+            _ => {
+                // SECURITY: SDv1/SDv2 cards take a 32-bit byte address. A large
+                // LBA can overflow the u64 product or silently truncate to u32,
+                // corrupting the command argument and potentially triggering
+                // out-of-bounds hardware access.  Reject any LBA whose byte
+                // address does not fit in u32.
+                let byte_addr = lba
+                    .checked_mul(SD_BLOCK_SIZE as u64)
+                    .ok_or(Error::InvalidArgument)?;
+                u32::try_from(byte_addr).map_err(|_| Error::InvalidArgument)?
+            }
         };
 
         // Configure block size and count.
@@ -963,7 +973,17 @@ impl SdHostController {
 
         let arg = match self.card.card_type {
             CardType::Sdhc | CardType::Sdxc => lba as u32,
-            _ => (lba * SD_BLOCK_SIZE as u64) as u32,
+            _ => {
+                // SECURITY: SDv1/SDv2 cards take a 32-bit byte address. A large
+                // LBA can overflow the u64 product or silently truncate to u32,
+                // corrupting the command argument and potentially triggering
+                // out-of-bounds hardware access.  Reject any LBA whose byte
+                // address does not fit in u32.
+                let byte_addr = lba
+                    .checked_mul(SD_BLOCK_SIZE as u64)
+                    .ok_or(Error::InvalidArgument)?;
+                u32::try_from(byte_addr).map_err(|_| Error::InvalidArgument)?
+            }
         };
 
         self.write16(REG_BLOCK_SIZE, SD_BLOCK_SIZE as u16);
@@ -1017,7 +1037,17 @@ impl SdHostController {
 
         let arg = match self.card.card_type {
             CardType::Sdhc | CardType::Sdxc => lba as u32,
-            _ => (lba * SD_BLOCK_SIZE as u64) as u32,
+            _ => {
+                // SECURITY: SDv1/SDv2 cards take a 32-bit byte address. A large
+                // LBA can overflow the u64 product or silently truncate to u32,
+                // corrupting the command argument and potentially triggering
+                // out-of-bounds hardware access.  Reject any LBA whose byte
+                // address does not fit in u32.
+                let byte_addr = lba
+                    .checked_mul(SD_BLOCK_SIZE as u64)
+                    .ok_or(Error::InvalidArgument)?;
+                u32::try_from(byte_addr).map_err(|_| Error::InvalidArgument)?
+            }
         };
 
         self.write16(REG_BLOCK_SIZE, SD_BLOCK_SIZE as u16);

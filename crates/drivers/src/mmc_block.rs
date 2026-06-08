@@ -211,7 +211,13 @@ impl MmcBlockDevice {
         if count == 0 {
             return Err(Error::InvalidArgument);
         }
-        let end = start_block + count as u64;
+        // SECURITY: checked_add prevents overflow when start_block is near u64::MAX;
+        // a malicious/emulated controller could supply a capacity that allows a
+        // crafted (start_block, count) pair to wrap around and bypass the capacity
+        // check, potentially triggering out-of-bounds DMA or ring-0 panic.
+        let end = start_block
+            .checked_add(count as u64)
+            .ok_or(Error::InvalidArgument)?;
         if end > self.csd.capacity_blocks {
             return Err(Error::InvalidArgument);
         }
@@ -219,10 +225,32 @@ impl MmcBlockDevice {
     }
 
     /// Returns the LBA argument for a command (adjusts for SDHC byte addressing).
-    pub fn cmd_arg(&self, lba: u64) -> u32 {
+    ///
+    /// For standard-capacity SD cards the LBA is converted to a byte offset, which
+    /// must fit in 32 bits. Returns [`Error::InvalidArgument`] if the byte address
+    /// would overflow `u32` (lba ≥ 2^32 / 512 = 8_388_608).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] on byte-address overflow for `CardType::Sd`.
+    pub fn cmd_arg(&self, lba: u64) -> Result<u32> {
         match self.card_type {
-            CardType::Sd => (lba * MMC_BLOCK_SIZE as u64) as u32,
-            CardType::Sdhc | CardType::Mmc | CardType::MmcHc => lba as u32,
+            CardType::Sd => {
+                // SECURITY: for byte-addressed (standard-capacity) SD cards the
+                // controller argument register is 32-bit. Multiplying an attacker-
+                // controlled LBA by 512 can overflow u64 and then truncate to a
+                // different valid sector, bypassing capacity checks. Use checked_mul
+                // and reject the overflow explicitly.
+                let byte_addr = lba
+                    .checked_mul(MMC_BLOCK_SIZE as u64)
+                    .ok_or(Error::InvalidArgument)?;
+                // The argument register is 32-bit; reject values that don't fit.
+                u32::try_from(byte_addr).map_err(|_| Error::InvalidArgument)
+            }
+            CardType::Sdhc | CardType::Mmc | CardType::MmcHc => {
+                // Block-addressed: LBA is passed directly; must fit in 32 bits.
+                u32::try_from(lba).map_err(|_| Error::InvalidArgument)
+            }
         }
     }
 
