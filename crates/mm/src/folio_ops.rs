@@ -156,12 +156,23 @@ impl FolioDescriptor {
 
     /// Return the number of pages in this folio.
     pub const fn nr_pages(&self) -> u64 {
+        // SECURITY: `1u64 << order` panics (overflow-checks) when
+        // `order >= 64`. Reject out-of-range orders before the shift and
+        // return a saturated count; every legitimate folio order
+        // (0..=MAX_ORDER) is well under the bit width and is unaffected.
+        if self.order >= 64 {
+            return u64::MAX;
+        }
         1u64 << self.order
     }
 
     /// Return the size in bytes.
     pub const fn size(&self) -> u64 {
-        self.nr_pages() * PAGE_SIZE
+        // SECURITY: a maximally-bounded `nr_pages()` would overflow the
+        // `* PAGE_SIZE` multiply; use a saturating multiply so the byte
+        // size is clamped instead of panicking. Normal orders multiply
+        // exactly.
+        self.nr_pages().saturating_mul(PAGE_SIZE)
     }
 
     /// Return the reference count.

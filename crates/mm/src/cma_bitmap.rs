@@ -137,20 +137,37 @@ impl CmaBitmap {
         }
         let align = if alignment == 0 { 1 } else { alignment };
 
-        let mut start = 0;
-        while start + count <= self.total_blocks {
-            // Align start.
+        let mut start: usize = 0;
+        // SECURITY: every index advance below is bounded against
+        // `total_blocks` and uses checked/saturating arithmetic so the scan
+        // cannot wrap a usize and always terminates, even for a huge `count`,
+        // `align`, or (hypothetically) `total_blocks`.
+        while start
+            .checked_add(count)
+            .is_some_and(|end| end <= self.total_blocks)
+        {
+            // Align start. `((start / align) + 1) * align` can overflow for a
+            // large alignment; saturate so we walk off the end and stop.
             if start % align != 0 {
-                start = ((start / align) + 1) * align;
+                start = (start / align).saturating_add(1).saturating_mul(align);
                 continue;
             }
 
             // Check if range is free.
             let mut all_free = true;
             for i in 0..count {
-                if self.is_allocated(start + i) {
-                    // Skip past the allocated block.
-                    start = start + i + 1;
+                // SECURITY: `start + i` stays within the window guaranteed by
+                // the loop condition, but guard the add defensively before
+                // indexing through `is_allocated`.
+                let probe = match start.checked_add(i) {
+                    Some(p) => p,
+                    None => return None,
+                };
+                if self.is_allocated(probe) {
+                    // Skip past the allocated block. `start + i + 1` can wrap
+                    // at the usize ceiling; saturate so the outer loop's
+                    // `end <= total_blocks` test then fails and we stop.
+                    start = probe.saturating_add(1);
                     all_free = false;
                     break;
                 }
@@ -250,7 +267,16 @@ impl Default for CmaRegion {
 impl CmaRegion {
     /// Initialises a CMA region.
     pub fn init(region_id: u64, base_pfn: u64, total_pages: u64, order_per_bit: u32) -> Self {
-        let pages_per_block = 1u64 << order_per_bit;
+        // SECURITY: `order_per_bit` is a u32 and may exceed the bit width of
+        // u64. `1u64 << order_per_bit` for order >= 64 is an undefined shift
+        // and panics under overflow-checks. Saturate an out-of-range order so
+        // this infallible constructor cannot panic; an order that large yields
+        // one giant block, and the allocation paths reject such orders.
+        let pages_per_block = if order_per_bit >= u64::BITS {
+            u64::MAX
+        } else {
+            1u64 << order_per_bit
+        };
         let count = (total_pages / pages_per_block) as usize;
         let clamped = count.min(MAX_CMA_BLOCKS);
 
@@ -275,9 +301,25 @@ impl CmaRegion {
             return Err(Error::InvalidArgument);
         }
 
+        // SECURITY: reject an out-of-range shift order before the shift; a
+        // u32 order >= 64 would make `1u64 << order` an undefined shift that
+        // panics under overflow-checks. All legal orders 0..=63 still pass.
+        if self.info.order_per_bit >= u64::BITS {
+            return Err(Error::InvalidArgument);
+        }
         let pages_per_block = 1u64 << self.info.order_per_bit;
-        let blocks_needed = ((nr_pages + pages_per_block - 1) / pages_per_block) as usize;
-        let align_blocks = ((alignment_pages + pages_per_block - 1) / pages_per_block) as usize;
+        // SECURITY: `nr_pages`/`alignment_pages` are caller-controlled. The
+        // ceil-divide round-up `x + pages_per_block - 1` can overflow u64 for
+        // a near-MAX request; use checked_add and reject the oversize request
+        // instead of panicking. (pages_per_block >= 1, so the `- 1` is safe.)
+        let blocks_needed = (nr_pages
+            .checked_add(pages_per_block - 1)
+            .ok_or(Error::InvalidArgument)?
+            / pages_per_block) as usize;
+        let align_blocks = (alignment_pages
+            .checked_add(pages_per_block - 1)
+            .ok_or(Error::InvalidArgument)?
+            / pages_per_block) as usize;
 
         let start = self
             .bitmap

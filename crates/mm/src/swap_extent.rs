@@ -87,7 +87,12 @@ impl SwapExtent {
 
     /// Return the ending swap offset (exclusive).
     pub const fn end_offset(&self) -> u64 {
-        self.swap_offset + self.nr_pages
+        // SECURITY: swap_offset and nr_pages are disk-controlled once a live
+        // swapon caller is wired; their sum can overflow u64. This is an
+        // exclusive end marker used only for range comparisons, so clamping at
+        // u64::MAX is safe (it can never be a valid contained offset) and
+        // avoids an overflow panic under overflow-checks.
+        self.swap_offset.saturating_add(self.nr_pages)
     }
 
     /// Check whether a swap offset falls within this extent.
@@ -96,13 +101,29 @@ impl SwapExtent {
     }
 
     /// Map a swap offset to a disk block.
+    ///
+    /// Callers must ensure `offset` falls within this extent (see
+    /// [`contains`](Self::contains)); the lookup path guarantees this.
     pub const fn to_block(&self, offset: u64) -> u64 {
-        self.start_block + (offset - self.swap_offset) * SECTORS_PER_PAGE
+        // SECURITY: `offset` and the extent fields are disk-controlled. A stray
+        // offset below swap_offset would underflow the subtraction, and the
+        // page->sector scale plus start_block could overflow the u64 block
+        // address; both panic under overflow-checks. Saturating arithmetic
+        // keeps this plain-u64 accessor total. Within a validated extent
+        // (offset in [swap_offset, end_offset)) the result is exact, so legit
+        // values are unaffected.
+        let rel = offset.saturating_sub(self.swap_offset);
+        self.start_block
+            .saturating_add(rel.saturating_mul(SECTORS_PER_PAGE))
     }
 
     /// Return the size in disk sectors.
     pub const fn sector_count(&self) -> u64 {
-        self.nr_pages * SECTORS_PER_PAGE
+        // SECURITY: nr_pages is disk-controlled; nr_pages * SECTORS_PER_PAGE can
+        // overflow u64 and panic under overflow-checks. This value is used for
+        // diagnostics/I/O sizing, so saturating at u64::MAX is safe. Valid
+        // extents (bounded by MAX_SWAP_PAGES on add) never reach the clamp.
+        self.nr_pages.saturating_mul(SECTORS_PER_PAGE)
     }
 }
 
@@ -199,7 +220,20 @@ impl SwapExtentMap {
         if self.count >= MAX_EXTENTS {
             return Err(Error::OutOfMemory);
         }
-        if self.total_pages + extent.nr_pages() > MAX_SWAP_PAGES {
+        // SECURITY: extent.nr_pages() and total_pages are disk-controlled. The
+        // original guard `total_pages + nr_pages > MAX_SWAP_PAGES` overflows the
+        // add itself before the comparison, panicking under overflow-checks (or
+        // wrapping to a small value that bypasses the cap). Reject a single
+        // oversized extent first, then bound the running total with checked_add
+        // so a genuine overflow is rejected rather than silently wrapping. All
+        // valid totals (<= MAX_SWAP_PAGES) still pass.
+        let nr_pages = extent.nr_pages();
+        if nr_pages > MAX_SWAP_PAGES
+            || self
+                .total_pages
+                .checked_add(nr_pages)
+                .is_none_or(|t| t > MAX_SWAP_PAGES)
+        {
             return Err(Error::InvalidArgument);
         }
         // Verify ordering.
@@ -209,9 +243,16 @@ impl SwapExtentMap {
                 return Err(Error::InvalidArgument);
             }
         }
+        // SECURITY: commit the running total with checked_add as well; the cap
+        // check above guarantees this cannot overflow, but checked_add keeps the
+        // increment panic-free defensively (and matches the guard's arithmetic).
+        let new_total = self
+            .total_pages
+            .checked_add(nr_pages)
+            .ok_or(Error::InvalidArgument)?;
         self.extents[self.count] = extent;
         self.count += 1;
-        self.total_pages += extent.nr_pages();
+        self.total_pages = new_total;
         Ok(())
     }
 

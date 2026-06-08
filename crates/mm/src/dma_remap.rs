@@ -147,10 +147,19 @@ impl DmaRemapEntry {
 
     /// Translate a DMA address to physical.
     pub const fn translate(&self, dma: u64) -> Option<u64> {
-        if dma >= self.dma_addr && dma < self.dma_addr + self.size && self.active {
-            Some(self.phys_addr + (dma - self.dma_addr))
-        } else {
-            None
+        // SECURITY: rewrite the range test and translation as offset
+        // arithmetic so neither `dma_addr + size` (upper bound) nor
+        // `phys_addr + offset` can wrap. `dma.checked_sub(dma_addr)`
+        // both enforces the lower bound (`dma >= dma_addr`) and yields
+        // the in-mapping offset; the offset is then range-checked
+        // against `size` and added to `phys_addr` with checked math.
+        // The `?` operator is avoided to keep this a `const fn`.
+        if !self.active {
+            return None;
+        }
+        match dma.checked_sub(self.dma_addr) {
+            Some(off) if off < self.size => self.phys_addr.checked_add(off),
+            _ => None,
         }
     }
 

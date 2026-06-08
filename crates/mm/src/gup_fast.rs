@@ -39,6 +39,16 @@ const PAGE_SIZE_2M: u64 = 2 * 1024 * 1024;
 /// 1 GiB huge page size.
 const PAGE_SIZE_1G: u64 = 1024 * 1024 * 1024;
 
+/// Exclusive upper bound of the canonical user-space address range on
+/// x86_64 (48-bit). Any request whose start lies at or above this, or
+/// whose `start + nr_pages * PAGE_SIZE` end exceeds it, refers to
+/// non-user (kernel / non-canonical) memory and must be rejected before
+/// any page-table walk.
+// SECURITY: bound every attacker-supplied address to the user window
+// before walking page tables; mirrors `USER_ADDR_MAX` in the sibling
+// `gup.rs` slow path.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
 /// Maximum pages pinned per fast-path request.
 const MAX_FAST_PAGES: usize = 256;
 
@@ -329,6 +339,31 @@ impl GupFastSubsystem {
             return Err(Error::InvalidArgument);
         }
 
+        // SECURITY: reject a zero-length request and a misaligned start so
+        // the walk below cannot generate degenerate or unaligned page
+        // addresses, matching the slow-path `gup.rs::pin_user_pages`.
+        if request.nr_pages == 0 || request.start_vaddr % PAGE_SIZE != 0 {
+            return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: compute the exclusive end of the request with checked
+        // arithmetic and confine the whole [start, end) range to the
+        // canonical user window BEFORE any page-table walk. Without this,
+        // `start_vaddr + idx * PAGE_SIZE` below could wrap (a ring-0 panic
+        // under overflow-checks) or alias the kernel half. `span` cannot
+        // wrap in practice because `nr_pages <= MAX_FAST_PAGES`, but use
+        // checked_mul so the bound stays robust if that cap ever changes.
+        let span = (request.nr_pages as u64)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        let end_vaddr = request
+            .start_vaddr
+            .checked_add(span)
+            .ok_or(Error::InvalidArgument)?;
+        if request.start_vaddr >= USER_ADDR_MAX || end_vaddr > USER_ADDR_MAX {
+            return Err(Error::InvalidArgument);
+        }
+
         let slot = self
             .results
             .iter()
@@ -371,7 +406,18 @@ impl GupFastSubsystem {
 
             let is_huge = raw & PTE_HUGE != 0;
             let phys = raw & PHYS_ADDR_MASK;
-            let vaddr = request.start_vaddr + (idx as u64) * PAGE_SIZE;
+            // SECURITY: derive the per-page address with checked steps so no
+            // add can wrap and panic. The whole range was bounded to
+            // `<= USER_ADDR_MAX` above, so every `vaddr` is a valid user
+            // address (`vaddr < end_vaddr <= USER_ADDR_MAX`). `idx` only ever
+            // indexes within `nr_pages`, so the offset cannot overflow here.
+            let offset = (idx as u64)
+                .checked_mul(PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+            let vaddr = request
+                .start_vaddr
+                .checked_add(offset)
+                .ok_or(Error::InvalidArgument)?;
 
             let (page_size, pages_covered) = if is_huge {
                 // Detect 1G vs 2M by alignment.
