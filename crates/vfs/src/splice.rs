@@ -402,7 +402,9 @@ impl SpliceState {
             SpliceEndpoint::File(_fd) => {
                 let out_buf = file_out_buf.ok_or(Error::InvalidArgument)?;
                 let start = off_out.unwrap_or(0) as usize;
-                let end = start.checked_add(bytes_read).ok_or(Error::InvalidArgument)?;
+                let end = start
+                    .checked_add(bytes_read)
+                    .ok_or(Error::InvalidArgument)?;
                 if end > out_buf.len() {
                     return Err(Error::InvalidArgument);
                 }
