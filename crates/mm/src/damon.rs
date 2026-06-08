@@ -178,7 +178,14 @@ impl DamonTarget {
         }
 
         // Check for overlap with existing regions.
-        for r in &self.regions[..self.region_count] {
+        // SECURITY: scan the ENTIRE backing array, not regions[..region_count].
+        // remove_region deactivates a slot and decrements region_count without
+        // compaction, so a still-active region can persist at an index >=
+        // region_count. Bounding the scan by region_count would skip such
+        // regions and accept an overlapping (aliasing) region after a removal
+        // leaves a gap, breaking the non-overlap invariant the rest of the
+        // monitor relies on. The insert scan below already walks all slots.
+        for r in &self.regions {
             if !r.active {
                 continue;
             }
@@ -558,8 +565,31 @@ impl DamonMonitor {
     }
 
     /// Sets the timing configuration.
-    pub fn set_context(&mut self, ctx: DamonContext) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if any interval is zero or if
+    /// `sample_interval_us > aggr_interval_us`, or if `max_regions` is zero
+    /// or less than `min_regions`.
+    pub fn set_context(&mut self, ctx: DamonContext) -> Result<()> {
+        // SECURITY: re-validate the same invariants DamonContext::new enforces.
+        // DamonContext's fields are public, so a caller can hand us a struct
+        // built by hand (e.g. via the Default-then-mutate pattern) that skips
+        // DamonContext::new. A zero sample/aggr/update interval or sample >
+        // aggr would drive the sampling loop with a degenerate cadence; a zero
+        // or inverted region bound corrupts split/merge accounting. Reject the
+        // config instead of storing it.
+        if ctx.sample_interval_us == 0 || ctx.aggr_interval_us == 0 || ctx.update_interval_us == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        if ctx.sample_interval_us > ctx.aggr_interval_us {
+            return Err(Error::InvalidArgument);
+        }
+        if ctx.max_regions == 0 || ctx.max_regions < ctx.min_regions {
+            return Err(Error::InvalidArgument);
+        }
         self.context = ctx;
+        Ok(())
     }
 
     /// Returns the current configuration.

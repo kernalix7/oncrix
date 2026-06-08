@@ -48,6 +48,14 @@ const BITMAP_WORDS: usize = MAX_REGION_PAGES / 64;
 /// Default migration scan batch size in pages.
 const DEFAULT_SCAN_BATCH: usize = 32;
 
+/// Maximum number of pages a single allocation request may ask for.
+///
+/// A request can never be satisfied by more than one region, so the
+/// per-region page cap is a hard upper bound. Capping `count` here
+/// prevents `count * PAGE_SIZE` (and PFN arithmetic) from overflowing
+/// under `overflow-checks` on attacker-supplied sizes.
+const MAX_REQUEST_PAGES: usize = MAX_REGION_PAGES;
+
 // -------------------------------------------------------------------
 // CmaAllocPolicy
 // -------------------------------------------------------------------
@@ -132,8 +140,9 @@ impl CmaAllocRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `count` is 0 or
-    /// `align_pages` is not a power of 2.
+    /// Returns [`Error::InvalidArgument`] if `count` is 0, `count`
+    /// exceeds [`MAX_REQUEST_PAGES`], or `align_pages` is not a power
+    /// of 2.
     pub const fn new(
         count: usize,
         align_pages: usize,
@@ -142,6 +151,12 @@ impl CmaAllocRequest {
         requester_id: u64,
     ) -> Result<Self> {
         if count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: bound the request size so that downstream PFN and
+        // byte arithmetic (e.g. `count * PAGE_SIZE` in `size_bytes`)
+        // cannot overflow under `overflow-checks` on a hostile count.
+        if count > MAX_REQUEST_PAGES {
             return Err(Error::InvalidArgument);
         }
         if !align_pages.is_power_of_two() {
@@ -158,8 +173,14 @@ impl CmaAllocRequest {
     }
 
     /// Required allocation size in bytes.
+    ///
+    /// Uses saturating multiplication so that a `count` set directly
+    /// via a struct literal (bypassing [`CmaAllocRequest::new`]'s cap)
+    /// cannot panic under `overflow-checks`.
     pub const fn size_bytes(&self) -> u64 {
-        self.count as u64 * PAGE_SIZE
+        // SECURITY: saturate instead of `*` to avoid a ring-0 panic on
+        // an oversized count.
+        (self.count as u64).saturating_mul(PAGE_SIZE)
     }
 }
 
@@ -320,9 +341,18 @@ impl CmaManagedRegion {
         }
     }
 
-    /// Returns `true` if the given PFN falls within this region.
+    /// Returns `true` if the given PFN range falls within this region.
     fn contains_pfn(&self, pfn: u64, count: usize) -> bool {
-        pfn >= self.base_pfn && pfn + count as u64 <= self.base_pfn + self.size_pages as u64
+        // SECURITY: an attacker-supplied `pfn`/`count` must not overflow
+        // the PFN-end computation. Treat any overflow as out-of-range so
+        // a wrapped value can never alias a valid region.
+        let Some(req_end) = pfn.checked_add(count as u64) else {
+            return false;
+        };
+        let Some(region_end) = self.base_pfn.checked_add(self.size_pages as u64) else {
+            return false;
+        };
+        pfn >= self.base_pfn && req_end <= region_end
     }
 }
 
@@ -414,15 +444,13 @@ impl CmaMigrationEngine {
     ) -> usize {
         let mut migrated = 0_usize;
 
-        for i in offset
-            ..offset
-                .min(region.size_pages)
-                .max(offset)
-                .min(offset + count)
-        {
-            if i >= region.size_pages {
-                break;
-            }
+        // SECURITY: clamp the scan window to the region so that a hostile
+        // `offset`/`count` cannot overflow `offset + count` (panic under
+        // `overflow-checks`) nor index the bitmap out of bounds.
+        let start = offset.min(region.size_pages);
+        let end = offset.saturating_add(count).min(region.size_pages);
+
+        for i in start..end {
             let word = i / 64;
             let bit = i % 64;
             let occupied = region.bitmap[word] & (1u64 << bit) != 0;
@@ -434,7 +462,10 @@ impl CmaMigrationEngine {
                 region.bitmap[word] &= !(1u64 << bit);
                 if self.entry_count < MAX_MIGRATION_ENTRIES {
                     self.entries[self.entry_count] = CmaMigrationEntry {
-                        src_pfn: region.base_pfn + i as u64,
+                        // SECURITY: `migrate_range` is public and may run on
+                        // a region not vetted by `add_region`; saturate so a
+                        // large `base_pfn` cannot overflow the logged PFN.
+                        src_pfn: region.base_pfn.saturating_add(i as u64),
                         dst_pfn: 0, // destination is outside CMA
                         success: true,
                     };
@@ -576,7 +607,8 @@ impl CmaAllocManager {
     /// # Errors
     ///
     /// Returns [`Error::OutOfMemory`] if all region slots are full.
-    /// Returns [`Error::InvalidArgument`] if `size_pages` is 0.
+    /// Returns [`Error::InvalidArgument`] if `size_pages` is 0 or the
+    /// region's PFN/physical-address range would overflow.
     pub fn add_region(
         &mut self,
         base_pfn: u64,
@@ -584,6 +616,25 @@ impl CmaAllocManager {
         numa_node: u32,
     ) -> Result<usize> {
         if size_pages == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: reject regions whose PFN end or physical-address span
+        // (`base_pfn..base_pfn+size_pages`, scaled by PAGE_SIZE) would
+        // overflow u64. This guarantees the per-allocation phys-addr
+        // computations in `try_alloc_direct`/`try_alloc_with_migration`
+        // — `(base_pfn + offset) * PAGE_SIZE` for in-range offsets —
+        // can never overflow once a region is admitted. The cap to
+        // MAX_REGION_PAGES is applied inside `CmaManagedRegion::new`, so
+        // validate against the capped count here too.
+        let capped_pages = if size_pages > MAX_REGION_PAGES {
+            MAX_REGION_PAGES
+        } else {
+            size_pages
+        };
+        let end_pfn = base_pfn
+            .checked_add(capped_pages as u64)
+            .ok_or(Error::InvalidArgument)?;
+        if end_pfn.checked_mul(PAGE_SIZE).is_none() {
             return Err(Error::InvalidArgument);
         }
         if self.region_count >= MAX_MANAGED_REGIONS {
@@ -816,10 +867,17 @@ impl CmaAllocManager {
         self.regions[idx].mark_allocated(offset, request.count);
         self.regions[idx].alloc_count += 1;
 
+        // SECURITY: `offset < size_pages`, and `add_region` validated that
+        // `(base_pfn + size_pages) * PAGE_SIZE` fits in u64, so this is
+        // overflow-free for admitted regions. Use checked/saturating math
+        // as defense-in-depth against a region admitted by another path.
+        let pfn = self.regions[idx].base_pfn.saturating_add(offset as u64);
+        let phys_addr = pfn.saturating_mul(PAGE_SIZE);
+
         Some(CmaAllocResult {
-            pfn: self.regions[idx].base_pfn + offset as u64,
+            pfn,
             count: request.count,
-            phys_addr: (self.regions[idx].base_pfn + offset as u64) * PAGE_SIZE,
+            phys_addr,
             region_idx: idx,
             migrated: false,
         })
@@ -834,9 +892,21 @@ impl CmaAllocManager {
                 continue;
             }
             // Try to find an aligned offset, then migrate.
-            let align = request.align_pages;
+            // SECURITY: an `align_pages` of 0 would leave `start`
+            // unchanged on every iteration, spinning this loop forever in
+            // ring 0 (DoS). Sanitize to 1, mirroring `find_free_range`.
+            let align = if request.align_pages == 0 {
+                1
+            } else {
+                request.align_pages
+            };
             let mut start = 0_usize;
-            while start + request.count <= self.regions[idx].size_pages {
+            // SECURITY: guard the loop bound with checked_add so a hostile
+            // `count` cannot overflow `start + count` under overflow-checks.
+            while start
+                .checked_add(request.count)
+                .is_some_and(|stop| stop <= self.regions[idx].size_pages)
+            {
                 self.migration
                     .migrate_range(&mut self.regions[idx], start, request.count);
 
@@ -844,16 +914,23 @@ impl CmaAllocManager {
                     self.regions[idx].mark_allocated(offset, request.count);
                     self.regions[idx].alloc_count += 1;
 
+                    // SECURITY: saturating math; `add_region` guarantees the
+                    // in-range product fits, this is belt-and-braces.
+                    let pfn = self.regions[idx].base_pfn.saturating_add(offset as u64);
+                    let phys_addr = pfn.saturating_mul(PAGE_SIZE);
+
                     return Some(CmaAllocResult {
-                        pfn: self.regions[idx].base_pfn + offset as u64,
+                        pfn,
                         count: request.count,
-                        phys_addr: (self.regions[idx].base_pfn + offset as u64) * PAGE_SIZE,
+                        phys_addr,
                         region_idx: idx,
                         migrated: true,
                     });
                 }
 
-                start += align;
+                // SECURITY: saturate so the advance cannot overflow `start`
+                // on a huge `align`; a saturated `start` exits the loop.
+                start = start.saturating_add(align);
             }
         }
 

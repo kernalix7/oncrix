@@ -26,6 +26,20 @@ use oncrix_lib::{Error, Result};
 /// Standard page size (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
+/// Upper bound of the user virtual address space (exclusive).
+///
+// SECURITY: Mirrors the mm `USER_ADDR_LIMIT`. Every userfaultfd range
+// must lie strictly below this limit so that a monitor cannot register
+// or write-protect kernel / non-canonical addresses, which would turn
+// userfaultfd into an arbitrary kernel-memory primitive.
+const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
+
+/// Valid `UffdMode` bits accepted by `register_range`.
+///
+// SECURITY: Reject reserved mode bits so a caller cannot smuggle
+// unknown flags into the registered range record.
+const VALID_MODES: u32 = UffdMode::MISSING | UffdMode::WP | UffdMode::MINOR;
+
 /// Maximum number of userfaultfd contexts.
 const MAX_UFFD_CONTEXTS: usize = 32;
 
@@ -275,6 +289,19 @@ impl UserfaultfdCtx {
         if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: Reject reserved mode bits and require at least one
+        // valid mode so an attacker cannot register a range with unknown
+        // or empty handling semantics.
+        if mode == 0 || mode & !VALID_MODES != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: Bound the range to the user address space. `end` is
+        // the page-aligned exclusive limit; rejecting `end > USER_ADDR_LIMIT`
+        // prevents registering kernel / non-canonical addresses for
+        // userfaultfd handling (arbitrary kernel-memory exposure).
+        if end > USER_ADDR_LIMIT {
+            return Err(Error::InvalidArgument);
+        }
         if self.range_count >= MAX_RANGES {
             return Err(Error::OutOfMemory);
         }
@@ -476,11 +503,24 @@ impl UserfaultfdCtx {
         len: u64,
         enable_wp: bool,
     ) -> Result<()> {
-        if start % PAGE_SIZE != 0 || len == 0 {
+        // SECURITY: Require a non-zero, page-aligned start and length.
+        // A non-page-aligned length would let the caller write-protect a
+        // partial / misaligned span that the registration scan below could
+        // not have validated.
+        if start % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
         }
 
-        let end = start + len;
+        // SECURITY: overflow-checks are ON in ring 0, so a raw `start + len`
+        // with an attacker-controlled `len` would panic (DoS). Use a checked
+        // add and reject wraparound before the registered-range scan.
+        let end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
+
+        // SECURITY: Bound the range to the user address space so a monitor
+        // cannot write-protect kernel / non-canonical addresses.
+        if end > USER_ADDR_LIMIT {
+            return Err(Error::InvalidArgument);
+        }
 
         // Verify the range is registered.
         let mut found = false;

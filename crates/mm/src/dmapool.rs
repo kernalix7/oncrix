@@ -294,6 +294,19 @@ impl PoolConfig {
         if count == 0 || count > MAX_BUFFERS_PER_POOL {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: reject a pool whose physical or virtual address window
+        // (`base..base+pool_size`) would overflow u64. Every per-buffer
+        // address computed at alloc/free time is `base + offset` with
+        // `offset < pool_size`, so validating the end here guarantees
+        // those `+ offset` sites can never wrap (panic under
+        // overflow-checks) for any in-range buffer index.
+        let pool_size = self.pool_size as u64;
+        if self.base_phys.checked_add(pool_size).is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        if self.base_virt.checked_add(pool_size).is_none() {
+            return Err(Error::InvalidArgument);
+        }
         Ok(())
     }
 }
@@ -477,9 +490,14 @@ impl DmaPool {
             self.allocated += 1;
             self.alloc_count += 1;
 
-            let offset = (index as u64) * (self.stride as u64);
-            let phys = self.config.base_phys + offset;
-            let virt = self.config.base_virt + offset;
+            // SECURITY: `index < total_buffers` and `validate` proved
+            // `base_phys/base_virt + pool_size` fits in u64 with
+            // `offset < pool_size`, so these adds cannot wrap for any
+            // admitted pool. Use saturating math as defense-in-depth so a
+            // pool reaching here by another path cannot panic in ring 0.
+            let offset = (index as u64).saturating_mul(self.stride as u64);
+            let phys = self.config.base_phys.saturating_add(offset);
+            let virt = self.config.base_virt.saturating_add(offset);
 
             self.record_event(index, phys, true);
 
@@ -547,8 +565,11 @@ impl DmaPool {
         self.allocated = self.allocated.saturating_sub(1);
         self.free_count += 1;
 
-        let offset = (index as u64) * (self.stride as u64);
-        let phys = self.config.base_phys + offset;
+        // SECURITY: saturating math; `index < total_buffers` keeps this in
+        // the validated `base_phys + pool_size` window, this is belt-and-
+        // braces against a non-validated pool.
+        let offset = (index as u64).saturating_mul(self.stride as u64);
+        let phys = self.config.base_phys.saturating_add(offset);
         self.record_event(index, phys, false);
 
         Ok(())
@@ -626,8 +647,10 @@ impl DmaPool {
         if index >= self.total_buffers {
             return Err(Error::InvalidArgument);
         }
-        let offset = (index as u64) * (self.stride as u64);
-        Ok(self.config.base_phys + offset)
+        // SECURITY: saturating math; in-range index stays within the
+        // validated `base_phys + pool_size` window.
+        let offset = (index as u64).saturating_mul(self.stride as u64);
+        Ok(self.config.base_phys.saturating_add(offset))
     }
 
     /// Returns the virtual address of a buffer by index.
@@ -639,8 +662,10 @@ impl DmaPool {
         if index >= self.total_buffers {
             return Err(Error::InvalidArgument);
         }
-        let offset = (index as u64) * (self.stride as u64);
-        Ok(self.config.base_virt + offset)
+        // SECURITY: saturating math; in-range index stays within the
+        // validated `base_virt + pool_size` window.
+        let offset = (index as u64).saturating_mul(self.stride as u64);
+        Ok(self.config.base_virt.saturating_add(offset))
     }
 
     /// Checks whether a buffer at `index` is currently allocated.
@@ -814,7 +839,11 @@ impl DmaPoolManager {
                 continue;
             }
             let base = pool.config.base_phys;
-            let end = base + pool.config.pool_size as u64;
+            // SECURITY: checked_add — a validated pool cannot overflow here, but
+            // treat any overflow as "not this pool" rather than panicking.
+            let Some(end) = base.checked_add(pool.config.pool_size as u64) else {
+                continue;
+            };
             if phys >= base && phys < end {
                 return pool.free_by_phys(phys);
             }
@@ -890,7 +919,11 @@ impl DmaPoolManager {
                 continue;
             }
             let base = pool.config.base_phys;
-            let end = base + pool.config.pool_size as u64;
+            // SECURITY: checked_add — a validated pool cannot overflow here, but
+            // treat any overflow as "not this pool" rather than panicking.
+            let Some(end) = base.checked_add(pool.config.pool_size as u64) else {
+                continue;
+            };
             if phys >= base && phys < end {
                 return Some(pool.pool_id);
             }

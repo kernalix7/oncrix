@@ -843,8 +843,11 @@ impl MmTable {
         let mut total_locked: u64 = 0;
         for entry in &self.entries {
             if entry.active {
-                total_vm += entry.total_vm;
-                total_locked += entry.locked_vm;
+                // SECURITY: total_vm/locked_vm are public fields summed over
+                // up to MAX_MM_ENTRIES (256) descriptors; a raw += can overflow
+                // u64 -> ring-0 panic under overflow-checks. Saturate instead.
+                total_vm = total_vm.saturating_add(entry.total_vm);
+                total_locked = total_locked.saturating_add(entry.locked_vm);
             }
         }
         self.stats.total_vm_pages = total_vm;
