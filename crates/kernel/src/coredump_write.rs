@@ -348,7 +348,9 @@ impl CoredumpWriter {
         let phentsize = ELF64_PHDR_SIZE as u16;
         hdr[54..56].copy_from_slice(&phentsize.to_le_bytes());
         // e_phnum = notes + included segments
-        let phnum = self.included_segment_count() as u16 + 1;
+        // saturating_add: if count somehow reaches u16::MAX the field stays
+        // at u16::MAX rather than wrapping or panicking.
+        let phnum = (self.included_segment_count() as u16).saturating_add(1);
         hdr[56..58].copy_from_slice(&phnum.to_le_bytes());
         // e_phoff = immediately after header
         let phoff = ELF64_EHDR_SIZE as u64;
@@ -429,13 +431,17 @@ impl CoredumpWriter {
             .iter()
             .filter(|n| n.populated)
             .map(|n| n.data_size as u64 + 12) // name+desc hdr
-            .sum();
+            .fold(0u64, |acc, v| acc.saturating_add(v));
         let segment_data: u64 = self.segments[..self.segment_count]
             .iter()
             .filter(|s| s.included)
             .map(|s| s.size)
-            .sum();
-        header_size + note_phdr + load_phdrs + note_data + segment_data
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+        header_size
+            .saturating_add(note_phdr)
+            .saturating_add(load_phdrs)
+            .saturating_add(note_data)
+            .saturating_add(segment_data)
     }
 }
 

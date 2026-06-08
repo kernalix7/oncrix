@@ -570,10 +570,13 @@ impl TcpUlpRegistry {
         }
 
         let len = data.len();
-        self.instances[inst_slot].send_count += 1;
-        self.instances[inst_slot].send_bytes += len as u64;
-        self.stats.send_intercepts += 1;
-        self.stats.send_bytes += len as u64;
+        self.instances[inst_slot].send_count =
+            self.instances[inst_slot].send_count.saturating_add(1);
+        self.instances[inst_slot].send_bytes = self.instances[inst_slot]
+            .send_bytes
+            .saturating_add(len as u64);
+        self.stats.send_intercepts = self.stats.send_intercepts.saturating_add(1);
+        self.stats.send_bytes = self.stats.send_bytes.saturating_add(len as u64);
 
         Ok(UlpIoResult::new(len, true))
     }
@@ -602,10 +605,13 @@ impl TcpUlpRegistry {
         let copy_len = data.len().min(out.len());
         out[..copy_len].copy_from_slice(&data[..copy_len]);
 
-        self.instances[inst_slot].recv_count += 1;
-        self.instances[inst_slot].recv_bytes += copy_len as u64;
-        self.stats.recv_intercepts += 1;
-        self.stats.recv_bytes += copy_len as u64;
+        self.instances[inst_slot].recv_count =
+            self.instances[inst_slot].recv_count.saturating_add(1);
+        self.instances[inst_slot].recv_bytes = self.instances[inst_slot]
+            .recv_bytes
+            .saturating_add(copy_len as u64);
+        self.stats.recv_intercepts = self.stats.recv_intercepts.saturating_add(1);
+        self.stats.recv_bytes = self.stats.recv_bytes.saturating_add(copy_len as u64);
 
         Ok(UlpIoResult::new(copy_len, true))
     }

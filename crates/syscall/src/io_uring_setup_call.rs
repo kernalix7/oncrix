@@ -378,7 +378,9 @@ pub fn sys_io_uring_setup(entries: u32, params: &mut IoUringParams) -> Result<Io
         }
         params.cq_entries.next_power_of_two()
     } else {
-        sq_entries * 2
+        // checked_mul: sq_entries * 2 can overflow for pathological inputs;
+        // propagate as InvalidArgument (EINVAL) rather than panicking.
+        sq_entries.checked_mul(2).ok_or(Error::InvalidArgument)?
     };
 
     // Fill in kernel-set output fields.

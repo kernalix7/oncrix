@@ -933,7 +933,10 @@ impl XfrmEngine {
         // non-NULL ciphers are accepted (see ensure_cipher_supported).
         ensure_cipher_supported(sa.cipher_alg)?;
 
-        let total = ESP_HEADER_LEN + cleartext.len() + ICV_LEN;
+        let total = ESP_HEADER_LEN
+            .checked_add(cleartext.len())
+            .and_then(|v| v.checked_add(ICV_LEN))
+            .ok_or(Error::InvalidArgument)?;
         if out.len() < total {
             return Err(Error::InvalidArgument);
         }
@@ -1067,7 +1070,9 @@ impl XfrmEngine {
             .lookup_mut(spi, XfrmProto::Ah)
             .ok_or(Error::NotFound)?;
 
-        let total = AH_HEADER_LEN + payload.len();
+        let total = AH_HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or(Error::InvalidArgument)?;
         if out.len() < total {
             return Err(Error::InvalidArgument);
         }
