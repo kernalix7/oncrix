@@ -60,6 +60,42 @@ pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 pub const PR_SET_CHILD_SUBREAPER: i32 = 36;
 /// Get the child-subreaper flag.
 pub const PR_GET_CHILD_SUBREAPER: i32 = 37;
+/// Get the securebits flags.
+pub const PR_GET_SECUREBITS: i32 = 27;
+/// Set the securebits flags.
+pub const PR_SET_SECUREBITS: i32 = 28;
+
+// ── Securebits bit definitions (Linux-compatible) ──────────────────────────
+
+/// If set, a process that has one or more 0 UIDs keeps its capabilities when
+/// it switches all UIDs to non-zero.
+pub const SECBIT_KEEP_CAPS: u64 = 1 << 4;
+/// Lock bit for [`SECBIT_KEEP_CAPS`]; once set it cannot be cleared.
+pub const SECBIT_KEEP_CAPS_LOCKED: u64 = 1 << 5;
+/// If set, the kernel does not grant capabilities when a setuid-root program
+/// is executed (no-root behaviour).
+pub const SECBIT_NOROOT: u64 = 1 << 0;
+/// Lock bit for [`SECBIT_NOROOT`]; once set it cannot be cleared.
+pub const SECBIT_NOROOT_LOCKED: u64 = 1 << 1;
+/// If set, capabilities are not raised when executing a file with the setuid
+/// bit set or with file capabilities (no-setuid-fixup behaviour).
+pub const SECBIT_NO_SETUID_FIXUP: u64 = 1 << 2;
+/// Lock bit for [`SECBIT_NO_SETUID_FIXUP`]; once set it cannot be cleared.
+pub const SECBIT_NO_SETUID_FIXUP_LOCKED: u64 = 1 << 3;
+
+/// Mask of all securebits "locked" bits. A locked bit, once set, is one-way:
+/// it can never be cleared, and the value bit it guards can never change.
+const SECBITS_LOCK_MASK: u64 =
+    SECBIT_NOROOT_LOCKED | SECBIT_NO_SETUID_FIXUP_LOCKED | SECBIT_KEEP_CAPS_LOCKED;
+
+/// Mask of every defined securebit (value + lock). Any bit outside this mask
+/// is rejected so unknown/future bits cannot be smuggled in.
+const SECBITS_ALL_MASK: u64 = SECBIT_NOROOT
+    | SECBIT_NOROOT_LOCKED
+    | SECBIT_NO_SETUID_FIXUP
+    | SECBIT_NO_SETUID_FIXUP_LOCKED
+    | SECBIT_KEEP_CAPS
+    | SECBIT_KEEP_CAPS_LOCKED;
 
 /// Maximum length of a process name (excluding null terminator).
 const PRCTL_NAME_MAX: usize = 15;
@@ -73,8 +109,23 @@ const MAX_PRCTL_ENTRIES: usize = 256;
 /// Default timer slack (50 microseconds in nanoseconds, matches Linux).
 const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
 
-/// Maximum number of Linux capabilities (CAP_LAST_CAP + 1).
+/// Highest valid Linux capability number (`CAP_LAST_CAP`).
 const CAP_LAST_CAP: u64 = 40;
+
+/// Capability number for `CAP_SETPCAP`, required to drop bounding-set caps and
+/// to alter securebits. Matches the Linux capability numbering.
+///
+/// Exposed so the syscall dispatcher can compute the `has_cap_setpcap`
+/// argument to [`do_prctl`] from the caller's effective capability set.
+pub const CAP_SETPCAP: u64 = 8;
+
+/// Full capability bounding set: bit `n` set for every valid capability
+/// (`0..=CAP_LAST_CAP`). Used as the default per-process bounding set.
+const CAP_BSET_FULL: u64 = if CAP_LAST_CAP >= 63 {
+    u64::MAX
+} else {
+    (1u64 << (CAP_LAST_CAP + 1)) - 1
+};
 
 // ---------------------------------------------------------------------------
 // PrctlOption enum
@@ -120,6 +171,10 @@ pub enum PrctlOption {
     SetKeepCaps,
     /// Get the keep-capabilities flag.
     GetKeepCaps,
+    /// Set the securebits flags.
+    SetSecurebits,
+    /// Get the securebits flags.
+    GetSecurebits,
 }
 
 impl PrctlOption {
@@ -146,6 +201,8 @@ impl PrctlOption {
             PR_CAP_BSET_DROP => Ok(Self::CapBsetDrop),
             PR_SET_KEEPCAPS => Ok(Self::SetKeepCaps),
             PR_GET_KEEPCAPS => Ok(Self::GetKeepCaps),
+            PR_SET_SECUREBITS => Ok(Self::SetSecurebits),
+            PR_GET_SECUREBITS => Ok(Self::GetSecurebits),
             _ => Err(Error::InvalidArgument),
         }
     }
@@ -179,6 +236,12 @@ pub struct PrctlState {
     pdeathsig: i32,
     /// Seccomp filter mode (0 = disabled, 1 = strict, 2 = filter).
     seccomp_mode: u32,
+    /// Capability bounding-set bitmask: bit `n` set means capability `n` is
+    /// still present. Capabilities can only be dropped (cleared), never added.
+    cap_bset: u64,
+    /// Securebits flags (see `SECBIT_*`). Bits in [`SECBITS_LOCK_MASK`] are
+    /// one-way: once set they (and the value bit they guard) can never change.
+    securebits: u64,
 }
 
 impl Default for PrctlState {
@@ -193,6 +256,8 @@ impl Default for PrctlState {
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             pdeathsig: 0,
             seccomp_mode: 0,
+            cap_bset: CAP_BSET_FULL,
+            securebits: 0,
         }
     }
 }
@@ -364,6 +429,68 @@ impl PrctlTable {
         self.validate_idx(pid_idx)?;
         Ok(self.entries[pid_idx].keep_caps)
     }
+
+    // ── Capability bounding set ───────────────────────────────────
+
+    /// Returns whether capability `cap` is present in `pid_idx`'s bounding set.
+    ///
+    /// `cap` must be in `0..=CAP_LAST_CAP`; out-of-range values are rejected
+    /// to avoid shifting past the bitmask width.
+    pub fn cap_bset_read(&self, pid_idx: usize, cap: u64) -> Result<bool> {
+        self.validate_idx(pid_idx)?;
+        if cap > CAP_LAST_CAP {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((self.entries[pid_idx].cap_bset & (1u64 << cap)) != 0)
+    }
+
+    /// Drops capability `cap` from `pid_idx`'s bounding set (one-way).
+    ///
+    /// SECURITY: the caller must already hold `CAP_SETPCAP`; this is enforced
+    /// by the dispatcher before calling. Dropping is irreversible — a cleared
+    /// bit can never be restored through this interface.
+    pub fn cap_bset_drop(&mut self, pid_idx: usize, cap: u64) -> Result<()> {
+        self.validate_idx(pid_idx)?;
+        if cap > CAP_LAST_CAP {
+            return Err(Error::InvalidArgument);
+        }
+        self.entries[pid_idx].cap_bset &= !(1u64 << cap);
+        Ok(())
+    }
+
+    // ── Securebits ────────────────────────────────────────────────
+
+    /// Get the securebits flags for `pid_idx`.
+    pub fn get_securebits(&self, pid_idx: usize) -> Result<u64> {
+        self.validate_idx(pid_idx)?;
+        Ok(self.entries[pid_idx].securebits)
+    }
+
+    /// Set the securebits flags for `pid_idx`.
+    ///
+    /// SECURITY: this enforces the one-way locking semantics — no bit guarded
+    /// by an already-set lock bit (nor the lock bit itself) may change, and no
+    /// undefined bit may be set. The capability check (`CAP_SETPCAP`) is the
+    /// caller's responsibility and is enforced by the dispatcher.
+    pub fn set_securebits(&mut self, pid_idx: usize, new_bits: u64) -> Result<()> {
+        self.validate_idx(pid_idx)?;
+        // Reject any bit outside the defined securebits set.
+        if new_bits & !SECBITS_ALL_MASK != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let current = self.entries[pid_idx].securebits;
+        // For every lock bit that is already set, neither that lock bit nor the
+        // value bit immediately below it (lock = value << 1) may change.
+        let locked = current & SECBITS_LOCK_MASK;
+        // Build a frozen-bit mask: each set lock bit freezes itself and its
+        // paired value bit (the value bit sits one position lower).
+        let frozen = locked | (locked >> 1);
+        if (current & frozen) != (new_bits & frozen) {
+            return Err(Error::PermissionDenied);
+        }
+        self.entries[pid_idx].securebits = new_bits;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,11 +503,22 @@ impl PrctlTable {
 /// `option`. Arguments `arg2`–`arg5` are option-specific; unused
 /// arguments are silently ignored.
 ///
+/// SECURITY: `has_cap_setpcap` must reflect whether the *calling* process
+/// holds `CAP_SETPCAP`. It gates the privileged operations
+/// (`PR_CAP_BSET_DROP`, `PR_SET_SECUREBITS`); callers must compute it from the
+/// caller's effective capability set, never assume `true`.
+///
 /// # Returns
 ///
 /// - `PR_SET_*` operations return `0` on success.
 /// - `PR_GET_*` operations return the requested value as `u64`.
 /// - Unknown or invalid options return `Error::InvalidArgument`.
+/// - Privileged operations without `CAP_SETPCAP` return
+///   `Error::PermissionDenied`.
+// The prctl ABI is inherently wide (option + arg2..arg5 + caller context);
+// the extra `has_cap_setpcap` credential is required to enforce the privileged
+// gates, so the argument count is by design.
+#[allow(clippy::too_many_arguments)]
 pub fn do_prctl(
     table: &mut PrctlTable,
     option: i32,
@@ -389,6 +527,7 @@ pub fn do_prctl(
     arg4: u64,
     arg5: u64,
     pid_idx: usize,
+    has_cap_setpcap: bool,
 ) -> Result<u64> {
     let opt = PrctlOption::from_i32(option)?;
 
@@ -428,10 +567,17 @@ pub fn do_prctl(
 
         // ── Seccomp ───────────────────────────────────────────────
         PrctlOption::SetSeccomp => {
-            let mode = arg2 as u32;
-            if mode > 2 {
+            // SECURITY: bound the PID slot before any table read/write. Every
+            // other set branch goes through validate_idx; this one indexed the
+            // table directly, so an out-of-range pid_idx was an OOB access.
+            table.validate_idx(pid_idx)?;
+            // SECURITY: validate the raw u64 arg before truncating to u32 so a
+            // high-bit-only value (e.g. 0x1_0000_0000) cannot alias a valid
+            // low mode after truncation.
+            if arg2 > 2 {
                 return Err(Error::InvalidArgument);
             }
+            let mode = arg2 as u32;
             // Seccomp mode can only be tightened.
             let current = table.entries[pid_idx].seccomp_mode;
             if mode < current {
@@ -447,6 +593,10 @@ pub fn do_prctl(
 
         // ── No-new-privileges ─────────────────────────────────────
         PrctlOption::SetNoNewPrivs => {
+            // SECURITY: no_new_privs is strictly one-way. We only accept the
+            // value 1 (set); there is no code path that clears it, and
+            // set_no_new_privs only ever writes `true`. A 0->1 transition is
+            // the only legal change.
             if arg2 != 1 {
                 return Err(Error::InvalidArgument);
             }
@@ -490,22 +640,32 @@ pub fn do_prctl(
 
         // ── Capability bounding set ───────────────────────────────
         PrctlOption::CapBsetRead => {
-            if arg2 > CAP_LAST_CAP {
-                return Err(Error::InvalidArgument);
-            }
-            // Stub: report all capabilities as present.
-            Ok(1)
+            // SECURITY: bound the cap number (cap_bset_read also re-checks) and
+            // report the *actual* bounding-set bit, not a hard-coded 1. A
+            // constant 1 would hide caps that have been dropped.
+            let present = table.cap_bset_read(pid_idx, arg2)?;
+            Ok(u64::from(present))
         }
         PrctlOption::CapBsetDrop => {
-            if arg2 > CAP_LAST_CAP {
-                return Err(Error::InvalidArgument);
+            // SECURITY: dropping a bounding-set capability requires CAP_SETPCAP.
+            // Without this gate any process could shrink the bounding set; more
+            // importantly the previous stub returned Ok without enforcing it.
+            if !has_cap_setpcap {
+                return Err(Error::PermissionDenied);
             }
-            // Stub: accept the drop but don't persist it yet.
+            // Bound the cap number, then persist the (one-way) drop.
+            table.cap_bset_drop(pid_idx, arg2)?;
             Ok(0)
         }
 
         // ── Keep capabilities ─────────────────────────────────────
         PrctlOption::SetKeepCaps => {
+            table.validate_idx(pid_idx)?;
+            // SECURITY: if SECBIT_KEEP_CAPS is locked, the keepcaps state is
+            // frozen and PR_SET_KEEPCAPS must not be able to flip it.
+            if table.entries[pid_idx].securebits & SECBIT_KEEP_CAPS_LOCKED != 0 {
+                return Err(Error::PermissionDenied);
+            }
             match arg2 {
                 0 => table.set_keepcaps(pid_idx, false)?,
                 1 => table.set_keepcaps(pid_idx, true)?,
@@ -517,5 +677,178 @@ pub fn do_prctl(
             let val = table.get_keepcaps(pid_idx)?;
             Ok(u64::from(val))
         }
+
+        // ── Securebits ────────────────────────────────────────────
+        PrctlOption::SetSecurebits => {
+            // SECURITY: changing securebits is privileged (CAP_SETPCAP). The
+            // previous code did not implement this option at all; failing to
+            // gate it would let any process clear NOROOT/NO_SETUID_FIXUP and
+            // regain root-on-exec semantics.
+            if !has_cap_setpcap {
+                return Err(Error::PermissionDenied);
+            }
+            // set_securebits enforces the one-way LOCKED-bit semantics and
+            // rejects undefined bits.
+            table.set_securebits(pid_idx, arg2)?;
+            Ok(0)
+        }
+        PrctlOption::GetSecurebits => {
+            let val = table.get_securebits(pid_idx)?;
+            Ok(val)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> PrctlTable {
+        let mut t = PrctlTable::default();
+        t.init_for_pid(0).unwrap();
+        t
+    }
+
+    #[test]
+    fn seccomp_out_of_range_pid_idx_rejected() {
+        // SetSeccomp must bound-check the slot, not OOB-index the table.
+        let mut t = table();
+        let r = do_prctl(&mut t, PR_SET_SECCOMP, 1, 0, 0, 0, MAX_PRCTL_ENTRIES, false);
+        assert_eq!(r.unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn seccomp_high_bits_truncation_rejected() {
+        // A value whose low 32 bits are a valid mode but with high bits set
+        // must be rejected before truncation to u32.
+        let mut t = table();
+        let r = do_prctl(&mut t, PR_SET_SECCOMP, 0x1_0000_0001, 0, 0, 0, 0, false);
+        assert_eq!(r.unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn cap_bset_drop_requires_setpcap() {
+        let mut t = table();
+        // Without CAP_SETPCAP: denied.
+        assert_eq!(
+            do_prctl(&mut t, PR_CAP_BSET_DROP, CAP_SETPCAP, 0, 0, 0, 0, false).unwrap_err(),
+            Error::PermissionDenied
+        );
+        // Cap still present after the denied drop.
+        assert_eq!(
+            do_prctl(&mut t, PR_CAP_BSET_READ, CAP_SETPCAP, 0, 0, 0, 0, false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn cap_bset_drop_persists_with_setpcap() {
+        let mut t = table();
+        // With CAP_SETPCAP the drop succeeds and persists.
+        assert_eq!(
+            do_prctl(&mut t, PR_CAP_BSET_DROP, 5, 0, 0, 0, 0, true).unwrap(),
+            0
+        );
+        assert_eq!(
+            do_prctl(&mut t, PR_CAP_BSET_READ, 5, 0, 0, 0, 0, false).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn cap_bset_read_out_of_range_rejected() {
+        let mut t = table();
+        let r = do_prctl(
+            &mut t,
+            PR_CAP_BSET_READ,
+            CAP_LAST_CAP + 1,
+            0,
+            0,
+            0,
+            0,
+            false,
+        );
+        assert_eq!(r.unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn securebits_requires_setpcap() {
+        let mut t = table();
+        let r = do_prctl(&mut t, PR_SET_SECUREBITS, SECBIT_NOROOT, 0, 0, 0, 0, false);
+        assert_eq!(r.unwrap_err(), Error::PermissionDenied);
+    }
+
+    #[test]
+    fn securebits_locked_bit_is_one_way() {
+        let mut t = table();
+        // Set NOROOT and lock it (privileged).
+        do_prctl(
+            &mut t,
+            PR_SET_SECUREBITS,
+            SECBIT_NOROOT | SECBIT_NOROOT_LOCKED,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+        .unwrap();
+        // Attempt to clear NOROOT (and its lock) now fails: locked is one-way.
+        let r = do_prctl(&mut t, PR_SET_SECUREBITS, 0, 0, 0, 0, 0, true);
+        assert_eq!(r.unwrap_err(), Error::PermissionDenied);
+        // Value is unchanged.
+        assert_eq!(
+            do_prctl(&mut t, PR_GET_SECUREBITS, 0, 0, 0, 0, 0, false).unwrap(),
+            SECBIT_NOROOT | SECBIT_NOROOT_LOCKED
+        );
+    }
+
+    #[test]
+    fn securebits_undefined_bit_rejected() {
+        let mut t = table();
+        // Bit 63 is not a defined securebit.
+        let r = do_prctl(&mut t, PR_SET_SECUREBITS, 1 << 63, 0, 0, 0, 0, true);
+        assert_eq!(r.unwrap_err(), Error::InvalidArgument);
+    }
+
+    #[test]
+    fn keepcaps_frozen_when_locked() {
+        let mut t = table();
+        // Lock KEEP_CAPS via securebits.
+        do_prctl(
+            &mut t,
+            PR_SET_SECUREBITS,
+            SECBIT_KEEP_CAPS | SECBIT_KEEP_CAPS_LOCKED,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+        .unwrap();
+        // PR_SET_KEEPCAPS must not be able to flip the frozen state.
+        let r = do_prctl(&mut t, PR_SET_KEEPCAPS, 0, 0, 0, 0, 0, false);
+        assert_eq!(r.unwrap_err(), Error::PermissionDenied);
+    }
+
+    #[test]
+    fn no_new_privs_is_one_way() {
+        let mut t = table();
+        // Only 0->1 is permitted; clearing (arg2 == 0) is rejected outright.
+        assert_eq!(
+            do_prctl(&mut t, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0, false).unwrap(),
+            0
+        );
+        let r = do_prctl(&mut t, PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, false);
+        assert_eq!(r.unwrap_err(), Error::InvalidArgument);
+        // Still set.
+        assert_eq!(
+            do_prctl(&mut t, PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0, false).unwrap(),
+            1
+        );
     }
 }

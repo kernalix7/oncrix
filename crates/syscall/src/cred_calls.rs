@@ -221,7 +221,27 @@ pub fn do_getgroups(cred: &Credentials, buf: &mut [u32]) -> Result<usize> {
 /// # POSIX conformance
 ///
 /// `setuid()` — POSIX.1-2024 §2.2.
+///
+/// # SECURITY INVARIANT
+///
+/// The privileged (set-all-three / arbitrary-UID) branch below is gated on the
+/// `euid == 0` fail-safe predicate. This is correct but stricter than the Linux
+/// capability model: the canonical gate for the privileged branch is
+/// `CAP_SETUID OR euid == 0`. `CapSet`/`Capability` live in `oncrix-kernel`,
+/// which this crate does not (and must not) depend on, so the capability is not
+/// reachable here and cannot be threaded without a new cross-crate dependency.
+///
+/// `cred_calls` is the single authorization authority for credential writes.
+/// Until the cap is plumbed through, the dispatcher MUST gate this syscall on
+/// `CAP_SETUID || euid == 0` before invoking the handler, and a future revision
+/// of this handler MUST honor `CAP_SETUID` for the privileged branch (so a
+/// legitimate `CAP_SETUID` holder with `euid != 0` is not refused). The
+/// `euid == 0` check is the fail-safe floor and MUST NOT be removed, and the
+/// unprivileged branch MUST NOT be widened.
 pub fn do_setuid(cred: &mut Credentials, new_uid: u32) -> Result<()> {
+    // SECURITY: privileged branch — fail-safe `euid == 0` floor. Canonical gate
+    // is `CAP_SETUID || euid == 0`; cap is enforced by the dispatcher (see
+    // SECURITY INVARIANT above). Do NOT remove this check.
     if cred.is_privileged() {
         cred.uid = new_uid;
         cred.euid = new_uid;
@@ -229,7 +249,9 @@ pub fn do_setuid(cred: &mut Credentials, new_uid: u32) -> Result<()> {
         cred.fsuid = new_uid;
         return Ok(());
     }
-    // Unprivileged: only allow switching to real or saved-set UID.
+    // SECURITY: unprivileged path — only the real or saved-set UID is reachable.
+    // This membership gate MUST stay exactly this strict; widening it is a
+    // privilege-escalation primitive.
     if new_uid == cred.uid || new_uid == cred.suid {
         cred.euid = new_uid;
         cred.fsuid = new_uid;
@@ -249,7 +271,19 @@ pub fn do_setuid(cred: &mut Credentials, new_uid: u32) -> Result<()> {
 /// # Errors
 ///
 /// * [`Error::PermissionDenied`] — Unprivileged caller.
+///
+/// # SECURITY INVARIANT
+///
+/// Mirrors [`do_setuid`] for the GID dimension. The privileged branch is gated
+/// on the fail-safe `euid == 0` floor; the canonical gate is
+/// `CAP_SETGID || euid == 0`. `CAP_SETGID` lives in `oncrix-kernel` and is not
+/// reachable here, so the dispatcher MUST gate this syscall on
+/// `CAP_SETGID || euid == 0` and a future revision MUST honor `CAP_SETGID` for
+/// the privileged branch. The `euid == 0` floor MUST NOT be removed and the
+/// unprivileged membership branch MUST NOT be widened.
 pub fn do_setgid(cred: &mut Credentials, new_gid: u32) -> Result<()> {
+    // SECURITY: privileged branch — fail-safe `euid == 0` floor. Canonical gate
+    // is `CAP_SETGID || euid == 0`, enforced by the dispatcher.
     if cred.is_privileged() {
         cred.gid = new_gid;
         cred.egid = new_gid;
@@ -257,6 +291,8 @@ pub fn do_setgid(cred: &mut Credentials, new_gid: u32) -> Result<()> {
         cred.fsgid = new_gid;
         return Ok(());
     }
+    // SECURITY: unprivileged path — only the real or saved-set GID is reachable.
+    // MUST stay exactly this strict.
     if new_gid == cred.gid || new_gid == cred.sgid {
         cred.egid = new_gid;
         cred.fsgid = new_gid;
@@ -284,11 +320,22 @@ pub fn do_setgid(cred: &mut Credentials, new_gid: u32) -> Result<()> {
 /// # Errors
 ///
 /// * [`Error::PermissionDenied`] — Forbidden combination for unprivileged caller.
+///
+/// # SECURITY INVARIANT
+///
+/// The privileged (arbitrary real/effective UID) branch is gated on the
+/// fail-safe `euid == 0` floor; the canonical gate is `CAP_SETUID || euid == 0`.
+/// `CAP_SETUID` is not reachable in this crate, so the dispatcher MUST gate this
+/// syscall on `CAP_SETUID || euid == 0` and a future revision MUST honor
+/// `CAP_SETUID`. The `euid == 0` floor MUST NOT be removed and the unprivileged
+/// `{uid,euid,suid}` membership branch MUST NOT be widened.
 pub fn do_setreuid(cred: &mut Credentials, ruid: u32, euid: u32) -> Result<()> {
     let old_uid = cred.uid;
     let old_euid = cred.euid;
     let old_suid = cred.suid;
 
+    // SECURITY: privileged branch — fail-safe `euid == 0` floor. Canonical gate
+    // is `CAP_SETUID || euid == 0`, enforced by the dispatcher.
     if cred.is_privileged() {
         if ruid != NOOP_ID {
             cred.uid = ruid;
@@ -336,11 +383,22 @@ pub fn do_setreuid(cred: &mut Credentials, ruid: u32, euid: u32) -> Result<()> {
 /// # Errors
 ///
 /// * [`Error::PermissionDenied`] — Forbidden combination for unprivileged caller.
+///
+/// # SECURITY INVARIANT
+///
+/// The privileged (arbitrary real/effective GID) branch is gated on the
+/// fail-safe `euid == 0` floor; the canonical gate is `CAP_SETGID || euid == 0`.
+/// `CAP_SETGID` is not reachable in this crate, so the dispatcher MUST gate this
+/// syscall on `CAP_SETGID || euid == 0` and a future revision MUST honor
+/// `CAP_SETGID`. The `euid == 0` floor MUST NOT be removed and the unprivileged
+/// `{gid,egid,sgid}` membership branch MUST NOT be widened.
 pub fn do_setregid(cred: &mut Credentials, rgid: u32, egid: u32) -> Result<()> {
     let old_gid = cred.gid;
     let old_egid = cred.egid;
     let old_sgid = cred.sgid;
 
+    // SECURITY: privileged branch — fail-safe `euid == 0` floor. Canonical gate
+    // is `CAP_SETGID || euid == 0`, enforced by the dispatcher.
     if cred.is_privileged() {
         if rgid != NOOP_ID {
             cred.gid = rgid;
@@ -392,7 +450,20 @@ pub fn do_setregid(cred: &mut Credentials, rgid: u32, egid: u32) -> Result<()> {
 ///
 /// * [`Error::PermissionDenied`] — Unprivileged caller uses an ID outside the
 ///   current set.
+///
+/// # SECURITY INVARIANT
+///
+/// The `euid == 0` fast path skips the `{uid,euid,suid}` membership check and is
+/// the fail-safe floor; the canonical gate for skipping that check is
+/// `CAP_SETUID || euid == 0`. `CAP_SETUID` is not reachable in this crate, so
+/// the dispatcher MUST gate this syscall on `CAP_SETUID || euid == 0` and a
+/// future revision MUST honor `CAP_SETUID` here. The `euid == 0` floor MUST NOT
+/// be removed and the unprivileged membership check MUST NOT be weakened.
 pub fn do_setresuid(cred: &mut Credentials, ruid: u32, euid: u32, suid: u32) -> Result<()> {
+    // SECURITY: privileged fast path is `euid == 0` (fail-safe). Canonical gate
+    // is `CAP_SETUID || euid == 0`, enforced by the dispatcher. When not
+    // privileged, every requested ID MUST already be in the current
+    // `{uid,euid,suid}` set — this membership gate MUST stay this strict.
     if !cred.is_privileged() {
         let allowed = [cred.uid, cred.euid, cred.suid];
         if ruid != NOOP_ID && !allowed.contains(&ruid) {
@@ -427,7 +498,20 @@ pub fn do_setresuid(cred: &mut Credentials, ruid: u32, euid: u32, suid: u32) -> 
 ///
 /// * [`Error::PermissionDenied`] — Unprivileged caller uses a GID outside
 ///   the current set.
+///
+/// # SECURITY INVARIANT
+///
+/// The `euid == 0` fast path skips the `{gid,egid,sgid}` membership check and is
+/// the fail-safe floor; the canonical gate for skipping that check is
+/// `CAP_SETGID || euid == 0`. `CAP_SETGID` is not reachable in this crate, so
+/// the dispatcher MUST gate this syscall on `CAP_SETGID || euid == 0` and a
+/// future revision MUST honor `CAP_SETGID` here. The `euid == 0` floor MUST NOT
+/// be removed and the unprivileged membership check MUST NOT be weakened.
 pub fn do_setresgid(cred: &mut Credentials, rgid: u32, egid: u32, sgid: u32) -> Result<()> {
+    // SECURITY: privileged fast path is `euid == 0` (fail-safe). Canonical gate
+    // is `CAP_SETGID || euid == 0`, enforced by the dispatcher. When not
+    // privileged, every requested ID MUST already be in the current
+    // `{gid,egid,sgid}` set — this membership gate MUST stay this strict.
     if !cred.is_privileged() {
         let allowed = [cred.gid, cred.egid, cred.sgid];
         if rgid != NOOP_ID && !allowed.contains(&rgid) {
@@ -474,7 +558,18 @@ pub fn do_setresgid(cred: &mut Credentials, rgid: u32, egid: u32, sgid: u32) -> 
 /// # POSIX conformance
 ///
 /// Requires `CAP_SETGID` or root privilege.  Here simplified to `euid == 0`.
+///
+/// # SECURITY INVARIANT
+///
+/// The canonical gate is `CAP_SETGID || euid == 0`. `CAP_SETGID` is not
+/// reachable in this crate, so the dispatcher MUST gate this syscall on
+/// `CAP_SETGID || euid == 0` and a future revision MUST honor `CAP_SETGID` here.
+/// The `euid == 0` fail-safe floor below MUST NOT be removed (an unprivileged
+/// process rewriting its supplementary groups is a privilege-escalation
+/// primitive).
 pub fn do_setgroups(cred: &mut Credentials, groups: &[u32]) -> Result<()> {
+    // SECURITY: fail-safe `euid == 0` floor. Canonical gate is
+    // `CAP_SETGID || euid == 0`, enforced by the dispatcher. Fail closed.
     if !cred.is_privileged() {
         return Err(Error::PermissionDenied);
     }

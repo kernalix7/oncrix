@@ -48,6 +48,13 @@ pub const ARCH_GET_CPUID: i32 = 0x1011;
 /// Enable or disable CPUID instruction for the thread.
 pub const ARCH_SET_CPUID: i32 = 0x1012;
 
+/// First address of the kernel (non-canonical/upper) half on x86_64.
+///
+/// User space occupies `0x0000_0000_0000_0000..0x0000_8000_0000_0000`; any
+/// base at or above this split is either non-canonical or kernel-owned and
+/// must never be loaded into `FSBASE`/`GSBASE` from an unprivileged caller.
+const X86_64_USER_KERNEL_SPLIT: u64 = 0xFFFF_8000_0000_0000;
+
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
@@ -63,6 +70,21 @@ pub fn is_valid_code(code: i32) -> bool {
 /// Returns `true` if `code` is a get operation (writes to `addr`).
 pub fn is_get_code(code: i32) -> bool {
     matches!(code, ARCH_GET_FS | ARCH_GET_GS | ARCH_GET_CPUID)
+}
+
+/// Returns `true` if `code` sets a segment base (`FSBASE`/`GSBASE`).
+pub fn is_set_base_code(code: i32) -> bool {
+    matches!(code, ARCH_SET_FS | ARCH_SET_GS)
+}
+
+/// Returns `true` if `base` is a legal user-space segment base.
+///
+/// SECURITY: any base in the kernel half (`>= X86_64_USER_KERNEL_SPLIT`) is
+/// non-canonical or kernel-owned; loading it into `FSBASE`/`GSBASE` would let
+/// an unprivileged thread point TLS-relative accesses at kernel memory, so it
+/// is rejected here (matching `handler::sys_arch_prctl`).
+fn is_valid_user_base(base: u64) -> bool {
+    base < X86_64_USER_KERNEL_SPLIT
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +105,12 @@ pub fn sys_arch_prctl(code: i32, addr: u64) -> Result<i64> {
         return Err(Error::InvalidArgument);
     }
     if is_get_code(code) && addr == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    // SECURITY: reject a kernel-half / non-canonical base for ARCH_SET_FS and
+    // ARCH_SET_GS before it can ever reach FSBASE/GSBASE. Without this an
+    // unprivileged thread could set its TLS base into kernel memory.
+    if is_set_base_code(code) && !is_valid_user_base(addr) {
         return Err(Error::InvalidArgument);
     }
     let _ = (code, addr);
@@ -122,6 +150,36 @@ mod tests {
     fn set_fs_zero_addr_ok() {
         // Setting FS to address 0 is valid.
         let r = sys_arch_prctl(ARCH_SET_FS, 0);
+        assert_eq!(r.unwrap_err(), Error::NotImplemented);
+    }
+
+    #[test]
+    fn set_fs_kernel_base_rejected() {
+        // A kernel-half / non-canonical base must never reach FSBASE.
+        assert_eq!(
+            sys_arch_prctl(ARCH_SET_FS, X86_64_USER_KERNEL_SPLIT).unwrap_err(),
+            Error::InvalidArgument
+        );
+        assert_eq!(
+            sys_arch_prctl(ARCH_SET_FS, u64::MAX).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn set_gs_kernel_base_rejected() {
+        // Same canonical-split gate applies to GSBASE.
+        assert_eq!(
+            sys_arch_prctl(ARCH_SET_GS, X86_64_USER_KERNEL_SPLIT).unwrap_err(),
+            Error::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn set_fs_high_user_base_ok() {
+        // The highest legal user base is just below the split; it passes the
+        // canonical check and reaches the (still-unimplemented) stub.
+        let r = sys_arch_prctl(ARCH_SET_FS, X86_64_USER_KERNEL_SPLIT - 1);
         assert_eq!(r.unwrap_err(), Error::NotImplemented);
     }
 
