@@ -295,7 +295,7 @@ impl LandlockSubsystem {
     ) -> Result<u64> {
         let slot = self.find_free_ruleset()?;
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
 
         self.rulesets[slot].id = id;
         self.rulesets[slot].handled_access_fs = handled_access_fs;

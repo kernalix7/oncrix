@@ -171,7 +171,7 @@ impl SecurityContext {
 
     /// Return the type field as a byte slice.
     pub fn type_bytes(&self) -> &[u8] {
-        &self.type_field[..self.type_len]
+        &self.type_field[..self.type_len.min(self.type_field.len())]
     }
 }
 
@@ -225,9 +225,9 @@ impl MacRule {
             && self.source_len == source.len()
             && self.target_len == target.len()
             && self.class_len == class.len()
-            && self.source_type[..self.source_len] == *source
-            && self.target_type[..self.target_len] == *target
-            && self.obj_class[..self.class_len] == *class
+            && self.source_type[..self.source_len.min(self.source_type.len())] == *source
+            && self.target_type[..self.target_len.min(self.target_type.len())] == *target
+            && self.obj_class[..self.class_len.min(self.obj_class.len())] == *class
     }
 }
 
