@@ -132,7 +132,11 @@ impl DamonRegion {
         if self.sample_attempts == 0 {
             return 0;
         }
-        self.access_count * 100 / self.sample_attempts
+        // SECURITY: widen to u64 before the *100 so a large access_count
+        // cannot overflow u32 (panics with overflow-checks on). The ratio is
+        // bounded (<=100 for realistic counts) so the cast back is exact and
+        // matches the previous result for all realistic sample counts.
+        ((self.access_count as u64 * 100) / self.sample_attempts as u64) as u32
     }
 
     /// Record a sample.

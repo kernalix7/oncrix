@@ -269,7 +269,12 @@ pub struct CompactionZone {
 impl CompactionZone {
     /// Create a new compaction zone.
     pub fn new_zone(zone_id: u32, start_pfn: u64, end_pfn: u64) -> Self {
-        let mid = start_pfn + (end_pfn - start_pfn) / 2;
+        // SECURITY: `end_pfn - start_pfn` underflows (and `start_pfn + ..`
+        // could overflow) for an inverted range. saturating arithmetic keeps
+        // `mid` within `[start_pfn, end_pfn]` and never faults; the public
+        // reaching path (`CompactionManager::add_zone`) rejects inverted
+        // ranges, so legitimate ordered ranges are unaffected.
+        let mid = start_pfn.saturating_add(end_pfn.saturating_sub(start_pfn) / 2);
         Self {
             zone_id,
             free_scanner: CompactionScanner::new(mid, end_pfn),
@@ -391,7 +396,19 @@ impl CompactionManager {
     }
 
     /// Add a zone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `start_pfn >= end_pfn`, or
+    /// [`Error::OutOfMemory`] if the maximum number of zones is reached.
     pub fn add_zone(&mut self, zone_id: u32, start_pfn: u64, end_pfn: u64) -> Result<()> {
+        // SECURITY: reject an inverted/empty PFN range before forwarding to
+        // `new_zone`, mirroring `compaction.rs::Compactor::add_zone`. This
+        // prevents an underflowing `mid` computation while letting every
+        // ordered range (start_pfn < end_pfn) through unchanged.
+        if start_pfn >= end_pfn {
+            return Err(Error::InvalidArgument);
+        }
         if self.count >= MAX_ZONES {
             return Err(Error::OutOfMemory);
         }

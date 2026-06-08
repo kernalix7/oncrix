@@ -85,7 +85,15 @@ pub struct DamonRegion {
 
 impl DamonRegion {
     /// Creates a new region for the given address range.
+    ///
+    /// An inverted range (`start > end`) is normalized to an empty
+    /// region at `start` so the `start <= end` invariant always holds;
+    /// ordered ranges are stored unchanged.
     pub const fn new(start: u64, end: u64) -> Self {
+        // SECURITY: normalize an inverted (start > end) range to an empty
+        // region so size()/end-start arithmetic never underflows. A legit
+        // ordered range (start <= end) is preserved identically.
+        let end = if end < start { start } else { end };
         Self {
             start,
             end,
@@ -107,7 +115,10 @@ impl DamonRegion {
 
     /// Returns the region size in bytes.
     pub const fn size(&self) -> u64 {
-        self.end - self.start
+        // SECURITY: saturating_sub avoids a ring-0 underflow panic if an
+        // inverted region (start > end) ever reaches here; a normal ordered
+        // region yields the identical end - start result.
+        self.end.saturating_sub(self.start)
     }
 
     /// Returns the number of accesses in the current period.
@@ -214,8 +225,12 @@ impl DamonTarget {
                 b_accesses - a_accesses
             };
             if diff <= threshold {
+                // SECURITY: only extend the merged region's end forward so a
+                // mis-ordered or inverted neighbour can never push end below
+                // start (which would underflow size()). Ordered, adjacent
+                // regions take b_end unchanged.
                 let b_end = self.regions[i + 1].end;
-                self.regions[i].end = b_end;
+                self.regions[i].end = self.regions[i].end.max(b_end);
                 // Shift remaining regions left.
                 let mut j = i + 1;
                 while j + 1 < self.nr_regions {

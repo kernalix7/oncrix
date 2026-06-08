@@ -450,7 +450,11 @@ impl Compactor {
         };
 
         let zone = &self.zones[idx];
-        let needed = 1_u64 << order;
+        // SECURITY: `1_u64 << order` panics (shift overflow) once
+        // `order >= 64` under overflow-checks; a saturating shift keeps
+        // pathological orders from faulting in ring 0 while preserving
+        // identical behaviour for every realistic order (0..~11).
+        let needed = 1_u64.checked_shl(order as u32).unwrap_or(u64::MAX);
 
         // Not worth compacting if fewer free pages than needed.
         if zone.free_pages < needed {
@@ -464,7 +468,9 @@ impl Compactor {
 
         // Heuristic: compact if free pages are at least twice the
         // requested block but total fragmentation is high.
-        zone.free_pages >= needed * 2
+        // SECURITY: `needed * 2` overflows for a saturated `needed`;
+        // saturating_mul keeps the comparison well-defined.
+        zone.free_pages >= needed.saturating_mul(2)
     }
 
     /// Returns aggregate compaction statistics.

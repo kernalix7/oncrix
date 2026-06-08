@@ -198,7 +198,13 @@ impl CompactionScanner {
 
         self.total_passes += 1;
         // Advance migration scanner.
-        let migrate_end = (self.migrate_pfn + SCAN_BATCH).min(self.free_pfn);
+        // SECURITY: `migrate_pfn + SCAN_BATCH` can overflow u64 for a
+        // pathological cursor; saturating_add caps it, then `.min(free_pfn)`
+        // bounds it within the zone exactly as before.
+        let migrate_end = self
+            .migrate_pfn
+            .saturating_add(SCAN_BATCH)
+            .min(self.free_pfn);
         // Simulate finding movable pages.
         let movable = (migrate_end - self.migrate_pfn) / 4;
         self.migrate_pfn = migrate_end;
@@ -230,12 +236,18 @@ impl CompactionScanner {
 
     /// Return progress as a percentage.
     pub fn progress_pct(&self) -> u64 {
-        let total = self.zone_end - self.zone_start;
+        // SECURITY: use saturating_sub throughout so an out-of-range cursor
+        // (free_pfn > zone_end, or migrate_pfn < zone_start) cannot underflow
+        // and panic; for a well-formed zone the arithmetic is unchanged.
+        let total = self.zone_end.saturating_sub(self.zone_start);
         if total == 0 {
             return 100;
         }
-        let scanned = (self.migrate_pfn - self.zone_start) + (self.zone_end - self.free_pfn);
-        (scanned * 100 / total).min(100)
+        let scanned = self
+            .migrate_pfn
+            .saturating_sub(self.zone_start)
+            .saturating_add(self.zone_end.saturating_sub(self.free_pfn));
+        (scanned.saturating_mul(100) / total).min(100)
     }
 }
 
@@ -393,12 +405,25 @@ pub fn compact_zone(zone_start: u64, zone_end: u64, target_order: u8) -> u64 {
 
 /// Check whether compaction would help satisfy an allocation.
 pub fn should_compact(free_pages: u64, total_pages: u64, order: u8) -> bool {
-    if order < MIN_COMPACT_ORDER {
+    // SECURITY: the existing lower bound only rejected
+    // `order < MIN_COMPACT_ORDER`; an `order >= 64` would panic on the
+    // `1u64 << order` shift under overflow-checks. Reject the out-of-range
+    // order up front — no realistic compaction order approaches 64.
+    if order < MIN_COMPACT_ORDER || order >= 64 {
+        return false;
+    }
+    // SECURITY: guard `total_pages == 0` before any division to avoid a
+    // div-by-zero panic on a caller-supplied total.
+    if total_pages == 0 {
         return false;
     }
     // Heuristic: compact if we have enough free pages but fragmented.
     let needed = 1u64 << order;
-    free_pages >= needed && (free_pages * 100 / total_pages) < 30
+    // SECURITY: compare cross-multiplied with saturating products instead
+    // of `free_pages * 100 / total_pages` to avoid both the multiply
+    // overflow and the division entirely. `f/t < 30/100` ⇔ `f*100 <
+    // t*30` for positive `t`, so the heuristic is unchanged.
+    free_pages >= needed && free_pages.saturating_mul(100) < total_pages.saturating_mul(30)
 }
 
 /// Return a summary of compaction state.
