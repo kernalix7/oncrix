@@ -108,12 +108,18 @@ impl I2sConfig {
 
     /// Computes the bit clock frequency in Hz.
     pub fn bclk_hz(&self) -> u32 {
-        self.sample_rate as u32 * self.bit_depth as u32 * self.channels as u32
+        // SECURITY: saturating_mul prevents overflow when device-supplied bit_depth or
+        // channels are abnormally large; a clamped value is safe for diagnostic use.
+        (self.sample_rate as u32)
+            .saturating_mul(self.bit_depth as u32)
+            .saturating_mul(self.channels as u32)
     }
 
     /// Computes the master clock frequency in Hz.
     pub fn mclk_hz(&self) -> u32 {
-        self.sample_rate as u32 * self.mclk_multiplier
+        // SECURITY: saturating_mul prevents overflow when mclk_multiplier is abnormally
+        // large; the multiplier is also bounded at init() time as defense-in-depth.
+        (self.sample_rate as u32).saturating_mul(self.mclk_multiplier)
     }
 }
 
@@ -199,12 +205,22 @@ impl I2sController {
     /// Initializes the I2S controller with the given configuration.
     ///
     /// # Errors
-    /// Returns `Error::InvalidArgument` if base_addr is zero or channels invalid.
+    /// Returns `Error::InvalidArgument` if base_addr is zero, channels invalid,
+    /// or mclk_multiplier exceeds the maximum sane value (1024).
     pub fn init(&mut self, config: I2sConfig) -> Result<()> {
         if self.base_addr == 0 {
             return Err(Error::InvalidArgument);
         }
         if config.channels == 0 || (config.channels as usize) > MAX_TDM_SLOTS {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: Reject device-supplied mclk_multiplier values that would cause
+        // sample_rate * mclk_multiplier to overflow u32.  A sane codec never needs
+        // a multiplier above 1024 (512x is the highest standard value: 192 kHz * 512
+        // = ~98 MHz, well within reason).  Values above this cap are treated as a
+        // malformed/malicious config.
+        const MAX_MCLK_MULTIPLIER: u32 = 1024;
+        if config.mclk_multiplier > MAX_MCLK_MULTIPLIER {
             return Err(Error::InvalidArgument);
         }
         self.config = config;
@@ -415,7 +431,11 @@ impl Default for I2sRegistry {
 ///
 /// BCLK = sample_rate * bit_depth * channels
 pub fn compute_bclk(sample_rate: u32, bit_depth: u8, channels: u8) -> u32 {
-    sample_rate * bit_depth as u32 * channels as u32
+    // SECURITY: saturating_mul prevents overflow when device-supplied bit_depth or
+    // channels are out of range; a saturated value is safe for diagnostic use.
+    sample_rate
+        .saturating_mul(bit_depth as u32)
+        .saturating_mul(channels as u32)
 }
 
 /// Converts a sample count to a duration in microseconds.
