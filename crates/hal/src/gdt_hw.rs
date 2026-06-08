@@ -275,7 +275,8 @@ pub unsafe fn load_gdt(gdtr: &Gdtr) {
             kds  = in(reg) kds,
             tmp  = out(reg) _,
             out("rax") _,
-            options(nostack),
+            // No `nostack`: the block executes `push`/`push`/`retfq`, which
+            // modify RSP and write the stack, so it genuinely uses the stack.
         );
     }
 }
