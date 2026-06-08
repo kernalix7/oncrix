@@ -602,8 +602,10 @@ impl SwapCgroupRegistry {
             .counters
             .total_swapout
             .saturating_add(charge_bytes);
-        self.cgroups[idx].counters.swapout_events += 1;
-        self.cgroups[idx].counters.charge_success += 1;
+        self.cgroups[idx].counters.swapout_events =
+            self.cgroups[idx].counters.swapout_events.saturating_add(1);
+        self.cgroups[idx].counters.charge_success =
+            self.cgroups[idx].counters.charge_success.saturating_add(1);
 
         self.cgroups[idx].record_event(SwapEventType::Charge, nr_pages, now_ns);
         self.record_global_event(SwapEventType::SwapOut, cgroup_id, nr_pages, now_ns);
@@ -635,9 +637,14 @@ impl SwapCgroupRegistry {
             .counters
             .usage
             .saturating_sub(uncharge_bytes);
-        self.cgroups[idx].counters.total_swapin += uncharge_bytes;
-        self.cgroups[idx].counters.swapin_events += 1;
-        self.cgroups[idx].counters.uncharge_count += 1;
+        self.cgroups[idx].counters.total_swapin = self.cgroups[idx]
+            .counters
+            .total_swapin
+            .saturating_add(uncharge_bytes);
+        self.cgroups[idx].counters.swapin_events =
+            self.cgroups[idx].counters.swapin_events.saturating_add(1);
+        self.cgroups[idx].counters.uncharge_count =
+            self.cgroups[idx].counters.uncharge_count.saturating_add(1);
 
         // Remove charge entry.
         self.remove_charge(swap_area, slot_offset);
@@ -659,7 +666,8 @@ impl SwapCgroupRegistry {
     /// Charge parent cgroup (hierarchical).
     fn charge_parent(&mut self, parent_id: u32, bytes: u64) {
         if let Some(idx) = self.find_cgroup(parent_id) {
-            self.cgroups[idx].counters.usage += bytes;
+            self.cgroups[idx].counters.usage =
+                self.cgroups[idx].counters.usage.saturating_add(bytes);
             if self.cgroups[idx].counters.usage > self.cgroups[idx].counters.max_usage {
                 self.cgroups[idx].counters.max_usage = self.cgroups[idx].counters.usage;
             }
