@@ -192,7 +192,7 @@ impl FileRule {
         if !self.active {
             return false;
         }
-        let pattern = &self.path[..self.path_len];
+        let pattern = &self.path[..self.path_len.min(self.path.len())];
         aa_glob_match(pattern, request_path)
     }
 }
@@ -392,10 +392,11 @@ impl ProfileTransition {
 
     /// Check whether an exec path matches this transition trigger.
     fn matches_path(&self, exec_path: &[u8]) -> bool {
-        if !self.active || exec_path.len() < self.trigger_len {
+        if !self.active {
             return false;
         }
-        exec_path[..self.trigger_len] == self.trigger_path[..self.trigger_len]
+        let n = self.trigger_len.min(self.trigger_path.len());
+        exec_path.len() >= n && exec_path[..n] == self.trigger_path[..n]
     }
 }
 
@@ -461,7 +462,7 @@ impl AppArmorProfile {
 
     /// Return the profile name as a byte slice.
     pub fn name_bytes(&self) -> &[u8] {
-        &self.name[..self.name_len]
+        &self.name[..self.name_len.min(self.name.len())]
     }
 
     /// Add a file access rule to this profile.
@@ -582,7 +583,7 @@ impl AppArmorProfile {
         while i < self.transition_count {
             let t = &self.transitions[i];
             if t.matches_path(exec_path) {
-                return Some(&t.target_profile[..t.target_len]);
+                return Some(&t.target_profile[..t.target_len.min(t.target_profile.len())]);
             }
             i = i.saturating_add(1);
         }
