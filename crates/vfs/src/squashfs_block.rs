@@ -325,7 +325,10 @@ impl SquashfsBlockReader {
         }
 
         let off = block_offset as usize;
-        if off + BLOCK_HEADER_SIZE > image.len() {
+        let off_end = off
+            .checked_add(BLOCK_HEADER_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        if off_end > image.len() {
             return Err(Error::InvalidArgument);
         }
 
