@@ -134,9 +134,14 @@ impl ArmGicV2 {
         // Disable distributor during setup
         self.gicd_write32(GICD_CTLR, 0);
 
-        // Set all SPIs to lowest priority
+        // Set all SPIs to lowest priority.
+        // SECURITY: Iterate over priority *registers* (one register covers
+        // 4 interrupt priority bytes), not over individual interrupts.
+        // Using spi_count as the loop bound would write 4× too many registers
+        // and walk into adjacent MMIO space beyond the IPRIORITYR bank.
         let spi_count = (self.num_irqs - GIC_SPI_BASE) as usize;
-        for i in 0..spi_count {
+        let spi_prio_regs = spi_count.div_ceil(4);
+        for i in 0..spi_prio_regs {
             let offset = GICD_IPRIORITYR + (GIC_SPI_BASE as usize / 4 * 4) + i * 4;
             self.gicd_write32(offset, 0xA0A0A0A0);
         }

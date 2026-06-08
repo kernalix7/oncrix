@@ -250,6 +250,11 @@ pub unsafe fn load_gdt(gdtr: &Gdtr) {
     let kcs = SEL_KERNEL_CODE as u64;
     let kds = SEL_KERNEL_DATA as u64;
     // SAFETY: Caller guarantees GDTR is valid and GDT is resident in memory.
+    // SECURITY: `rax` is used as a scratch for `mov ax, {kds:x}` and `xor ax,ax`
+    // but was previously undeclared.  LLVM may allocate a live value in rax for
+    // any `in(reg)` operand, which the segment-register stores would silently
+    // corrupt.  Declaring `out("rax") _` (a clobber) forces LLVM to save/restore
+    // any live value it places there across this block.
     unsafe {
         core::arch::asm!(
             "lgdt [{gdtr}]",
@@ -269,6 +274,7 @@ pub unsafe fn load_gdt(gdtr: &Gdtr) {
             kcs  = in(reg) kcs,
             kds  = in(reg) kds,
             tmp  = out(reg) _,
+            out("rax") _,
             options(nostack),
         );
     }

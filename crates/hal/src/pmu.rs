@@ -717,6 +717,10 @@ impl PmuRegistry {
 unsafe fn wrmsr(msr: u32, value: u64) {
     let lo = value as u32;
     let hi = (value >> 32) as u32;
+    // SECURITY: nomem added — wrmsr only writes to MSR state (not memory);
+    // omitting nomem incorrectly tells LLVM the instruction may alias memory,
+    // causing unnecessary memory barriers and preventing valid optimisations.
+    // Matches the sibling pattern in msr.rs.
     // SAFETY: Caller guarantees valid MSR and ring-0 context.
     unsafe {
         core::arch::asm!(
@@ -724,7 +728,7 @@ unsafe fn wrmsr(msr: u32, value: u64) {
             in("ecx") msr,
             in("eax") lo,
             in("edx") hi,
-            options(nostack, preserves_flags),
+            options(nostack, nomem, preserves_flags),
         );
     }
 }
@@ -739,6 +743,10 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 unsafe fn rdmsr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
+    // SECURITY: nomem added — rdmsr only reads from MSR state (not memory);
+    // omitting nomem incorrectly tells LLVM the instruction may alias memory,
+    // causing unnecessary memory barriers and preventing valid optimisations.
+    // Matches the sibling pattern in msr.rs.
     // SAFETY: Caller guarantees valid MSR and ring-0 context.
     unsafe {
         core::arch::asm!(
@@ -746,7 +754,7 @@ unsafe fn rdmsr(msr: u32) -> u64 {
             in("ecx") msr,
             out("eax") lo,
             out("edx") hi,
-            options(nostack, preserves_flags),
+            options(nostack, nomem, preserves_flags),
         );
     }
     (hi as u64) << 32 | lo as u64

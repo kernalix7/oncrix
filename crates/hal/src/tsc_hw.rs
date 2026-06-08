@@ -297,14 +297,19 @@ pub unsafe fn tsc_deadline_read() -> u64 {
 #[cfg(target_arch = "x86_64")]
 fn cpuid_ecx(leaf: u32, sub: u32) -> u32 {
     let ecx: u32;
-    // SAFETY: CPUID at any privilege level; rbx preserved via push/pop.
+    // SECURITY: push/pop rbx under options(nostack) is UB (modifies RSP, violating
+    // the nostack contract). Use the mov/xchg-rbx idiom instead: save rbx into a
+    // temporary register allocated by the compiler, run cpuid, then swap it back.
+    // This keeps RSP untouched and correctly declares every written register.
+    // SAFETY: CPUID is non-privileged and read-only; RBX preserved via tmp register.
     unsafe {
         core::arch::asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
-            "pop rbx",
+            "xchg {tmp:r}, rbx",
             inout("eax") leaf => _,
             inout("ecx") sub => ecx,
+            tmp = out(reg) _,
             out("edx") _,
             options(nostack, nomem, preserves_flags),
         );
@@ -315,14 +320,19 @@ fn cpuid_ecx(leaf: u32, sub: u32) -> u32 {
 #[cfg(target_arch = "x86_64")]
 fn cpuid_edx(leaf: u32, sub: u32) -> u32 {
     let edx: u32;
-    // SAFETY: CPUID at any privilege level; rbx preserved via push/pop.
+    // SECURITY: push/pop rbx under options(nostack) is UB (modifies RSP, violating
+    // the nostack contract). Use the mov/xchg-rbx idiom instead: save rbx into a
+    // temporary register allocated by the compiler, run cpuid, then swap it back.
+    // This keeps RSP untouched and correctly declares every written register.
+    // SAFETY: CPUID is non-privileged and read-only; RBX preserved via tmp register.
     unsafe {
         core::arch::asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
-            "pop rbx",
+            "xchg {tmp:r}, rbx",
             inout("eax") leaf => _,
             inout("ecx") sub => _,
+            tmp = out(reg) _,
             out("edx") edx,
             options(nostack, nomem, preserves_flags),
         );
@@ -336,13 +346,17 @@ fn cpuid_all(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
     let ebx: u32;
     let ecx: u32;
     let edx: u32;
-    // SAFETY: CPUID; rbx saved to a scratch register then restored.
+    // SECURITY: push/pop rbx under options(nostack) is UB (modifies RSP, violating
+    // the nostack contract). Use the mov/xchg-rbx idiom: save rbx into tmp, run
+    // cpuid (cpuid writes the result into rbx), then xchg swaps rbx back with the
+    // original value — leaving rbx restored and tmp holding the CPUID EBX output.
+    // The compiler allocates tmp as a general-purpose register (not rbx/rsp).
+    // SAFETY: CPUID is non-privileged and read-only; RBX preserved via tmp register.
     unsafe {
         core::arch::asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
-            "mov {tmp:e}, ebx",
-            "pop rbx",
+            "xchg {tmp:r}, rbx",
             inout("eax") leaf => eax,
             inout("ecx") sub => ecx,
             tmp = out(reg) ebx,

@@ -257,11 +257,17 @@ impl Default for IdtHw {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn load_idt(idtr: &Idtr) {
     // SAFETY: Caller guarantees IDTR is valid and IDT is resident in memory.
+    // SECURITY: `lidt` reads the 10-byte IDTR struct from the address in the
+    // register operand.  The previous `nomem` option was incorrect: it told LLVM
+    // the block does not access memory, allowing the compiler to defer or reorder
+    // the write of the Idtr struct fields relative to the asm block.  Removing
+    // `nomem` forces LLVM to treat this block as a potential memory reader,
+    // ensuring all preceding stores to `*idtr` are visible before `lidt` executes.
     unsafe {
         core::arch::asm!(
             "lidt [{idtr}]",
             idtr = in(reg) idtr as *const Idtr,
-            options(nomem, nostack, preserves_flags),
+            options(nostack, preserves_flags),
         );
     }
 }

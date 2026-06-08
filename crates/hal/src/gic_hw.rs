@@ -234,29 +234,60 @@ impl GicHw {
     }
 
     /// Enables an interrupt by IRQ number.
-    pub fn enable_irq(&self, irq: u32) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `irq` is out of the
+    /// implemented interrupt range.
+    pub fn enable_irq(&self, irq: u32) -> Result<()> {
+        // SECURITY: Reject out-of-range IRQs to prevent register offset overflow
+        // into adjacent MMIO regions beyond the GICD ISENABLER bank.
+        if (irq as usize) >= self.num_irqs {
+            return Err(Error::InvalidArgument);
+        }
         let reg = GICD_ISENABLER + (irq / 32) * 4;
         let bit = 1u32 << (irq % 32);
         self.write_gicd(reg, bit);
+        Ok(())
     }
 
     /// Disables an interrupt by IRQ number.
-    pub fn disable_irq(&self, irq: u32) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `irq` is out of the
+    /// implemented interrupt range.
+    pub fn disable_irq(&self, irq: u32) -> Result<()> {
+        // SECURITY: Reject out-of-range IRQs to prevent register offset overflow
+        // into adjacent MMIO regions beyond the GICD ICENABLER bank.
+        if (irq as usize) >= self.num_irqs {
+            return Err(Error::InvalidArgument);
+        }
         let reg = GICD_ICENABLER + (irq / 32) * 4;
         let bit = 1u32 << (irq % 32);
         self.write_gicd(reg, bit);
+        Ok(())
     }
 
     /// Sets the priority for an interrupt (0 = highest, 0xFF = lowest).
-    pub fn set_priority(&self, irq: u32, priority: u8) {
-        let reg = GICD_IPRIORITYR + irq;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `irq` is out of the
+    /// implemented interrupt range.
+    pub fn set_priority(&self, irq: u32, priority: u8) -> Result<()> {
+        // SECURITY: Reject out-of-range IRQs to prevent register offset overflow
+        // into adjacent MMIO regions beyond the GICD IPRIORITYR bank.
+        if (irq as usize) >= self.num_irqs {
+            return Err(Error::InvalidArgument);
+        }
         // Byte-access: read-modify-write the 32-bit register.
         let shift = (irq % 4) * 8;
         let mask = !(0xFFu32 << shift);
         let word_reg = GICD_IPRIORITYR + (irq / 4) * 4;
         let val = (self.read_gicd(word_reg) & mask) | ((priority as u32) << shift);
         self.write_gicd(word_reg, val);
-        let _ = reg;
+        Ok(())
     }
 
     /// Sends an SGI (Software Generated Interrupt) to the target CPUs (GICv2).
