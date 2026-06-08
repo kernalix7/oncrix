@@ -297,11 +297,17 @@ pub struct SerialPortState {
 impl SerialPortState {
     /// Create a new uninitialized port state.
     pub const fn new(index: u32) -> Self {
+        // SECURITY: use saturating arithmetic before narrowing to u16 so that a
+        // device-supplied index value large enough to overflow u32 is clamped
+        // to u32::MAX rather than wrapping.  For legitimate port indices
+        // (0..MAX_PORTS = 4) the result is identical to direct multiplication.
+        let rx_q = index.saturating_mul(2);
+        let tx_q = rx_q.saturating_add(1);
         Self {
             index,
             open: false,
-            rx_queue: (index * 2) as u16,
-            tx_queue: (index * 2 + 1) as u16,
+            rx_queue: rx_q as u16,
+            tx_queue: tx_q as u16,
             rx_buf: [0u8; PORT_BUFFER_SIZE],
             rx_len: 0,
             rx_pos: 0,
@@ -330,7 +336,10 @@ impl SerialPortState {
     ///
     /// Returns the number of bytes copied.
     pub fn dequeue_rx(&mut self, dst: &mut [u8]) -> usize {
-        let avail = self.rx_len - self.rx_pos;
+        // SECURITY: saturating_sub guards against rx_pos > rx_len (e.g. if a
+        // caller or interrupt path corrupts the ring indices).  For all normal
+        // values the result is identical to plain subtraction.
+        let avail = self.rx_len.saturating_sub(self.rx_pos);
         let n = dst.len().min(avail);
         dst[..n].copy_from_slice(&self.rx_buf[self.rx_pos..self.rx_pos + n]);
         self.rx_pos += n;
@@ -354,7 +363,10 @@ impl SerialPortState {
 
     /// Number of bytes available to read.
     pub fn rx_available(&self) -> usize {
-        self.rx_len - self.rx_pos
+        // SECURITY: saturating_sub mirrors the same guard in dequeue_rx —
+        // if indices are ever inconsistent the result is 0 (no data) rather
+        // than a huge underflowed value that triggers a ring-0 panic.
+        self.rx_len.saturating_sub(self.rx_pos)
     }
 
     /// Whether there is pending TX data.
@@ -804,14 +816,21 @@ impl VirtioSerial {
     ///
     /// Only valid when MULTIPORT feature is negotiated.
     pub fn ctrl_rx_queue(&self) -> u16 {
-        (self.num_ports * 2) as u16
+        // SECURITY: num_ports is device-supplied (from max_nr_ports config
+        // field).  Use saturating_mul/saturating_add before narrowing to u16
+        // so a malicious value cannot overflow u32 and produce a wrong queue
+        // index.  For legitimate values (num_ports <= MAX_PORTS = 4) the
+        // result is identical to direct multiplication.
+        self.num_ports.saturating_mul(2) as u16
     }
 
     /// Returns the control TX virtqueue index for this device.
     ///
     /// Only valid when MULTIPORT feature is negotiated.
     pub fn ctrl_tx_queue(&self) -> u16 {
-        (self.num_ports * 2 + 1) as u16
+        // SECURITY: same guard as ctrl_rx_queue — saturating arithmetic before
+        // narrowing so a device-supplied num_ports cannot overflow u32.
+        self.num_ports.saturating_mul(2).saturating_add(1) as u16
     }
 
     /// Returns whether the multiport feature is active.

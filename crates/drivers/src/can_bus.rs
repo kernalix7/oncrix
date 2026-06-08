@@ -737,7 +737,9 @@ impl CanController {
             let status = unsafe { read_reg8(base, REG_STATUS) };
             if status & SR_BS != 0 {
                 self.state = CanState::BusOff;
-                self.errors.bus_off_count = self.errors.bus_off_count.wrapping_add(1);
+                // SECURITY: saturating_add prevents a bus-off storm from silently rolling the
+                // counter back to 0 (wrapping_add), which would mask a persistent fault condition.
+                self.errors.bus_off_count = self.errors.bus_off_count.saturating_add(1);
             } else if self.errors.tx_errors >= 128 || self.errors.rx_errors >= 128 {
                 self.state = CanState::Passive;
             } else {
@@ -746,7 +748,9 @@ impl CanController {
         }
 
         if ir & IR_ALI != 0 {
-            self.errors.arb_lost_count = self.errors.arb_lost_count.wrapping_add(1);
+            // SECURITY: saturating_add prevents an arbitration-lost storm from rolling the
+            // counter back to 0 (wrapping_add), which would mask a persistent bus contention fault.
+            self.errors.arb_lost_count = self.errors.arb_lost_count.saturating_add(1);
         }
 
         ir

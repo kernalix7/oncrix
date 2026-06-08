@@ -295,7 +295,9 @@ impl CanSocket {
         }
         let next = (self.rx_head + 1) & (RX_RING_SIZE - 1);
         if next == self.rx_tail {
-            self.drop_count += 1;
+            // SECURITY: saturating_add prevents a frame-flood from wrapping drop_count to 0,
+            // which would produce misleading diagnostics and, with overflow-checks ON, panic.
+            self.drop_count = self.drop_count.saturating_add(1);
             return false;
         }
         self.rx_ring[self.rx_head] = frame;

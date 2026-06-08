@@ -268,18 +268,32 @@ impl I2sConfig {
         if self.mclk_ratio == 0 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: Reject device-supplied mclk_ratio values that would cause
+        // sample_rate * mclk_ratio to overflow u32.  Standard codecs use at most 512x;
+        // cap at 1024 to give headroom while blocking malicious/corrupt configs.
+        // 192000 * 1024 = 196_608_000, comfortably within u32::MAX (4_294_967_295).
+        const MAX_MCLK_RATIO: u16 = 1024;
+        if self.mclk_ratio > MAX_MCLK_RATIO {
+            return Err(Error::InvalidArgument);
+        }
 
         Ok(())
     }
 
     /// Compute the bit clock (BCLK) frequency.
     pub fn bclk_hz(&self) -> u32 {
-        self.sample_rate * self.bit_depth as u32 * self.channels as u32
+        // SECURITY: saturating_mul prevents overflow when device-supplied bit_depth or
+        // channels are abnormally large; a saturated value is safe for diagnostic use.
+        self.sample_rate
+            .saturating_mul(self.bit_depth as u32)
+            .saturating_mul(self.channels as u32)
     }
 
     /// Compute the MCLK frequency from the ratio.
     pub fn mclk_hz(&self) -> u32 {
-        self.sample_rate * self.mclk_ratio as u32
+        // SECURITY: saturating_mul prevents overflow when mclk_ratio is abnormally
+        // large; the ratio is also bounded in validate() as defense-in-depth.
+        self.sample_rate.saturating_mul(self.mclk_ratio as u32)
     }
 
     /// Encode the sample rate into the clock config register
@@ -892,28 +906,34 @@ impl I2sController {
         }
 
         if status & INT_TX_UNDERRUN != 0 {
-            self.tx_underruns += 1;
+            // SECURITY: saturating_add prevents the diagnostic counter from wrapping to
+            // zero under a device-triggered interrupt storm (malicious or faulty HW).
+            self.tx_underruns = self.tx_underruns.saturating_add(1);
             // Update active playback streams.
             let mut i = 0;
             while i < self.stream_count {
                 if self.streams[i].direction == StreamDirection::Playback
                     && self.streams[i].state == StreamState::Running
                 {
-                    self.streams[i].underruns += 1;
+                    // SECURITY: same saturating_add guard for per-stream counter.
+                    self.streams[i].underruns = self.streams[i].underruns.saturating_add(1);
                 }
                 i += 1;
             }
         }
 
         if status & INT_RX_OVERRUN != 0 {
-            self.rx_overruns += 1;
+            // SECURITY: saturating_add prevents the diagnostic counter from wrapping to
+            // zero under a device-triggered interrupt storm (malicious or faulty HW).
+            self.rx_overruns = self.rx_overruns.saturating_add(1);
             // Update active capture streams.
             let mut i = 0;
             while i < self.stream_count {
                 if self.streams[i].direction == StreamDirection::Capture
                     && self.streams[i].state == StreamState::Running
                 {
-                    self.streams[i].overruns += 1;
+                    // SECURITY: same saturating_add guard for per-stream counter.
+                    self.streams[i].overruns = self.streams[i].overruns.saturating_add(1);
                 }
                 i += 1;
             }
@@ -930,7 +950,11 @@ impl I2sController {
             let mut i = 0;
             while i < self.stream_count {
                 if self.streams[i].state == StreamState::Running {
-                    self.streams[i].frames_transferred += frames;
+                    // SECURITY: device-DMA-driven counter — saturating_add avoids a
+                    // ring-0 overflow panic on a sustained DMA-completion storm
+                    // (same class as the underrun/overrun counters above).
+                    self.streams[i].frames_transferred =
+                        self.streams[i].frames_transferred.saturating_add(frames);
                 }
                 i += 1;
             }
