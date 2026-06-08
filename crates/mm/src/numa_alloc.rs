@@ -429,7 +429,7 @@ impl NumaAllocator {
         if node >= self.node_count {
             return Err(Error::InvalidArgument);
         }
-        self.free_pages[node] += count;
+        self.free_pages[node] = self.free_pages[node].saturating_add(count);
         Ok(())
     }
 
