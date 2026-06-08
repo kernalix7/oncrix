@@ -277,6 +277,15 @@ pub struct IoQueuePair {
     sq_doorbell: u64,
     /// CQ head doorbell virtual address.
     cq_doorbell: u64,
+    // SECURITY: In-flight CID tracker (one bit per CID slot, 1..=255).
+    // submit_io sets the bit for the assigned CID; poll_completion accepts a
+    // CQE only when its CID bit is set, clearing it exactly once.  This
+    // prevents a malicious/buggy device from spoofing completions for commands
+    // that were never submitted (completion spoofing) and from posting
+    // duplicate completions for the same CID (double-free / use-after-free).
+    // CID 0 is never issued (next_cid starts at 1 and wraps to 1), so index 0
+    // is permanently false and serves as a natural sentinel.
+    in_flight: [bool; IO_CQ_DEPTH],
 }
 
 impl IoQueuePair {
@@ -313,6 +322,7 @@ impl IoQueuePair {
             next_cid: 1,
             sq_doorbell,
             cq_doorbell,
+            in_flight: [false; IO_CQ_DEPTH],
         }
     }
 
@@ -348,10 +358,36 @@ impl IoQueuePair {
         }
 
         let cid = self.next_cid;
+        // SECURITY: keep the issued CID within [1, IO_CQ_DEPTH-1] so it is always
+        // a valid index into the [bool; IO_CQ_DEPTH] in-flight array. A
+        // free-running u16 counter (1..=65535) would index out of bounds on the
+        // 256th submission and panic in ring 0 (machine halt) — not even an
+        // attacker is required. Wrap at IO_CQ_DEPTH and skip 0 (the never-issued
+        // sentinel that keeps in_flight[0] permanently false). This caps the
+        // effective outstanding depth at IO_CQ_DEPTH-1 CIDs, which matches the
+        // in-flight array size; a device-advertised depth larger than that is
+        // intentionally not used (safe, just not maximal).
         self.next_cid = self.next_cid.wrapping_add(1);
-        if self.next_cid == 0 {
+        if self.next_cid as usize >= IO_CQ_DEPTH {
             self.next_cid = 1;
         }
+
+        // SECURITY: refuse to reissue a CID that is still in flight. The CID
+        // space is bounded to [1, IO_CQ_DEPTH-1], so a queue driven beyond that
+        // many outstanding commands (a device-advertised SQ depth larger than
+        // the in-flight array) would otherwise alias two live commands onto one
+        // slot — a later completion would then resolve against the wrong
+        // command. Returning Busy keeps the in-flight set exactly 1:1 with the
+        // outstanding CIDs regardless of sq_depth (fail-closed back-pressure;
+        // the caller retries once a completion frees a slot).
+        if self.in_flight[cid as usize] {
+            return Err(Error::Busy);
+        }
+
+        // SECURITY: Mark this CID as in-flight before posting the command to
+        // DMA memory. By the bound above the CID is in 1..=IO_CQ_DEPTH-1, so the
+        // index is always valid for the [bool; IO_CQ_DEPTH] array.
+        self.in_flight[cid as usize] = true;
 
         let sqe = cmd.to_sqe(cid);
         // SAFETY: sq_virt is a valid ring; sq_tail is in bounds.
@@ -400,6 +436,47 @@ impl IoQueuePair {
                     // spin-counter decrement above bounds a malicious device
                     // that floods phase-correct CQEs (DoS guard); cq_head stays
                     // in [0, cq_depth) so the `+= 1` cannot overflow.
+
+                    // SECURITY: Reject completions from a different submission
+                    // queue.  A rogue device (or hypervisor) may post a
+                    // phase-correct CQE with sq_id != self.id to cause a
+                    // false/spoofed completion on behalf of another queue's
+                    // command.  Advance and discard without acting on it.
+                    if entry.sq_id != self.id {
+                        self.cq_head += 1;
+                        if self.cq_head >= self.cq_depth {
+                            self.cq_head = 0;
+                            self.cq_phase = !self.cq_phase;
+                        }
+                        write_doorbell(self.cq_doorbell, self.cq_head as u32);
+                        continue;
+                    }
+
+                    // SECURITY: Reject completions for CIDs that are not
+                    // in-flight.  This closes two attack vectors:
+                    //   (a) Completion spoofing — device posts a CQE for a CID
+                    //       the driver never submitted.
+                    //   (b) Duplicate completion / double-free — device posts a
+                    //       second CQE for an already-completed CID.
+                    // CID 0 is never issued (next_cid skips 0), so
+                    // in_flight[0] == false always; the index is in 0..256.
+                    let cid_idx = entry.cid as usize;
+                    let is_in_flight = cid_idx < IO_CQ_DEPTH && self.in_flight[cid_idx];
+                    if !is_in_flight {
+                        // Spurious or duplicate CQE: consume from ring, discard.
+                        self.cq_head += 1;
+                        if self.cq_head >= self.cq_depth {
+                            self.cq_head = 0;
+                            self.cq_phase = !self.cq_phase;
+                        }
+                        write_doorbell(self.cq_doorbell, self.cq_head as u32);
+                        continue;
+                    }
+
+                    // Clear the in-flight bit exactly once to prevent duplicate
+                    // processing of this CID.
+                    self.in_flight[cid_idx] = false;
+
                     let matched = entry.cid == cid;
                     self.cq_head += 1;
                     if self.cq_head >= self.cq_depth {

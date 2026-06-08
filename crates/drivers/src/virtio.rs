@@ -174,6 +174,15 @@ pub struct Virtqueue {
     free_head: u16,
     /// Last used index we've processed.
     last_used_idx: u16,
+    // SECURITY: Tracks which descriptor heads are currently in-flight (posted to the
+    // device but not yet reclaimed).  A malicious device can DMA any id value into
+    // VirtqUsedElem::id; without this guard a duplicate used-ring entry for an already
+    // freed descriptor would put the same slot into the free list twice, allowing two
+    // subsequent alloc_desc() calls to return the same index — leading to descriptor
+    // aliasing and DMA memory corruption.  The bitmap is set by mark_in_flight() at
+    // push_avail time and cleared exactly once by clear_in_flight() at completion.
+    // free_desc() is only called after a successful clear, so double-free is impossible.
+    in_flight: [bool; MAX_QUEUE_SIZE],
 }
 
 impl Default for Virtqueue {
@@ -201,6 +210,9 @@ impl Virtqueue {
             num: MAX_QUEUE_SIZE as u16,
             free_head: 0,
             last_used_idx: 0,
+            // SECURITY: All descriptors start as not in-flight; mark_in_flight() arms
+            // each slot when the driver posts it, clear_in_flight() disarms exactly once.
+            in_flight: [false; MAX_QUEUE_SIZE],
         }
     }
 
@@ -214,6 +226,42 @@ impl Virtqueue {
             };
         }
         self.free_head = 0;
+        // SECURITY: Reset all in-flight flags so no stale state survives a re-init.
+        self.in_flight = [false; MAX_QUEUE_SIZE];
+    }
+
+    /// Mark descriptor `idx` as in-flight.
+    ///
+    /// Called by the driver immediately after [`push_avail`](Self::push_avail)
+    /// for every chain head that is handed to the device.  No-op for
+    /// out-of-range indices (which should never occur for driver-allocated
+    /// descriptors).
+    pub fn mark_in_flight(&mut self, idx: u16) {
+        if (idx as usize) < MAX_QUEUE_SIZE {
+            // SECURITY: Arms the in-flight guard so that a used-ring completion
+            // for this index is accepted exactly once.
+            self.in_flight[idx as usize] = true;
+        }
+    }
+
+    /// Attempt to clear the in-flight flag for `idx`.
+    ///
+    /// Returns `true` if the descriptor was in-flight (flag was set and is
+    /// now cleared), `false` if it was already clear or out of range.
+    /// Callers MUST treat a `false` return as a malicious/spurious completion
+    /// and must NOT free or re-use the descriptor.
+    pub fn clear_in_flight(&mut self, idx: u16) -> bool {
+        if (idx as usize) >= MAX_QUEUE_SIZE {
+            return false;
+        }
+        // SECURITY: Atomic test-and-clear.  Returns false on a second call for
+        // the same idx, preventing the duplicate-free / descriptor-aliasing attack.
+        if self.in_flight[idx as usize] {
+            self.in_flight[idx as usize] = false;
+            true
+        } else {
+            false
+        }
     }
 
     /// Allocate a descriptor from the free list.
@@ -231,8 +279,17 @@ impl Virtqueue {
     /// Silently ignores indices that are out of range; such values can
     /// originate from device-controlled descriptor chain `.next` fields
     /// and must not be used to index the descriptor table.
+    ///
+    /// # Security
+    ///
+    /// This function intentionally does NOT check `in_flight` because it is
+    /// also used to free chained (non-head) descriptors (e.g. `d_data` in the
+    /// RX two-descriptor chain), which are never individually tracked by the
+    /// in-flight bitmap (only the chain head is tracked).  The caller is
+    /// responsible for verifying in-flight status on the chain HEAD via
+    /// [`clear_in_flight`](Self::clear_in_flight) before walking the chain.
     pub fn free_desc(&mut self, idx: u16) {
-        // Guard against device-supplied out-of-range indices.
+        // SECURITY: Guard against device-supplied out-of-range indices.
         // A malicious device can write any value into `.next`; using it
         // without validation would produce an OOB write into kernel memory.
         if idx as usize >= MAX_QUEUE_SIZE {

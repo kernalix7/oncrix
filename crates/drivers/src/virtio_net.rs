@@ -346,6 +346,10 @@ impl VirtioNet {
         self.rx.desc[d_data as usize].next = 0;
 
         self.rx.push_avail(d_hdr);
+        // SECURITY: Arm the in-flight guard for this chain head so that
+        // receive() can accept its completion exactly once, rejecting any
+        // duplicate or spoofed used-ring entry with the same id.
+        self.rx.mark_in_flight(d_hdr);
         self.mmio.notify(RX_QUEUE);
         Ok(())
     }
@@ -455,6 +459,19 @@ impl VirtioNet {
             None => return Ok(0),
         };
 
+        // SECURITY: Reject completions for descriptors that are not currently
+        // in-flight.  pop_used() only bounds desc_head < MAX_QUEUE_SIZE; it
+        // cannot detect a malicious device replaying a previously consumed id.
+        // clear_in_flight() is atomic test-and-clear: it returns true only the
+        // first time for any given index, making double-free impossible even if
+        // the device sends the same id twice in the used ring.
+        // If clear returns false the descriptor is already free (or was never
+        // posted); proceeding would corrupt the free list by inserting a
+        // duplicate.  Discard the completion without freeing or re-posting.
+        if !self.rx.clear_in_flight(desc_head) {
+            return Ok(0);
+        }
+
         // `total_len` is the device-written `VirtqUsedElem.len` field
         // (DMA, attacker-controlled). Validate it against the actual RX
         // DMA buffer capacity before computing any lengths. A device
@@ -463,9 +480,15 @@ impl VirtioNet {
         // out-of-bounds data to the upper-layer protocol parsers.
         if total_len as usize > MAX_RX_BUF_SIZE {
             // Free the descriptor chain before returning.
-            // `desc_head` was already validated by pop_used (< MAX_QUEUE_SIZE).
+            // `desc_head` was already validated by pop_used (< MAX_QUEUE_SIZE)
+            // and cleared from in_flight above (no double-free possible here).
+            // SECURITY: Guard the chain walk against self-reference: a malicious
+            // device could have DMA'd desc_head into desc[desc_head].next,
+            // creating a cycle.  Reject any d_next == desc_head before freeing.
             let d_next = self.rx.desc[desc_head as usize].next;
-            self.rx.free_desc(d_next);
+            if d_next != desc_head {
+                self.rx.free_desc(d_next);
+            }
             self.rx.free_desc(desc_head);
             // Re-post the receive buffer so future receives can proceed.
             let _ = self.post_rx_buf();
@@ -488,10 +511,15 @@ impl VirtioNet {
         buf[..copy_len].copy_from_slice(&self.rx_buf[..copy_len]);
 
         // Free the descriptor chain.
-        // `desc_head` was validated by pop_used; free_desc guards its
-        // own `idx` and the `.next` value it receives.
+        // `desc_head` was validated by pop_used and cleared from in_flight above.
+        // SECURITY: Guard the chain walk against self-reference: if the device
+        // corrupted desc[desc_head].next to equal desc_head, freeing it first
+        // and then freeing desc_head again would insert desc_head twice into the
+        // free list.  Skip freeing d_next when it equals the head.
         let d_next = self.rx.desc[desc_head as usize].next;
-        self.rx.free_desc(d_next);
+        if d_next != desc_head {
+            self.rx.free_desc(d_next);
+        }
         self.rx.free_desc(desc_head);
 
         // Re-post the receive buffer for the next packet.

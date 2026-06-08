@@ -27,6 +27,22 @@ const RING_SIZE: usize = 128;
 const BUFFER_SIZE: usize = 2048;
 /// Maximum number of e1000e controllers tracked.
 const MAX_CONTROLLERS: usize = 4;
+/// Minimum valid Ethernet frame length (bytes, CRC already stripped by RCTL_SECRC).
+///
+/// IEEE 802.3 mandates a 64-byte minimum on the wire; with the 4-byte CRC stripped
+/// the smallest payload that can reach this driver is 60 bytes.  Any device-supplied
+/// `length` below this threshold is either a hardware bug or an attacker forging a
+/// malformed completion — reject it before it reaches upper-layer parsers.
+// SECURITY: mirrors the MIN_FRAME guard in e1000.rs; see F5 fix.
+const MIN_FRAME: u16 = 60;
+/// Maximum standard Ethernet frame size (bytes, CRC stripped).
+///
+/// 1518 = 1522 (max 802.3 frame with VLAN tag) − 4 (CRC stripped by RCTL_SECRC).
+/// Frames larger than this are not expected on a standard (non-jumbo) ring; reject
+/// them rather than silently truncating to BUFFER_SIZE, which would hide the anomaly.
+// SECURITY: combined with MIN_FRAME this closes the zero-length / oversized frame
+// DoS path (F5): downstream Ethernet/IP parsers cannot be handed an out-of-spec len.
+const MAX_FRAME: u16 = 1518;
 
 // ---------------------------------------------------------------------------
 // MMIO Register Offsets
@@ -451,10 +467,31 @@ impl E1000e {
                 self.rx_head = (idx + 1) % RING_SIZE;
                 return None;
             }
-            // `length` is device-written and may be attacker-controlled
-            // (up to 65535). Clamp to the physical buffer size so callers
-            // cannot perform an out-of-bounds read of the 2 KiB buffer.
-            let len = rx_ring[idx].length.min(BUFFER_SIZE as u16);
+            // SECURITY (F5): `length` is device-written and may be attacker-controlled.
+            // A malicious or buggy NIC can write any value in [0, 65535].
+            // Enforce the Ethernet frame-size envelope before returning to callers:
+            //   - length == 0  → forged zero-length completion; downstream parsers
+            //                    may panic or divide-by-zero on an empty frame.
+            //   - length < MIN_FRAME (60) → sub-minimum frame; not a valid Ethernet
+            //                    payload after CRC stripping (RCTL_SECRC is set).
+            //   - length > MAX_FRAME (1518) → oversized frame on a non-jumbo ring;
+            //                    silently truncating to BUFFER_SIZE would hide the
+            //                    anomaly and still expose up to 2048 bytes of DMA
+            //                    memory to the parser.
+            // In all three cases: advance the head, skip the slot, return None.
+            // The caller is responsible for recycling the buffer via recycle_rx()
+            // before the slot is reused — same contract as the error/EOP paths above.
+            // This mirrors the zero-length guard in e1000.rs::receive().
+            let raw_len = rx_ring[idx].length;
+            if raw_len < MIN_FRAME || raw_len > MAX_FRAME {
+                self.rx_head = (idx + 1) % RING_SIZE;
+                return None;
+            }
+            // `raw_len` is now guaranteed within [MIN_FRAME, MAX_FRAME] ⊆ [1, BUFFER_SIZE].
+            // The `.min()` below is a belt-and-suspenders cap; with MAX_FRAME = 1518
+            // and BUFFER_SIZE = 2048 it will never trigger, but it preserves the
+            // invariant should these constants ever be changed independently.
+            let len = raw_len.min(BUFFER_SIZE as u16);
             let slot = idx;
             self.rx_head = (idx + 1) % RING_SIZE;
             Some((slot, len))
