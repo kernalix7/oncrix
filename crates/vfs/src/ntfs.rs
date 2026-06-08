@@ -930,6 +930,12 @@ impl<R: BlockReader> NtfsFs<R> {
                 }
             }
 
+            // SECURITY: entry_len is an on-disk u16; an unchecked add can overflow
+            // pos (wrapping) or advance it past the buffer, turning later index
+            // access into an OOB read.  Guard both before advancing.
+            if pos.checked_add(entry_len).map_or(true, |e| e > buf.len()) {
+                break;
+            }
             pos += entry_len;
             if is_last {
                 break;
@@ -1022,6 +1028,14 @@ impl<R: BlockReader> NtfsFs<R> {
                 }
             }
 
+            // SECURITY: entry_len is on-disk data; guard against overflow and
+            // past-end advances before updating pos (mirrors search_index_entries).
+            if pos
+                .checked_add(entry_len)
+                .map_or(true, |e| e > root_val.len())
+            {
+                break;
+            }
             pos += entry_len;
             if is_last {
                 break;

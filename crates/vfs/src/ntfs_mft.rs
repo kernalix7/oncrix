@@ -160,6 +160,16 @@ impl MftRecord {
             u16::from_le_bytes(raw[18..20].try_into().map_err(|_| Error::InvalidArgument)?);
         let attr_offset =
             u16::from_le_bytes(raw[20..22].try_into().map_err(|_| Error::InvalidArgument)?);
+        // SECURITY: attr_offset is on-disk data from an attacker-controlled image.
+        // Values < 48 would point inside the fixed MFT record header (the header
+        // itself occupies bytes 0..48), allowing attribute parsing to re-interpret
+        // header fields as attribute data — a confused-deputy read.  Values >=
+        // MFT_RECORD_SIZE are out of bounds.  The wired ntfs.rs find_attr path
+        // already enforces the same range; mirror that check here so MftRecord
+        // carries only structurally valid attr_offset values.
+        if (attr_offset as usize) < 48 || (attr_offset as usize) >= MFT_RECORD_SIZE {
+            return Err(Error::InvalidArgument);
+        }
         let flags_raw =
             u16::from_le_bytes(raw[22..24].try_into().map_err(|_| Error::InvalidArgument)?);
         let bytes_in_use =

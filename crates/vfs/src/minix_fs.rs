@@ -10,6 +10,15 @@
 
 use oncrix_lib::{Error, Result};
 
+/// Maximum block size accepted for a Minix V3 filesystem.
+///
+/// Minix V3 supports block sizes of 1024..=65536 bytes (log_zone_size in [0, 6]).
+/// Any shift >= 64 (log_zone_size >= 64 on a 64-bit host) would overflow usize
+/// and panic in ring 0 when overflow-checks are enabled.  This const caps the
+/// result after a successful `checked_shl` to prevent propagation of an oversized
+/// block size into the rest of the mount path.
+pub const MINIX_MAX_BLOCK_SIZE: usize = 64 * 1024;
+
 /// Minix V1 magic number.
 pub const MINIX_V1_MAGIC1: u16 = 0x137f;
 /// Minix V1 magic number (30-char names).
@@ -131,9 +140,25 @@ impl MinixSuperblockDisk {
     }
 
     /// Filesystem block size in bytes.
+    ///
+    /// For V3, the block size is `1024 << log_zone_size`.  Because `log_zone_size`
+    /// is an on-disk u16 read from an attacker-controlled image, an unchecked shift
+    /// panics in ring 0 when `log_zone_size >= 64` (overflow-checks = ON).
+    /// `checked_shl` returns `None` on out-of-range shifts; `unwrap_or(0)` converts
+    /// that to 0, which `MinixSuperblock::parse` then rejects via the
+    /// `MINIX_MAX_BLOCK_SIZE` guard so the bad value can never propagate.
     pub fn block_size(&self, version: MinixVersion) -> usize {
         match version {
-            MinixVersion::V3 => 1024usize << self.log_zone_size,
+            MinixVersion::V3 => {
+                // SECURITY: log_zone_size is attacker-controlled on-disk data.
+                // A value >= usize::BITS (64 on x86-64) makes `<<` panic with
+                // overflow-checks enabled.  checked_shl returns None for such
+                // values; unwrap_or(0) is the panic-free sentinel that the caller
+                // (MinixSuperblock::parse) rejects immediately.
+                1024usize
+                    .checked_shl(self.log_zone_size as u32)
+                    .unwrap_or(0)
+            }
             _ => 1024,
         }
     }
@@ -164,6 +189,14 @@ impl MinixSuperblock {
     pub fn parse(disk: &MinixSuperblockDisk) -> Result<Self> {
         let version = disk.version()?;
         let block_size = disk.block_size(version);
+        // SECURITY: block_size == 0 means checked_shl detected an out-of-range
+        // log_zone_size (>= usize::BITS).  block_size > MINIX_MAX_BLOCK_SIZE
+        // means the image claims a block larger than 64 KiB, which no real Minix
+        // filesystem uses.  Both cases are rejected here so the bad value cannot
+        // propagate into the rest of the mount path.
+        if block_size == 0 || block_size > MINIX_MAX_BLOCK_SIZE {
+            return Err(Error::InvalidArgument);
+        }
         let long_names = disk.long_names();
         let name_len = if long_names {
             MINIX_V2_NAME_LEN
