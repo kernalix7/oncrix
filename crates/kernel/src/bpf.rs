@@ -458,8 +458,25 @@ impl BpfVm {
             let class = insn.class();
             let op = insn.op();
             let dst = insn.dst_reg() as usize;
+            let src = insn.src_reg() as usize;
+            // SECURITY: dst_reg()/src_reg() are 4-bit instruction fields
+            // (value 0..15), but `self.regs` has only NUM_REGS (11) entries.
+            // An unverified — or, via opcode-bit aliasing, a maliciously
+            // crafted but "verified" — program could carry a register nibble
+            // such as 0x0b, yielding dst/src == 11, which would index out of
+            // bounds. With overflow/bounds checks enabled in ring 0 that is a
+            // kernel panic (machine halt); without them an OOB read/write of
+            // adjacent VM state. Reject any instruction whose dst or src
+            // register index is out of range BEFORE any `self.regs[..]` access
+            // below, so every direct index in the ALU/JMP arms is provably in
+            // bounds. This is defence-in-depth: the verifier MUST also reject
+            // such programs, but the interpreter must not trust the `verified`
+            // flag for memory safety. Mirrors `bpf_core.rs::run`.
+            if dst >= NUM_REGS || src >= NUM_REGS {
+                return Err(Error::InvalidArgument);
+            }
             let src_val = if insn.src() == BPF_X {
-                self.regs[insn.src_reg() as usize]
+                self.regs[src]
             } else {
                 insn.imm as u64
             };
