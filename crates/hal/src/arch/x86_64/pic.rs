@@ -170,12 +170,13 @@ impl InterruptController for Pic8259 {
         let flags: u64;
         // SAFETY: Reading RFLAGS and disabling interrupts in Ring 0.
         // `cli` clears the IF bit in RFLAGS, so `preserves_flags` is
-        // intentionally omitted.
+        // intentionally omitted. `nomem` is also omitted: `pushfq`/`pop`
+        // read+write the stack, and `cli` is a critical-section boundary —
+        // the compiler must not reorder memory accesses across it.
         unsafe {
             core::arch::asm!(
                 "pushfq; pop {}; cli",
                 out(reg) flags,
-                options(nomem),
             );
         }
         // IF (Interrupt Flag) is bit 9.
