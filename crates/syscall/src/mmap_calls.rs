@@ -208,8 +208,12 @@ fn is_page_aligned(addr: u64) -> bool {
 }
 
 /// Align `size` up to the next page boundary.
-fn page_align_up(size: u64) -> u64 {
-    (size.wrapping_add(PAGE_SIZE - 1)) & !PAGE_MASK
+///
+/// Returns [`None`] on overflow. `checked_add` (not `wrapping_add`) prevents
+/// a near-`u64::MAX` size from wrapping to `0` and producing a zero-length
+/// range that would slip past the `aligned_len == 0` guard.
+fn page_align_up(size: u64) -> Option<u64> {
+    size.checked_add(PAGE_SIZE - 1).map(|v| v & !PAGE_MASK)
 }
 
 /// Validate that a protection value contains only known bits.
@@ -243,7 +247,7 @@ fn validate_advice(advice: i32) -> Result<()> {
 pub fn do_mmap(args: &MmapArgs) -> Result<u64> {
     args.validate()?;
 
-    let aligned_len = page_align_up(args.length);
+    let aligned_len = page_align_up(args.length).ok_or(Error::InvalidArgument)?;
     if aligned_len == 0 {
         // Overflow during alignment.
         return Err(Error::InvalidArgument);
@@ -274,7 +278,7 @@ pub fn do_munmap(addr: u64, length: u64) -> Result<()> {
         return Err(Error::InvalidArgument);
     }
 
-    let aligned_len = page_align_up(length);
+    let aligned_len = page_align_up(length).ok_or(Error::InvalidArgument)?;
     if aligned_len == 0 {
         return Err(Error::InvalidArgument);
     }
@@ -301,7 +305,7 @@ pub fn do_mprotect(addr: u64, length: u64, prot: u32) -> Result<()> {
 
     validate_prot(prot)?;
 
-    let aligned_len = page_align_up(length);
+    let aligned_len = page_align_up(length).ok_or(Error::InvalidArgument)?;
     if aligned_len == 0 {
         return Err(Error::InvalidArgument);
     }
@@ -347,8 +351,8 @@ pub fn do_mremap(
         return Err(Error::InvalidArgument);
     }
 
-    let aligned_old = page_align_up(old_size);
-    let aligned_new = page_align_up(new_size);
+    let aligned_old = page_align_up(old_size).ok_or(Error::InvalidArgument)?;
+    let aligned_new = page_align_up(new_size).ok_or(Error::InvalidArgument)?;
     if aligned_old == 0 || aligned_new == 0 {
         return Err(Error::InvalidArgument);
     }
@@ -375,7 +379,7 @@ pub fn do_madvise(addr: u64, length: u64, advice: i32) -> Result<()> {
 
     validate_advice(advice)?;
 
-    let aligned_len = page_align_up(length);
+    let aligned_len = page_align_up(length).ok_or(Error::InvalidArgument)?;
     if aligned_len == 0 {
         return Err(Error::InvalidArgument);
     }

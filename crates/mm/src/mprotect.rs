@@ -15,6 +15,7 @@
 use oncrix_lib::{Error, Result};
 
 use crate::addr::PAGE_SIZE;
+use crate::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // ── mprotect protection flags ────────────────────────────────────
 
@@ -123,6 +124,14 @@ pub fn do_mprotect(addr: u64, len: u64, prot: u32) -> Result<()> {
 
     // Validate protection flags.
     let _flags = ProtFlags::from_raw(prot)?;
+
+    // Guard against addr+len overflow and confine the range to the canonical
+    // user-space window.  A kernel-half or non-canonical address is rejected
+    // before any page-table walk.
+    let end = addr.checked_add(len).ok_or(Error::InvalidArgument)?;
+    if addr < USER_SPACE_START || end > USER_SPACE_END.saturating_add(1) {
+        return Err(Error::InvalidArgument);
+    }
 
     // Stub: full implementation will:
     //   1. Look up VMA(s) covering [addr, addr+len).
@@ -275,6 +284,14 @@ pub fn do_madvise(addr: u64, len: u64, advice: i32) -> Result<()> {
 
     // Validate and parse the advice hint.
     let _hint = MadviseHint::from_raw(advice)?;
+
+    // Guard against addr+len overflow and confine the range to the canonical
+    // user-space window.  A kernel-half or non-canonical address is rejected
+    // before any page-table walk.
+    let end = addr.checked_add(len).ok_or(Error::InvalidArgument)?;
+    if addr < USER_SPACE_START || end > USER_SPACE_END.saturating_add(1) {
+        return Err(Error::InvalidArgument);
+    }
 
     // Stub: full implementation will:
     //   1. Look up VMA(s) covering [addr, addr+len).

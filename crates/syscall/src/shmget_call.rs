@@ -193,7 +193,10 @@ pub fn do_shmget(
     }
     let slot = table.alloc_slot().ok_or(Error::OutOfMemory)?;
     let id = table.next_id;
-    table.next_id += 1;
+    // SECURITY: fail rather than wrap the segment-id counter — a recycled
+    // id would alias a live segment (cross-process descriptor confusion),
+    // and the bare `+= 1` would panic in ring 0 at the boundary.
+    table.next_id = table.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
     table.segments[slot] = Some(ShmSegment {
         key,
         id,

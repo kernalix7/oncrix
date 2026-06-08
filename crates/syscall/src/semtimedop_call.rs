@@ -24,6 +24,7 @@
 //! - Linux: `ipc/sem.c`
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -101,16 +102,39 @@ impl SemtimedopRequest {
     }
 
     /// Validate the request.
+    ///
+    /// Mirrors the checks in `semop_call::validate_semop_args`:
+    /// - `semid` non-negative
+    /// - `nsops` in `[1, SEMOPM]`
+    /// - `sops` user pointer is non-null, within the canonical user window,
+    ///   and the full `nsops × sizeof(SemBuf)` range does not wrap or escape.
     pub fn validate(&self) -> Result<()> {
         if self.semid < 0 {
-            return Err(Error::InvalidArgument);
-        }
-        if self.sops == 0 {
             return Err(Error::InvalidArgument);
         }
         if self.nsops == 0 || self.nsops > SEMOPM {
             return Err(Error::InvalidArgument);
         }
+
+        // Compute total byte length with overflow protection — an attacker
+        // could supply nsops close to SEMOPM to craft a near-overflow.
+        let total = (self.nsops as usize)
+            .checked_mul(core::mem::size_of::<SemBuf>())
+            .ok_or(Error::InvalidArgument)?;
+
+        // Validate the user pointer: non-null and within the canonical
+        // user-space lower-half window; also guard against wrap-around.
+        if self.sops == 0 || self.sops < USER_SPACE_START {
+            return Err(Error::InvalidArgument);
+        }
+        let end = self
+            .sops
+            .checked_add(total as u64)
+            .ok_or(Error::InvalidArgument)?;
+        if end > USER_SPACE_END.saturating_add(1) {
+            return Err(Error::InvalidArgument);
+        }
+
         Ok(())
     }
 
@@ -199,8 +223,9 @@ mod tests {
 
     #[test]
     fn valid_request_reaches_subsystem() {
+        // Use a valid user-space address (above USER_SPACE_START = 0x40_0000).
         assert_eq!(
-            sys_semtimedop(0, 1, 1, 0).unwrap_err(),
+            sys_semtimedop(0, 0x0000_0000_0080_0000, 1, 0).unwrap_err(),
             Error::NotImplemented
         );
     }

@@ -48,6 +48,12 @@ const EMPTY_PID: u32 = u32::MAX;
 /// Maximum semaphore value (`SEMVMX`).
 pub const SEMVMX: i32 = 32767;
 
+/// Maximum number of semaphore operations per `semop` call (`SEMOPM`).
+///
+/// Matches the POSIX-recommended limit and prevents O(n^2) undo-capacity
+/// pre-checks from being driven by an unbounded user-supplied slice length.
+pub const SEMOPM: usize = 500;
+
 // ---------------------------------------------------------------------------
 // IPC flags
 // ---------------------------------------------------------------------------
@@ -566,6 +572,12 @@ pub fn semget(
 /// `IPC_NOWAIT` is not set, `WouldBlock` is returned and the array
 /// is left unmodified (no partial application in this implementation).
 pub fn semop(registry: &mut SemRegistry, sem_id: usize, sops: &[Sembuf], pid: u32) -> Result<()> {
+    // Reject oversized operation lists before any iteration to prevent O(n^2)
+    // undo-capacity pre-check from becoming a DoS vector.
+    if sops.len() > SEMOPM {
+        return Err(Error::InvalidArgument);
+    }
+
     // SECURITY INVARIANT: semop alters another process's semaphore set but this
     // signature does not carry an authenticated caller credential, so it CANNOT
     // perform the SysV ipc_perm (owner/group/mode) gate that POSIX.1-2024 /

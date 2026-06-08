@@ -432,6 +432,9 @@ impl DbusConnection {
 
     /// Enqueue a message (as serialized bytes).
     pub fn enqueue_msg(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() > MAX_MSG_BODY_SIZE {
+            return Err(Error::InvalidArgument);
+        }
         if self.msg_count >= MAX_QUEUED_MSGS {
             return Err(Error::WouldBlock);
         }
@@ -513,7 +516,10 @@ impl DbusBus {
     /// Generate a unique name (":1.N").
     fn generate_unique_name(&mut self) -> Result<BusName> {
         let id = self.next_unique_id;
-        self.next_unique_id += 1;
+        self.next_unique_id = self
+            .next_unique_id
+            .checked_add(1)
+            .ok_or(Error::OutOfMemory)?;
         // Format ":1.{id}" manually (no_std).
         let mut buf = [0u8; 32];
         buf[0] = b':';
