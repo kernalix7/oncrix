@@ -200,7 +200,11 @@ impl CifsFileTable {
 
     /// Advance the internal clock by `ticks`.
     pub fn advance_clock(&mut self, ticks: u64) {
-        self.clock += ticks;
+        // SECURITY: saturating_add prevents a panic under overflow-checks=on
+        // when ticks is large or the clock counter approaches u64::MAX.  The
+        // clock is monotonic; clamping at u64::MAX is safe — timeouts computed
+        // against it will correctly expire.
+        self.clock = self.clock.saturating_add(ticks);
     }
 
     fn find_file(&self, fid: u64) -> Option<usize> {
@@ -223,7 +227,10 @@ impl CifsFileTable {
 
     fn alloc_fid(&mut self) -> u64 {
         let fid = self.next_fid;
-        self.next_fid += 1;
+        // SECURITY: wrapping_add prevents a panic under overflow-checks=on at
+        // u64::MAX.  FIDs are rotating identifiers; wrap-around is acceptable
+        // (the server treats them as opaque handles scoped to the session).
+        self.next_fid = self.next_fid.wrapping_add(1);
         fid
     }
 }
@@ -377,7 +384,13 @@ pub fn reconnect_durable(
     }
     let slot = found_slot.ok_or(Error::NotFound)?;
     let now = table.clock;
-    if now - table.files[slot].last_activity > DURABLE_HANDLE_TIMEOUT {
+    // SECURITY: saturating_sub prevents a panic under overflow-checks=on when
+    // now < last_activity (clock is not guaranteed monotonic across a reconnect
+    // — e.g., the clock may be reset to 0 on a new connection while
+    // last_activity still carries the prior session's timestamp).  A saturating
+    // result of 0 means "no time has elapsed", which is safe: the handle will
+    // not be spuriously expired.
+    if now.saturating_sub(table.files[slot].last_activity) > DURABLE_HANDLE_TIMEOUT {
         table.files[slot].in_use = false;
         table.count = table.count.saturating_sub(1);
         return Err(Error::NotFound);

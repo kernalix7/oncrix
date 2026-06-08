@@ -298,7 +298,10 @@ impl CifsSession {
     /// Allocate and return the next message ID.
     pub fn alloc_message_id(&mut self) -> u64 {
         let id = self.next_message_id;
-        self.next_message_id += 1;
+        // SECURITY: wrapping_add prevents a panic under overflow-checks=on at
+        // u64::MAX.  Message IDs are rotating identifiers; wrap-around is
+        // acceptable (the server re-sequences on reconnect).
+        self.next_message_id = self.next_message_id.wrapping_add(1);
         id
     }
 

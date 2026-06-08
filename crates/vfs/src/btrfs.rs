@@ -398,8 +398,23 @@ impl BtrfsInternalNode {
     ///
     /// Returns the index of the child subtree that should contain
     /// the key, based on binary search of the separator keys.
+    ///
+    /// # Panics (prevented)
+    ///
+    /// `header.nritems` is disk-derived; without the cap, `for i in 0..count`
+    /// would index `self.ptrs[i]` past the 32-slot array when a crafted image
+    /// sets nritems > 32 — an OOB panic (kernel halt) in overflow-check mode.
+    /// The explicit reject mirrors the guard in `BtrfsLeaf::insert`.
     pub fn find_child(&self, key: &BtrfsKey) -> usize {
-        let count = self.header.nritems as usize;
+        // SECURITY: nritems is an on-disk (attacker-controlled) u32.  Reject a
+        // corrupt node whose raw value exceeds the fixed backing array, then cap
+        // for all subsequent indexing — matching BtrfsLeaf::find() and insert().
+        // Callers that cannot propagate errors (e.g. tree-walk hot paths) receive
+        // 0, which is the safe "descend into first child" fallback.
+        if self.header.nritems as usize > MAX_KEYS_PER_INTERNAL {
+            return 0;
+        }
+        let count = (self.header.nritems as usize).min(MAX_KEYS_PER_INTERNAL);
         if count == 0 {
             return 0;
         }
@@ -860,11 +875,39 @@ impl BtrfsSuperblock {
         }
     }
 
-    /// Validate the superblock magic number.
+    /// Validate the superblock fields.
+    ///
+    /// Checks the magic number and all disk-derived size fields that could
+    /// be used as divisors or shift amounts elsewhere in the filesystem code.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` if any field is invalid or out of range.
     pub fn validate(&self) -> Result<()> {
         if self.magic != BTRFS_MAGIC {
             return Err(Error::InvalidArgument);
         }
+
+        // SECURITY: nodesize, sectorsize, and leafsize are on-disk (attacker-
+        // controlled) u32 fields.  Any consumer that divides by these values
+        // (block index calculation, readahead, etc.) would hit a div-by-zero
+        // kernel halt if the values were 0.  Require power-of-two values in the
+        // valid range [512, 65536] so the division is always well-defined and
+        // no individual value can produce an absurdly large block count.
+        // Also enforce leafsize == nodesize as the btrfs on-disk format requires.
+        if self.nodesize == 0
+            || self.sectorsize == 0
+            || !self.nodesize.is_power_of_two()
+            || !self.sectorsize.is_power_of_two()
+            || self.nodesize < 512
+            || self.nodesize > 65536
+            || self.sectorsize < 512
+            || self.sectorsize > 65536
+            || self.leafsize != self.nodesize
+        {
+            return Err(Error::InvalidArgument);
+        }
+
         Ok(())
     }
 }

@@ -465,7 +465,17 @@ impl BtrfsTree {
         if !leaf.is_leaf() {
             return Err(Error::NotImplemented);
         }
-        let nritems = leaf.header.nritems as usize;
+        // SECURITY: nritems is an on-disk (attacker-controlled) u32.  A crafted
+        // image can set nritems > MAX_LEAF_ITEMS.  Without the explicit reject the
+        // shift loop below computes `i + 1` up to nritems, which can reach index
+        // 32 on a 32-slot array — an OOB panic (kernel halt) in overflow-check mode.
+        // Reject the node immediately so no subsequent path can reach the loop with
+        // an out-of-range nritems, matching the guard already present in
+        // search_slot() and delete_item().
+        if leaf.header.nritems as usize > MAX_LEAF_ITEMS {
+            return Err(Error::InvalidArgument);
+        }
+        let nritems = (leaf.header.nritems as usize).min(MAX_LEAF_ITEMS);
         if nritems >= MAX_LEAF_ITEMS {
             return Err(Error::OutOfMemory);
         }
