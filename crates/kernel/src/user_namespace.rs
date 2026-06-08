@@ -483,7 +483,7 @@ impl UserNsTable {
     /// Increment reference count.
     pub fn get_ns_ref(&mut self, ns_id: u64) -> Result<()> {
         let idx = self.find_ns(ns_id)?;
-        self.namespaces[idx].ref_count += 1;
+        self.namespaces[idx].ref_count = self.namespaces[idx].ref_count.saturating_add(1);
         Ok(())
     }
 

@@ -201,7 +201,7 @@ impl NetNsManager {
     /// Increment the reference count of a namespace.
     pub fn get_ref(&mut self, id: u32) -> Result<()> {
         let slot = self.find_ns(id)?;
-        self.namespaces[slot].refcount += 1;
+        self.namespaces[slot].refcount = self.namespaces[slot].refcount.saturating_add(1);
         self.stats.total_refs += 1;
         Ok(())
     }

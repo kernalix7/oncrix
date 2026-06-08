@@ -136,8 +136,17 @@ impl Timespec {
     }
 
     /// Convert to Ktime.
+    ///
+    /// Uses saturating arithmetic so that an out-of-range timespec
+    /// (e.g. tv_sec near i64::MAX) saturates to i64::MAX rather than
+    /// panicking under overflow-checks = ON.  A well-formed timespec
+    /// (|tv_sec| < ~292 years) is never affected.
     pub const fn to_ktime(self) -> Ktime {
-        Ktime(self.tv_sec * NSEC_PER_SEC + self.tv_nsec)
+        Ktime(
+            self.tv_sec
+                .saturating_mul(NSEC_PER_SEC)
+                .saturating_add(self.tv_nsec),
+        )
     }
 
     /// Convert from Ktime.

@@ -272,9 +272,9 @@ impl TimerSlackManager {
                 if soft_deadline > group.latest_ns {
                     group.latest_ns = soft_deadline;
                 }
-                group.count += 1;
+                group.count = group.count.saturating_add(1);
                 self.stats.coalesced_count += 1;
-                self.stats.saved_ns += slack_ns;
+                self.stats.saved_ns = self.stats.saved_ns.saturating_add(slack_ns);
                 return CoalesceResult::Coalesced;
             }
         }

@@ -150,7 +150,7 @@ impl PidNamespace {
             .ok_or(Error::OutOfMemory)?;
 
         let local = self.next_pid;
-        self.next_pid += 1;
+        self.next_pid = self.next_pid.saturating_add(1);
 
         self.mappings[slot] = PidMapping {
             local_pid: local,

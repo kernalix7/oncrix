@@ -273,7 +273,9 @@ impl FixedBufTable {
             return Err(Error::NotFound);
         }
         self.bufs[index] = FixedBuffer::empty();
-        self.count -= 1;
+        // saturating_sub: defensive against a count already at 0 due to
+        // any future code path inconsistency; avoids an overflow panic.
+        self.count = self.count.saturating_sub(1);
         Ok(())
     }
 

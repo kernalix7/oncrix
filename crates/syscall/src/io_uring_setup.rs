@@ -483,14 +483,12 @@ static mut RINGS: [IoUringInstance; MAX_RINGS] = {
 
 /// Round `n` up to the next power of two.  Returns `n` unchanged if
 /// it is already a power of two.  Returns `0` when `n == 0`.
+///
+/// Uses `checked_next_power_of_two` to avoid a shift-by-32 panic when
+/// `n > 0x8000_0000` (overflow-checks are enabled in ring-0 builds).
+/// `unwrap_or` is panic-free: it returns the fallback value on `None`.
 fn next_power_of_two(n: u32) -> u32 {
-    if n == 0 {
-        return 0;
-    }
-    if n & (n - 1) == 0 {
-        return n;
-    }
-    1u32 << (32 - (n - 1).leading_zeros())
+    n.checked_next_power_of_two().unwrap_or(0)
 }
 
 /// Validate and clamp SQ entries.  If the `CLAMP` flag is set, oversized
@@ -510,7 +508,13 @@ fn validate_sq_entries(entries: u32, clamp: bool) -> Result<u32> {
 
 /// Validate and clamp CQ entries.  CQ must be at least as large as SQ.
 fn validate_cq_entries(entries: u32, sq: u32, clamp: bool) -> Result<u32> {
-    let want = if entries == 0 { 2 * sq } else { entries };
+    // `2 * sq` would overflow for large sq values; use checked_mul and
+    // propagate as InvalidArgument (EINVAL) rather than panicking.
+    let want = if entries == 0 {
+        sq.checked_mul(2).ok_or(Error::InvalidArgument)?
+    } else {
+        entries
+    };
     if want < sq {
         return Err(Error::InvalidArgument);
     }
@@ -788,7 +792,10 @@ pub fn sys_io_uring_enter(fd: i32, to_submit: u32, min_complete: u32, flags: u32
 
     // Process submissions.
     if to_submit > 0 {
-        let available = ring.sq_entries.wrapping_sub(ring.pending_submissions);
+        // saturating_sub: corrupt accounting (pending > sq_entries) yields
+        // 0 available rather than wrapping to a near-MAX count that would
+        // accept far more submissions than the ring actually has capacity for.
+        let available = ring.sq_entries.saturating_sub(ring.pending_submissions);
         let count = if to_submit > available {
             available
         } else {
@@ -836,7 +843,9 @@ pub fn sys_io_uring_enter(fd: i32, to_submit: u32, min_complete: u32, flags: u32
         // Stub: SQPOLL thread wake would happen here.
     }
 
-    Ok(submitted as i32)
+    // try_from guards against a huge submitted count wrapping to a negative
+    // value; unwrap_or is panic-free (returns the fallback on Err).
+    Ok(i32::try_from(submitted).unwrap_or(i32::MAX))
 }
 
 // ---------------------------------------------------------------------------

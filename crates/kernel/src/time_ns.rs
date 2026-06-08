@@ -355,7 +355,7 @@ impl TimeNsRegistry {
             return Err(Error::PermissionDenied);
         }
 
-        self.namespaces[slot].process_count += 1;
+        self.namespaces[slot].process_count = self.namespaces[slot].process_count.saturating_add(1);
         self.stats.total_enters += 1;
         Ok(())
     }
