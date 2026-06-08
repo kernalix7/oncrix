@@ -43,6 +43,15 @@ const _MAX_KEYRING_KEYS: usize = 32;
 /// Maximum length in bytes for a keyring name.
 const _MAX_KEYRING_NAME: usize = 32;
 
+/// Maximum keyring-link traversal depth when checking for cycles.
+///
+/// SECURITY: A crafted keyring graph that contains a cycle (keyring A links
+/// keyring B which links A) would otherwise let a reachability walk loop
+/// forever in ring 0 (a hard hang, since the kernel cannot be preempted out of
+/// it). Every keyring traversal is bounded by this depth so a pre-existing or
+/// attacker-induced cycle terminates the walk instead of hanging the machine.
+const MAX_KEYRING_DEPTH: usize = MAX_KEYRINGS;
+
 /// Special key ID: thread-specific keyring.
 pub const KEY_SPEC_THREAD_KEYRING: i32 = -1;
 
@@ -70,6 +79,13 @@ pub const KEY_POS_SEARCH: u8 = 0x08;
 
 /// Permission bit: link the key into a keyring.
 pub const KEY_POS_LINK: u8 = 0x10;
+
+/// Permission bit: set key attributes (permission mask, expiry, revoke).
+///
+/// SECURITY: Mirrors Linux `KEY_OTH_SETATTR`. Attribute-changing operations
+/// (SETPERM, SET_TIMEOUT, REVOKE) require this right (or key ownership) so a
+/// caller cannot re-permission, retime, or revoke another principal's key.
+pub const KEY_POS_SETATTR: u8 = 0x20;
 
 // -----------------------------------------------------------------------
 // KeyType
@@ -164,6 +180,15 @@ impl KeyPermission {
     /// Check whether the given role byte grants link access.
     pub const fn can_link(&self, role: u8) -> bool {
         role & KEY_POS_LINK != 0
+    }
+
+    /// Check whether the given role byte grants set-attribute access.
+    ///
+    /// SECURITY: Used to gate the attribute-mutating keyctl ops (SETPERM,
+    /// SET_TIMEOUT, REVOKE) for non-owners. Same role-byte shape as the other
+    /// `can_*` checks so it composes with [`perm_allows`].
+    pub const fn can_setattr(&self, role: u8) -> bool {
+        role & KEY_POS_SETATTR != 0
     }
 }
 
@@ -464,8 +489,22 @@ impl KeyringRegistry {
     ///
     /// Revoked keys remain in the registry until explicitly
     /// unlinked.
-    pub fn revoke_key(&mut self, id: u32) -> Result<()> {
+    ///
+    /// SECURITY INVARIANT: `caller_uid` MUST be the authenticated UID of the
+    /// calling principal (the keyctl dispatcher in `crates/syscall` is
+    /// responsible for resolving it from current credentials). Revocation is a
+    /// destructive mutation, so it is gated on the same authority as any other
+    /// attribute change: the caller must own the key (`key.uid == caller_uid`)
+    /// or hold `KEY_POS_SETATTR` on it, otherwise `Error::PermissionDenied` is
+    /// returned. Without this gate any caller could revoke another principal's
+    /// key (denial of service against that key).
+    pub fn revoke_key(&mut self, id: u32, caller_uid: u32) -> Result<()> {
         let key = self.find_key_mut(id)?;
+        // SECURITY: ownership OR set-attribute right required to revoke.
+        if key.uid != caller_uid && !Self::perm_allows(key, caller_uid, KeyPermission::can_setattr)
+        {
+            return Err(Error::PermissionDenied);
+        }
         key.revoked = true;
         Ok(())
     }
@@ -473,10 +512,25 @@ impl KeyringRegistry {
     /// Remove a key from the registry entirely.
     ///
     /// The slot is freed and the key count decremented.
-    pub fn unlink_key(&mut self, id: u32) -> Result<()> {
+    ///
+    /// SECURITY INVARIANT: `caller_uid` MUST be the authenticated UID of the
+    /// calling principal (resolved by the keyctl dispatcher). Destroying a key
+    /// is gated on the same authority as any other mutation: the caller must
+    /// own the key (`key.uid == caller_uid`) or hold `KEY_POS_WRITE` on it,
+    /// otherwise `Error::PermissionDenied` is returned. Without this gate any
+    /// caller could delete another principal's key.
+    pub fn unlink_key(&mut self, id: u32, caller_uid: u32) -> Result<()> {
         let mut i = 0;
         while i < MAX_KEYS {
             if self.keys[i].active && self.keys[i].id == id {
+                // SECURITY: authorize against the matched key BEFORE freeing it.
+                // Ownership OR write right is required to remove a key.
+                let key = &self.keys[i];
+                if key.uid != caller_uid
+                    && !Self::perm_allows(key, caller_uid, KeyPermission::can_write)
+                {
+                    return Err(Error::PermissionDenied);
+                }
                 self.keys[i] = Key::empty();
                 self.key_count = self.key_count.saturating_sub(1);
                 return Ok(());
@@ -487,8 +541,24 @@ impl KeyringRegistry {
     }
 
     /// Set the permission mask on a key.
-    pub fn set_key_perm(&mut self, id: u32, perm: u32) -> Result<()> {
+    ///
+    /// SECURITY INVARIANT: `caller_uid` MUST be the authenticated UID of the
+    /// calling principal (resolved by the keyctl dispatcher). Mirroring Linux,
+    /// where only the key owner (or `CAP_SYS_ADMIN`) may `keyctl setperm`, the
+    /// caller must own the key (`key.uid == caller_uid`) or hold
+    /// `KEY_POS_SETATTR` on it. Otherwise `Error::PermissionDenied` is
+    /// returned. Without this gate any caller could rewrite another principal's
+    /// permission mask and grant itself read/write/link rights it was never
+    /// given (privilege escalation).
+    pub fn set_key_perm(&mut self, id: u32, perm: u32, caller_uid: u32) -> Result<()> {
         let key = self.find_key_mut(id)?;
+        // SECURITY: ownership OR set-attribute right required to re-permission.
+        // Checked BEFORE writing the new mask so the operation cannot be used
+        // to bootstrap rights the caller does not already hold.
+        if key.uid != caller_uid && !Self::perm_allows(key, caller_uid, KeyPermission::can_setattr)
+        {
+            return Err(Error::PermissionDenied);
+        }
         key.perm = KeyPermission::new(perm);
         Ok(())
     }
@@ -496,8 +566,21 @@ impl KeyringRegistry {
     /// Set (or clear) the expiry time on a key.
     ///
     /// Pass `0` for `expiry_ns` to remove the expiry.
-    pub fn set_key_expiry(&mut self, id: u32, expiry_ns: u64) -> Result<()> {
+    ///
+    /// SECURITY INVARIANT: `caller_uid` MUST be the authenticated UID of the
+    /// calling principal (resolved by the keyctl `SET_TIMEOUT` dispatcher).
+    /// Changing the expiry is an attribute mutation, so the caller must own the
+    /// key (`key.uid == caller_uid`) or hold `KEY_POS_SETATTR` on it; otherwise
+    /// `Error::PermissionDenied` is returned. Without this gate any caller
+    /// could clear another principal's expiry (keeping a key alive past its
+    /// intended lifetime) or force-expire it (denial of service).
+    pub fn set_key_expiry(&mut self, id: u32, expiry_ns: u64, caller_uid: u32) -> Result<()> {
         let key = self.find_key_mut(id)?;
+        // SECURITY: ownership OR set-attribute right required to retime a key.
+        if key.uid != caller_uid && !Self::perm_allows(key, caller_uid, KeyPermission::can_setattr)
+        {
+            return Err(Error::PermissionDenied);
+        }
         key.expiry_ns = expiry_ns;
         Ok(())
     }
@@ -533,16 +616,39 @@ impl KeyringRegistry {
     ///
     /// Requires the key to grant `KEY_POS_LINK` to `caller_uid`.
     ///
-    /// Returns `Err(Error::NotFound)` if either the key or
-    /// keyring does not exist, `Err(Error::PermissionDenied)` if
-    /// the caller lacks link permission, `Err(Error::AlreadyExists)`
-    /// if the key is already linked, or `Err(Error::OutOfMemory)`
-    /// if the keyring is full.
+    /// SECURITY: A keyring may not be linked into itself, and linking one
+    /// keyring into another may not create a cycle in the keyring graph; both
+    /// are rejected with `Error::InvalidArgument` because a cycle would let a
+    /// later keyring walk loop forever in ring 0.
+    ///
+    /// Returns `Err(Error::InvalidArgument)` for a self-link or a cycle-forming
+    /// link, `Err(Error::NotFound)` if either the key or keyring does not
+    /// exist, `Err(Error::PermissionDenied)` if the caller lacks link
+    /// permission, `Err(Error::AlreadyExists)` if the key is already linked, or
+    /// `Err(Error::OutOfMemory)` if the keyring is full.
     pub fn link_to_keyring(&mut self, key_id: u32, ring_id: u32, caller_uid: u32) -> Result<()> {
+        // SECURITY: Reject a keyring self-link outright. Linking a keyring into
+        // itself is the smallest possible cycle and would make any later
+        // traversal of `ring_id` loop forever in ring 0.
+        if key_id == ring_id {
+            return Err(Error::InvalidArgument);
+        }
+
         // Verify the key exists and grants link permission to the caller.
         let key = self.find_key(key_id)?;
         if !Self::perm_allows(key, caller_uid, KeyPermission::can_link) {
             return Err(Error::PermissionDenied);
+        }
+
+        // SECURITY: If the object being linked is itself a keyring, linking it
+        // into `ring_id` must not create a cycle. A cycle (ring_id reachable
+        // from key_id, which would then point back at ring_id) lets a later
+        // walk of the keyring graph loop forever -> ring-0 hang. The walk below
+        // is depth-bounded, so even a pre-existing cycle cannot hang here.
+        if self.find_ring(key_id).is_ok()
+            && self.keyring_reaches(key_id, ring_id, MAX_KEYRING_DEPTH)
+        {
+            return Err(Error::InvalidArgument);
         }
 
         let ring = self.find_ring_mut(ring_id)?;
@@ -567,9 +673,35 @@ impl KeyringRegistry {
 
     /// Unlink a key from a keyring.
     ///
-    /// Returns `Err(Error::NotFound)` if the keyring does not
-    /// exist or the key is not linked in it.
-    pub fn unlink_from_keyring(&mut self, key_id: u32, ring_id: u32) -> Result<()> {
+    /// SECURITY INVARIANT: `caller_uid` MUST be the authenticated UID of the
+    /// calling principal (resolved by the keyctl dispatcher). This is the
+    /// asymmetric counterpart to [`Self::link_to_keyring`] and is gated on the
+    /// same authority: the caller must own the key (`key.uid == caller_uid`) or
+    /// hold link permission on it. Without this gate any caller could unlink
+    /// another principal's key from a keyring (membership denial-of-service). A
+    /// stale link whose key no longer exists in the registry is treated as a
+    /// harmless dangling entry and may be removed (cleanup only — no live key is
+    /// affected), so the gate is enforced only when the key still exists.
+    ///
+    /// Returns `Err(Error::PermissionDenied)` if the caller lacks authority over
+    /// a live key, or `Err(Error::NotFound)` if the keyring does not exist or the
+    /// key is not linked in it.
+    pub fn unlink_from_keyring(
+        &mut self,
+        key_id: u32,
+        ring_id: u32,
+        caller_uid: u32,
+    ) -> Result<()> {
+        // SECURITY: authorize against the key being unlinked BEFORE mutating the
+        // keyring membership. The immutable borrow ends with this block, so the
+        // subsequent `find_ring_mut` borrow does not conflict.
+        if let Ok(key) = self.find_key(key_id) {
+            if key.uid != caller_uid && !Self::perm_allows(key, caller_uid, KeyPermission::can_link)
+            {
+                return Err(Error::PermissionDenied);
+            }
+        }
+
         let ring = self.find_ring_mut(ring_id)?;
 
         let mut i = 0;
@@ -669,6 +801,18 @@ impl KeyringRegistry {
         Err(Error::NotFound)
     }
 
+    /// Look up an active keyring by ID (immutable).
+    fn find_ring(&self, id: u32) -> Result<&Keyring> {
+        let mut i = 0;
+        while i < MAX_KEYRINGS {
+            if self.keyrings[i].active && self.keyrings[i].id == id {
+                return Ok(&self.keyrings[i]);
+            }
+            i = i.saturating_add(1);
+        }
+        Err(Error::NotFound)
+    }
+
     /// Look up an active keyring by ID (mutable).
     fn find_ring_mut(&mut self, id: u32) -> Result<&mut Keyring> {
         let mut i = 0;
@@ -679,5 +823,82 @@ impl KeyringRegistry {
             i = i.saturating_add(1);
         }
         Err(Error::NotFound)
+    }
+
+    /// Return `true` if `target` is reachable from keyring `start` by following
+    /// keyring-to-keyring links, searching no deeper than `depth` levels.
+    ///
+    /// SECURITY: This is the cycle guard for [`link_to_keyring`]. The traversal
+    /// is strictly bounded by `depth` (and by the fact that only the at most
+    /// `MAX_KEYRINGS` distinct keyrings can ever be visited), so a keyring
+    /// graph that already contains a cycle terminates the walk instead of
+    /// spinning forever in ring 0. Non-keyring linked entries are leaves and
+    /// are skipped. The walk is iterative (no recursion) to keep ring-0 stack
+    /// use constant.
+    fn keyring_reaches(&self, start: u32, target: u32, depth: usize) -> bool {
+        // Breadth-first walk over a fixed-size frontier. `MAX_KEYRINGS` bounds
+        // the number of distinct keyrings, so a queue of that size with a
+        // per-id "seen" guard can never overflow or revisit a node.
+        let mut queue = [0u32; MAX_KEYRINGS];
+        let mut seen = [false; MAX_KEYRINGS];
+        let mut head = 0usize;
+        let mut tail = 0usize;
+
+        queue[tail] = start;
+        tail = tail.saturating_add(1);
+        let mut steps = 0usize;
+
+        while head < tail {
+            // Hard cap on iterations: defence-in-depth against any indexing
+            // mistake that could otherwise keep the loop alive.
+            if steps >= depth.saturating_mul(MAX_KEYRINGS).saturating_add(1) {
+                break;
+            }
+            steps = steps.saturating_add(1);
+
+            let ring_id = queue[head];
+            head = head.saturating_add(1);
+
+            if ring_id == target {
+                return true;
+            }
+
+            // Resolve the keyring slot; non-keyring or missing ids are leaves.
+            let ring = match self.find_ring(ring_id) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Mark visited by slot index to avoid re-enqueueing a node in a
+            // cycle. `find_ring` only returns active slots within bounds.
+            let mut slot = 0usize;
+            let mut already = false;
+            while slot < MAX_KEYRINGS {
+                if self.keyrings[slot].active && self.keyrings[slot].id == ring_id {
+                    if seen[slot] {
+                        already = true;
+                    } else {
+                        seen[slot] = true;
+                    }
+                    break;
+                }
+                slot = slot.saturating_add(1);
+            }
+            if already {
+                continue;
+            }
+
+            // Enqueue child entries that are themselves keyrings.
+            let mut k = 0usize;
+            while k < ring.key_count && k < ring.keys.len() {
+                let child = ring.keys[k];
+                if child != 0 && self.find_ring(child).is_ok() && tail < MAX_KEYRINGS {
+                    queue[tail] = child;
+                    tail = tail.saturating_add(1);
+                }
+                k = k.saturating_add(1);
+            }
+        }
+        false
     }
 }
