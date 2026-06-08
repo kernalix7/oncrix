@@ -361,6 +361,11 @@ impl VirtioScsi {
         }
 
         // Step 5: Set up virtqueues.
+        // SECURITY: The event queue (vq_event) is set up below so the device can
+        // post hotplug/capacity-change events.  This driver does not process those
+        // events autonomously; callers must invoke drain_events() periodically (e.g.
+        // from the interrupt handler) to prevent the ring from filling and stalling
+        // the device backend.  See drain_events() for the bounded-drain implementation.
         // Split borrows: take raw pointers before passing &mut self.
         let vq_ctl = &raw mut self.vq_control;
         let vq_evt = &raw mut self.vq_event;
@@ -379,6 +384,15 @@ impl VirtioScsi {
         let max_lun = (self.mmio.read32(0x114) & 0xFFFF) as u16;
         let max_target = ((self.mmio.read32(0x114) >> 16) & 0xFFFF) as u16;
         let max_channel = self.mmio.read32(0x118);
+
+        // SECURITY: num_queues and seg_max are device-supplied u32 values and are
+        // therefore attacker-controlled.  Clamp them to the driver's own maxima
+        // before storing so that any code that uses them as loop bounds or
+        // allocation counts can trust the stored value is in range.
+        // Legitimate devices always report values within these limits.
+        let num_queues = num_queues.min(NUM_VQS as u32);
+        let seg_max = seg_max.min(MAX_INFLIGHT as u32);
+
         self.config = VirtioScsiConfig {
             num_queues,
             seg_max,
@@ -559,30 +573,39 @@ impl VirtioScsi {
     /// Returns `Some(slot)` if a command completed, `None` if no completions
     /// are pending or if the completion was spurious/malicious.
     ///
-    /// # Double-completion defence (Finding 4)
+    /// # Double-completion defence
     ///
     /// `desc_head` is device-DMA-writable and can be replayed by a malicious
     /// device.  We reject any completion whose `desc_head` is not recorded as
     /// in-flight in `desc_inflight`, preventing premature retirement of a live
-    /// request that reused the same descriptor index.
+    /// request that reused the same descriptor index.  The flag is cleared
+    /// exactly once (atomic test-and-clear pattern) so a second replay of the
+    /// same id is also rejected after the first legitimate completion.
     ///
-    /// # Descriptor-chain bounds check (Finding 2)
+    /// # Descriptor-chain aliasing and bounds check
     ///
-    /// The `.next` fields traversed while freeing the chain are also
-    /// device-writable.  Each hop is validated against `MAX_QUEUE_SIZE` before
-    /// being used as a descriptor-table index; an out-of-range value stops the
-    /// walk early (remaining descriptors stay allocated — safe, the device is
-    /// already considered broken at this point).
+    /// The `.next` fields traversed while freeing the three-descriptor chain are
+    /// also device-DMA-writable.  Each hop is validated against `MAX_QUEUE_SIZE`
+    /// (bounds), `desc_head` (self-reference), and the previous index (d2 != d1,
+    /// d2 != desc_head) before being used as a descriptor-table index.  A crafted
+    /// `.next` pointing at another in-flight request's head would otherwise cause
+    /// a cross-request double-free and descriptor aliasing.  An out-of-range or
+    /// aliased value stops the walk early; remaining descriptors stay allocated
+    /// (safe — the device is already considered broken at this point).
     pub fn poll_completion(&mut self) -> Option<usize> {
         let (desc_head, _len) = self.vq_request.pop_used()?;
 
-        // Finding 4: reject completions for descriptor heads that are not
-        // currently in-flight.
+        // SECURITY: reject completions for descriptor heads that are not currently
+        // in-flight.  A device can replay a used-ring entry for an already-completed
+        // (and potentially recycled) descriptor head; without this check that replay
+        // would prematurely retire the new request that reused the same index.
         let head_idx = desc_head as usize;
         if !self.desc_inflight[head_idx] {
             return None;
         }
-        // Clear immediately; further replays of the same id are also dropped.
+        // SECURITY: atomic test-and-clear — clear the in-flight mark immediately so
+        // that further replays of the same id are also rejected even if the
+        // inflight-slot scan below finds no matching slot.
         self.desc_inflight[head_idx] = false;
 
         for (i, req) in self.inflight.iter_mut().enumerate() {
@@ -590,13 +613,19 @@ impl VirtioScsi {
                 req.active = false;
                 self.inflight_count = self.inflight_count.saturating_sub(1);
 
-                // Free the three-descriptor chain.
-                // Finding 2: `d1` and `d2` are device-DMA-writable `.next`
-                // fields — validate each before indexing the descriptor table.
+                // Free the three-descriptor chain (req_header → data → resp_header).
+                // SECURITY: d1 and d2 are device-DMA-writable .next fields and are
+                // therefore attacker-controlled.  Validate each index against:
+                //   (a) MAX_QUEUE_SIZE — OOB array access / kernel memory corruption
+                //   (b) != desc_head   — self-referential chain / infinite loop
+                //   (c) d2 != d1       — aliased chain that would double-free d1
+                // These three guards mirror the pattern in virtio_blk.rs and close
+                // the cross-request descriptor-aliasing double-free vector.
                 let d1 = self.vq_request.desc[desc_head as usize].next;
-                if (d1 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                if (d1 as usize) < crate::virtio::MAX_QUEUE_SIZE && d1 != desc_head {
                     let d2 = self.vq_request.desc[d1 as usize].next;
-                    if (d2 as usize) < crate::virtio::MAX_QUEUE_SIZE {
+                    if (d2 as usize) < crate::virtio::MAX_QUEUE_SIZE && d2 != desc_head && d2 != d1
+                    {
                         self.vq_request.free_desc(d2);
                     }
                     self.vq_request.free_desc(d1);
@@ -676,6 +705,42 @@ impl VirtioScsi {
         &self.config
     }
 
+    /// Drain up to `MAX_QUEUE_SIZE` entries from the event virtqueue.
+    ///
+    /// The event queue receives asynchronous device notifications (hot-plug,
+    /// capacity change, etc.).  The device backend stalls once the ring is
+    /// full, so callers must invoke this method periodically — typically from
+    /// `handle_irq()` or a polling loop — to keep the ring drained.
+    ///
+    /// Returns the number of events drained in this call.
+    ///
+    /// # SECURITY
+    ///
+    /// The drain loop is bounded by `MAX_QUEUE_SIZE` iterations and exits as
+    /// soon as `pop_used()` returns `None`, so a malicious device that writes a
+    /// stale or wrapped `used_idx` cannot cause an unbounded spin.  Each
+    /// descriptor id from the used ring is bounds-checked inside `pop_used()`
+    /// before being returned.  Events are discarded (this driver does not
+    /// currently act on hotplug notifications); the important invariant is that
+    /// the ring stays drained so the device backend does not stall.
+    pub fn drain_events(&mut self) -> usize {
+        if !self.initialized {
+            return 0;
+        }
+        // SECURITY: cap at MAX_QUEUE_SIZE to bound the loop regardless of what
+        // the device-writable used_idx contains.  pop_used() returns None as
+        // soon as last_used_idx catches up with used_idx, providing the normal
+        // exit condition for a well-behaved device.
+        let mut drained = 0usize;
+        for _ in 0..crate::virtio::MAX_QUEUE_SIZE {
+            if self.vq_event.pop_used().is_none() {
+                break;
+            }
+            drained += 1;
+        }
+        drained
+    }
+
     /// Handle a VirtIO SCSI interrupt.
     ///
     /// Acknowledges the interrupt and returns `true` if used-buffer
@@ -685,6 +750,9 @@ impl VirtioScsi {
             return false;
         }
         let isr = self.mmio.ack_interrupt();
+        // Drain the event queue on every interrupt so the device backend does
+        // not stall when the event ring fills up.
+        self.drain_events();
         isr & 1 != 0
     }
 

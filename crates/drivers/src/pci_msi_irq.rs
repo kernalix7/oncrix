@@ -586,9 +586,22 @@ pub fn parse_msi_control(ctrl: u16) -> (u8, bool, bool) {
 
 /// Parses the MSI-X capability control register.
 ///
-/// Returns the number of MSI-X vectors (hardware stores N-1).
+/// Returns the number of MSI-X vectors (hardware stores N-1), clamped to
+/// [`MAX_IRQ_VECTORS`] to prevent callers from indexing beyond the fixed-size
+/// vector array.
+///
+/// # Security
+///
+/// The MSI-X Table Size field is device-controlled and can report up to 2048
+/// vectors; our per-domain vector table is bounded by `MAX_IRQ_VECTORS` (64).
+/// Clamping here ensures that downstream code using the returned count as an
+/// array bound or loop limit cannot access memory beyond the allocated array.
 pub fn parse_msix_control(ctrl: u16) -> u16 {
-    (ctrl & MSIX_TABLE_SIZE_MASK) + 1
+    // SECURITY: Raw value from device capability register is attacker-controlled
+    // (up to 2048).  Clamp to MAX_IRQ_VECTORS so callers never index beyond the
+    // fixed-size IrqDomain::vectors array.
+    let raw = (ctrl & MSIX_TABLE_SIZE_MASK) + 1;
+    raw.min(MAX_IRQ_VECTORS as u16)
 }
 
 /// Builds an MSI control word that enables MSI with `num_vectors` vectors.

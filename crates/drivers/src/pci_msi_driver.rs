@@ -223,24 +223,56 @@ impl MsixController {
     ///
     /// `table_virt` must be the virtual address of the MSI-X table mapped
     /// from the device's BAR. `table_size` is the number of entries.
-    pub const fn new(table_virt: u64, table_size: usize) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `table_size` is zero or exceeds
+    /// [`MAX_MSIX_VECTORS`] — rejects a device-supplied MSI-X Table Size that
+    /// would allow out-of-bounds MMIO access via [`entry_addr`](Self::entry_addr).
+    ///
+    /// # Security
+    ///
+    /// `table_size` is read from device config space and is therefore
+    /// attacker-controlled.  An unbounded table_size would allow
+    /// [`entry_addr`] to compute a pointer far outside the mapped BAR region.
+    pub fn new(table_virt: u64, table_size: usize) -> Result<Self> {
+        // SECURITY: Reject a device-reported table size of zero (nonsensical)
+        // or larger than MAX_MSIX_VECTORS (256) — the PCIe spec allows up to
+        // 2048 but our backing array is bounded by this constant.  A malicious
+        // device could otherwise cause entry_addr to walk off the end of the
+        // mapped BAR region.
+        if table_size == 0 || table_size > MAX_MSIX_VECTORS {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self {
             table_virt,
             table_size,
             enabled: false,
-        }
+        })
     }
 
     /// Returns the virtual address of entry `index` in the MSI-X table.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] if `index >= table_size`.
+    /// Returns [`Error::InvalidArgument`] if `index >= table_size` or if the
+    /// address arithmetic overflows.
     fn entry_addr(&self, index: usize) -> Result<u64> {
+        // SECURITY: index is bounds-checked against the already-validated
+        // table_size (capped at MAX_MSIX_VECTORS in new()), preventing
+        // out-of-bounds MMIO access.
         if index >= self.table_size {
             return Err(Error::InvalidArgument);
         }
-        Ok(self.table_virt + (index as u64) * (MSIX_ENTRY_SIZE as u64))
+        // SECURITY: Use checked arithmetic for the MMIO address calculation.
+        // A malicious device could supply a table_virt near u64::MAX; overflow
+        // here would produce a wrapped address pointing outside the BAR.
+        let offset = (index as u64)
+            .checked_mul(MSIX_ENTRY_SIZE as u64)
+            .ok_or(Error::InvalidArgument)?;
+        self.table_virt
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Programs entry `index` with the given message address and data.

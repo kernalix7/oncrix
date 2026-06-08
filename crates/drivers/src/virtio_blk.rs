@@ -289,7 +289,16 @@ impl VirtioBlk {
         if buf.len() < needed_bytes {
             return Err(Error::InvalidArgument);
         }
-        if sector + sector_count > self.config.capacity {
+        // SECURITY: `sector` and `sector_count` are caller-supplied u64 values.
+        // An unchecked `sector + sector_count` overflows and wraps for values
+        // near u64::MAX (overflow-checks ON → panic in ring 0; checks OFF →
+        // silent wrap that bypasses the capacity check).  Use checked_add so
+        // that a near-MAX sector is rejected with InvalidArgument instead of
+        // panicking or producing a wrapped comparison.
+        let end = sector
+            .checked_add(sector_count)
+            .ok_or(Error::InvalidArgument)?;
+        if end > self.config.capacity {
             return Err(Error::InvalidArgument);
         }
 
