@@ -227,7 +227,11 @@ pub fn do_write(table: &mut WriteFdTable, fd: i32, count: u64) -> Result<WriteRe
     } else {
         file.position
     };
-    let new_pos = write_pos + count;
+    // SECURITY: use checked_add to prevent overflow of the new file
+    // position when write_pos is near u64::MAX and count is large.
+    // count has already been clamped to MAX_RW_COUNT (i32::MAX), but
+    // write_pos itself is user-influenced through file.position/size.
+    let new_pos = write_pos.checked_add(count).ok_or(Error::InvalidArgument)?;
     let new_size = new_pos.max(file.size);
 
     if let Some(f) = table.find_mut(fd) {
@@ -270,6 +274,11 @@ pub fn do_pwrite64(
     if count > MAX_RW_COUNT {
         return Err(Error::InvalidArgument);
     }
+    // SECURITY: pwrite64 takes a signed off_t on the wire; a u64 offset
+    // that exceeds i64::MAX is not a valid file offset (Linux EINVAL).
+    if offset > i64::MAX as u64 {
+        return Err(Error::InvalidArgument);
+    }
     let file = table.find(fd).ok_or(Error::NotFound)?;
     if !file.writable() {
         return Err(Error::PermissionDenied);
@@ -277,7 +286,10 @@ pub fn do_pwrite64(
     if !file.peer_connected {
         return Err(Error::IoError);
     }
-    let write_end = offset + count;
+    // SECURITY: use checked_add to prevent overflow; offset is bounded
+    // above by i64::MAX and count by MAX_RW_COUNT (i32::MAX), so their
+    // sum fits in u64, but defend-in-depth requires the explicit check.
+    let write_end = offset.checked_add(count).ok_or(Error::InvalidArgument)?;
     let new_size = write_end.max(file.size);
     let saved_position = file.position;
 

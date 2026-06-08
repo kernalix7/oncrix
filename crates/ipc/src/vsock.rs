@@ -202,7 +202,11 @@ impl VsockMessage {
 
     /// Returns a slice over the valid payload bytes.
     pub fn data(&self) -> &[u8] {
-        &self.payload[..self.len]
+        // SECURITY: `len` and `payload` are public fields, so a hand-built
+        // message can set `len` past the payload capacity; clamp to the
+        // backing array length before slicing to avoid an OOB / ring-0 panic
+        // (same guard as `VsockRegistry::recv`).
+        &self.payload[..self.len.min(self.payload.len())]
     }
 }
 
@@ -601,7 +605,12 @@ impl VsockRegistry {
     pub fn recv(&mut self, socket_id: usize, owner: u32, buf: &mut [u8]) -> Result<usize> {
         let socket = self.owned_slot_mut(socket_id, owner)?;
         let msg = socket.dequeue().ok_or(Error::WouldBlock)?;
-        let n = msg.len.min(buf.len());
+        // SECURITY: `msg.len` is a public field and may exceed the actual
+        // `payload` capacity (a caller can build a `VsockMessage` with a
+        // bogus `len` via the public fields), so bound the copy by the real
+        // payload length as well — otherwise `&msg.payload[..n]` is an OOB
+        // slice / ring-0 panic.
+        let n = msg.len.min(buf.len()).min(msg.payload.len());
         buf[..n].copy_from_slice(&msg.payload[..n]);
         Ok(n)
     }

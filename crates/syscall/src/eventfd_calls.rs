@@ -237,6 +237,15 @@ impl EventfdRegistry {
 
     /// Create a new eventfd with the given initial counter and flags.
     fn create(&mut self, initval: u64, flags: u32, pid: u64) -> Result<u64> {
+        // SECURITY: reject initial counter values that exceed EVENTFD_MAX_VAL
+        // (u64::MAX - 1).  Matching the guard in eventfd_call.rs::do_eventfd_create
+        // (~line 102-104).  Storing u64::MAX as the initial counter would make
+        // every subsequent write block immediately, which is misleading and
+        // inconsistent with Linux behaviour (EINVAL).
+        if initval > EVENTFD_MAX_VAL {
+            return Err(Error::InvalidArgument);
+        }
+
         let idx = self.find_free().ok_or(Error::OutOfMemory)?;
 
         let mode = if flags & EFD_SEMAPHORE != 0 {
@@ -246,7 +255,9 @@ impl EventfdRegistry {
         };
 
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        // SECURITY: use checked_add so that a wrapping counter never
+        // recycles a live eventfd ID and causes transaction confusion.
+        self.next_id = self.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
 
         let slot = &mut self.fds[idx];
         slot.id = id;
@@ -402,7 +413,7 @@ impl Default for EventfdRegistry {
 /// # Arguments
 ///
 /// * `registry` — The global eventfd registry.
-/// * `initval`  — Initial counter value.
+/// * `initval`  — Initial counter value (must be ≤ [`EVENTFD_MAX_VAL`]).
 /// * `pid`      — Calling process ID.
 ///
 /// # Returns
@@ -411,6 +422,7 @@ impl Default for EventfdRegistry {
 ///
 /// # Errors
 ///
+/// * [`Error::InvalidArgument`] — `initval` > `EVENTFD_MAX_VAL`.
 /// * [`Error::OutOfMemory`] — Registry is full.
 pub fn sys_eventfd(registry: &mut EventfdRegistry, initval: u64, pid: u64) -> Result<u64> {
     registry.create(initval, 0, pid)
@@ -431,7 +443,7 @@ pub fn sys_eventfd(registry: &mut EventfdRegistry, initval: u64, pid: u64) -> Re
 ///
 /// # Errors
 ///
-/// * [`Error::InvalidArgument`] — Unknown flags.
+/// * [`Error::InvalidArgument`] — Unknown flags, or `initval` > `EVENTFD_MAX_VAL`.
 /// * [`Error::OutOfMemory`] — Registry is full.
 pub fn sys_eventfd2(
     registry: &mut EventfdRegistry,

@@ -348,7 +348,9 @@ impl KcmMux {
         let idx = self.find_send_connection()?;
         if let Some(conn) = self.connections[idx].as_mut() {
             conn.tx_count += 1;
-            conn.tx_bytes += msg_len as u64;
+            // SECURITY: peer-driven byte accumulator — saturating_add avoids a
+            // ring-0 overflow panic under overflow-checks on a long-lived mux.
+            conn.tx_bytes = conn.tx_bytes.saturating_add(msg_len as u64);
             self.total_tx += 1;
         }
         Ok(idx)
@@ -387,7 +389,9 @@ impl KcmMux {
                     return Err(Error::NotFound);
                 }
                 conn.rx_count += 1;
-                conn.rx_bytes += msg_len as u64;
+                // SECURITY: peer/framer-derived byte accumulator — saturating_add
+                // avoids a ring-0 overflow panic under overflow-checks.
+                conn.rx_bytes = conn.rx_bytes.saturating_add(msg_len as u64);
                 self.total_rx += 1;
                 Ok(KcmMessage::new(conn_idx, msg_len))
             }

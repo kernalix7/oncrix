@@ -1156,10 +1156,22 @@ impl BinderRegistry {
     // --- internal helpers ---
 
     /// Allocate the next transaction id.
-    fn alloc_txn_id(&mut self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OutOfMemory`] if the u64 transaction counter has been
+    /// exhausted (2^64 − 1 transactions issued). Under normal workloads this is
+    /// unreachable; the guard exists to prevent wrapping_add from recycling a
+    /// live transaction ID, which would redirect a reply to the wrong pending
+    /// transaction (reply redirection).
+    // SECURITY: checked_add prevents the transaction counter from wrapping around.
+    // A wrap would cause alloc_txn_id to return an ID that is already registered
+    // in the pending-transaction table, silently redirecting the eventual reply
+    // to the original (wrong) caller. Fail the alloc instead.
+    fn alloc_txn_id(&mut self) -> Result<u64> {
         let id = self.next_txn_id;
-        self.next_txn_id = self.next_txn_id.wrapping_add(1);
-        id
+        self.next_txn_id = self.next_txn_id.checked_add(1).ok_or(Error::OutOfMemory)?;
+        Ok(id)
     }
 
     /// Handle BC_ACQUIRE: increment strong ref count on the referenced node.
@@ -1277,7 +1289,7 @@ impl BinderRegistry {
             return Err(Error::InvalidArgument);
         }
 
-        let id = self.alloc_txn_id();
+        let id = self.alloc_txn_id()?;
         txn.id = id;
         txn.sender = sender_pid;
 

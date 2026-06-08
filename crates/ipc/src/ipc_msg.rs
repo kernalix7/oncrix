@@ -243,7 +243,14 @@ impl MsgQueue {
             return Err(Error::WouldBlock);
         }
         let actual = msgsz.min(data.len()).min(MSG_MAX_TEXT);
-        if self.current_bytes + actual as u64 > self.max_bytes {
+        // SECURITY: checked_add guards against overflow of the byte-quota sum;
+        // an overflowed sum would bypass the max_bytes cap and allow unbounded
+        // message accumulation.
+        if self
+            .current_bytes
+            .checked_add(actual as u64)
+            .is_none_or(|sum| sum > self.max_bytes)
+        {
             return Err(Error::WouldBlock);
         }
 
@@ -255,7 +262,10 @@ impl MsgQueue {
 
         self.write_idx = (self.write_idx + 1) % MSG_QUEUE_DEPTH;
         self.count += 1;
-        self.current_bytes += actual as u64;
+        self.current_bytes = self
+            .current_bytes
+            .checked_add(actual as u64)
+            .unwrap_or(self.current_bytes); // overflow guarded above; saturate defensively
         self.lspid = sender_pid;
         self.stime = self.stime.wrapping_add(1);
         Ok(())
@@ -536,9 +546,15 @@ pub fn msgsnd(
     }
 
     // Check capacity before mutating.
+    // SECURITY: checked_add guards against overflow when summing current_bytes
+    // + msgsz; a wrapped sum could bypass the max_bytes cap.
     let would_block = {
         let queue = registry.queues[msqid].as_ref().ok_or(Error::NotFound)?;
-        queue.is_full() || queue.current_bytes + msgsz as u64 > queue.max_bytes
+        queue.is_full()
+            || queue
+                .current_bytes
+                .checked_add(msgsz as u64)
+                .is_none_or(|sum| sum > queue.max_bytes)
     };
     if would_block {
         // IPC_NOWAIT controls whether we block (currently always non-blocking).
