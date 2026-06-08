@@ -181,13 +181,28 @@ impl MsiCapability {
     }
 
     /// Returns the maximum number of vectors this device supports.
+    ///
+    /// The MSI spec (PCI 3.0 §6.8.1) defines `MMC` (Multiple Message Capable)
+    /// as a 3-bit field with a maximum value of 5 (meaning 32 vectors). A
+    /// device advertising MMC > 5 is non-compliant; we cap it at 5 to prevent
+    /// an excessively large shift.
     pub fn max_vectors(&self) -> usize {
-        1 << self.multi_msg_capable
+        // SECURITY: cap mmc at 5 (spec maximum) before shifting; a malicious
+        // device could set the 3-bit MMC field to 7 (supported by the mask in
+        // from_msg_control), yielding 1<<7 = 128 vectors — beyond the spec max
+        // of 32.  Clamping to 5 means at most 1<<5 = 32, matching MSI_MAX_VECTORS.
+        let mmc = self.multi_msg_capable.min(5);
+        1 << mmc
     }
 
     /// Returns the number of currently enabled vectors.
+    ///
+    /// `MME` (Multiple Message Enable) is a 3-bit field; same spec cap as
+    /// `MMC` applies.
     pub fn enabled_vectors(&self) -> usize {
-        1 << self.multi_msg_enable
+        // SECURITY: mirror the same cap applied in max_vectors.
+        let mme = self.multi_msg_enable.min(5);
+        1 << mme
     }
 }
 

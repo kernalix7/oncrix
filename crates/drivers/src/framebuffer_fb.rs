@@ -112,25 +112,58 @@ pub struct FbInfo {
 
 impl FbInfo {
     /// Create framebuffer info with tightly-packed stride.
-    pub fn new(width: u32, height: u32, format: PixelFormat) -> Self {
+    ///
+    /// Returns `Err(InvalidArgument)` if the geometry would overflow or if `bpp` is zero
+    /// (degenerate mode that would make every pixel alias offset 0).
+    // SECURITY: firmware/GOP may supply crafted width/height/bpp; reject zero bpp (degenerate
+    // stride=0 means all pixels alias the same address) and reject width*bpp overflow before
+    // storing the stride.
+    pub fn new(width: u32, height: u32, format: PixelFormat) -> Result<Self> {
         let bpp = format.bytes_per_pixel() as u32;
-        Self {
+        // bpp is derived from the enum so it is always 3 or 4; the check is a safety net in case
+        // the enum grows a zero-byte variant.
+        if bpp == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: checked_mul prevents width*bpp overflow from producing a truncated stride
+        // that would later cause pixel_offset to compute an in-bounds-looking but wrong offset.
+        let stride = width.checked_mul(bpp).ok_or(Error::InvalidArgument)?;
+        Ok(Self {
             width,
             height,
             format,
-            stride: width * bpp,
-        }
+            stride,
+        })
     }
 
     /// Total framebuffer size in bytes.
-    pub fn buffer_size(&self) -> usize {
-        (self.stride as usize) * (self.height as usize)
+    ///
+    /// Returns `Err(InvalidArgument)` if `stride * height` overflows `usize`.
+    // SECURITY: firmware/GOP-supplied stride and height may each be up to u32::MAX; their
+    // product can overflow usize on 32-bit targets or with malicious values on 64-bit targets.
+    pub fn buffer_size(&self) -> Result<usize> {
+        (self.stride as usize)
+            .checked_mul(self.height as usize)
+            .ok_or(Error::InvalidArgument)
     }
 
     /// Byte offset of pixel (x, y).
-    pub fn pixel_offset(&self, x: u32, y: u32) -> usize {
-        let bpp = self.format.bytes_per_pixel() as u32;
-        (y * self.stride + x * bpp) as usize
+    ///
+    /// Returns `Err(InvalidArgument)` on arithmetic overflow or if `(x, y)` is out of bounds.
+    // SECURITY: each intermediate product (y*stride, x*bpp) can overflow independently even
+    // when x < width and y < height for large firmware-supplied strides.
+    pub fn pixel_offset(&self, x: u32, y: u32) -> Result<usize> {
+        if x >= self.width || y >= self.height {
+            return Err(Error::InvalidArgument);
+        }
+        let bpp = self.format.bytes_per_pixel() as usize;
+        let row = (y as usize)
+            .checked_mul(self.stride as usize)
+            .ok_or(Error::InvalidArgument)?;
+        let col = (x as usize)
+            .checked_mul(bpp)
+            .ok_or(Error::InvalidArgument)?;
+        row.checked_add(col).ok_or(Error::InvalidArgument)
     }
 }
 
@@ -155,11 +188,13 @@ impl Framebuffer {
     /// Return the virtual (identity-mapped) pointer to the pixel at (x, y).
     ///
     /// # Safety
-    /// `phys_base` must be a valid mapped framebuffer region.
+    /// `phys_base` must be a valid mapped framebuffer region and `(x, y)` must
+    /// be within framebuffer bounds (enforced by the `Result` return).
     #[inline]
-    unsafe fn pixel_ptr(&self, x: u32, y: u32) -> *mut u8 {
-        // SAFETY: caller guarantees phys_base is a valid mapped region.
-        unsafe { (self.phys_base as *mut u8).add(self.info.pixel_offset(x, y)) }
+    unsafe fn pixel_ptr(&self, x: u32, y: u32) -> Result<*mut u8> {
+        let off = self.info.pixel_offset(x, y)?;
+        // SAFETY: caller guarantees phys_base is a valid mapped region; offset is bounds-checked.
+        Ok(unsafe { (self.phys_base as *mut u8).add(off) })
     }
 
     /// Write a single pixel at (x, y) with `color`.
@@ -167,12 +202,10 @@ impl Framebuffer {
     /// # Safety
     /// `phys_base` must be a valid mapped framebuffer region.
     pub unsafe fn write_pixel(&mut self, x: u32, y: u32, color: Color) -> Result<()> {
-        if x >= self.info.width || y >= self.info.height {
-            return Err(Error::InvalidArgument);
-        }
-        // SAFETY: bounds checked above; phys_base is valid.
+        // pixel_ptr performs bounds + overflow checks internally.
+        // SAFETY: phys_base is valid; pixel_ptr returns Ok only if offset is within bounds.
         unsafe {
-            let ptr = self.pixel_ptr(x, y);
+            let ptr = self.pixel_ptr(x, y)?;
             match self.info.format {
                 PixelFormat::Rgb888 => {
                     core::ptr::write_volatile(ptr, color.r);
@@ -190,7 +223,8 @@ impl Framebuffer {
 
     /// Fill a rectangle with `color`.
     ///
-    /// Clips to framebuffer bounds.
+    /// Clips to framebuffer bounds. Returns early (no-op) if the rectangle
+    /// origin is outside the framebuffer.
     ///
     /// # Safety
     /// `phys_base` must be a valid mapped framebuffer region.
@@ -202,11 +236,13 @@ impl Framebuffer {
         height: u32,
         color: Color,
     ) -> Result<()> {
-        let x_end = (x + width).min(self.info.width);
-        let y_end = (y + height).min(self.info.height);
         if x >= self.info.width || y >= self.info.height {
             return Ok(());
         }
+        // SECURITY: saturating_add prevents x+width / y+height overflow before the .min() clamp;
+        // a crafted large width/height would otherwise wrap to a small value and pass the clamp.
+        let x_end = x.saturating_add(width).min(self.info.width);
+        let y_end = y.saturating_add(height).min(self.info.height);
         for row in y..y_end {
             for col in x..x_end {
                 // SAFETY: bounds checked; phys_base is valid.
@@ -231,6 +267,9 @@ impl Framebuffer {
 
     /// Copy a rectangular region from (src_x, src_y) to (dst_x, dst_y).
     ///
+    /// Returns `Err(InvalidArgument)` if any corner of either rectangle lies outside
+    /// the framebuffer or if arithmetic overflows.
+    ///
     /// # Safety
     /// `phys_base` must be a valid mapped framebuffer region.
     pub unsafe fn copy_area(
@@ -242,30 +281,41 @@ impl Framebuffer {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        if src_x + width > self.info.width
-            || src_y + height > self.info.height
-            || dst_x + width > self.info.width
-            || dst_y + height > self.info.height
+        // SECURITY: checked_add prevents src_x+width / src_y+height overflow that would produce
+        // a small value passing the > comparison and allowing an out-of-bounds memcpy.
+        let src_x_end = src_x.checked_add(width).ok_or(Error::InvalidArgument)?;
+        let src_y_end = src_y.checked_add(height).ok_or(Error::InvalidArgument)?;
+        let dst_x_end = dst_x.checked_add(width).ok_or(Error::InvalidArgument)?;
+        let dst_y_end = dst_y.checked_add(height).ok_or(Error::InvalidArgument)?;
+        if src_x_end > self.info.width
+            || src_y_end > self.info.height
+            || dst_x_end > self.info.width
+            || dst_y_end > self.info.height
         {
             return Err(Error::InvalidArgument);
         }
         let bpp = self.info.format.bytes_per_pixel();
-        let row_bytes = width as usize * bpp;
+        // SECURITY: width is bounded by framebuffer width (max ~8K pixels); bpp is 3 or 4;
+        // product fits in usize.  Use checked_mul anyway to be defensive.
+        let row_bytes = (width as usize)
+            .checked_mul(bpp)
+            .ok_or(Error::InvalidArgument)?;
         let base = self.phys_base as *mut u8;
 
-        // SAFETY: all coordinates are bounds-checked; base is valid.
+        // SAFETY: all coordinates are bounds-checked; pixel_offset returns Ok only for valid
+        // in-bounds positions; base is a valid mapped framebuffer region.
         unsafe {
             // Copy direction: top-to-bottom if dst_y <= src_y, else bottom-to-top.
             if dst_y <= src_y {
                 for row in 0..height {
-                    let src_off = self.info.pixel_offset(src_x, src_y + row);
-                    let dst_off = self.info.pixel_offset(dst_x, dst_y + row);
+                    let src_off = self.info.pixel_offset(src_x, src_y + row)?;
+                    let dst_off = self.info.pixel_offset(dst_x, dst_y + row)?;
                     core::ptr::copy(base.add(src_off), base.add(dst_off), row_bytes);
                 }
             } else {
                 for row in (0..height).rev() {
-                    let src_off = self.info.pixel_offset(src_x, src_y + row);
-                    let dst_off = self.info.pixel_offset(dst_x, dst_y + row);
+                    let src_off = self.info.pixel_offset(src_x, src_y + row)?;
+                    let dst_off = self.info.pixel_offset(dst_x, dst_y + row)?;
                     core::ptr::copy(base.add(src_off), base.add(dst_off), row_bytes);
                 }
             }
@@ -275,8 +325,11 @@ impl Framebuffer {
 
     /// Blit a packed RGB888 or ARGB8888 image at (dst_x, dst_y).
     ///
-    /// `image_data` must have `width * height` pixels in the framebuffer's
-    /// native format. Clips to display bounds.
+    /// `image_data` must have `img_width * img_height` pixels in the framebuffer's
+    /// native format. The region is clipped to display bounds.
+    ///
+    /// Returns `Err(InvalidArgument)` if `image_data` is shorter than the computed
+    /// expected size, or if any geometry product overflows.
     ///
     /// # Safety
     /// `phys_base` must be a valid mapped framebuffer region; `image_data`
@@ -290,22 +343,38 @@ impl Framebuffer {
         image_data: &[u8],
     ) -> Result<()> {
         let bpp = self.info.format.bytes_per_pixel();
-        let expected = img_width as usize * img_height as usize * bpp;
+        // SECURITY: img_width * img_height * bpp can overflow usize when firmware/GOP supplies
+        // large crafted image dimensions.  Use chained checked_mul to reject overflow before
+        // using the product as a slice-length guard.
+        let expected = (img_width as usize)
+            .checked_mul(img_height as usize)
+            .and_then(|n| n.checked_mul(bpp))
+            .ok_or(Error::InvalidArgument)?;
         if image_data.len() < expected {
             return Err(Error::InvalidArgument);
         }
 
         let copy_w = img_width.min(self.info.width.saturating_sub(dst_x));
         let copy_h = img_height.min(self.info.height.saturating_sub(dst_y));
-        let row_bytes = copy_w as usize * bpp;
-        let src_stride = img_width as usize * bpp;
+        // SECURITY: row_bytes and src_stride computed with checked_mul; both are bounded by the
+        // expected-size check above, but we re-check defensively.
+        let row_bytes = (copy_w as usize)
+            .checked_mul(bpp)
+            .ok_or(Error::InvalidArgument)?;
+        let src_stride = (img_width as usize)
+            .checked_mul(bpp)
+            .ok_or(Error::InvalidArgument)?;
 
         let base = self.phys_base as *mut u8;
 
         for row in 0..copy_h {
-            let src_off = (row as usize) * src_stride;
-            let dst_off = self.info.pixel_offset(dst_x, dst_y + row);
-            // SAFETY: bounds checked; base and image_data are valid.
+            // SECURITY: row * src_stride checked to prevent overflow in the source index.
+            let src_off = (row as usize)
+                .checked_mul(src_stride)
+                .ok_or(Error::InvalidArgument)?;
+            let dst_off = self.info.pixel_offset(dst_x, dst_y + row)?;
+            // SAFETY: src_off + row_bytes <= expected <= image_data.len(); dst_off is within
+            // the mapped framebuffer region (pixel_offset enforces bounds).
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     image_data.as_ptr().add(src_off),
@@ -348,7 +417,9 @@ impl Framebuffer {
     }
 
     /// Total buffer size in bytes.
-    pub fn buffer_size(&self) -> usize {
+    ///
+    /// Returns `Err(InvalidArgument)` if `stride * height` overflows `usize`.
+    pub fn buffer_size(&self) -> Result<usize> {
         self.info.buffer_size()
     }
 }

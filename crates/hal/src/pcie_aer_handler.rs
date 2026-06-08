@@ -33,34 +33,42 @@ use oncrix_lib::{Error, Result};
 // ---------------------------------------------------------------------------
 
 /// AER capability header (offset from cap base).
-const AER_CAP_HEADER: u16 = 0x00;
+// SECURITY: offsets are u32 so that cap_offset (up to 0xFFC) + offset never
+// overflows on a malicious/crafted extended-capability pointer.
+const AER_CAP_HEADER: u32 = 0x00;
 
 /// Uncorrectable Error Status register offset.
-const AER_UNCORR_STATUS: u16 = 0x04;
+const AER_UNCORR_STATUS: u32 = 0x04;
 
 /// Uncorrectable Error Mask register offset.
-const AER_UNCORR_MASK: u16 = 0x08;
+const AER_UNCORR_MASK: u32 = 0x08;
 
 /// Uncorrectable Error Severity register offset.
-const AER_UNCORR_SEVERITY: u16 = 0x0C;
+const AER_UNCORR_SEVERITY: u32 = 0x0C;
 
 /// Correctable Error Status register offset.
-const AER_CORR_STATUS: u16 = 0x10;
+const AER_CORR_STATUS: u32 = 0x10;
 
 /// Correctable Error Mask register offset.
-const AER_CORR_MASK: u16 = 0x14;
+const AER_CORR_MASK: u32 = 0x14;
 
 /// Advanced Error Capabilities and Control register offset.
-const AER_CAP_CTRL: u16 = 0x18;
+const AER_CAP_CTRL: u32 = 0x18;
 
 /// Root Error Command register offset (root port only).
-const AER_ROOT_CMD: u16 = 0x2C;
+const AER_ROOT_CMD: u32 = 0x2C;
 
 /// Root Error Status register offset (root port only).
-const AER_ROOT_STATUS: u16 = 0x30;
+const AER_ROOT_STATUS: u32 = 0x30;
 
 /// Error Source Identification register offset.
-const AER_ERR_SOURCE_ID: u16 = 0x34;
+const AER_ERR_SOURCE_ID: u32 = 0x34;
+
+/// Largest valid AER register offset (ERR_SOURCE_ID at 0x34).
+const AER_MAX_REG_OFFSET: u32 = 0x34;
+
+/// PCIe extended config space window size (4 KB per spec).
+const PCIE_CFG_SPACE_SIZE: u32 = 0x1000;
 
 // ---------------------------------------------------------------------------
 // Uncorrectable Error Status Bits
@@ -166,7 +174,8 @@ const AER_ROOT_STS_FIRST_FATAL: u32 = 1 << 4;
 pub const PCIE_EXT_CAP_AER: u16 = 0x0001;
 
 /// PCIe Extended Capability start offset.
-const PCIE_EXT_CAP_BASE: u16 = 0x100;
+// u32 so it can be compared directly against the u32 offset/cap fields.
+const PCIE_EXT_CAP_BASE: u32 = 0x100;
 
 /// Maximum number of AER-capable devices tracked.
 const MAX_AER_DEVICES: usize = 16;
@@ -241,7 +250,9 @@ pub struct AerDevice {
     /// BDF identifier.
     pub bdf: u16,
     /// Base offset of the AER extended capability in config space.
-    pub cap_offset: u16,
+    // SECURITY: u32 so that cap_offset + AER register offset cannot overflow
+    // even when a malicious device sets cap_offset to the maximum (0xFFC).
+    pub cap_offset: u32,
     /// Whether this is a root port (has Root Error Command/Status).
     pub is_root_port: bool,
     /// Saved uncorrectable mask (for restore after reset).
@@ -254,7 +265,7 @@ pub struct AerDevice {
 
 impl AerDevice {
     /// Create a new AER device entry.
-    pub const fn new(bdf: u16, cap_offset: u16, is_root_port: bool) -> Self {
+    pub const fn new(bdf: u16, cap_offset: u32, is_root_port: bool) -> Self {
         Self {
             bdf,
             cap_offset,
@@ -324,13 +335,25 @@ impl AerHandler {
     ///
     /// `cap_offset` is the offset of the AER extended capability block in
     /// configuration space (typically found by scanning the extended cap
-    /// chain starting at 0x100).
+    /// chain starting at 0x100). Must be in `[0x100, 0xFFC]` and DWORD-aligned.
     ///
     /// # Errors
     ///
     /// - [`Error::OutOfMemory`] if the device table is full.
     /// - [`Error::AlreadyExists`] if `bdf` is already registered.
-    pub fn register_device(&mut self, bdf: u16, cap_offset: u16, is_root_port: bool) -> Result<()> {
+    /// - [`Error::InvalidArgument`] if `cap_offset` is out of the extended
+    ///   config space window or the cap+max_reg would exceed 0xFFF.
+    pub fn register_device(&mut self, bdf: u16, cap_offset: u32, is_root_port: bool) -> Result<()> {
+        // SECURITY: reject a cap_offset that would let cap + AER_MAX_REG_OFFSET
+        // overflow or escape the 4 KB PCIe extended config window.
+        if cap_offset < PCIE_EXT_CAP_BASE
+            || cap_offset & 0x3 != 0
+            || cap_offset
+                .checked_add(AER_MAX_REG_OFFSET)
+                .map_or(true, |end| end >= PCIE_CFG_SPACE_SIZE)
+        {
+            return Err(Error::InvalidArgument);
+        }
         if self.count >= MAX_AER_DEVICES {
             return Err(Error::OutOfMemory);
         }
@@ -356,13 +379,13 @@ impl AerHandler {
     ///
     /// # Arguments
     ///
-    /// - `read_cfg` — closure: `(bdf, offset) -> u32` reading a dword
+    /// - `read_cfg` — closure: `(offset) -> u32` reading a dword
     ///   from PCI configuration space.
-    pub fn find_aer_cap<F>(&self, _bdf: u16, read_cfg: F) -> Result<u16>
+    pub fn find_aer_cap<F>(&self, _bdf: u16, read_cfg: F) -> Result<u32>
     where
-        F: Fn(u16) -> u32,
+        F: Fn(u32) -> u32,
     {
-        let mut offset = PCIE_EXT_CAP_BASE;
+        let mut offset: u32 = PCIE_EXT_CAP_BASE;
         let mut depth = 0u32;
         loop {
             if offset < PCIE_EXT_CAP_BASE || offset & 0x3 != 0 {
@@ -376,8 +399,16 @@ impl AerHandler {
             if cap_id == PCIE_EXT_CAP_AER {
                 return Ok(offset);
             }
-            let next = ((header >> 20) & 0xFFC) as u16;
+            // SECURITY: extract next-pointer from bits [31:20]; it is a
+            // DWORD-aligned offset into the 4 KB config space.
+            let next: u32 = (header >> 20) & 0xFFC;
             if next == 0 {
+                return Err(Error::NotFound);
+            }
+            // SECURITY: reject a crafted next-pointer that falls below the
+            // extended-capability region (< 0x100) — this prevents a
+            // malicious device from redirecting us into standard config space.
+            if next < PCIE_EXT_CAP_BASE {
                 return Err(Error::NotFound);
             }
             offset = next;
@@ -396,8 +427,8 @@ impl AerHandler {
     /// # Arguments
     ///
     /// - `root_bdf` — BDF of the root port that signalled the interrupt.
-    /// - `read_cfg` — closure reading config space: `(offset) -> u32`.
-    /// - `write_cfg` — closure writing config space: `(offset, val)`.
+    /// - `read_cfg` — closure reading config space: `(offset: u32) -> u32`.
+    /// - `write_cfg` — closure writing config space: `(offset: u32, val: u32)`.
     ///
     /// # Errors
     ///
@@ -409,10 +440,12 @@ impl AerHandler {
         write_cfg: W,
     ) -> Result<Option<AerErrorRecord>>
     where
-        R: Fn(u16) -> u32,
-        W: Fn(u16, u32),
+        R: Fn(u32) -> u32,
+        W: Fn(u32, u32),
     {
-        self.irq_count += 1;
+        // SECURITY: use saturating_add so a device that fires a continuous
+        // storm of AER IRQs cannot wrap the counter and lose count.
+        self.irq_count = self.irq_count.saturating_add(1);
 
         // Find the root port entry.
         let dev_idx = self.devices[..self.count]
@@ -420,7 +453,9 @@ impl AerHandler {
             .position(|d| d.as_ref().map_or(false, |d| d.bdf == root_bdf))
             .ok_or(Error::NotFound)?;
 
-        let cap = self.devices[dev_idx]
+        // cap_offset is u32; AER_ROOT_STATUS is u32 — addition stays in u32,
+        // cannot overflow for any validated cap_offset <= 0xFFF - 0x34.
+        let cap: u32 = self.devices[dev_idx]
             .as_ref()
             .map(|d| d.cap_offset)
             .ok_or(Error::NotFound)?;
@@ -442,7 +477,8 @@ impl AerHandler {
                 d.as_ref()
                     .filter(|d| d.bdf == uncorr_src || d.bdf == corr_src)
             }) {
-            let base = src_dev.cap_offset;
+            // src_dev.cap_offset is already validated u32; these additions are safe.
+            let base: u32 = src_dev.cap_offset;
             let u = read_cfg(base + AER_UNCORR_STATUS);
             let c = read_cfg(base + AER_CORR_STATUS);
             let sev = read_cfg(base + AER_UNCORR_SEVERITY);
@@ -477,9 +513,10 @@ impl AerHandler {
         // Acknowledge by writing 1 to set status bits (W1C).
         write_cfg(cap + AER_ROOT_STATUS, root_status);
 
-        // Increment error count for this root port.
+        // SECURITY: saturating_add so a device that reports continuous errors
+        // cannot wrap error_count back to zero and hide its fault history.
         if let Some(dev) = self.devices[dev_idx].as_mut() {
-            dev.error_count += 1;
+            dev.error_count = dev.error_count.saturating_add(1);
         }
 
         Ok(Some(record))
@@ -494,7 +531,7 @@ impl AerHandler {
     /// Returns [`Error::NotFound`] if `root_bdf` is not registered.
     pub fn enable_root_reporting<W>(&self, root_bdf: u16, write_cfg: W) -> Result<()>
     where
-        W: Fn(u16, u32),
+        W: Fn(u32, u32),
     {
         let dev = self.devices[..self.count]
             .iter()
@@ -506,6 +543,8 @@ impl AerHandler {
         }
 
         let cmd = AER_ROOT_CMD_CORR_EN | AER_ROOT_CMD_NONFATAL_EN | AER_ROOT_CMD_FATAL_EN;
+        // cap_offset is u32; AER_ROOT_CMD is u32 — no overflow possible for
+        // validated cap_offset values (checked in register_device).
         write_cfg(dev.cap_offset + AER_ROOT_CMD, cmd);
         Ok(())
     }
@@ -527,15 +566,17 @@ impl AerHandler {
         write_cfg: W,
     ) -> Result<u16>
     where
-        R: Fn(u16) -> u32,
-        W: Fn(u16, u32),
+        R: Fn(u32) -> u32,
+        W: Fn(u32, u32),
     {
         let dev_idx = self.devices[..self.count]
             .iter()
             .position(|d| d.as_ref().map_or(false, |d| d.bdf == root_bdf))
             .ok_or(Error::NotFound)?;
 
-        let cap = self.devices[dev_idx]
+        // cap_offset is validated u32 — additions with u32 AER_* offsets cannot
+        // overflow for any cap_offset that passed register_device validation.
+        let cap: u32 = self.devices[dev_idx]
             .as_ref()
             .map(|d| d.cap_offset)
             .ok_or(Error::NotFound)?;
@@ -577,7 +618,7 @@ impl AerHandler {
 
     // Keep these public for unit tests and allow dead_code.
     #[allow(dead_code)]
-    const AER_CAP_HEADER_VAL: u16 = AER_CAP_HEADER;
+    const AER_CAP_HEADER_VAL: u32 = AER_CAP_HEADER;
 
     #[allow(dead_code)]
     const AER_UNCORR_BITS: u32 = AER_UNCORR_TRAINING

@@ -627,8 +627,10 @@ impl AerCapability {
         if cor_status != 0 {
             self.log_error(true, cor_status);
             self.clear_cor_status(cor_status);
-            self.cor_count += 1;
-            self.total_errors += 1;
+            // SECURITY: saturating_add prevents a device that fires a
+            // continuous error storm from wrapping counters to zero.
+            self.cor_count = self.cor_count.saturating_add(1);
+            self.total_errors = self.total_errors.saturating_add(1);
             observed |= 0x01;
         }
 
@@ -649,13 +651,14 @@ impl AerCapability {
 
             let fatal_bits = unc_status & sev;
             if fatal_bits != 0 {
-                self.unc_fatal_count += 1;
+                // SECURITY: saturating_add — same storm-protection rationale.
+                self.unc_fatal_count = self.unc_fatal_count.saturating_add(1);
                 observed |= 0x04;
             } else {
-                self.unc_nonfatal_count += 1;
+                self.unc_nonfatal_count = self.unc_nonfatal_count.saturating_add(1);
                 observed |= 0x02;
             }
-            self.total_errors += 1;
+            self.total_errors = self.total_errors.saturating_add(1);
         }
 
         observed
@@ -706,7 +709,13 @@ impl AerCapability {
 
     /// Reads a 32-bit register at `offset` from the capability MMIO base.
     fn read_reg(&self, offset: u32) -> u32 {
-        let addr = self.mmio_base + offset as u64;
+        // SECURITY: checked_add prevents a crafted/large offset from wrapping
+        // mmio_base to an attacker-controlled address; treat overflow as a
+        // programming error and return 0xFFFF_FFFF (all-ones = absent device).
+        let addr = match self.mmio_base.checked_add(offset as u64) {
+            Some(a) => a,
+            None => return 0xFFFF_FFFF,
+        };
         // SAFETY: mmio_base is a valid PCIe MMIO capability region provided
         // by the PCI enumeration layer. The offset is a known valid AER register
         // offset. Volatile read ensures the access is not optimized away.
@@ -715,7 +724,12 @@ impl AerCapability {
 
     /// Writes a 32-bit value to `offset` from the capability MMIO base.
     fn write_reg(&self, offset: u32, val: u32) {
-        let addr = self.mmio_base + offset as u64;
+        // SECURITY: checked_add — same rationale as read_reg; drop the write
+        // silently if the address would overflow.
+        let addr = match self.mmio_base.checked_add(offset as u64) {
+            Some(a) => a,
+            None => return,
+        };
         // SAFETY: Same as read_reg. Volatile write ensures hardware visibility.
         unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
     }

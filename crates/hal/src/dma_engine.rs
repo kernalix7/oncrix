@@ -406,10 +406,19 @@ impl DmaEngine {
     }
 
     /// Allocates the next unique transfer ID.
-    fn alloc_xfer_id(&mut self) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Busy`] if the ID counter has been exhausted
+    /// (all 2^64 - 1 non-zero IDs have been issued, which is not
+    /// reachable in practice but must be handled safely).
+    fn alloc_xfer_id(&mut self) -> Result<u64> {
+        // SECURITY: use checked_add to prevent the counter from wrapping to 0.
+        // ID 0 is the "invalid / unused" sentinel (see DmaTransfer::is_idle).
+        // On exhaustion return Busy rather than silently recycling the sentinel.
         let id = self.next_xfer_id;
-        self.next_xfer_id += 1;
-        id
+        self.next_xfer_id = id.checked_add(1).ok_or(Error::Busy)?;
+        Ok(id)
     }
 
     /// Requests an unused DMA channel.
@@ -477,7 +486,7 @@ impl DmaEngine {
             return Err(Error::InvalidArgument);
         }
 
-        let xfer_id = self.alloc_xfer_id();
+        let xfer_id = self.alloc_xfer_id()?;
         let transfer = DmaTransfer {
             id: xfer_id,
             direction: DmaTransferDir::MemToMem,
@@ -516,7 +525,7 @@ impl DmaEngine {
             return Err(Error::InvalidArgument);
         }
 
-        let xfer_id = self.alloc_xfer_id();
+        let xfer_id = self.alloc_xfer_id()?;
         let (src, dst) = match direction {
             DmaTransferDir::MemToDev => (addr, 0),
             DmaTransferDir::DevToMem => (0, addr),
@@ -562,7 +571,7 @@ impl DmaEngine {
             return Err(Error::InvalidArgument);
         }
 
-        let xfer_id = self.alloc_xfer_id();
+        let xfer_id = self.alloc_xfer_id()?;
         let total_len = period_len.saturating_mul(periods);
         let (src, dst) = match direction {
             DmaTransferDir::MemToDev => (addr, 0),
