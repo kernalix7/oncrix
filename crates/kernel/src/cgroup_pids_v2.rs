@@ -32,6 +32,12 @@ use oncrix_lib::{Error, Result};
 /// Maximum number of PID cgroups.
 const MAX_GROUPS: usize = 256;
 
+/// Maximum parent-chain depth for hierarchy walks.
+///
+/// Bounded by the maximum number of distinct groups that can exist.
+/// Any cycle that slipped past creation-time validation is terminated here.
+const CGROUP_MAX_DEPTH: usize = MAX_GROUPS;
+
 /// Value indicating unlimited PIDs.
 const PIDS_UNLIMITED: u64 = u64::MAX;
 
@@ -124,14 +130,35 @@ impl PidsCgroupV2 {
     }
 
     /// Create a new PIDs cgroup.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidArgument` if `parent_id` is non-zero and does not refer to
+    ///   an existing active group.  This rejects self-referential and
+    ///   forward-referencing parent IDs, which would otherwise cause infinite
+    ///   loops in the hierarchy walks.
+    /// - `OutOfMemory` if no free slots remain or the ID counter would overflow.
     pub fn create_group(&mut self, parent_id: u32) -> Result<u32> {
+        // Validate parent before touching any state.
+        // A non-zero parent must already exist; zero means top-level (root).
+        // Because IDs are monotonically increasing, a parent_id equal to
+        // next_id (or beyond) can never match an active group, so self-cycles
+        // and forward-references are rejected here.
+        if parent_id != 0 && self.find_group(parent_id).is_err() {
+            return Err(Error::InvalidArgument);
+        }
+
         let slot = self
             .groups
             .iter()
             .position(|g| !g.active)
             .ok_or(Error::OutOfMemory)?;
+
+        // Compute new next_id with overflow check BEFORE writing to the slot,
+        // so a failure leaves the groups array unmodified.
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = id.checked_add(1).ok_or(Error::OutOfMemory)?;
+
         self.groups[slot] = PidsCgroupEntry {
             id,
             parent_id,
@@ -178,7 +205,12 @@ impl PidsCgroupV2 {
 
         // Charge along the hierarchy.
         let mut current_id = id;
+        let mut hops = 0usize;
         loop {
+            hops += 1;
+            if hops > CGROUP_MAX_DEPTH {
+                break;
+            }
             if let Ok(slot) = self.find_group(current_id) {
                 self.groups[slot].current += 1;
                 if self.groups[slot].current > self.groups[slot].peak {
@@ -199,7 +231,12 @@ impl PidsCgroupV2 {
     /// Uncharge a task (exit) from a cgroup.
     pub fn uncharge(&mut self, id: u32) -> Result<()> {
         let mut current_id = id;
+        let mut hops = 0usize;
         loop {
+            hops += 1;
+            if hops > CGROUP_MAX_DEPTH {
+                break;
+            }
             if let Ok(slot) = self.find_group(current_id) {
                 self.groups[slot].current = self.groups[slot].current.saturating_sub(1);
                 let pid = self.groups[slot].parent_id;
@@ -236,7 +273,12 @@ impl PidsCgroupV2 {
 
     fn can_charge_hierarchy(&self, id: u32) -> bool {
         let mut current_id = id;
+        let mut hops = 0usize;
         loop {
+            hops += 1;
+            if hops > CGROUP_MAX_DEPTH {
+                break;
+            }
             if let Some(slot) = self
                 .groups
                 .iter()

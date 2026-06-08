@@ -154,15 +154,19 @@ impl MemCgroupV2 {
     ///
     /// # Errors
     ///
-    /// - `OutOfMemory` if no free slots remain.
+    /// - `OutOfMemory` if no free slots remain or the ID counter would overflow.
     pub fn create_group(&mut self, parent_id: u32) -> Result<u32> {
         let slot = self
             .groups
             .iter()
             .position(|g| !g.active)
             .ok_or(Error::OutOfMemory)?;
+
+        // Compute new next_id with overflow check BEFORE writing to the slot,
+        // so a failure leaves the groups array unmodified.
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = id.checked_add(1).ok_or(Error::OutOfMemory)?;
+
         self.groups[slot] = MemCgroupEntry {
             id,
             parent_id,

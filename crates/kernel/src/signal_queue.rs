@@ -90,9 +90,10 @@ impl SigInfo {
 pub struct TaskSignalQueue {
     /// Task identifier.
     pub task_id: u64,
-    /// Bitmask of pending signals (bit N = signal N).
+    /// Bitmask of pending signals (bit `N` = signal `N + 1`, so signals
+    /// 1..=64 occupy bits 0..=63 and `1u64 << 64` is never formed).
     pub pending_mask: u64,
-    /// Bitmask of blocked signals.
+    /// Bitmask of blocked signals (bit `N` = signal `N + 1`).
     pub blocked_mask: u64,
     /// Real-time signal queue.
     rt_queue: [SigInfo; MAX_RT_QUEUED],
@@ -123,12 +124,16 @@ impl TaskSignalQueue {
 
     /// Check if a signal is pending.
     pub fn is_pending(&self, signo: u32) -> bool {
-        signo > 0 && signo <= SIGNAL_MAX && (self.pending_mask & (1u64 << signo)) != 0
+        // Signal `signo` (1..=SIGNAL_MAX) maps to bit `signo - 1` (0..=63).
+        // The `signo > 0` guard ensures `signo - 1` cannot underflow and the
+        // `signo <= SIGNAL_MAX` guard keeps the shift below the 64-bit width.
+        signo > 0 && signo <= SIGNAL_MAX && (self.pending_mask & (1u64 << (signo - 1))) != 0
     }
 
     /// Check if a signal is blocked.
     pub fn is_blocked(&self, signo: u32) -> bool {
-        signo > 0 && signo <= SIGNAL_MAX && (self.blocked_mask & (1u64 << signo)) != 0
+        // Signal `signo` (1..=SIGNAL_MAX) maps to bit `signo - 1` (0..=63).
+        signo > 0 && signo <= SIGNAL_MAX && (self.blocked_mask & (1u64 << (signo - 1))) != 0
     }
 }
 
@@ -218,8 +223,9 @@ impl SignalQueueManager {
         let queue = &mut self.queues[slot];
 
         if signo <= STD_SIGNAL_MAX {
-            // Standard signal: set the bit (coalesce).
-            queue.pending_mask |= 1u64 << signo;
+            // Standard signal: set the bit (coalesce). Signal `signo` maps to
+            // bit `signo - 1`; `signo >= 1` is guaranteed by the guard above.
+            queue.pending_mask |= 1u64 << (signo - 1);
             self.stats.total_queued += 1;
         } else if signo >= RT_SIGNAL_MIN {
             // RT signal: queue the siginfo.
@@ -229,7 +235,8 @@ impl SignalQueueManager {
                     queue.rt_queue[idx] = info;
                     queue.rt_queue[idx].active = true;
                     queue.rt_queued += 1;
-                    queue.pending_mask |= 1u64 << signo;
+                    // Signal `signo` maps to bit `signo - 1`.
+                    queue.pending_mask |= 1u64 << (signo - 1);
                     self.stats.total_queued += 1;
                     self.stats.total_rt_queued += 1;
                 }
@@ -255,14 +262,17 @@ impl SignalQueueManager {
         if deliverable == 0 {
             return Ok(None);
         }
-        // Find lowest set bit.
-        let signo = deliverable.trailing_zeros();
+        // Find lowest set bit. Bit `b` corresponds to signal `b + 1`, so the
+        // signal number is `trailing_zeros() + 1`. `deliverable != 0` here
+        // (handled above), so `trailing_zeros()` is in 0..=63 and `signo` is
+        // in 1..=64 — no overflow and within range.
+        let signo = deliverable.trailing_zeros() + 1;
         if signo == 0 || signo > SIGNAL_MAX {
             return Ok(None);
         }
 
-        // Clear the pending bit.
-        queue.pending_mask &= !(1u64 << signo);
+        // Clear the pending bit. Signal `signo` maps to bit `signo - 1`.
+        queue.pending_mask &= !(1u64 << (signo - 1));
         queue.delivered += 1;
         self.stats.total_delivered += 1;
 
@@ -278,7 +288,8 @@ impl SignalQueueManager {
                 queue.rt_queued = queue.rt_queued.saturating_sub(1);
                 // Re-check if more of the same RT signal are queued.
                 if queue.rt_queue.iter().any(|s| s.active && s.signo == signo) {
-                    queue.pending_mask |= 1u64 << signo;
+                    // Signal `signo` maps to bit `signo - 1`; `signo >= 1` here.
+                    queue.pending_mask |= 1u64 << (signo - 1);
                 }
                 return Ok(Some((signo, Some(info))));
             }
@@ -291,8 +302,10 @@ impl SignalQueueManager {
         if slot >= MAX_TASKS || !self.queues[slot].active {
             return Err(Error::InvalidArgument);
         }
-        // SIGKILL (9) and SIGSTOP (19) cannot be blocked.
-        let sanitised = mask & !((1u64 << 9) | (1u64 << 19));
+        // SIGKILL (9) and SIGSTOP (19) cannot be blocked. Signal `n` maps to
+        // bit `n - 1`, so SIGKILL is bit 8 and SIGSTOP is bit 18 — matching the
+        // `signo - 1` convention used by `is_blocked` / set / clear / test.
+        let sanitised = mask & !((1u64 << (9 - 1)) | (1u64 << (19 - 1)));
         self.queues[slot].blocked_mask = sanitised;
         Ok(())
     }
