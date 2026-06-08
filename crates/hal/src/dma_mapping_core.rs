@@ -131,14 +131,27 @@ impl IovaAllocator {
     ///
     /// # Errors
     ///
-    /// - `InvalidArgument` if `size == 0` or `align_shift > 30`.
+    /// - `InvalidArgument` if `size == 0`, `align_shift > 30`, or `size`
+    ///   exceeds the IOVA window size.
     /// - `OutOfMemory` if the IOVA window is exhausted or the table is full.
     pub fn alloc(&mut self, size: u64, align_shift: u32) -> Result<u64> {
         if size == 0 || align_shift > 30 {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: reject absurd sizes before arithmetic; a near-u64::MAX
+        // size passes the `== 0` guard but would overflow the round-up below.
+        let window_size = self.window_end.saturating_sub(self.window_start);
+        if size > window_size {
+            return Err(Error::InvalidArgument);
+        }
         let align = 1u64 << align_shift;
-        let aligned_start = (self.cursor + align - 1) & !(align - 1);
+        // SECURITY: align-up of cursor must be checked; if cursor is near
+        // u64::MAX this addition overflows and panics under overflow-checks ON.
+        let aligned_start = self
+            .cursor
+            .checked_add(align - 1)
+            .ok_or(Error::OutOfMemory)?
+            & !(align - 1);
         let end = aligned_start.checked_add(size).ok_or(Error::OutOfMemory)?;
         if end > self.window_end {
             return Err(Error::OutOfMemory);
@@ -276,10 +289,15 @@ impl CoherentPool {
             .position(|&u| !u)
             .ok_or(Error::OutOfMemory)?;
 
+        // SECURITY: slot index × slot_size and the subsequent base + offset
+        // additions must not overflow; reject on overflow rather than panic.
+        let byte_offset = idx.checked_mul(self.slot_size).ok_or(Error::OutOfMemory)? as u64;
+        let phys = self
+            .phys_base
+            .checked_add(byte_offset)
+            .ok_or(Error::OutOfMemory)?;
         self.used[idx] = true;
         self.count += 1;
-        let offset = (idx * self.slot_size) as u64;
-        let phys = self.phys_base + offset;
         let dma = phys.wrapping_add_signed(self.dma_offset);
         Ok(CoherentSlot {
             virt_addr: phys,
@@ -512,8 +530,13 @@ impl BouncePool {
             .position(|&u| !u)
             .ok_or(Error::OutOfMemory)?;
 
-        let offset = (idx * self.slot_size) as u64;
-        let bounce_phys = self.phys_base + offset;
+        // SECURITY: slot index × slot_size and base + offset additions must not
+        // overflow; reject on overflow rather than panic with overflow-checks ON.
+        let byte_offset = idx.checked_mul(self.slot_size).ok_or(Error::OutOfMemory)? as u64;
+        let bounce_phys = self
+            .phys_base
+            .checked_add(byte_offset)
+            .ok_or(Error::OutOfMemory)?;
         let bounce_dma = bounce_phys.wrapping_add_signed(self.dma_offset);
 
         let buf = BounceBuffer {

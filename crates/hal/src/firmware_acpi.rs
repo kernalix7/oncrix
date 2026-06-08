@@ -320,10 +320,17 @@ impl McfgEntry {
             return None;
         }
         let bus_off = (bus - self.start_bus) as u64;
-        let addr = self.base_address
-            + (bus_off << 20)
-            + ((device as u64 & 0x1F) << 15)
-            + ((function as u64 & 0x07) << 12);
+        // SECURITY: use checked_add for every step of the ECAM address
+        // computation.  The firmware-supplied base_address is a u64; adding
+        // three shift products without overflow guards can wrap on a malicious
+        // or corrupted MCFG entry, mapping PCI config accesses to an arbitrary
+        // physical address.  Return None on overflow so callers fail safely
+        // instead of accessing the wrong physical page.
+        let addr = self
+            .base_address
+            .checked_add(bus_off << 20)?
+            .checked_add((device as u64 & 0x1F) << 15)?
+            .checked_add((function as u64 & 0x07) << 12)?;
         Some(addr)
     }
 }
@@ -954,8 +961,19 @@ pub fn parse_rsdp(data: &[u8]) -> Result<RsdpInfo> {
     // ACPI 2.0+: extended structure.
     let (xsdt_address, length) = if revision >= 2 && data.len() >= RSDP_V2_LENGTH {
         let len = read_u32(data, 20);
+        // SECURITY: the extended checksum window must cover at least the full
+        // 36-byte RSDP v2 structure so that xsdt_address (bytes 24-31) is
+        // always included in the integrity check.  Using (len as usize).min()
+        // allows firmware to set len < 36 (e.g., len == 20), which satisfies
+        // the revision >= 2 branch while leaving xsdt_address outside the
+        // checksummed region — an attacker could then supply any XSDT pointer
+        // and still pass checksum validation.  Reject any declared length that
+        // is shorter than the mandatory v2 size.
+        if (len as usize) < RSDP_V2_LENGTH {
+            return Err(Error::InvalidArgument);
+        }
         let check_len = (len as usize).min(data.len());
-        // Extended checksum covers full structure.
+        // Extended checksum covers full structure (including xsdt_address).
         let ext_sum: u8 = data[..check_len]
             .iter()
             .fold(0u8, |acc, &b| acc.wrapping_add(b));

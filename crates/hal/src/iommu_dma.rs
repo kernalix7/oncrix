@@ -184,9 +184,16 @@ impl IovaAllocator {
     ///
     /// # Errors
     ///
+    /// Returns [`Error::InvalidArgument`] if `len` is so large that
+    /// rounding it up to a page boundary would overflow `u64`.
     /// Returns [`Error::OutOfMemory`] if the IOVA window is exhausted.
     pub fn alloc(&mut self, len: u64) -> Result<u64> {
-        let aligned_len = (len + PAGE_MASK) & !PAGE_MASK;
+        // SECURITY: checked_add prevents u64 overflow when rounding `len` up
+        // to a page boundary. A near-u64::MAX `len` (e.g. from a malicious
+        // device descriptor) would silently wrap to a tiny value without this
+        // guard, bypassing the space-exhaustion check below and corrupting
+        // IOVA accounting.
+        let aligned_len = len.checked_add(PAGE_MASK).ok_or(Error::InvalidArgument)? & !PAGE_MASK;
         if self.cursor + aligned_len > self.base + self.size {
             return Err(Error::OutOfMemory);
         }
@@ -326,7 +333,13 @@ impl DmaMapper {
         len: u64,
         direction: DmaDirection,
     ) -> Result<DmaHandle> {
-        if len == 0 || phys_addr & PAGE_MASK != 0 {
+        // SECURITY: reject absurdly large `len` values before any arithmetic.
+        // A device-supplied length near u64::MAX passes the `== 0` check but
+        // would overflow the page-align round-up in IovaAllocator::alloc,
+        // potentially wrapping to a small value and bypassing space checks.
+        // Capping at the IOVA window size is a safe upper bound for any real
+        // transfer; legitimate DMA sizes are many orders of magnitude smaller.
+        if len == 0 || len > self.iova_alloc.window_size() || phys_addr & PAGE_MASK != 0 {
             self.stats.map_errors += 1;
             return Err(Error::InvalidArgument);
         }
@@ -402,7 +415,17 @@ impl DmaMapper {
             return Err(Error::InvalidArgument);
         }
 
-        let total_size: u64 = segments.iter().map(|s| s.length).sum();
+        // SECURITY: use try_fold with checked_add to detect u64 overflow when
+        // summing device-supplied segment lengths. A crafted SG list whose
+        // lengths sum past u64::MAX would silently wrap to a small total_size,
+        // defeating the space check and causing IOVA aliasing.
+        let total_size: u64 = segments
+            .iter()
+            .try_fold(0u64, |acc, s| acc.checked_add(s.length))
+            .ok_or_else(|| {
+                self.stats.map_errors += 1;
+                Error::InvalidArgument
+            })?;
         if total_size == 0 {
             self.stats.map_errors += 1;
             return Err(Error::InvalidArgument);
@@ -422,7 +445,18 @@ impl DmaMapper {
         let mut cursor = iova_base;
         for seg in segments.iter_mut() {
             seg.iova = cursor;
-            cursor += (seg.length + PAGE_MASK) & !PAGE_MASK;
+            // SECURITY: both the page-align round-up and the cursor advance
+            // require checked arithmetic. seg.length near u64::MAX overflows
+            // the `+ PAGE_MASK` rounding, and even a legitimate aligned_len
+            // can overflow `cursor +=` if cursor is already near u64::MAX.
+            let aligned_len = seg
+                .length
+                .checked_add(PAGE_MASK)
+                .ok_or(Error::InvalidArgument)?
+                & !PAGE_MASK;
+            cursor = cursor
+                .checked_add(aligned_len)
+                .ok_or(Error::InvalidArgument)?;
         }
 
         let seq = self.next_seq;
