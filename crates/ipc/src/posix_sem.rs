@@ -510,6 +510,34 @@ impl SemRegistry {
             if flags.contains(SemOpenFlags::O_CREAT) && flags.contains(SemOpenFlags::O_EXCL) {
                 return Err(Error::AlreadyExists);
             }
+            // SECURITY: opening an existing named semaphore must enforce the
+            // stored mode/owner. A POSIX semaphore is always opened for both
+            // operations (sem_wait decrements, sem_post increments), so the
+            // caller needs read+write (0o6) access for its permission class.
+            // Without this check any process could attach to another user's
+            // named semaphore regardless of its mode bits.
+            //
+            // SECURITY INVARIANT: group membership is not threaded to this
+            // layer, so the group triad cannot be honoured here; the dispatcher
+            // MUST enforce the named-object mode/owner (including the gid class)
+            // on open with the authenticated caller credential. We fail closed
+            // for the owner/other classes below using the contained owner_uid.
+            {
+                let entry = &self.named[ni];
+                let mode = entry.mode.bits() as u16;
+                let want = 0o6u16; // read + write
+                let granted = if uid == entry.owner_uid {
+                    (mode >> 6) & 0o7
+                } else {
+                    // No gid credential wired: treat non-owner as "other" and
+                    // fail closed on the owner/group bits. (gid is still used by
+                    // the create branch below to stamp owner_gid.)
+                    mode & 0o7
+                };
+                if granted & want != want {
+                    return Err(Error::PermissionDenied);
+                }
+            }
             // Open an existing semaphore — allocate a handle.
             let hi = self.alloc_handle()?;
             let cur_gen = self.named[ni].generation;

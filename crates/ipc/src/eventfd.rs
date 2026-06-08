@@ -183,6 +183,18 @@ impl IpcEventFdRegistry {
     /// Returns the assigned eventfd ID on success, or
     /// `OutOfMemory` if the registry is full.
     pub fn create(&mut self, initval: u64, flags: u32, pid: u64) -> Result<u32> {
+        // SECURITY: `initval` is attacker-controlled (the `eventfd2` syscall
+        // argument). The counter invariant maintained by `write`/`poll`/`read`
+        // is `counter <= EVENTFD_MAX` (= u64::MAX - 1). Storing an unbounded
+        // `initval` (e.g. u64::MAX) breaks that invariant: a subsequent
+        // `write` computes `EVENTFD_MAX - val` and a counter already above
+        // `EVENTFD_MAX` defeats the overflow guard. Reject out-of-range
+        // initial values up front, matching Linux's `eventfd` rejection of
+        // an initial count of `ULLONG_MAX`.
+        if initval > EVENTFD_MAX {
+            return Err(Error::InvalidArgument);
+        }
+
         let slot_idx = self.find_free().ok_or(Error::OutOfMemory)?;
 
         let mode = if flags & EFD_SEMAPHORE != 0 {

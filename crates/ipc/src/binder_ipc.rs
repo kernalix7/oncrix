@@ -286,6 +286,12 @@ pub const TF_STATUS_CODE: u32 = 0x08;
 /// Accept file descriptors from the remote side.
 pub const TF_ACCEPT_FDS: u32 = 0x10;
 
+/// Mask of all defined transaction flag bits. Any bit outside this mask is
+/// reserved and must be rejected: an attacker-controlled `flags` field with
+/// unknown bits set must not be silently accepted (forward-compat hazard and
+/// a way to smuggle undefined driver behaviour).
+pub const TF_KNOWN_MASK: u32 = TF_ONE_WAY | TF_ROOT_OBJECT | TF_STATUS_CODE | TF_ACCEPT_FDS;
+
 impl BinderTransaction {
     /// Create a new empty transaction.
     pub const fn new(
@@ -704,6 +710,20 @@ impl BinderProcess {
     /// [`BinderNode::is_unreferenced`].
     ///
     /// Returns `Err(NotFound)` if the handle does not exist.
+    //
+    // SECURITY INVARIANT: any death notification registered against `handle`
+    // captured a snapshot of (node_ptr, node_owner) at registration time (see
+    // `request_death_notification`). When the ref is removed here the handle
+    // number is freed and may later be REUSED for a different node, so a stale
+    // DeathNotification keyed on the old (node_ptr, node_owner) snapshot could
+    // fire for the wrong node or leak a cookie. The dispatcher MUST, on
+    // remove_ref, purge every `death_notifs` entry whose `handle` matches the
+    // removed handle, AND the delivery path (`deliver_death_for_node`) MUST
+    // re-resolve the handle through the live ref table at delivery time rather
+    // than trusting the recorded snapshot. This signature-preserving guard does
+    // not perform that purge (it would change return-shape and ripple to
+    // `BinderRegistry::handle_release`); it is documented here so the dispatcher
+    // wires it. Do NOT treat the surviving snapshot as authoritative.
     pub fn remove_ref(&mut self, handle: BinderHandle) -> Result<(BinderPtr, BinderPid)> {
         for slot in self.refs.iter_mut() {
             if slot.as_ref().map(|r| r.handle == handle).unwrap_or(false) {
@@ -760,6 +780,15 @@ impl BinderProcess {
         handle: BinderHandle,
         cookie: u64,
     ) -> Result<(BinderPtr, BinderPid)> {
+        // SECURITY INVARIANT: the (node_ptr, node_owner) pair captured below is
+        // a SNAPSHOT taken at registration time. If the underlying ref is later
+        // removed (see `remove_ref`) and the handle number is recycled to a
+        // different node, this snapshot becomes stale and BR_DEAD_BINDER could
+        // fire for the wrong node or disclose a cookie to the wrong client. The
+        // delivery path MUST re-resolve `handle` through the live ref table at
+        // delivery time and MUST treat the death notification as void if the
+        // ref no longer maps to this (node_ptr, node_owner). `remove_ref` MUST
+        // purge matching death_notifs. Do NOT trust this snapshot at delivery.
         // Resolve the reference to get node info.
         let binder_ref = self.find_ref(handle).ok_or(Error::NotFound)?;
         let node_ptr = binder_ref.node_ptr;
@@ -1239,6 +1268,15 @@ impl BinderRegistry {
         _sender_tid: u32,
         mut txn: BinderTransaction,
     ) -> Result<BinderReturn> {
+        // SECURITY: reject reserved/unknown transaction flag bits. `txn.flags`
+        // is fully attacker-controlled (it arrives in the BC_TRANSACTION
+        // parcel); only the defined TF_* bits may be set. This applies to every
+        // target, including the privileged context manager (handle 0), so a
+        // client cannot smuggle undefined flag semantics into a service.
+        if txn.flags & !TF_KNOWN_MASK != 0 {
+            return Err(Error::InvalidArgument);
+        }
+
         let id = self.alloc_txn_id();
         txn.id = id;
         txn.sender = sender_pid;
@@ -1281,6 +1319,23 @@ impl BinderRegistry {
         //
         // In a real implementation the thread's transaction stack would record
         // which client thread to reply to.  Here we acknowledge with BrReply.
+        //
+        // SECURITY INVARIANT: BC_REPLY MUST pop a *verified* entry from this
+        // thread's per-thread transaction stack and route the reply ONLY to the
+        // client thread recorded on that entry. This stub does not yet keep a
+        // transaction stack, so it cannot bind the reply to a real pending
+        // transaction. The correct (not-yet-built) machinery is:
+        //   1. push an entry on BC_TRANSACTION recording (client_pid,
+        //      client_tid, txn_id) on the *target* thread's stack;
+        //   2. on BC_REPLY, pop the top entry of `_sender_tid`'s stack and
+        //      REJECT with an error (e.g. Error::InvalidArgument) when the
+        //      stack is empty — a reply with no matching outstanding
+        //      transaction must never be delivered;
+        //   3. deliver BR_REPLY exclusively to the recorded client thread,
+        //      never to a caller-chosen handle.
+        // Until that exists, callers MUST NOT trust this path to authorise a
+        // reply target. Returning a synthetic BrReply here is a placeholder and
+        // does NOT constitute a validated reply route.
         let _ = txn;
         Ok(BinderReturn::BrReply(BinderTransaction::new(
             BinderHandle::CONTEXT_MANAGER,

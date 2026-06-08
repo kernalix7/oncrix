@@ -286,6 +286,17 @@ impl MsgQueue {
         }
 
         // msgtyp < 0: find the message with the smallest type <= |msgtyp|.
+        //
+        // SECURITY: `msgtyp` is attacker-controlled (passed straight through
+        // from the `msgrcv` syscall argument). Negating `i64::MIN` is undefined
+        // in two's-complement and PANICS under overflow-checks, halting ring 0
+        // (DoS). `i64::MIN` has no representable positive magnitude, so no
+        // valid `mtype` (which is always `> 0`) can satisfy `t <= |i64::MIN|`
+        // beyond the full range; Linux treats this corner as a plain no-match.
+        // Reject it before negating instead of computing `-msgtyp`.
+        if msgtyp == i64::MIN {
+            return None;
+        }
         let limit = -msgtyp;
         let mut best_idx: Option<usize> = None;
         let mut best_type: i64 = i64::MAX;

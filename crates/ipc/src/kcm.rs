@@ -500,12 +500,22 @@ pub fn bpf_parse_msg(data: &[u8]) -> Option<BpfMsgBoundary> {
         return None; // need more data
     }
     let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    let total = (4u64 + len as u64).min(u32::MAX as u64) as u32;
-    if data.len() < total as usize {
+    // SECURITY: `len` is an attacker-controlled big-endian length prefix read
+    // straight from the TCP byte stream. Clamping the frame size to `u32::MAX`
+    // (the previous behaviour) reports a truncated `end_offset` for an
+    // oversized frame, desynchronising the framer and letting a peer smuggle
+    // payload past the boundary. Reject any frame larger than the KCM message
+    // limit instead, using widened (u64) checked arithmetic so the 4-byte
+    // header addition cannot wrap.
+    let total = 4u64 + len as u64;
+    if total > KCM_MAX_MSG_SIZE as u64 + 4 {
+        return None; // oversized frame — reject rather than clamp
+    }
+    if (data.len() as u64) < total {
         return None; // incomplete message
     }
     Some(BpfMsgBoundary {
-        end_offset: total,
+        end_offset: total as u32,
         header_len: 4,
     })
 }

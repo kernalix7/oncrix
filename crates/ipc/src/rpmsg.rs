@@ -110,8 +110,18 @@ impl RpmsgHeader {
     }
 
     /// Validate the header.
+    ///
+    /// Must be called on every header decoded from the wire and before a
+    /// header built locally is transmitted.
     pub fn validate(&self) -> Result<()> {
         if self.len as usize > RPMSG_MAX_PAYLOAD {
+            return Err(Error::InvalidArgument);
+        }
+        // SECURITY: `reserved` and `flags` are documented must-be-0 fields.
+        // A non-zero value is either a malformed/hostile wire frame or a
+        // forward-incompatible sender; reject it rather than silently
+        // ignoring attacker-controlled bits that future logic may key on.
+        if self.reserved != 0 || self.flags != 0 {
             return Err(Error::InvalidArgument);
         }
         Ok(())
@@ -140,6 +150,11 @@ impl RpmsgMessage {
             return Err(Error::InvalidArgument);
         }
         let header = RpmsgHeader::new(src, dst, payload.len() as u16);
+        // SECURITY: validate the header before the message can be enqueued or
+        // transmitted, so reserved/flags invariants and the length bound are
+        // enforced on the send path (validate() was previously never called
+        // on construction).
+        header.validate()?;
         let mut data = [0u8; RPMSG_MAX_PAYLOAD];
         data[..payload.len()].copy_from_slice(payload);
         Ok(Self {
@@ -204,6 +219,14 @@ impl ChannelName {
 pub struct RpmsgEndpoint {
     /// Endpoint address.
     pub addr: u32,
+    /// Owning principal (user id) recorded at creation.
+    ///
+    /// SECURITY: the source endpoint of a `send` must be owned by the
+    /// authenticated caller. The registry rejects a send whose `src`
+    /// endpoint's `owner` does not match the caller's credential, which
+    /// stops source-address spoofing and cross-endpoint injection. Mirrors
+    /// the `VsockSocket::owner` pattern.
+    owner: u32,
     /// Channel name (for named endpoints).
     pub name: Option<ChannelName>,
     /// Whether this endpoint is active.
@@ -219,10 +242,15 @@ pub struct RpmsgEndpoint {
 }
 
 impl RpmsgEndpoint {
-    /// Create a new endpoint.
-    pub fn new(addr: u32, name: Option<ChannelName>) -> Self {
+    /// Create a new endpoint owned by `owner`.
+    ///
+    /// `owner` is the authenticated principal that created the endpoint and
+    /// must be presented on subsequent `send` operations using this endpoint
+    /// as the source.
+    pub fn new(addr: u32, owner: u32, name: Option<ChannelName>) -> Self {
         Self {
             addr,
+            owner,
             name,
             active: true,
             rx_queue: [const { None }; MAX_PENDING_MSGS],
@@ -230,6 +258,11 @@ impl RpmsgEndpoint {
             rx_tail: 0,
             rx_count: 0,
         }
+    }
+
+    /// Returns the owning principal (user id) of this endpoint.
+    pub const fn owner(&self) -> u32 {
+        self.owner
     }
 
     /// Enqueue a received message.
@@ -416,10 +449,19 @@ impl RpmsgDevice {
         None
     }
 
-    /// Create a new endpoint.
+    /// Create a new endpoint owned by `owner`.
     ///
     /// If `addr` is `RPMSG_ADDR_ANY`, a dynamic address is allocated.
-    pub fn create_endpoint(&mut self, addr: u32, name: Option<ChannelName>) -> Result<u32> {
+    ///
+    /// SECURITY: `owner` is the authenticated principal of the caller and is
+    /// recorded on the endpoint so that `send`/`trysend` can verify the
+    /// caller owns the source endpoint (no source-address spoofing).
+    pub fn create_endpoint(
+        &mut self,
+        owner: u32,
+        addr: u32,
+        name: Option<ChannelName>,
+    ) -> Result<u32> {
         let slot = self.find_free_slot()?;
 
         // Check for name collision.
@@ -444,7 +486,7 @@ impl RpmsgDevice {
             self.log_ns_announcement(&n, actual_addr, RPMSG_NS_CREATE);
         }
 
-        self.endpoints[slot] = Some(RpmsgEndpoint::new(actual_addr, name));
+        self.endpoints[slot] = Some(RpmsgEndpoint::new(actual_addr, owner, name));
         self.endpoint_count += 1;
         Ok(actual_addr)
     }
@@ -461,13 +503,24 @@ impl RpmsgDevice {
         Ok(())
     }
 
-    /// Send a message from src to dst endpoint.
-    pub fn send(&mut self, src: u32, dst: u32, payload: &[u8]) -> Result<()> {
+    /// Send a message from src to dst endpoint on behalf of `owner`.
+    ///
+    /// SECURITY: `owner` is the authenticated principal of the caller. The
+    /// caller MUST own the `src` endpoint; otherwise the send is rejected
+    /// with `PermissionDenied`. This prevents source-address spoofing and
+    /// cross-endpoint injection — a caller cannot forge a message that
+    /// appears to originate from an endpoint it does not own.
+    pub fn send(&mut self, owner: u32, src: u32, dst: u32, payload: &[u8]) -> Result<()> {
         if !self.online {
             return Err(Error::IoError);
         }
-        // Verify src exists.
-        let _ = self.find_endpoint(src)?;
+        // SECURITY: verify the src endpoint exists AND is owned by the caller.
+        let src_slot = self.find_endpoint(src)?;
+        match &self.endpoints[src_slot] {
+            Some(ep) if ep.owner == owner => {}
+            Some(_) => return Err(Error::PermissionDenied),
+            None => return Err(Error::NotFound),
+        }
         // Route to dst.
         let dst_slot = self.find_endpoint(dst)?;
         let msg = RpmsgMessage::new(src, dst, payload)?;
@@ -478,8 +531,11 @@ impl RpmsgDevice {
     }
 
     /// Try to send (non-blocking, returns WouldBlock if dst queue is full).
-    pub fn trysend(&mut self, src: u32, dst: u32, payload: &[u8]) -> Result<()> {
-        self.send(src, dst, payload)
+    ///
+    /// SECURITY: enforces the same source-endpoint ownership check as
+    /// [`RpmsgDevice::send`].
+    pub fn trysend(&mut self, owner: u32, src: u32, dst: u32, payload: &[u8]) -> Result<()> {
+        self.send(owner, src, dst, payload)
     }
 
     /// Receive a message from an endpoint's queue.
@@ -593,6 +649,9 @@ impl Default for RpmsgBus {
 mod tests {
     use super::*;
 
+    /// Authenticated caller principal used by tests.
+    const TEST_OWNER: u32 = 1000;
+
     fn test_name() -> ChannelName {
         ChannelName::from_bytes(b"test-channel").unwrap()
     }
@@ -640,7 +699,9 @@ mod tests {
     #[test]
     fn test_create_endpoint_dynamic() {
         let mut dev = RpmsgDevice::new(0);
-        let addr = dev.create_endpoint(RPMSG_ADDR_ANY, None).unwrap();
+        let addr = dev
+            .create_endpoint(TEST_OWNER, RPMSG_ADDR_ANY, None)
+            .unwrap();
         assert!(addr >= RPMSG_DYNAMIC_ADDR_START);
         assert_eq!(dev.endpoint_count(), 1);
     }
@@ -648,7 +709,7 @@ mod tests {
     #[test]
     fn test_create_endpoint_fixed() {
         let mut dev = RpmsgDevice::new(0);
-        let addr = dev.create_endpoint(42, None).unwrap();
+        let addr = dev.create_endpoint(TEST_OWNER, 42, None).unwrap();
         assert_eq!(addr, 42);
     }
 
@@ -656,7 +717,9 @@ mod tests {
     fn test_create_endpoint_named() {
         let mut dev = RpmsgDevice::new(0);
         let name = test_name();
-        let addr = dev.create_endpoint(RPMSG_ADDR_ANY, Some(name)).unwrap();
+        let addr = dev
+            .create_endpoint(TEST_OWNER, RPMSG_ADDR_ANY, Some(name))
+            .unwrap();
         assert!(addr > 0);
         assert_eq!(dev.ns_announcement_count(), 1);
     }
@@ -665,9 +728,11 @@ mod tests {
     fn test_create_endpoint_duplicate_name() {
         let mut dev = RpmsgDevice::new(0);
         let name = test_name();
-        dev.create_endpoint(RPMSG_ADDR_ANY, Some(name)).unwrap();
+        dev.create_endpoint(TEST_OWNER, RPMSG_ADDR_ANY, Some(name))
+            .unwrap();
         assert_eq!(
-            dev.create_endpoint(RPMSG_ADDR_ANY, Some(name)).unwrap_err(),
+            dev.create_endpoint(TEST_OWNER, RPMSG_ADDR_ANY, Some(name))
+                .unwrap_err(),
             Error::AlreadyExists
         );
     }
@@ -675,9 +740,9 @@ mod tests {
     #[test]
     fn test_create_endpoint_duplicate_addr() {
         let mut dev = RpmsgDevice::new(0);
-        dev.create_endpoint(42, None).unwrap();
+        dev.create_endpoint(TEST_OWNER, 42, None).unwrap();
         assert_eq!(
-            dev.create_endpoint(42, None).unwrap_err(),
+            dev.create_endpoint(TEST_OWNER, 42, None).unwrap_err(),
             Error::AlreadyExists
         );
     }
@@ -685,7 +750,7 @@ mod tests {
     #[test]
     fn test_destroy_endpoint() {
         let mut dev = RpmsgDevice::new(0);
-        let addr = dev.create_endpoint(50, None).unwrap();
+        let addr = dev.create_endpoint(TEST_OWNER, 50, None).unwrap();
         assert!(dev.destroy_endpoint(addr).is_ok());
         assert_eq!(dev.endpoint_count(), 0);
     }
@@ -699,10 +764,10 @@ mod tests {
     #[test]
     fn test_send_recv() {
         let mut dev = RpmsgDevice::new(0);
-        let src = dev.create_endpoint(10, None).unwrap();
-        let dst = dev.create_endpoint(20, None).unwrap();
+        let src = dev.create_endpoint(TEST_OWNER, 10, None).unwrap();
+        let dst = dev.create_endpoint(TEST_OWNER, 20, None).unwrap();
 
-        dev.send(src, dst, b"hello rpmsg").unwrap();
+        dev.send(TEST_OWNER, src, dst, b"hello rpmsg").unwrap();
         let msg = dev.recv(dst).unwrap();
         assert_eq!(msg.header.src, 10);
         assert_eq!(msg.payload(), b"hello rpmsg");
@@ -711,7 +776,7 @@ mod tests {
     #[test]
     fn test_recv_empty() {
         let mut dev = RpmsgDevice::new(0);
-        let addr = dev.create_endpoint(10, None).unwrap();
+        let addr = dev.create_endpoint(TEST_OWNER, 10, None).unwrap();
         assert_eq!(dev.recv(addr).unwrap_err(), Error::WouldBlock);
     }
 
@@ -721,20 +786,40 @@ mod tests {
         dev.online = false;
         let src = 10;
         // Cannot create endpoints on offline device easily, so test send.
-        assert_eq!(dev.send(src, 20, b"data").unwrap_err(), Error::NotFound);
+        assert_eq!(
+            dev.send(TEST_OWNER, src, 20, b"data").unwrap_err(),
+            Error::NotFound
+        );
     }
 
     #[test]
     fn test_trysend() {
         let mut dev = RpmsgDevice::new(0);
-        let src = dev.create_endpoint(10, None).unwrap();
-        let dst = dev.create_endpoint(20, None).unwrap();
-        assert!(dev.trysend(src, dst, b"data").is_ok());
+        let src = dev.create_endpoint(TEST_OWNER, 10, None).unwrap();
+        let dst = dev.create_endpoint(TEST_OWNER, 20, None).unwrap();
+        assert!(dev.trysend(TEST_OWNER, src, dst, b"data").is_ok());
+    }
+
+    /// SECURITY: a caller that does not own the source endpoint must not be
+    /// able to send from it (no source-address spoofing).
+    #[test]
+    fn test_send_rejects_foreign_owner() {
+        let mut dev = RpmsgDevice::new(0);
+        let src = dev.create_endpoint(TEST_OWNER, 10, None).unwrap();
+        let dst = dev.create_endpoint(TEST_OWNER, 20, None).unwrap();
+        // A different principal attempts to spoof the source endpoint.
+        let attacker = TEST_OWNER + 1;
+        assert_eq!(
+            dev.send(attacker, src, dst, b"spoofed").unwrap_err(),
+            Error::PermissionDenied
+        );
+        // The owner can still send.
+        assert!(dev.send(TEST_OWNER, src, dst, b"legit").is_ok());
     }
 
     #[test]
     fn test_endpoint_try_recv() {
-        let mut ep = RpmsgEndpoint::new(10, None);
+        let mut ep = RpmsgEndpoint::new(10, TEST_OWNER, None);
         assert!(ep.try_recv().is_none());
         let msg = RpmsgMessage::new(20, 10, b"data").unwrap();
         ep.enqueue(msg).unwrap();
@@ -749,7 +834,7 @@ mod tests {
         assert_eq!(bus.device_count(), 1);
         {
             let dev = bus.get_device_mut(idx).unwrap();
-            dev.create_endpoint(10, None).unwrap();
+            dev.create_endpoint(TEST_OWNER, 10, None).unwrap();
         }
         assert!(bus.unregister_device(idx).is_ok());
         assert_eq!(bus.device_count(), 0);
@@ -769,6 +854,18 @@ mod tests {
         assert_eq!(h2.validate().unwrap_err(), Error::InvalidArgument);
     }
 
+    /// SECURITY: reserved/flags are documented must-be-0; a non-zero value
+    /// (e.g. an attacker-controlled wire frame) must be rejected.
+    #[test]
+    fn test_header_validate_rejects_reserved_and_flags() {
+        let mut h = RpmsgHeader::new(0, 0, 8);
+        h.reserved = 1;
+        assert_eq!(h.validate().unwrap_err(), Error::InvalidArgument);
+        let mut h2 = RpmsgHeader::new(0, 0, 8);
+        h2.flags = 0x8000;
+        assert_eq!(h2.validate().unwrap_err(), Error::InvalidArgument);
+    }
+
     #[test]
     fn test_ns_announcement() {
         let name = test_name();
@@ -781,7 +878,9 @@ mod tests {
     fn test_named_endpoint_destroy_ns() {
         let mut dev = RpmsgDevice::new(0);
         let name = test_name();
-        let addr = dev.create_endpoint(RPMSG_ADDR_ANY, Some(name)).unwrap();
+        let addr = dev
+            .create_endpoint(TEST_OWNER, RPMSG_ADDR_ANY, Some(name))
+            .unwrap();
         assert_eq!(dev.ns_announcement_count(), 1); // create
         dev.destroy_endpoint(addr).unwrap();
         assert_eq!(dev.ns_announcement_count(), 2); // create + destroy
