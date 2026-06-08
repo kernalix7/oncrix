@@ -299,7 +299,12 @@ impl ApicTimer {
         if self.ticks_per_ms == 0 {
             return 0;
         }
-        (nanos * self.ticks_per_ms as u64) / NANOS_PER_MS
+        // SECURITY: `nanos` is a caller-supplied value (e.g. from nanosleep).
+        // A raw multiply `nanos * ticks_per_ms` overflows for large deadlines
+        // and panics with overflow-checks=on (ring-0 DoS).  saturating_mul
+        // caps the result at u64::MAX; the subsequent divide then returns a
+        // saturated-but-finite tick count rather than panicking.
+        nanos.saturating_mul(self.ticks_per_ms as u64) / NANOS_PER_MS
     }
 
     /// Convert APIC ticks to nanoseconds.
@@ -309,7 +314,9 @@ impl ApicTimer {
         if self.ticks_per_ms == 0 {
             return 0;
         }
-        (ticks * NANOS_PER_MS) / self.ticks_per_ms as u64
+        // SECURITY: Same overflow risk as nanos_to_ticks — `ticks` may be a
+        // large device-read value.  saturating_mul prevents ring-0 panic.
+        ticks.saturating_mul(NANOS_PER_MS) / (self.ticks_per_ms as u64)
     }
 
     /// Return the current APIC timer count.

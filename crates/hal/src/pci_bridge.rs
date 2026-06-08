@@ -185,7 +185,11 @@ impl MemoryWindow {
     /// Return the size of the memory window in bytes.
     pub fn size(&self) -> u64 {
         if self.limit >= self.base {
-            self.limit - self.base + MEM_WINDOW_ALIGNMENT
+            // SECURITY: saturating arithmetic prevents overflow when limit is near
+            // u64::MAX (a device-supplied value could be adversarially large).
+            self.limit
+                .saturating_sub(self.base)
+                .saturating_add(MEM_WINDOW_ALIGNMENT)
         } else {
             0
         }
@@ -193,7 +197,10 @@ impl MemoryWindow {
 
     /// Check whether a physical address falls within this window.
     pub fn contains(&self, addr: u64) -> bool {
-        self.enabled && addr >= self.base && addr <= self.limit + MEM_WINDOW_ALIGNMENT - 1
+        // SECURITY: saturating_add prevents overflow when limit is near u64::MAX.
+        self.enabled
+            && addr >= self.base
+            && addr <= self.limit.saturating_add(MEM_WINDOW_ALIGNMENT - 1)
     }
 
     /// Enable the memory window.
@@ -253,7 +260,12 @@ impl IoWindow {
     /// Return the size of the I/O window in bytes.
     pub fn size(&self) -> u32 {
         if self.limit >= self.base {
-            self.limit - self.base + IO_WINDOW_ALIGNMENT
+            // SECURITY: `self.limit - self.base + IO_WINDOW_ALIGNMENT` overflows u32
+            // when limit is near u32::MAX (e.g., a firmware-supplied 0xFFFF_F000 limit
+            // with IO_WINDOW_ALIGNMENT=4096 wraps to 0). Use saturating arithmetic.
+            self.limit
+                .saturating_sub(self.base)
+                .saturating_add(IO_WINDOW_ALIGNMENT)
         } else {
             0
         }
@@ -261,7 +273,10 @@ impl IoWindow {
 
     /// Check whether a port address falls within this window.
     pub fn contains(&self, port: u32) -> bool {
-        self.enabled && port >= self.base && port <= self.limit + IO_WINDOW_ALIGNMENT - 1
+        // SECURITY: saturating_add prevents overflow when limit is near u32::MAX.
+        self.enabled
+            && port >= self.base
+            && port <= self.limit.saturating_add(IO_WINDOW_ALIGNMENT - 1)
     }
 
     /// Enable the I/O window.
@@ -321,7 +336,11 @@ impl PrefetchWindow {
     /// Return the size of the prefetchable window in bytes.
     pub fn size(&self) -> u64 {
         if self.limit >= self.base {
-            self.limit - self.base + MEM_WINDOW_ALIGNMENT
+            // SECURITY: saturating arithmetic prevents overflow when limit is near
+            // u64::MAX (a device-supplied value could be adversarially large).
+            self.limit
+                .saturating_sub(self.base)
+                .saturating_add(MEM_WINDOW_ALIGNMENT)
         } else {
             0
         }
@@ -329,7 +348,10 @@ impl PrefetchWindow {
 
     /// Check whether a physical address falls within this window.
     pub fn contains(&self, addr: u64) -> bool {
-        self.enabled && addr >= self.base && addr <= self.limit + MEM_WINDOW_ALIGNMENT - 1
+        // SECURITY: saturating_add prevents overflow when limit is near u64::MAX.
+        self.enabled
+            && addr >= self.base
+            && addr <= self.limit.saturating_add(MEM_WINDOW_ALIGNMENT - 1)
     }
 
     /// Enable the prefetchable window.

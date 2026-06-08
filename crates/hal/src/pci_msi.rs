@@ -318,6 +318,59 @@ pub unsafe fn pci_msix_unmask_vector(table_vaddr: u64, entry: usize) {
     }
 }
 
+/// Safe wrapper: mask a single MSI-X vector with explicit table-size bound check.
+///
+/// `table_size` is the number of entries in the MSI-X table (read from the
+/// MSI-X Message Control register: `(ctrl & MSIX_CTRL_TABLE_SIZE) + 1`).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `entry >= table_size`.
+///
+/// # Security
+///
+/// SECURITY: `entry` is caller/device-supplied; without an explicit bound check
+/// the MMIO write lands at `table_vaddr + entry * 16 + 12`, which can reach
+/// arbitrary kernel virtual addresses if `entry` is unconstrained.
+pub fn pci_msix_mask_vector_checked(
+    table_vaddr: u64,
+    entry: usize,
+    table_size: usize,
+) -> Result<()> {
+    // SECURITY: reject any entry index that would access beyond the table mapping.
+    if entry >= table_size {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: entry < table_size guarantees the MMIO offset is within the
+    // MSI-X table mapping established by the caller.
+    unsafe { pci_msix_mask_vector(table_vaddr, entry) };
+    Ok(())
+}
+
+/// Safe wrapper: unmask a single MSI-X vector with explicit table-size bound check.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `entry >= table_size`.
+///
+/// # Security
+///
+/// SECURITY: same bound-check rationale as [`pci_msix_mask_vector_checked`].
+pub fn pci_msix_unmask_vector_checked(
+    table_vaddr: u64,
+    entry: usize,
+    table_size: usize,
+) -> Result<()> {
+    // SECURITY: reject any entry index that would access beyond the table mapping.
+    if entry >= table_size {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: entry < table_size guarantees the MMIO offset is within the
+    // MSI-X table mapping established by the caller.
+    unsafe { pci_msix_unmask_vector(table_vaddr, entry) };
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // PciMsiState — device state tracker
 // ---------------------------------------------------------------------------

@@ -648,7 +648,13 @@ impl IoApicSystem {
             if !slot.active {
                 continue;
             }
-            let end_gsi = slot.gsi_base + slot.entry_count as u32;
+            // SECURITY: gsi_base comes from ACPI firmware (caller-controlled).
+            // A raw `gsi_base + entry_count` overflows and wraps when gsi_base
+            // is near u32::MAX, producing a degenerate (empty/inverted) range
+            // [gsi_base, wrapped_small) — and worse, panics under
+            // overflow-checks=on. saturating_add clamps end_gsi to u32::MAX,
+            // giving a well-defined [gsi_base, u32::MAX) range.
+            let end_gsi = slot.gsi_base.saturating_add(slot.entry_count as u32);
             if gsi >= slot.gsi_base && gsi < end_gsi {
                 let pin = (gsi - slot.gsi_base) as u8;
                 return Ok((i, pin));

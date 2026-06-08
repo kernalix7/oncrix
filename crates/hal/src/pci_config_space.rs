@@ -423,7 +423,11 @@ impl<A: PciConfigAccess> PciConfigScanner<A> {
             self.access.write_u32(info.addr, offset, raw);
 
             let mask = if is_io { !0x3u32 } else { !0xFu32 };
-            let size32 = !(size_raw & mask) + 1;
+            // SECURITY: when a device returns all-ones (or all-zeros after masking),
+            // `!(size_raw & mask) + 1` overflows u32. Use wrapping_add so that a
+            // non-decodable BAR (size == 0) is handled gracefully rather than
+            // panicking under overflow-checks=on.
+            let size32 = (!(size_raw & mask)).wrapping_add(1);
 
             let (base, size) = if is_64bit && bar_idx < 5 {
                 let offset_hi = CFG_BAR0 + (bar_idx + 1) * 4;
@@ -435,10 +439,18 @@ impl<A: PciConfigAccess> PciConfigScanner<A> {
 
                 let base64 = ((raw & !0xF) as u64) | ((raw_hi as u64) << 32);
                 let size64 = if size_hi == 0 {
+                    // High dword has no writable sizing bits: the BAR is sized
+                    // within 32 bits, so the size is the decoded low size.
                     size32 as u64
                 } else {
-                    let full = !((size32 as u64) | ((!(size_hi) as u64) << 32)) + 1;
-                    full
+                    // SECURITY: decode the full 64-bit size from the COMBINED
+                    // sizing mask (raw masked low dword | raw high dword), then
+                    // `!combined + 1`. The previous formula fed the ALREADY-
+                    // decoded `size32` and a double-negated `size_hi` into the
+                    // complement, yielding garbage. wrapping_add(1) keeps the
+                    // all-ones edge from panicking under overflow-checks=on.
+                    let combined = ((size_raw & mask) as u64) | ((size_hi as u64) << 32);
+                    (!combined).wrapping_add(1)
                 };
                 (base64, size64)
             } else {
