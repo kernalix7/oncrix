@@ -969,8 +969,14 @@ fn parse_i64_value(value: &[u8]) -> Result<ParamValue> {
         if abs > (i64::MAX as u64) + 1 {
             return Err(Error::InvalidArgument);
         }
-        // Two's complement negation.
-        Ok(ParamValue::I64(-(abs as i64)))
+        // Two's complement negation. Special-case i64::MIN so we never
+        // negate i64::MIN (which would overflow under overflow-checks).
+        let v = if abs == (i64::MAX as u64) + 1 {
+            i64::MIN
+        } else {
+            -(abs as i64)
+        };
+        Ok(ParamValue::I64(v))
     } else {
         if abs > i64::MAX as u64 {
             return Err(Error::InvalidArgument);
