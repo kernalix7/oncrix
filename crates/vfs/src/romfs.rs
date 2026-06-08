@@ -534,7 +534,15 @@ impl RomfsFs {
                     return Ok(hdr);
                 }
             }
-            offset = hdr.next_hdr;
+            // SECURITY: require strictly-forward progress. A crafted image can set
+            // next_hdr == current offset (self-loop) or a smaller offset (backward
+            // loop), causing an infinite ring-0 hang. Valid ROMFS headers always
+            // point strictly forward, so any non-advancing next_hdr ends the chain.
+            let next = hdr.next_hdr;
+            if next != 0 && next <= offset {
+                break;
+            }
+            offset = next;
         }
         Err(Error::NotFound)
     }
@@ -678,7 +686,15 @@ impl RomfsFs {
                 entries[count].executable = hdr.executable;
                 count += 1;
             }
-            offset = hdr.next_hdr;
+            // SECURITY: require strictly-forward progress. A crafted image can set
+            // next_hdr == current offset (self-loop) or a smaller offset (backward
+            // loop), causing an infinite ring-0 hang. Valid ROMFS headers always
+            // point strictly forward, so any non-advancing next_hdr ends the chain.
+            let next = hdr.next_hdr;
+            if next != 0 && next <= offset {
+                break;
+            }
+            offset = next;
         }
         Ok((entries, count))
     }

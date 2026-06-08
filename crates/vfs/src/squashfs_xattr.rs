@@ -554,9 +554,14 @@ impl SquashfsXattr {
         let block_idx = self.blocks[..self.block_count]
             .iter()
             .position(|b| {
+                // SECURITY: b.disk_offset + b.data_len as u64 can overflow u64 for a
+                // crafted image. Use checked_add so overflow silently excludes the block
+                // rather than wrapping the end pointer below disk_offset.
                 b.loaded
                     && b.disk_offset <= index.offset
-                    && index.offset < b.disk_offset + b.data_len as u64
+                    && b.disk_offset
+                        .checked_add(b.data_len as u64)
+                        .is_some_and(|end| index.offset < end)
             })
             .ok_or(Error::NotFound)?;
 
@@ -584,9 +589,14 @@ impl SquashfsXattr {
         let block_idx = self.blocks[..self.block_count]
             .iter()
             .position(|b| {
+                // SECURITY: b.disk_offset + b.data_len as u64 can overflow u64 for a
+                // crafted image. Use checked_add so overflow silently excludes the block
+                // rather than wrapping the end pointer below disk_offset.
                 b.loaded
                     && b.disk_offset <= index.offset
-                    && index.offset < b.disk_offset + b.data_len as u64
+                    && b.disk_offset
+                        .checked_add(b.data_len as u64)
+                        .is_some_and(|end| index.offset < end)
             })
             .ok_or(Error::NotFound)?;
 

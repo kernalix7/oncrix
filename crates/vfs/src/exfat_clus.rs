@@ -121,10 +121,16 @@ impl ExfatBootSector {
 
     /// Returns the byte offset on disk for a given cluster number.
     pub fn cluster_to_byte_offset(&self, cluster: u32) -> Result<u64> {
-        // SECURITY: cluster_count can be u32::MAX; adding 1 without a saturating
-        // add wraps to 0, making the upper-bound check always pass.
-        let max_valid = self.cluster_count.saturating_add(1);
-        if cluster < EXFAT_FIRST_CLUSTER || cluster > max_valid {
+        // SECURITY: cluster_count can be u32::MAX; saturating_add keeps max_valid
+        // at u32::MAX too, making the `cluster > max_valid` guard vacuous (any
+        // in-range cluster passes, and u32::MAX is never a valid cluster).
+        // Use checked_add like fat_entry_offset does: if the addition overflows,
+        // the volume is malformed and we reject it.
+        let max_valid = self
+            .cluster_count
+            .checked_add(EXFAT_FIRST_CLUSTER)
+            .ok_or(Error::InvalidArgument)?;
+        if cluster < EXFAT_FIRST_CLUSTER || cluster >= max_valid {
             return Err(Error::InvalidArgument);
         }
         // SECURITY: use checked_shl for the sectors_per_cluster_shift (on-disk u8).

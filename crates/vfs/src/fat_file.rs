@@ -133,7 +133,9 @@ impl FatTable {
     ///
     /// Cluster numbers 0 and 1 are reserved; data starts at 2.
     pub fn new(total_clusters: usize, fat_type: FatType) -> Self {
-        let count = (total_clusters + 2).min(MAX_CLUSTERS);
+        // SECURITY: total_clusters near usize::MAX overflows the `+ 2` addition.
+        // Use saturating_add so the count stays in range on attacker-controlled input.
+        let count = total_clusters.saturating_add(2).min(MAX_CLUSTERS);
         let mut entries = Vec::new();
         entries.resize(count, 0u32);
         // Reserve cluster 0 (BPB copy) and cluster 1 (EOC for root dir on FAT32).
@@ -280,6 +282,11 @@ pub fn read_file(
     if buf.is_empty() || file.is_eof() {
         return Ok(0);
     }
+    // SECURITY: cluster_size == 0 causes division-by-zero in the `position /
+    // cluster_size` and `position % cluster_size` expressions below.
+    if cluster_size == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let to_read = buf.len().min((file.file_size - file.position) as usize);
     let mut read_total = 0usize;
 
@@ -327,6 +334,11 @@ pub fn write_file(
 ) -> Result<usize> {
     if data.is_empty() {
         return Ok(0);
+    }
+    // SECURITY: cluster_size == 0 causes division-by-zero in the `position /
+    // cluster_size` and `position % cluster_size` expressions below.
+    if cluster_size == 0 {
+        return Err(Error::InvalidArgument);
     }
     let mut written = 0usize;
 
@@ -396,10 +408,19 @@ pub fn truncate_file(
         file.file_size = new_size;
         return Ok(());
     }
+    // SECURITY: cluster_size == 0 causes division-by-zero in the cluster-count
+    // arithmetic below, and `cluster_size as u64 - 1` underflows to u64::MAX.
+    if cluster_size == 0 {
+        return Err(Error::InvalidArgument);
+    }
     let clusters_needed = if new_size == 0 {
         0
     } else {
-        ((new_size + cluster_size as u64 - 1) / cluster_size as u64) as usize
+        // SECURITY: `new_size + (cs - 1)` can overflow u64 for a near-max new_size.
+        // Use checked_add; cs - 1 is safe because cs != 0 was checked above.
+        let cs = cluster_size as u64;
+        let clusters_needed = new_size.checked_add(cs - 1).ok_or(Error::InvalidArgument)? / cs;
+        clusters_needed as usize
     };
 
     // Walk to the last cluster we want to keep.
