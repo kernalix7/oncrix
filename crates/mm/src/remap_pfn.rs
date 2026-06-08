@@ -47,6 +47,38 @@ const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
 /// Page frame number shift (12 bits for 4 KiB pages).
 const PFN_SHIFT: u32 = 12;
 
+/// Exclusive upper bound on a valid PFN.
+///
+/// A PFN `p` is only convertible to a physical address without
+/// overflowing `u64` when `p << PFN_SHIFT` fits in 64 bits, i.e.
+/// `p < 2^(64 - PFN_SHIFT)`. Any PFN at or above this bound is
+/// rejected before it is ever shifted.
+//
+// SECURITY: this bound is what makes every `pfn << PFN_SHIFT` in this
+// module safe. With overflow-checks ON an unbounded shift of an
+// attacker-supplied PFN would panic in ring 0 (DoS); silently it would
+// wrap and synthesise an arbitrary physical address.
+const MAX_PFN: u64 = 1u64 << (64 - PFN_SHIFT);
+
+/// Convert a PFN to a physical address, rejecting out-of-range PFNs.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if `pfn >= MAX_PFN` (the shift
+/// would overflow `u64`).
+//
+// SECURITY: single choke point for PFN→phys conversion so the
+// `<< PFN_SHIFT` can never overflow / wrap.
+const fn pfn_to_phys(pfn: u64) -> Result<u64> {
+    if pfn >= MAX_PFN {
+        return Err(Error::InvalidArgument);
+    }
+    match pfn.checked_shl(PFN_SHIFT) {
+        Some(v) => Ok(v),
+        None => Err(Error::InvalidArgument),
+    }
+}
+
 /// Maximum number of active PFN remappings.
 const MAX_REMAPS: usize = 128;
 
@@ -202,13 +234,32 @@ impl PfnRange {
     }
 
     /// Physical start address.
+    ///
+    /// Saturates at [`u64::MAX`] for an out-of-range `start_pfn` rather
+    /// than overflowing; registered ranges are bounded below `MAX_PFN`
+    /// by [`PfnRemapManager::register_pfn_range`], so the saturation is
+    /// only a defence-in-depth guard.
+    //
+    // SECURITY: the previous `start_pfn << PFN_SHIFT` panicked (ring 0
+    // DoS, overflow-checks ON) / wrapped for `start_pfn >= MAX_PFN`.
     pub const fn phys_start(&self) -> u64 {
+        if self.start_pfn >= MAX_PFN {
+            return u64::MAX;
+        }
         self.start_pfn << PFN_SHIFT
     }
 
     /// Physical end address (exclusive).
+    ///
+    /// Saturates at [`u64::MAX`] rather than overflowing.
+    //
+    // SECURITY: bounded shift; see [`Self::phys_start`].
     pub const fn phys_end(&self) -> u64 {
-        self.end_pfn() << PFN_SHIFT
+        let end = self.end_pfn();
+        if end >= MAX_PFN {
+            return u64::MAX;
+        }
+        end << PFN_SHIFT
     }
 
     /// Whether a PFN falls within this range.
@@ -386,7 +437,15 @@ impl PfnRemapManager {
     /// # Errors
     ///
     /// - [`Error::OutOfMemory`] if the PFN range table is full.
-    /// - [`Error::InvalidArgument`] if `page_count` is zero.
+    /// - [`Error::InvalidArgument`] if `page_count` is zero or the
+    ///   `[start_pfn, start_pfn + page_count)` range is not fully
+    ///   representable as a physical address (`end_pfn > MAX_PFN`).
+    //
+    // SECURITY: registered ranges are later used (default-deny) to
+    // authorise user mappings and are shifted by `PFN_SHIFT`. Bounding
+    // the PFN range here guarantees `phys_start` / `phys_end` and every
+    // downstream `pfn << PFN_SHIFT` stay within `u64` and cannot panic
+    // (ring 0 DoS, overflow-checks ON) or wrap to an arbitrary address.
     pub fn register_pfn_range(
         &mut self,
         start_pfn: u64,
@@ -397,6 +456,14 @@ impl PfnRemapManager {
         device_id: u32,
     ) -> Result<()> {
         if page_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Reject a PFN range that cannot be converted to a physical
+        // address (or whose end PFN would wrap past `MAX_PFN`).
+        let end_pfn = start_pfn
+            .checked_add(page_count)
+            .ok_or(Error::InvalidArgument)?;
+        if start_pfn >= MAX_PFN || end_pfn > MAX_PFN {
             return Err(Error::InvalidArgument);
         }
 
@@ -436,21 +503,47 @@ impl PfnRemapManager {
         Ok(())
     }
 
-    /// Validate that a PFN range is safe to map.
+    /// Validate that a PFN range is safe to map into user space.
     ///
-    /// Checks that the PFN range does not overlap with reserved
-    /// (kernel/firmware) memory.
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if the range is empty or its end
+    ///   PFN would overflow / exceed [`MAX_PFN`].
+    /// - [`Error::PermissionDenied`] if the range is not fully covered
+    ///   by a registered, non-reserved PFN range.
+    //
+    // SECURITY: DEFAULT-DENY. The previous implementation only rejected
+    // overlaps with explicitly *reserved* ranges, meaning any PFN the
+    // caller had not bothered to reserve (the entire un-described
+    // physical address space) was mappable into user space — an
+    // arbitrary-physical-memory read/write primitive and a privilege
+    // escalation. We now require the *whole* requested range to lie
+    // inside a single registered range that is NOT reserved, so only
+    // physical memory the kernel has explicitly published (device MMIO,
+    // frame buffers) can ever be remapped. PFN remapping must remain
+    // capability-gated at the caller; this is the in-module backstop.
     fn validate_pfn_range(&self, start_pfn: u64, page_count: u64) -> Result<()> {
-        let end_pfn = start_pfn.saturating_add(page_count);
+        if page_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        // Bound the PFN range before any shift; a wrapping / oversized
+        // end PFN is rejected outright.
+        let end_pfn = start_pfn
+            .checked_add(page_count)
+            .ok_or(Error::InvalidArgument)?;
+        if start_pfn >= MAX_PFN || end_pfn > MAX_PFN {
+            return Err(Error::InvalidArgument);
+        }
 
-        for range in &self.pfn_ranges {
-            if !range.active {
-                continue;
-            }
-            // Check overlap with reserved ranges.
-            if range.reserved && start_pfn < range.end_pfn() && end_pfn > range.start_pfn {
-                return Err(Error::PermissionDenied);
-            }
+        // Require full containment in a registered, non-reserved range.
+        let permitted = self.pfn_ranges.iter().any(|range| {
+            range.active
+                && !range.reserved
+                && start_pfn >= range.start_pfn
+                && end_pfn <= range.end_pfn()
+        });
+        if !permitted {
+            return Err(Error::PermissionDenied);
         }
 
         Ok(())
@@ -508,6 +601,20 @@ impl PfnRemapManager {
         let flags = RemapFlags::from_raw(raw_flags)?;
         let page_count = size / PAGE_SIZE;
 
+        // SECURITY: bound the PFN range BEFORE any `<< PFN_SHIFT`, even
+        // when `REMAP_NOPFNCHECK` is set. `skip_pfn_check` only waives
+        // the registered-range (default-deny) check below; it must NOT
+        // let an out-of-range PFN reach the shift and panic in ring 0
+        // (overflow-checks ON) or wrap to a bogus physical address.
+        let end_pfn = start_pfn
+            .checked_add(page_count)
+            .ok_or(Error::InvalidArgument)
+            .inspect_err(|_| self.stats.failed += 1)?;
+        if start_pfn >= MAX_PFN || end_pfn > MAX_PFN {
+            self.stats.failed += 1;
+            return Err(Error::InvalidArgument);
+        }
+
         // PFN validation (unless caller requests skip).
         if !flags.skip_pfn_check() {
             if let Err(e) = self.validate_pfn_range(start_pfn, page_count) {
@@ -519,6 +626,12 @@ impl PfnRemapManager {
 
         // Build PTE flags.
         let pte_flags = self.build_pte_flags(&flags, mem_type);
+
+        // SECURITY: bounded PFN→phys conversion (no raw `<< PFN_SHIFT`).
+        // `start_pfn < MAX_PFN` is already guaranteed above, so this
+        // cannot fail here, but routing through the helper keeps the
+        // shift impossible to overflow.
+        let phys_addr = pfn_to_phys(start_pfn).inspect_err(|_| self.stats.failed += 1)?;
 
         // Find a free remap slot.
         let slot = self
@@ -554,7 +667,7 @@ impl PfnRemapManager {
 
         Ok(PfnRemap {
             virt_addr,
-            phys_addr: start_pfn << PFN_SHIFT,
+            phys_addr,
             size,
             ptes_created: page_count,
             pte_flags,
@@ -650,8 +763,15 @@ impl PfnRemapManager {
     /// address.
     pub fn virt_to_phys(&self, pid: u64, virt_addr: u64) -> Result<u64> {
         let remap = self.lookup(pid, virt_addr)?;
+        // `lookup` guarantees `virt_addr >= remap.virt_start`, so this
+        // subtraction cannot underflow.
         let offset = virt_addr - remap.virt_start;
-        let phys = (remap.start_pfn << PFN_SHIFT) + offset;
+        // SECURITY: bounded PFN→phys conversion plus a checked add for
+        // the in-mapping offset, so neither the `<< PFN_SHIFT` nor the
+        // base+offset can overflow / panic in ring 0. A stored
+        // `start_pfn` is already `< MAX_PFN` (enforced at remap time).
+        let base = pfn_to_phys(remap.start_pfn)?;
+        let phys = base.checked_add(offset).ok_or(Error::InvalidArgument)?;
         Ok(phys)
     }
 

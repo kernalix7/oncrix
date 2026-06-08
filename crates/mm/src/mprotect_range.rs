@@ -53,6 +53,15 @@ const MAX_PENDING_OPS: usize = 64;
 /// Maximum number of TLB flush entries batched.
 const MAX_TLB_FLUSH_ENTRIES: usize = 128;
 
+/// Upper bound of the user-space virtual address window (exclusive).
+///
+/// On x86_64 with 4-level paging the canonical lower half ends at
+/// `0x0000_8000_0000_0000`; user mappings must lie strictly below this.
+// SECURITY: every attacker-supplied `[start, start+size)` range must end at
+// or below this limit before it is stored or walked, so a range can never
+// describe (and later remap) kernel-half or non-canonical addresses.
+const TASK_SIZE: u64 = 0x0000_8000_0000_0000;
+
 // ── Protection flag constants ────────────────────────────────────
 
 /// No access allowed.
@@ -445,6 +454,17 @@ impl MprotectRangeManager {
             return Err(Error::InvalidArgument);
         }
 
+        // SECURITY: reject an unbounded / oversized range at the boundary so it
+        // is never stored. An overflowing `start + size` would later wrap and
+        // mis-scope merges/flushes; an enormous `size` yields a near-quadrillion
+        // page count that turns `queue_tlb_flush` into an unkillable ring-0 spin.
+        // Mirror the `do_mprotect_range` end-overflow guard: bound `start + size`
+        // and require the whole span to fit inside the user address window.
+        let end = start.checked_add(size).ok_or(Error::InvalidArgument)?;
+        if end > TASK_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+
         let slot = self
             .ranges
             .iter_mut()
@@ -724,7 +744,12 @@ impl MprotectRangeManager {
             }
 
             if let Some((first, second)) = merge_pair {
-                self.ranges[first].size += self.ranges[second].size;
+                // SECURITY: saturating add — never panic under overflow-checks if
+                // two adjacent sizes sum past u64::MAX (defense in depth even
+                // though `register_range` bounds each stored size to TASK_SIZE).
+                self.ranges[first].size = self.ranges[first]
+                    .size
+                    .saturating_add(self.ranges[second].size);
                 self.ranges[second].active = false;
                 self.range_count = self.range_count.saturating_sub(1);
                 merges += 1;
@@ -737,13 +762,19 @@ impl MprotectRangeManager {
 
     /// Queue a TLB flush for a range of pages.
     fn queue_tlb_flush(&mut self, start: u64, size: u64) {
-        let pages = size / PAGE_SIZE;
+        // SECURITY: cap the loop bound. `size / PAGE_SIZE` on an oversized range
+        // is up to ~quadrillion, which would be an unkillable ring-0 spin; the
+        // batch can hold at most MAX_TLB_FLUSH_ENTRIES anyway, so never iterate
+        // past it. (register_range now bounds stored sizes, but this keeps the
+        // hot path safe even if a caller passes an unbounded size directly.)
+        let pages = (size / PAGE_SIZE).min(MAX_TLB_FLUSH_ENTRIES as u64);
         let mut addr = start;
         for _ in 0..pages {
-            if self.tlb_batch_count < MAX_TLB_FLUSH_ENTRIES {
-                self.tlb_batch[self.tlb_batch_count] = TlbFlushEntry { addr, active: true };
-                self.tlb_batch_count += 1;
+            if self.tlb_batch_count >= MAX_TLB_FLUSH_ENTRIES {
+                break;
             }
+            self.tlb_batch[self.tlb_batch_count] = TlbFlushEntry { addr, active: true };
+            self.tlb_batch_count += 1;
             addr = addr.saturating_add(PAGE_SIZE);
         }
     }

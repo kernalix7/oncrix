@@ -41,6 +41,19 @@ use oncrix_lib::{Error, Result};
 /// Standard page size in bytes (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
+/// Lowest mappable user virtual address (`mmap_min_addr`).
+///
+// SECURITY: a user range must start at or above this floor; addresses
+// below it belong to the reserved low region and must never be walked.
+const MMAP_MIN_ADDR: u64 = 0x1_0000;
+
+/// Exclusive upper bound of the user virtual address window.
+///
+// SECURITY: a user range end must not exceed this canonical user max.
+// Bounding before any VMA / page-table walk prevents querying kernel or
+// non-canonical addresses on behalf of user space.
+const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
+
 /// Huge page size (2 MiB).
 const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 
@@ -236,23 +249,56 @@ impl MincoreQuery {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArgument`] if `addr` is not
-    /// page-aligned.
+    /// page-aligned, if rounding `length` up to a page boundary would
+    /// overflow `u64`, or if the resulting `[addr, addr + rounded_len)`
+    /// range leaves the user address window.
     pub fn new(addr: u64, length: u64) -> Result<Self> {
         if addr % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
+        }
+        // SECURITY: round `length` up to a page boundary with a checked
+        // add — an attacker-supplied `length` near u64::MAX would
+        // otherwise overflow and panic (overflow-checks) or wrap.
+        let rounded = length
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(Error::InvalidArgument)?
+            & !(PAGE_SIZE - 1);
+        // SECURITY: bound the whole range to the user window before any
+        // VMA iteration / page-table walk. A checked end-of-range that
+        // exceeds USER_ADDR_LIMIT (or below MMAP_MIN_ADDR) is rejected so
+        // mincore can never report residency for kernel / non-canonical
+        // addresses. A non-zero `addr` below the floor is also rejected.
+        if rounded > 0 {
+            let end = addr.checked_add(rounded).ok_or(Error::InvalidArgument)?;
+            if addr < MMAP_MIN_ADDR || end > USER_ADDR_LIMIT {
+                return Err(Error::InvalidArgument);
+            }
         }
         Ok(Self { addr, length })
     }
 
     /// Return the number of pages covered by this query.
+    ///
+    /// The result is clamped to [`MAX_OUTPUT_PAGES`] so it can never
+    /// exceed the mincore output vector capacity.
     pub fn page_count(&self) -> usize {
-        let rounded = (self.length + PAGE_SIZE - 1) / PAGE_SIZE;
-        rounded as usize
+        // SECURITY: checked page round-up — a raw `length + PAGE_SIZE - 1`
+        // overflows (and panics under overflow-checks) for a `length`
+        // near u64::MAX. Saturate, divide, then clamp the page count to
+        // MAX_OUTPUT_PAGES so a caller can never be driven to write past
+        // the fixed-capacity output vector (OOB write).
+        let rounded = self.length.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE;
+        (rounded as usize).min(MAX_OUTPUT_PAGES)
     }
 
     /// Return the ending virtual address (exclusive).
     pub fn end_addr(&self) -> u64 {
-        self.addr + (self.page_count() as u64) * PAGE_SIZE
+        // SECURITY: `page_count()` is already clamped to MAX_OUTPUT_PAGES;
+        // compute the span and end with saturating arithmetic so an
+        // attacker-supplied `addr` / `length` can neither overflow nor
+        // panic, and the walk loop terminates at a bounded address.
+        let span = (self.page_count() as u64).saturating_mul(PAGE_SIZE);
+        self.addr.saturating_add(span)
     }
 }
 

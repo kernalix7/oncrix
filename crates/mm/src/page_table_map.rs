@@ -52,6 +52,26 @@ const LEVEL_BITS: u32 = 9;
 /// Page offset bits.
 const PAGE_OFFSET_BITS: u32 = 12;
 
+/// Lowest mappable user virtual address (NULL-page guard region).
+///
+/// Mirrors the `MMAP_MIN_ADDR` used across the mm crate
+/// (`mmap_region.rs`, `mremap_grow.rs`).
+const MMAP_MIN_ADDR: u64 = 0x1_0000;
+
+/// User-space virtual address limit (canonical x86_64 lower half).
+///
+/// Mirrors the `USER_ADDR_LIMIT` used across the mm crate
+/// (`mmap_munmap.rs`, `mmap_region.rs`). The end of any mapped range
+/// must not exceed this value, keeping mappings inside the canonical
+/// user half and out of the non-canonical hole / kernel range.
+const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
+
+/// Lowest valid page-table level (PT).
+const MIN_LEVEL: u32 = 1;
+
+/// Highest valid page-table level (PML4).
+const MAX_LEVEL: u32 = 4;
+
 // -------------------------------------------------------------------
 // MapFlags
 // -------------------------------------------------------------------
@@ -219,6 +239,22 @@ impl MappingRequest {
     }
 
     /// Validates the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] for misaligned addresses, an
+    /// out-of-range page count, a missing `PRESENT` flag, or a virtual
+    /// range that wraps or escapes the user address window.
+    //
+    // SECURITY: `virt_addr` and `nr_pages` are attacker-controlled.
+    // The `map_range` / `unmap_range` loops compute
+    // `virt_addr + i * PAGE_SIZE` per page; without bounding the span
+    // here that arithmetic could wrap u64 (with overflow-checks ON, a
+    // ring-0 panic / DoS) or address kernel / non-canonical memory.
+    // We compute the span and end with checked math and require the
+    // whole range to sit within [MMAP_MIN_ADDR, USER_ADDR_LIMIT], so
+    // the per-page loops can never wrap or leave the user half. This
+    // mirrors the bound enforced by the mmap / mremap sibling paths.
     pub fn validate(&self) -> Result<()> {
         if self.virt_addr % PAGE_SIZE != 0 || self.phys_addr % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
@@ -227,6 +263,19 @@ impl MappingRequest {
             return Err(Error::InvalidArgument);
         }
         if !self.flags.contains(MapFlags::PRESENT) {
+            return Err(Error::InvalidArgument);
+        }
+        if self.virt_addr < MMAP_MIN_ADDR {
+            return Err(Error::InvalidArgument);
+        }
+        let span = (self.nr_pages as u64)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        let end = self
+            .virt_addr
+            .checked_add(span)
+            .ok_or(Error::InvalidArgument)?;
+        if end > USER_ADDR_LIMIT {
             return Err(Error::InvalidArgument);
         }
         Ok(())
@@ -316,9 +365,39 @@ impl MappingEngine {
 
     /// Extracts a page-table index at the given level from a virtual
     /// address. Level 4 = PML4, level 1 = PT.
-    pub const fn pt_index(virt_addr: u64, level: u32) -> usize {
-        let shift = PAGE_OFFSET_BITS + (level - 1) * LEVEL_BITS;
-        ((virt_addr >> shift) & 0x1FF) as usize
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `level` is outside the
+    /// valid `1..=4` range.
+    //
+    // SECURITY: `level` may be attacker-controlled. The previous
+    // `PAGE_OFFSET_BITS + (level - 1) * LEVEL_BITS` underflowed for
+    // `level == 0` (with overflow-checks ON, a ring-0 panic / DoS) and
+    // produced shift amounts >= 64 (UB / wrong PT index, an OOB
+    // page-table access) for large `level`. We bound `level` to the
+    // legal 1..=4 page-table levels first, then compute the shift with
+    // explicit checked-width math so it can never wrap or exceed the
+    // width of `u64`.
+    pub const fn pt_index(virt_addr: u64, level: u32) -> Result<usize> {
+        if level < MIN_LEVEL || level > MAX_LEVEL {
+            return Err(Error::InvalidArgument);
+        }
+        // level ∈ 1..=4 ⇒ (level - 1) ∈ 0..=3 ⇒ shift ∈ {12,21,30,39},
+        // all < 64, so the right-shift below is always well-defined.
+        let level_idx = match level.checked_sub(1) {
+            Some(v) => v,
+            None => return Err(Error::InvalidArgument),
+        };
+        let level_shift = match level_idx.checked_mul(LEVEL_BITS) {
+            Some(v) => v,
+            None => return Err(Error::InvalidArgument),
+        };
+        let shift = match PAGE_OFFSET_BITS.checked_add(level_shift) {
+            Some(v) => v,
+            None => return Err(Error::InvalidArgument),
+        };
+        Ok(((virt_addr >> shift) & 0x1FF) as usize)
     }
 
     /// Maps a range of virtual pages to physical frames.
@@ -327,8 +406,21 @@ impl MappingEngine {
         let mut result = MapResult::new();
 
         for i in 0..req.nr_pages {
-            let virt = req.virt_addr + (i as u64) * PAGE_SIZE;
-            let phys = req.phys_addr + (i as u64) * PAGE_SIZE;
+            // SECURITY: `validate()` above bounds `virt_addr + span` to
+            // the user window, so this per-page arithmetic cannot wrap;
+            // we still use checked math as defence in depth against any
+            // future caller that reaches this loop without validation.
+            let offset = (i as u64)
+                .checked_mul(PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+            let virt = req
+                .virt_addr
+                .checked_add(offset)
+                .ok_or(Error::InvalidArgument)?;
+            let phys = req
+                .phys_addr
+                .checked_add(offset)
+                .ok_or(Error::InvalidArgument)?;
 
             // Check for existing mapping at this address.
             for j in 0..MAX_MAPPINGS {
@@ -366,13 +458,46 @@ impl MappingEngine {
     }
 
     /// Unmaps a range of virtual pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] for a misaligned address, an
+    /// out-of-range page count, or a range that wraps or escapes the
+    /// user address window.
+    //
+    // SECURITY: `virt_addr` and `nr_pages` are attacker-controlled and
+    // this path does NOT go through `MappingRequest::validate`, so we
+    // bound the span here directly. The per-page `virt_addr + i *
+    // PAGE_SIZE` loop below could otherwise wrap u64 (ring-0 panic /
+    // DoS with overflow-checks ON). We require the whole range to lie
+    // within [MMAP_MIN_ADDR, USER_ADDR_LIMIT] and use checked math.
     pub fn unmap_range(&mut self, virt_addr: u64, nr_pages: usize) -> Result<usize> {
         if virt_addr % PAGE_SIZE != 0 {
             return Err(Error::InvalidArgument);
         }
+        if nr_pages > MAX_MAPPINGS {
+            return Err(Error::InvalidArgument);
+        }
+        if nr_pages != 0 {
+            if virt_addr < MMAP_MIN_ADDR {
+                return Err(Error::InvalidArgument);
+            }
+            let span = (nr_pages as u64)
+                .checked_mul(PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+            let end = virt_addr.checked_add(span).ok_or(Error::InvalidArgument)?;
+            if end > USER_ADDR_LIMIT {
+                return Err(Error::InvalidArgument);
+            }
+        }
         let mut unmapped = 0;
         for i in 0..nr_pages {
-            let addr = virt_addr + (i as u64) * PAGE_SIZE;
+            let offset = (i as u64)
+                .checked_mul(PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+            let addr = virt_addr
+                .checked_add(offset)
+                .ok_or(Error::InvalidArgument)?;
             for j in 0..MAX_MAPPINGS {
                 if self.mappings[j].in_use && self.mappings[j].virt_addr == addr {
                     self.mappings[j].in_use = false;

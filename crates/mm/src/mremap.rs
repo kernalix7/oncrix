@@ -44,6 +44,16 @@ const PAGE_SIZE: u64 = 4096;
 /// Page alignment mask.
 const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
 
+// SECURITY: bounds for every attacker-supplied virtual address. A target
+// below `MMAP_MIN_ADDR` traps the NULL guard region; an end above
+// `USER_ADDR_LIMIT` would map into kernel / non-canonical space. Mirror of
+// the constants in `mremap_grow.rs` so both engines agree on the split.
+/// Default mmap minimum address (NULL-page guard).
+const MMAP_MIN_ADDR: u64 = 0x1_0000;
+
+/// User-space address limit (canonical x86_64 user maximum).
+const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
+
 // -------------------------------------------------------------------
 // MremapFlags
 // -------------------------------------------------------------------
@@ -360,8 +370,10 @@ impl MremapManager {
             return Err(Error::InvalidArgument);
         }
 
-        let old_size = page_align_up(old_size);
-        let new_size = page_align_up(new_size);
+        // SECURITY: page-align-up an attacker length with checked arithmetic;
+        // an oversized value is rejected instead of panicking (DoS).
+        let old_size = page_align_up(old_size).inspect_err(|_| self.stats.failures += 1)?;
+        let new_size = page_align_up(new_size).inspect_err(|_| self.stats.failures += 1)?;
 
         if new_size == 0 {
             self.stats.failures += 1;
@@ -405,6 +417,22 @@ impl MremapManager {
         // Try moving if allowed.
         if flags.contains(MremapFlags::MAYMOVE) || flags.contains(MremapFlags::FIXED) {
             let target = if flags.contains(MremapFlags::FIXED) {
+                // SECURITY: MREMAP_FIXED supplies the destination directly.
+                // It must be bounded to the user address window before any
+                // VMA placement, otherwise an attacker could relocate a
+                // mapping into kernel / non-canonical space (privilege
+                // escalation). `new_addr + new_size` is computed with
+                // checked_add to avoid an overflow panic (DoS) under
+                // overflow-checks; mirrors `do_fixed_relocate` in
+                // `mremap_grow.rs`.
+                let target_end = new_addr_hint
+                    .checked_add(new_size)
+                    .ok_or(Error::InvalidArgument)
+                    .inspect_err(|_| self.stats.failures += 1)?;
+                if new_addr_hint < MMAP_MIN_ADDR || target_end > USER_ADDR_LIMIT {
+                    self.stats.failures += 1;
+                    return Err(Error::InvalidArgument);
+                }
                 new_addr_hint
             } else {
                 self.find_free_region(new_size)?
@@ -562,7 +590,9 @@ impl MremapManager {
     /// start or end of the VMA (no split needed).
     /// Returns [`Error::OutOfMemory`] if no VMA slot is available.
     pub fn split_vma(&mut self, addr: u64) -> Result<()> {
-        let addr = page_align_up(addr);
+        // SECURITY: page-align-up the supplied address with checked arithmetic
+        // (reject overflow rather than panic in ring 0).
+        let addr = page_align_up(addr)?;
 
         let idx = self
             .vmas
@@ -654,7 +684,14 @@ impl MremapManager {
         }
 
         for i in 0..count {
-            if candidate + size <= ranges[i].0 {
+            // SECURITY: `candidate + size` is an unchecked add on attacker-
+            // influenced sizes; under overflow-checks it would panic in ring 0
+            // (DoS). Use checked_add and treat overflow as "does not fit",
+            // matching the checked_add on the after-last-VMA path below.
+            if candidate
+                .checked_add(size)
+                .is_some_and(|end| end <= ranges[i].0)
+            {
                 return Ok(candidate);
             }
             if ranges[i].1 > candidate {
@@ -695,6 +732,18 @@ impl MremapManager {
 }
 
 /// Rounds `size` up to the next page boundary.
-const fn page_align_up(size: u64) -> u64 {
-    (size + PAGE_SIZE - 1) & PAGE_MASK
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if the rounded value would overflow
+/// `u64` (i.e. `size > u64::MAX - (PAGE_SIZE - 1)`).
+// SECURITY: the previous `(size + PAGE_SIZE - 1) & PAGE_MASK` is an unchecked
+// add on an attacker-supplied length; under overflow-checks a near-`u64::MAX`
+// size panics in ring 0 (DoS). Round up with checked_add and surface the
+// error to the caller; mirrors `pgtable_ops::page_align_up`.
+fn page_align_up(size: u64) -> Result<u64> {
+    Ok(size
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(Error::InvalidArgument)?
+        & PAGE_MASK)
 }

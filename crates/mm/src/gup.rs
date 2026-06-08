@@ -37,6 +37,17 @@ use oncrix_lib::{Error, Result};
 /// Standard page size (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
+/// Exclusive upper bound of the canonical user-space address range on
+/// x86_64 (48-bit). Any pin request whose start lies at or above this,
+/// or whose `start + nr_pages * PAGE_SIZE` end exceeds it, refers to
+/// non-user (kernel / non-canonical) memory and must be rejected before
+/// any page-table walk so a pin can never map kernel or arbitrary
+/// physical memory into user-visible state.
+// SECURITY: bound every attacker-supplied address to the user window
+// before walking page tables; mirrors `USER_ADDR_LIMIT` used by the
+// mmap / munmap sibling paths.
+const USER_ADDR_MAX: u64 = 0x0000_8000_0000_0000;
+
 /// Maximum number of pinned pages per set.
 const MAX_PINNED_PER_SET: usize = 256;
 
@@ -396,10 +407,32 @@ impl GupSubsystem {
     ) -> Result<u32> {
         // Validate inputs.
         Self::validate_flags(flags)?;
+        // SECURITY: `nr_pages` bounds the pin loop and the per-set
+        // `pages` array (capacity `MAX_PINNED_PER_SET`); reject zero and
+        // anything exceeding capacity so the loop index can never run
+        // past the descriptor array.
         if nr_pages == 0 || nr_pages as usize > MAX_PINNED_PER_SET {
             return Err(Error::InvalidArgument);
         }
         if start_addr % PAGE_SIZE != 0 {
+            return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: compute the exclusive end with checked arithmetic so
+        // an attacker-supplied `start_addr` / `nr_pages` can neither wrap
+        // (which would panic under overflow-checks = a ring-0 DoS) nor
+        // alias the kernel half. `span` cannot wrap in practice because
+        // `nr_pages <= MAX_PINNED_PER_SET`, but use checked_mul so the
+        // bound is robust if that cap ever changes.
+        let span = u64::from(nr_pages)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        let end_addr = start_addr.checked_add(span).ok_or(Error::InvalidArgument)?;
+        // SECURITY: confine the whole [start, end) range to the canonical
+        // user window before any page-table walk. `start_addr` must be a
+        // strictly-user address and the exclusive end must not spill past
+        // the user/kernel boundary.
+        if start_addr >= USER_ADDR_MAX || end_addr > USER_ADDR_MAX {
             return Err(Error::InvalidArgument);
         }
 
@@ -419,7 +452,16 @@ impl GupSubsystem {
 
         // Pin each page.
         for page_idx in 0..nr_pages {
-            let virt_addr = start_addr + u64::from(page_idx) * PAGE_SIZE;
+            // SECURITY: derive each page address with checked steps so no
+            // per-page add can wrap and panic. The whole range was bounded
+            // to `< USER_ADDR_MAX` above, so every `virt_addr` here is a
+            // valid user address and `virt_addr < end_addr <= USER_ADDR_MAX`.
+            let offset = u64::from(page_idx)
+                .checked_mul(PAGE_SIZE)
+                .ok_or(Error::InvalidArgument)?;
+            let virt_addr = start_addr
+                .checked_add(offset)
+                .ok_or(Error::InvalidArgument)?;
 
             // Simulate page-table walk to obtain physical address.
             // In a real implementation this would walk the user's
