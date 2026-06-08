@@ -157,13 +157,16 @@ pub unsafe fn wrmsr(msr: u32, val: u64) {
     let lo = val as u32;
     let hi = (val >> 32) as u32;
     // SAFETY: Caller guarantees `msr` is valid and we are in ring 0.
+    // No nomem: callers write memory-typing MSRs (IA32_PAT, IA32_MTRR_*, IA32_EFER) that
+    // change how physical memory is cached/interpreted; nomem would let the compiler
+    // reorder memory accesses across this write, producing stale-caching bugs.
     unsafe {
         core::arch::asm!(
             "wrmsr",
             in("ecx") msr,
             in("eax") lo,
             in("edx") hi,
-            options(nomem, nostack, preserves_flags),
+            options(nostack, preserves_flags),
         );
     }
 }
