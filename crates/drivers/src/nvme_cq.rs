@@ -225,6 +225,34 @@ impl<const DEPTH: usize> CqRing<DEPTH> {
     /// the expected phase, the entry is valid and the head advances.
     ///
     /// Returns `Some(CqEntry)` on success or `None` if the queue is empty.
+    ///
+    /// # Security Contract — callers MUST enforce before acting on the entry
+    ///
+    /// `CqRing::poll` validates only the **phase tag** (hardware liveness
+    /// signal).  It does **not** validate the device-supplied identity fields
+    /// inside the CQE.  Every caller is responsible for two additional checks:
+    ///
+    /// 1. **Queue-identity check** — `entry.sq_id() == self.qid` (or the
+    ///    expected submission-queue ID for this ring).  A rogue device or
+    ///    hypervisor may post a phase-correct CQE with a wrong `sq_id` to
+    ///    cause a false completion on behalf of a different queue.  Discard
+    ///    the entry (advance the head, ring the doorbell, keep polling) if
+    ///    the check fails.
+    ///
+    /// 2. **In-flight CID check** — `entry.command_id()` must correspond to
+    ///    a command that was actually submitted and not yet completed.
+    ///    Accepting a CQE whose CID was never posted (completion spoofing) or
+    ///    whose CID was already completed (duplicate completion / double-free)
+    ///    constitutes a security vulnerability.  Maintain a `[bool; DEPTH]`
+    ///    bitmap (or equivalent fixed-size structure) keyed by CID; set the
+    ///    bit at submit time, clear it exactly once at completion time, and
+    ///    discard any CQE whose bit is not set.
+    ///
+    /// `IoQueuePair::poll_completion` in `nvme_io.rs` implements both checks
+    /// and is the reference for correct usage.
+    // SECURITY: See contract above.  This primitive intentionally delegates
+    // identity validation to callers so that higher-level queue managers can
+    // apply their own in-flight tracking without duplicating ring mechanics.
     pub fn poll(&mut self) -> Option<CqEntry> {
         if !self.active {
             return None;
@@ -378,6 +406,16 @@ impl AdminCq {
     }
 
     /// Poll for the next completion.
+    ///
+    /// # Security Contract
+    ///
+    /// // SECURITY: Returns the raw phase-correct CQE from the ring.
+    /// // Before acting on the returned entry the caller MUST verify:
+    /// //   (1) entry.sq_id() == 0 (admin queue SQ identifier).
+    /// //   (2) entry.command_id() was posted by the driver and is not yet
+    /// //       completed (in-flight CID check via a bitmap or equivalent).
+    /// // Failure to perform these checks allows a rogue device to spoof
+    /// // admin-command completions or inject duplicate completions.
     pub fn poll(&mut self) -> Option<CqEntry> {
         self.inner.poll()
     }
@@ -421,6 +459,18 @@ impl IoCq {
     }
 
     /// Poll for the next completion.
+    ///
+    /// # Security Contract
+    ///
+    /// // SECURITY: Returns the raw phase-correct CQE from the ring.
+    /// // Before acting on the returned entry the caller MUST verify:
+    /// //   (1) entry.sq_id() == self.qid() (own submission-queue identifier).
+    /// //   (2) entry.command_id() was posted by the driver and has not yet
+    /// //       been completed (in-flight CID check via a bitmap or equivalent).
+    /// // Without these checks a rogue device can cause false completions
+    /// // (completion spoofing) or duplicate completions (double-free).
+    /// // `IoQueuePair::poll_completion` in nvme_io.rs is the reference
+    /// // implementation that satisfies this contract.
     pub fn poll(&mut self) -> Option<CqEntry> {
         self.inner.poll()
     }
