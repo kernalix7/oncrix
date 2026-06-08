@@ -718,7 +718,11 @@ impl FuseInodeOps {
             return Err(Error::IoError);
         }
         let (attr, entry_valid, attr_valid) = resp.parse_attr()?;
-        let timeout_abs = cur_time + attr_valid;
+        // attr_valid/entry_valid come from the untrusted FUSE server; bound the
+        // cache-expiry add so an oversized validity cannot overflow cur_time.
+        let timeout_abs = cur_time
+            .checked_add(attr_valid)
+            .ok_or(Error::InvalidArgument)?;
 
         if let Some(inode) = self.table.get_mut(nodeid) {
             inode.get();
@@ -726,7 +730,9 @@ impl FuseInodeOps {
         } else {
             let mut inode = FuseInode::new(nodeid, 0, attr);
             inode.attr_timeout = timeout_abs;
-            inode.entry_timeout = cur_time + entry_valid;
+            inode.entry_timeout = cur_time
+                .checked_add(entry_valid)
+                .ok_or(Error::InvalidArgument)?;
             self.table.insert(inode)?;
         }
         Ok(nodeid)
@@ -754,7 +760,11 @@ impl FuseInodeOps {
         }
         let (attr, _entry_valid, attr_valid) = resp.parse_attr()?;
         if let Some(inode) = self.table.get_mut(nodeid) {
-            inode.update_attr(attr, cur_time + attr_valid);
+            // attr_valid is FUSE-server-controlled; bound the cache-expiry add.
+            let timeout_abs = cur_time
+                .checked_add(attr_valid)
+                .ok_or(Error::InvalidArgument)?;
+            inode.update_attr(attr, timeout_abs);
         }
         Ok(attr)
     }
