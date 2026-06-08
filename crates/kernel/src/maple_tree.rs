@@ -143,7 +143,7 @@ impl MapleTree {
                 break;
             }
             if e.start > cursor && e.start.wrapping_sub(cursor) >= size {
-                if cursor + size <= max_addr {
+                if cursor.checked_add(size).is_some_and(|end| end <= max_addr) {
                     return Some(cursor);
                 }
             }

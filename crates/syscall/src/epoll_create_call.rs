@@ -203,7 +203,7 @@ pub fn do_epoll_ctl(
         EPOLL_CTL_DEL => {
             let idx = epoll.find(fd).ok_or(Error::NotFound)?;
             // Swap with last active entry to keep list compact.
-            let last = epoll.count - 1;
+            let last = epoll.count.checked_sub(1).ok_or(Error::NotFound)?;
             epoll.interest.swap(idx, last);
             epoll.interest[last] = None;
             epoll.count -= 1;

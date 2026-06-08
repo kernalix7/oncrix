@@ -273,7 +273,7 @@ pub fn do_inotify_add_watch(inotify: &mut InotifyInstance, path: &[u8], mask: u3
         return Err(Error::OutOfMemory);
     }
     let wd = inotify.next_wd;
-    inotify.next_wd += 1;
+    inotify.next_wd = wd.checked_add(1).ok_or(Error::OutOfMemory)?;
     let slot = inotify.watch_count;
     inotify.watches[slot] = Some(WatchEntry {
         wd,
