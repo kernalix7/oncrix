@@ -24,6 +24,12 @@ use oncrix_lib::{Error, Result};
 /// Standard page size (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
+/// Top of the user virtual address window (exclusive). Any madvise
+/// range whose end exceeds this leaves the canonical lower half and is
+/// rejected. Mirrors the sibling range-op modules (`mmap_munmap`,
+/// `mincore`, `mremap`, `process_vm`).
+const USER_ADDR_LIMIT: u64 = 0x0000_7FFF_FFFF_F000;
+
 /// Maximum number of VMAs the madvise handler tracks.
 const MAX_VMAS: usize = 256;
 
@@ -317,8 +323,23 @@ impl MadviseOps {
             return Err(Error::InvalidArgument);
         }
 
-        let end = start.saturating_add(len);
-        let aligned_end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // SECURITY: compute the range end with a checked add and reject
+        // overflow. A saturating end would silently widen the range and
+        // an attacker-supplied `len` near u64::MAX would otherwise wrap
+        // (or panic under overflow-checks) before any VMA iteration.
+        let end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
+        // SECURITY: round the end up to a page boundary with a checked
+        // add — `end + PAGE_SIZE - 1` overflows and panics in ring-0 for
+        // an `end` near u64::MAX. The rounded end is then bounded to the
+        // user window so madvise can never target kernel / non-canonical
+        // addresses. Legit (start, len) within the window is unaffected.
+        let aligned_end = end
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(Error::InvalidArgument)?
+            & !(PAGE_SIZE - 1);
+        if aligned_end > USER_ADDR_LIMIT {
+            return Err(Error::InvalidArgument);
+        }
 
         self.stats.total_calls += 1;
 
