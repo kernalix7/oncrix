@@ -396,7 +396,14 @@ impl NonResidentAttr {
         let initialized_size =
             u64::from_le_bytes(buf[56..64].try_into().map_err(|_| Error::InvalidArgument)?);
         let rl_off = run_list_offset as usize;
-        let runs = if rl_off < buf.len() {
+        // SECURITY: rl_off is attacker-controlled on-disk data.  A value smaller
+        // than the minimum non-resident header size (Self::MIN_SIZE = 64) would
+        // cause the run-list decoder to consume bytes from inside the fixed header,
+        // mis-interpreting metadata fields as run-list nibbles.  Reject such values
+        // before slicing, mirroring the guard in ntfs.rs read_data (~line 1081).
+        let runs = if rl_off < Self::MIN_SIZE {
+            return Err(Error::InvalidArgument);
+        } else if rl_off < buf.len() {
             decode_run_list(&buf[rl_off..])?
         } else {
             Vec::new()

@@ -192,7 +192,15 @@ impl<'a> IndexEntryIter<'a> {
         if (entry.length as usize) < INDEX_ENTRY_HEADER_SIZE {
             return Err(Error::InvalidArgument);
         }
-        self.offset += entry.length as usize;
+        // SECURITY: entry.length is on-disk data; an unchecked add can overflow
+        // self.offset, wrapping it to a small value and causing the iterator to
+        // re-parse already-visited bytes (or bytes before the current position).
+        // A value that advances past the end of the buffer is equally invalid.
+        // checked_add + upper-bound guard makes both impossible.
+        match self.offset.checked_add(entry.length as usize) {
+            Some(n) if n <= self.data.len() => self.offset = n,
+            _ => return Err(Error::InvalidArgument),
+        }
         Ok(Some(entry))
     }
 }
