@@ -239,22 +239,46 @@ impl PcieRootComplex {
     ///
     /// * `port` — Port index.
     /// * `bus` / `dev` / `func` / `reg` — BDF + register offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `port` is out of range,
+    /// `dev > 31`, or `func > 7`.
     pub fn ecam_read32(&self, port: usize, bus: u8, dev: u8, func: u8, reg: u16) -> Result<u32> {
         if port >= self.num_ports {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: dev and func are caller-supplied; unmasked values would shift
+        // the ECAM offset outside the valid per-bus 1 MiB window, reaching adjacent
+        // bus or aperture-external memory. Reject rather than mask so callers see
+        // the error instead of silently accessing the wrong device.
+        if dev > 31 || func > 7 {
+            return Err(Error::InvalidArgument);
+        }
         let ecam_base = self.ports[port].config.ecam_base;
+        let ecam_size = self.ports[port].config.ecam_size as u64;
+        // SECURITY: bus is a u8 (0-255); the ECAM window covers a finite aperture.
+        // Guard against a bus value that would exceed the mapped window size.
         let offset = ((bus as u64) << 20)
             | ((dev as u64) << 15)
             | ((func as u64) << 12)
             | (reg as u64 & 0xFFC);
+        if ecam_size > 0 && offset.saturating_add(4) > ecam_size {
+            return Err(Error::InvalidArgument);
+        }
         let ptr = (ecam_base + offset) as *const u32;
-        // SAFETY: ECAM window is memory-mapped; BDF is caller-validated.
+        // SAFETY: ECAM window is memory-mapped; dev/func bounds validated above;
+        // offset checked against aperture size.
         let val = unsafe { core::ptr::read_volatile(ptr) };
         Ok(val)
     }
 
     /// Writes a 32-bit value to the ECAM config space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if `port` is out of range,
+    /// `dev > 31`, or `func > 7`.
     pub fn ecam_write32(
         &self,
         port: usize,
@@ -267,13 +291,23 @@ impl PcieRootComplex {
         if port >= self.num_ports {
             return Err(Error::InvalidArgument);
         }
+        // SECURITY: same argument as ecam_read32 — unmasked dev/func would land
+        // the write outside the intended device's 4 KiB config window.
+        if dev > 31 || func > 7 {
+            return Err(Error::InvalidArgument);
+        }
         let ecam_base = self.ports[port].config.ecam_base;
+        let ecam_size = self.ports[port].config.ecam_size as u64;
         let offset = ((bus as u64) << 20)
             | ((dev as u64) << 15)
             | ((func as u64) << 12)
             | (reg as u64 & 0xFFC);
+        if ecam_size > 0 && offset.saturating_add(4) > ecam_size {
+            return Err(Error::InvalidArgument);
+        }
         let ptr = (ecam_base + offset) as *mut u32;
-        // SAFETY: ECAM window is memory-mapped; BDF is caller-validated.
+        // SAFETY: ECAM window is memory-mapped; dev/func bounds validated above;
+        // offset checked against aperture size.
         unsafe { core::ptr::write_volatile(ptr, val) };
         Ok(())
     }

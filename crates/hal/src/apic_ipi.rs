@@ -209,10 +209,18 @@ pub unsafe fn send_ipi(mode: ApicMode, dest_apic_id: u32, vector: u8, delivery: 
         | ICR_TRIGGER_EDGE
         | ICR_DEST_NO_SHORTHAND
         | (vector as u32);
+    // SECURITY: xAPIC ICR-high holds only bits [63:56] for the destination,
+    // i.e. an 8-bit APIC ID.  Casting a dest_apic_id > 0xFF silently
+    // truncates (e.g. 0x100 → APIC 0), sending the IPI to the wrong CPU.
+    // Reject out-of-range IDs before the xAPIC path.  x2APIC uses the full
+    // u32 destination field and requires no such check.
     // SAFETY: Caller ensures mode, dest, and vector are valid.
     unsafe {
         match mode {
             ApicMode::XApic { base } => {
+                if dest_apic_id > 0xFF {
+                    return Err(Error::InvalidArgument);
+                }
                 send_ipi_xapic(base, dest_apic_id as u8, icr_low)?;
             }
             ApicMode::X2Apic => {

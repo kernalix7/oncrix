@@ -331,8 +331,17 @@ impl PciConfigSpace {
             ConfigAccess::Ecam {
                 base_virt,
                 start_bus,
+                end_bus,
                 ..
-            } => self.ecam_read32(base_virt, start_bus, bus, device, function, offset),
+            } => {
+                // SECURITY: reject reads targeting buses outside the ECAM aperture;
+                // an out-of-range bus would compute an offset beyond the mapped region,
+                // accessing arbitrary physical memory. Return all-ones (no-device sentinel).
+                if bus < start_bus || bus > end_bus {
+                    return 0xFFFF_FFFF;
+                }
+                self.ecam_read32(base_virt, start_bus, bus, device, function, offset)
+            }
         }
     }
 
@@ -345,8 +354,14 @@ impl PciConfigSpace {
             ConfigAccess::Ecam {
                 base_virt,
                 start_bus,
+                end_bus,
                 ..
             } => {
+                // SECURITY: reject writes targeting buses outside the ECAM aperture;
+                // an out-of-range bus would compute an offset beyond the mapped region.
+                if bus < start_bus || bus > end_bus {
+                    return;
+                }
                 self.ecam_write32(base_virt, start_bus, bus, device, function, offset, value);
             }
         }

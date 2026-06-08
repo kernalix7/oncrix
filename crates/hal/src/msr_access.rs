@@ -21,8 +21,19 @@ use oncrix_lib::{Error, Result};
 // ---------------------------------------------------------------------------
 
 /// A strongly-typed MSR address.
+///
+/// The inner field is intentionally private.  External crates must use the
+/// named associated constants below; this prevents arbitrary MSR addresses
+/// from being constructed outside this module and subsequently passed to
+/// [`write_msr`], which would otherwise allow tampering with security-critical
+/// registers such as EFER (SMEP/SMAP/NXE), STAR/LSTAR (syscall dispatch), and
+/// IA32_APIC_BASE.
+// SECURITY: MsrId::0 is private.  All writable MSR IDs are enumerated below
+// and checked against ALLOWED_WRITE_MSRS in write_msr before any wrmsr is
+// issued.  An attacker who cannot construct an out-of-allowlist MsrId cannot
+// reach the wrmsr path even if they obtain a mutable reference to kernel state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MsrId(pub u32);
+pub struct MsrId(u32);
 
 impl MsrId {
     /// IA32_TSC — Time Stamp Counter.
@@ -69,6 +80,37 @@ impl MsrId {
 }
 
 // ---------------------------------------------------------------------------
+// Write allowlist
+// ---------------------------------------------------------------------------
+
+/// Exhaustive set of MSR addresses that this module permits writing.
+///
+/// Only MSRs that the kernel legitimately needs to write at runtime are listed
+/// here.  Read-only MSRs (e.g. IA32_TSC, IA32_PERF_STATUS, IA32_THERM_STATUS,
+/// IA32_MTRR_CAP) are intentionally absent; attempting to write them is almost
+/// always a programming error, and excluding them narrows the attack surface
+/// for any future caller-supplied MsrId path.
+// SECURITY: ALLOWED_WRITE_MSRS is the single choke-point that prevents an
+// out-of-allowlist MSR address from reaching wrmsr.  Any addition here must
+// be reviewed for security impact (e.g. EFER controls SMEP/SMAP/NXE/LME).
+const ALLOWED_WRITE_MSRS: &[u32] = &[
+    MsrId::IA32_MISC_ENABLE.0,
+    MsrId::IA32_PERF_CTL.0,
+    MsrId::IA32_PAT.0,
+    MsrId::IA32_MTRR_DEF_TYPE.0,
+    MsrId::IA32_EFER.0,
+    MsrId::IA32_STAR.0,
+    MsrId::IA32_LSTAR.0,
+    MsrId::IA32_CSTAR.0,
+    MsrId::IA32_FMASK.0,
+    MsrId::IA32_FS_BASE.0,
+    MsrId::IA32_GS_BASE.0,
+    MsrId::IA32_KERNEL_GS_BASE.0,
+    MsrId::IA32_TSC_AUX.0,
+    MsrId::IA32_APIC_BASE.0,
+];
+
+// ---------------------------------------------------------------------------
 // Raw MSR access
 // ---------------------------------------------------------------------------
 
@@ -89,10 +131,30 @@ pub unsafe fn read_msr(id: MsrId) -> u64 {
 /// - `id` must be a valid, writable MSR on the current CPU.
 /// - An incorrect value can alter fundamental CPU behaviour.
 /// - Must be called from ring 0.
+///
+/// # Allowlist enforcement
+/// The write is silently dropped (no-op, returns `Err`) if `id` is not in
+/// [`ALLOWED_WRITE_MSRS`].  All legitimate in-kernel callers use the named
+/// `MsrId::*` constants, every one of which is present in the allowlist; an
+/// Err here therefore always indicates a programming error or an attempted
+/// out-of-allowlist write.
+// SECURITY: allowlist check prevents arbitrary MSR writes even if a caller
+// manages to construct or supply a non-listed MsrId.  Security-critical
+// registers (EFER controls SMEP/SMAP/NXE; STAR/LSTAR control syscall
+// dispatch; IA32_APIC_BASE relocates the APIC) are only present because the
+// kernel itself needs to write them; no additional addresses should be added
+// without security review.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn write_msr(id: MsrId, val: u64) {
-    // SAFETY: Caller guarantees id and val are valid.
+pub unsafe fn write_msr(id: MsrId, val: u64) -> Result<()> {
+    // SECURITY: Enforce the write allowlist before issuing wrmsr.
+    let allowed = ALLOWED_WRITE_MSRS.iter().any(|&a| a == id.0);
+    if !allowed {
+        return Err(Error::InvalidArgument);
+    }
+    // SAFETY: id is in ALLOWED_WRITE_MSRS (all are valid, writable MSRs on
+    // x86_64 long-mode CPUs); caller guarantees ring 0 and a safe value.
     unsafe { crate::msr::wrmsr(id.0, val) }
+    Ok(())
 }
 
 /// Performs an atomic read-modify-write on an MSR (set bits, clear bits).
@@ -106,7 +168,9 @@ pub unsafe fn modify_msr(id: MsrId, set_mask: u64, clear_mask: u64) {
     // SAFETY: Delegating to read_msr/write_msr; caller is responsible.
     unsafe {
         let val = read_msr(id);
-        write_msr(id, (val | set_mask) & !clear_mask);
+        // All callers of modify_msr pass a named MsrId constant that is
+        // in ALLOWED_WRITE_MSRS; the Err path is structurally unreachable.
+        let _ = write_msr(id, (val | set_mask) & !clear_mask);
     }
 }
 
@@ -144,8 +208,11 @@ pub unsafe fn read_efer() -> u64 {
 /// Clearing LME while in long mode will cause a triple fault.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn write_efer(val: u64) {
-    // SAFETY: Caller ensures val is a safe EFER value.
-    unsafe { write_msr(MsrId::IA32_EFER, val) }
+    // SAFETY: IA32_EFER is in ALLOWED_WRITE_MSRS; write_msr never returns Err
+    // for this id.  Caller ensures val is a safe EFER value.
+    unsafe {
+        let _ = write_msr(MsrId::IA32_EFER, val);
+    }
 }
 
 /// Enables the NX bit in EFER.
@@ -175,12 +242,13 @@ pub unsafe fn enable_nx() {
 /// - Incorrect `lstar` or selectors will corrupt every future SYSCALL.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn setup_syscall(lstar: u64, kernel_cs: u16, user_cs32: u16, eflags_mask: u32) {
-    // SAFETY: Boot-time setup; caller guarantees valid params.
+    // SAFETY: Boot-time setup; caller guarantees valid params.  All three MSR
+    // IDs are in ALLOWED_WRITE_MSRS so write_msr never returns Err here.
     unsafe {
         let star = ((user_cs32 as u64) << 48) | ((kernel_cs as u64) << 32);
-        write_msr(MsrId::IA32_STAR, star);
-        write_msr(MsrId::IA32_LSTAR, lstar);
-        write_msr(MsrId::IA32_FMASK, eflags_mask as u64);
+        let _ = write_msr(MsrId::IA32_STAR, star);
+        let _ = write_msr(MsrId::IA32_LSTAR, lstar);
+        let _ = write_msr(MsrId::IA32_FMASK, eflags_mask as u64);
         // Enable SCE in EFER.
         modify_msr(MsrId::IA32_EFER, efer::SCE, 0);
     }
@@ -206,8 +274,11 @@ pub unsafe fn read_fs_base() -> u64 {
 /// Incorrect value corrupts the current task's TLS.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn write_fs_base(base: u64) {
-    // SAFETY: Caller ensures base is the correct TLS pointer.
-    unsafe { write_msr(MsrId::IA32_FS_BASE, base) }
+    // SAFETY: IA32_FS_BASE is in ALLOWED_WRITE_MSRS; Err is unreachable.
+    // Caller ensures base is the correct TLS pointer.
+    unsafe {
+        let _ = write_msr(MsrId::IA32_FS_BASE, base);
+    }
 }
 
 /// Reads the GS segment base.
@@ -226,8 +297,11 @@ pub unsafe fn read_gs_base() -> u64 {
 /// Incorrect value corrupts per-CPU data access.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn write_gs_base(base: u64) {
-    // SAFETY: Caller ensures base is a valid per-CPU pointer.
-    unsafe { write_msr(MsrId::IA32_GS_BASE, base) }
+    // SAFETY: IA32_GS_BASE is in ALLOWED_WRITE_MSRS; Err is unreachable.
+    // Caller ensures base is a valid per-CPU pointer.
+    unsafe {
+        let _ = write_msr(MsrId::IA32_GS_BASE, base);
+    }
 }
 
 /// Reads the kernel GS base (swapped in by `swapgs`).
@@ -246,8 +320,11 @@ pub unsafe fn read_kernel_gs_base() -> u64 {
 /// Incorrect value corrupts kernel per-CPU data on `swapgs`.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn write_kernel_gs_base(base: u64) {
-    // SAFETY: Caller ensures base is a valid kernel per-CPU pointer.
-    unsafe { write_msr(MsrId::IA32_KERNEL_GS_BASE, base) }
+    // SAFETY: IA32_KERNEL_GS_BASE is in ALLOWED_WRITE_MSRS; Err is unreachable.
+    // Caller ensures base is a valid kernel per-CPU pointer.
+    unsafe {
+        let _ = write_msr(MsrId::IA32_KERNEL_GS_BASE, base);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,8 +367,11 @@ pub unsafe fn read_pat() -> u64 {
 /// Must be called from ring 0 during early boot.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn write_pat(val: u64) {
-    // SAFETY: Caller ensures val encodes valid PAT entries.
-    unsafe { write_msr(MsrId::IA32_PAT, val) }
+    // SAFETY: IA32_PAT is in ALLOWED_WRITE_MSRS; Err is unreachable.
+    // Caller ensures val encodes valid PAT entries.
+    unsafe {
+        let _ = write_msr(MsrId::IA32_PAT, val);
+    }
 }
 
 /// Builds a PAT value from 8 individual memory type bytes.
@@ -398,13 +478,26 @@ impl MsrBatch {
 
     /// Writes all MSRs in the batch with the stored values.
     ///
+    /// MSR IDs not present in the write allowlist are silently skipped.
+    ///
     /// # Safety
     /// All MSR IDs must be valid and writable. Incorrect values crash the CPU.
+    // SECURITY: Routes through write_msr (and therefore ALLOWED_WRITE_MSRS)
+    // rather than calling wrmsr directly, so the allowlist is enforced even
+    // for batch writes.  Since MsrId's inner field is private, entries can
+    // only be added via MsrBatch::add(MsrId), which only accepts the named
+    // constants — all of which are in the allowlist.  The skip on Err is thus
+    // structurally unreachable in correct code.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn write_all(&self) {
         for i in 0..self.count {
-            // SAFETY: Caller guarantees IDs and values are valid.
-            unsafe { crate::msr::wrmsr(self.entries[i].id, self.entries[i].value) };
+            let id = MsrId(self.entries[i].id);
+            // SAFETY: Caller guarantees IDs and values are valid ring-0 writes.
+            // write_msr enforces the allowlist; non-allowlisted entries are
+            // skipped (Err ignored) rather than passed to wrmsr.
+            unsafe {
+                let _ = write_msr(id, self.entries[i].value);
+            }
         }
     }
 

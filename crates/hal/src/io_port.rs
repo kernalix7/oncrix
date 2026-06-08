@@ -18,17 +18,39 @@
 use oncrix_lib::{Error, Result};
 
 // ── Port I/O primitives ───────────────────────────────────────────────────────
+//
+// SECURITY: inb / outb / inw / outw / inl / outl are `pub fn` (safe) because
+// they are called from a large number of drivers and HAL modules across the
+// workspace; marking them `unsafe fn` would break those callers and is
+// therefore not feasible without a workspace-wide migration.
+//
+// These functions perform unrestricted ring-0 port I/O: any u16 port value is
+// accepted and the corresponding IN/OUT instruction is executed with no range
+// check.  The safety contract is enforced by convention:
+//   1. All kernel callers run at CPL 0 — userspace cannot reach this code.
+//   2. Driver authors SHOULD register every port range with [`IoPortAllocator`]
+//      before use; this prevents two drivers from claiming overlapping ranges
+//      and documents every port the kernel touches.
+//   3. Callers are responsible for passing only ports they own (i.e. ports
+//      returned / registered via IoPortAllocator::request or well-known fixed
+//      addresses such as 0x3F8 for COM1).
+//
+// A future hardening step would be to make these `unsafe fn` and update all
+// ~50 call sites at once, or to introduce a `OwnedPort` capability type that
+// bundles the port number with proof of IoPortAllocator ownership.
 
 /// Read a byte (8-bit) from an I/O port.
 ///
-/// # Safety (x86_64)
+/// # Caller contract
 ///
 /// Must be called at CPL 0. The port must be accessible to kernel
 /// space (IOPL=0 or the TSS I/O permission bitmap must allow it).
+/// Callers should have registered the port range with [`IoPortAllocator`].
 #[cfg(target_arch = "x86_64")]
 pub fn inb(port: u16) -> u8 {
     let val: u8;
-    // SAFETY: Caller ensures CPL 0 ring and valid port.
+    // SAFETY: Executes the x86 `in al, dx` instruction.  Callers are
+    // exclusively kernel-mode code (CPL 0); see module-level SECURITY note.
     unsafe {
         core::arch::asm!(
             "in al, dx",
@@ -42,12 +64,14 @@ pub fn inb(port: u16) -> u8 {
 
 /// Write a byte (8-bit) to an I/O port.
 ///
-/// # Safety (x86_64)
+/// # Caller contract
 ///
-/// Must be called at CPL 0.
+/// Must be called at CPL 0.  Callers should have registered the port range
+/// with [`IoPortAllocator`].  See module-level SECURITY note.
 #[cfg(target_arch = "x86_64")]
 pub fn outb(port: u16, val: u8) {
-    // SAFETY: Caller ensures CPL 0 ring and valid port.
+    // SAFETY: Executes the x86 `out dx, al` instruction.  Callers are
+    // exclusively kernel-mode code (CPL 0); see module-level SECURITY note.
     unsafe {
         core::arch::asm!(
             "out dx, al",
@@ -59,10 +83,15 @@ pub fn outb(port: u16, val: u8) {
 }
 
 /// Read a 16-bit word from an I/O port.
+///
+/// # Caller contract
+///
+/// Must be called at CPL 0.  See module-level SECURITY note.
 #[cfg(target_arch = "x86_64")]
 pub fn inw(port: u16) -> u16 {
     let val: u16;
-    // SAFETY: Caller ensures CPL 0 ring and valid port.
+    // SAFETY: Executes the x86 `in ax, dx` instruction.  Callers are
+    // exclusively kernel-mode code (CPL 0); see module-level SECURITY note.
     unsafe {
         core::arch::asm!(
             "in ax, dx",
@@ -75,9 +104,14 @@ pub fn inw(port: u16) -> u16 {
 }
 
 /// Write a 16-bit word to an I/O port.
+///
+/// # Caller contract
+///
+/// Must be called at CPL 0.  See module-level SECURITY note.
 #[cfg(target_arch = "x86_64")]
 pub fn outw(port: u16, val: u16) {
-    // SAFETY: Caller ensures CPL 0 ring and valid port.
+    // SAFETY: Executes the x86 `out dx, ax` instruction.  Callers are
+    // exclusively kernel-mode code (CPL 0); see module-level SECURITY note.
     unsafe {
         core::arch::asm!(
             "out dx, ax",
@@ -89,10 +123,15 @@ pub fn outw(port: u16, val: u16) {
 }
 
 /// Read a 32-bit doubleword from an I/O port.
+///
+/// # Caller contract
+///
+/// Must be called at CPL 0.  See module-level SECURITY note.
 #[cfg(target_arch = "x86_64")]
 pub fn inl(port: u16) -> u32 {
     let val: u32;
-    // SAFETY: Caller ensures CPL 0 ring and valid port.
+    // SAFETY: Executes the x86 `in eax, dx` instruction.  Callers are
+    // exclusively kernel-mode code (CPL 0); see module-level SECURITY note.
     unsafe {
         core::arch::asm!(
             "in eax, dx",
@@ -105,9 +144,14 @@ pub fn inl(port: u16) -> u32 {
 }
 
 /// Write a 32-bit doubleword to an I/O port.
+///
+/// # Caller contract
+///
+/// Must be called at CPL 0.  See module-level SECURITY note.
 #[cfg(target_arch = "x86_64")]
 pub fn outl(port: u16, val: u32) {
-    // SAFETY: Caller ensures CPL 0 ring and valid port.
+    // SAFETY: Executes the x86 `out dx, eax` instruction.  Callers are
+    // exclusively kernel-mode code (CPL 0); see module-level SECURITY note.
     unsafe {
         core::arch::asm!(
             "out dx, eax",
