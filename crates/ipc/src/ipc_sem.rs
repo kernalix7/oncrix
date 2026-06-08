@@ -261,6 +261,45 @@ impl SemArray {
         }
     }
 
+    // SECURITY: SysV IPC permission gate (ipc_perm owner/group/mode).
+    //
+    // POSIX.1-2024 / Linux `ipcperms()`: access to a semaphore set is granted
+    // when the caller is privileged, OR when the relevant rwx bits in
+    // `perm.mode` are set for the caller's class (owner → group → other).
+    // For semaphores the meaningful classes are *read* (alter==false) and
+    // *alter/write* (alter==true), each mapping to the read (0o4) and write
+    // (0o2) octal bits of the owner/group/other triad. Without this gate any
+    // process could read or modify another user's semaphore set.
+    //
+    // NOTE: a per-task group credential is not threaded to this layer yet, so
+    // the group triad cannot be evaluated here. To fail closed we treat every
+    // non-owner, non-privileged caller as the "other" class (only uid matches
+    // against perm.uid/perm.cuid select the owner class). The dispatcher MUST
+    // pass the authenticated caller_uid (never a userspace-supplied value) and
+    // SHOULD extend this with the caller's group set to honour the gid triad.
+    fn check_perm(&self, caller_uid: u32, is_privileged: bool, alter: bool) -> Result<()> {
+        if is_privileged {
+            return Ok(());
+        }
+        let want = if alter { 0o2u16 } else { 0o4u16 };
+        // Select the permission triad by caller class.
+        let granted = if caller_uid == self.perm.uid || caller_uid == self.perm.cuid {
+            // Owner/creator class: bits 0o700 shifted to the rwx position.
+            (self.perm.mode >> 6) & 0o7
+        } else {
+            // No per-task group credential is wired here; treat every other
+            // caller as the "other" class and fail closed on the owner/group
+            // bits. (When group membership is threaded, add a gid==perm.gid
+            // branch selecting `(mode >> 3) & 0o7`.)
+            self.perm.mode & 0o7
+        };
+        if granted & want != 0 {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied)
+        }
+    }
+
     /// Attempt a single `Sembuf` operation.
     ///
     /// Returns `WouldBlock` if the semaphore is not immediately available.
@@ -527,6 +566,18 @@ pub fn semget(
 /// `IPC_NOWAIT` is not set, `WouldBlock` is returned and the array
 /// is left unmodified (no partial application in this implementation).
 pub fn semop(registry: &mut SemRegistry, sem_id: usize, sops: &[Sembuf], pid: u32) -> Result<()> {
+    // SECURITY INVARIANT: semop alters another process's semaphore set but this
+    // signature does not carry an authenticated caller credential, so it CANNOT
+    // perform the SysV ipc_perm (owner/group/mode) gate that POSIX.1-2024 /
+    // Linux `ipcperms()` requires. Any op with a non-zero `sem_op` is an *alter*
+    // (needs write/0o2) and a zero `sem_op` is a *read/wait-for-zero* (needs
+    // read/0o4). The dispatcher MUST pass the kernel-authenticated caller_uid
+    // (and group set / is_privileged) and gate every operation in `sops` on
+    // `SemArray::check_perm` BEFORE this function mutates any value — otherwise
+    // any process can read or alter another user's semaphore set. Until that
+    // wiring exists this remains an authorization gap; do NOT treat the absence
+    // of a check here as intentional world-access. (See `check_perm` above and
+    // the already-gated `semctl` read/alter commands for the required policy.)
     registry.check_sem_id(sem_id)?;
 
     if sops.is_empty() {
@@ -702,10 +753,11 @@ pub fn semctl(
 
         IPC_STAT => {
             registry.check_sem_id(sem_id)?;
-            let _ds = registry.arrays[sem_id]
-                .as_ref()
-                .ok_or(Error::NotFound)?
-                .stat();
+            let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+            // SECURITY: IPC_STAT discloses owner/perm/value metadata — gate on
+            // read permission (mode bit 0o4 for the caller's class).
+            array.check_perm(caller_uid, is_privileged, false)?;
+            let _ds = array.stat();
             // In a real kernel this would copy `_ds` to user-space.
             Ok(0)
         }
@@ -735,6 +787,8 @@ pub fn semctl(
             registry.check_sem_id(sem_id)?;
             let idx = sem_num as usize;
             let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+            // SECURITY: reading a semaphore value requires read permission.
+            array.check_perm(caller_uid, is_privileged, false)?;
             array.check_sem_num(idx)?;
             Ok(array.sems[idx].value)
         }
@@ -746,6 +800,8 @@ pub fn semctl(
             }
             let idx = sem_num as usize;
             let array = registry.arrays[sem_id].as_mut().ok_or(Error::NotFound)?;
+            // SECURITY: altering a semaphore value requires write permission.
+            array.check_perm(caller_uid, is_privileged, true)?;
             array.check_sem_num(idx)?;
             array.sems[idx].value = arg_val;
             array.sem_ctime = array.sem_ctime.wrapping_add(1);
@@ -756,6 +812,8 @@ pub fn semctl(
             registry.check_sem_id(sem_id)?;
             let idx = sem_num as usize;
             let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+            // SECURITY: GETPID discloses the last-operating PID — read gate.
+            array.check_perm(caller_uid, is_privileged, false)?;
             array.check_sem_num(idx)?;
             Ok(array.sems[idx].sempid as i32)
         }
@@ -764,6 +822,8 @@ pub fn semctl(
             registry.check_sem_id(sem_id)?;
             let idx = sem_num as usize;
             let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+            // SECURITY: GETNCNT discloses waiter counts — read gate.
+            array.check_perm(caller_uid, is_privileged, false)?;
             array.check_sem_num(idx)?;
             Ok(array.sems[idx].semncnt as i32)
         }
@@ -772,6 +832,8 @@ pub fn semctl(
             registry.check_sem_id(sem_id)?;
             let idx = sem_num as usize;
             let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+            // SECURITY: GETZCNT discloses waiter counts — read gate.
+            array.check_perm(caller_uid, is_privileged, false)?;
             array.check_sem_num(idx)?;
             Ok(array.sems[idx].semzcnt as i32)
         }
@@ -779,6 +841,8 @@ pub fn semctl(
         GETALL => {
             registry.check_sem_id(sem_id)?;
             let array = registry.arrays[sem_id].as_ref().ok_or(Error::NotFound)?;
+            // SECURITY: GETALL reads every semaphore value — read gate.
+            array.check_perm(caller_uid, is_privileged, false)?;
             let count = array.nsems.min(arg_array.len());
             for i in 0..count {
                 arg_array[i] = array.sems[i].value;
@@ -796,6 +860,8 @@ pub fn semctl(
                 }
             }
             let array = registry.arrays[sem_id].as_mut().ok_or(Error::NotFound)?;
+            // SECURITY: SETALL overwrites every semaphore value — write gate.
+            array.check_perm(caller_uid, is_privileged, true)?;
             let count = array.nsems.min(arg_array.len());
             for i in 0..count {
                 array.sems[i].value = arg_array[i];
