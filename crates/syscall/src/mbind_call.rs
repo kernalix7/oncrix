@@ -19,6 +19,7 @@
 //! - `mbind(2)` man page
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // Re-export shared constants.
 pub use crate::set_mempolicy_call::{
@@ -67,6 +68,12 @@ pub fn sys_mbind(
         return Err(Error::InvalidArgument);
     }
     if len == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    // Guard against addr+len overflow and confine the range to the canonical
+    // user-space window before any NUMA policy walk.
+    let end = addr.checked_add(len).ok_or(Error::InvalidArgument)?;
+    if addr < USER_SPACE_START || end > USER_SPACE_END.saturating_add(1) {
         return Err(Error::InvalidArgument);
     }
     if !is_valid_mode(mode) {
@@ -145,7 +152,8 @@ mod tests {
 
     #[test]
     fn valid_mbind_reaches_stub() {
-        let r = sys_mbind(0x1000, 4096, MPOL_INTERLEAVE, 0x2000, 8, MPOL_MF_MOVE);
+        // In-range user address (>= USER_SPACE_START) so the call reaches the stub.
+        let r = sys_mbind(0x0040_0000, 4096, MPOL_INTERLEAVE, 0x2000, 8, MPOL_MF_MOVE);
         assert_eq!(r.unwrap_err(), Error::NotImplemented);
     }
 }

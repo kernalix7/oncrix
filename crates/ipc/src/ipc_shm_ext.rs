@@ -28,6 +28,12 @@ const SHM_EXT_MAX: usize = 64;
 /// Maximum number of users tracked in memory accounting.
 const SHM_ACCT_MAX_USERS: usize = 32;
 
+/// Maximum size of a single extended SHM segment (512 MiB).
+///
+/// Matches the `shmmax` value reported by `shmctl_ext(IPC_INFO)`.
+/// Prevents accounting corruption from near-`u64::MAX` attacker-supplied sizes.
+const SHMMAX: u64 = 0x2000_0000;
+
 /// Maximum number of NUMA nodes supported.
 const NUMA_NODES_MAX: usize = 16;
 
@@ -434,6 +440,9 @@ pub fn shmget_ext(
     numa_policy: ShmNumaPolicy,
 ) -> Result<()> {
     if size == 0 {
+        return Err(Error::InvalidArgument);
+    }
+    if size > SHMMAX {
         return Err(Error::InvalidArgument);
     }
 

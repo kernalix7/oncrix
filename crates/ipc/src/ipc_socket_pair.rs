@@ -486,7 +486,7 @@ pub fn create_pair(
 
     let pair_id = registry.next_id;
     registry.pairs[free_idx] = Some(SocketPair::new(pair_id, &flags));
-    registry.next_id += 1;
+    registry.next_id = registry.next_id.checked_add(1).ok_or(Error::OutOfMemory)?;
     registry.count += 1;
 
     Ok(pair_id)

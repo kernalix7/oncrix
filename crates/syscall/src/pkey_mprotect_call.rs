@@ -18,6 +18,7 @@
 //! - `pkey_mprotect(2)` man page
 
 use oncrix_lib::{Error, Result};
+use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 
 // Re-export the protection key limit from the pkey module.
 pub use crate::pkey::PKEY_MAX;
@@ -78,6 +79,13 @@ pub fn sys_pkey_mprotect(addr: u64, len: usize, prot: i32, pkey: i32) -> Result<
     if len == 0 {
         return Err(Error::InvalidArgument);
     }
+    // Guard against addr+len overflow and confine the range to the canonical
+    // user-space window before any mapping walk.
+    let len64 = len as u64;
+    let end = addr.checked_add(len64).ok_or(Error::InvalidArgument)?;
+    if addr < USER_SPACE_START || end > USER_SPACE_END.saturating_add(1) {
+        return Err(Error::InvalidArgument);
+    }
     if !prot_valid(prot) {
         return Err(Error::InvalidArgument);
     }
@@ -136,14 +144,15 @@ mod tests {
 
     #[test]
     fn pkey_minus_one_removes_association() {
-        // pkey = -1 is valid (removes association).
-        let r = sys_pkey_mprotect(0x1000, 4096, PROT_READ | PROT_WRITE, -1);
+        // pkey = -1 is valid (removes association). Use an in-range user address
+        // (>= USER_SPACE_START) so the call reaches the stub rather than the range guard.
+        let r = sys_pkey_mprotect(0x0040_0000, 4096, PROT_READ | PROT_WRITE, -1);
         assert_eq!(r.unwrap_err(), Error::NotImplemented);
     }
 
     #[test]
     fn valid_call_reaches_stub() {
-        let r = sys_pkey_mprotect(0x2000, 8192, PROT_READ, 0);
+        let r = sys_pkey_mprotect(0x0040_0000, 8192, PROT_READ, 0);
         assert_eq!(r.unwrap_err(), Error::NotImplemented);
     }
 }
