@@ -1264,16 +1264,71 @@ pub fn unshare(
         return Err(Error::PermissionDenied);
     }
 
+    // SECURITY: make the multi-namespace creation all-or-nothing. The
+    // previous loop created namespaces and mutated `ns_set` incrementally,
+    // so a mid-loop registry `OutOfMemory` left already-created namespaces
+    // leaked in the registry and `ns_set` half-rewritten while still
+    // returning `Err`. Here we (1) collect the requested types, (2) reserve
+    // capacity up front so the loop cannot fail partway, (3) create into a
+    // scratch buffer, rolling back every namespace made in *this* call on
+    // any failure, and (4) commit to `ns_set` only once all creations
+    // succeeded.
+
+    // (1) Collect requested (ns_type, parent_id) pairs. Bounded by
+    // NS_TYPE_COUNT, so this fixed-size scratch buffer never overflows.
+    let mut requested: [(NamespaceType, u64); NS_TYPE_COUNT] =
+        [(NamespaceType::Mount, 0); NS_TYPE_COUNT];
+    let mut requested_len = 0usize;
     let mut i = 0;
     while i < NS_TYPE_COUNT {
         let ns_type = ALL_TYPES[i];
-        let flag = NsFlags::for_type(ns_type);
-        if flags.contains(flag) {
-            let parent_id = ns_set.get(ns_type);
-            let new_id = registry.create(ns_type, parent_id)?;
-            ns_set.set(ns_type, new_id);
+        if flags.contains(NsFlags::for_type(ns_type)) {
+            requested[requested_len] = (ns_type, ns_set.get(ns_type));
+            requested_len = requested_len.saturating_add(1);
         }
         i = i.saturating_add(1);
+    }
+
+    // (2) Reserve capacity: refuse before mutating anything if the registry
+    // cannot hold every requested namespace. Prevents a partway failure.
+    if registry.len().saturating_add(requested_len) > MAX_NAMESPACES {
+        return Err(Error::OutOfMemory);
+    }
+
+    // (3) Create into a scratch buffer. On any failure, roll back every
+    // namespace created in this call and leave `ns_set` untouched.
+    let mut created: [(NamespaceType, u64); NS_TYPE_COUNT] =
+        [(NamespaceType::Mount, 0); NS_TYPE_COUNT];
+    let mut created_len = 0usize;
+    let mut j = 0;
+    while j < requested_len {
+        let (ns_type, parent_id) = requested[j];
+        match registry.create(ns_type, parent_id) {
+            Ok(new_id) => {
+                created[created_len] = (ns_type, new_id);
+                created_len = created_len.saturating_add(1);
+            }
+            Err(e) => {
+                // SECURITY: roll back partial state so no namespace leaks
+                // and `ns_set` is never half-mutated on the error path.
+                let mut k = 0;
+                while k < created_len {
+                    let _ = registry.destroy(created[k].1);
+                    k = k.saturating_add(1);
+                }
+                return Err(e);
+            }
+        }
+        j = j.saturating_add(1);
+    }
+
+    // (4) Commit: all creations succeeded, so publish the new IDs into the
+    // caller's namespace set in one pass.
+    let mut m = 0;
+    while m < created_len {
+        let (ns_type, new_id) = created[m];
+        ns_set.set(ns_type, new_id);
+        m = m.saturating_add(1);
     }
     Ok(())
 }

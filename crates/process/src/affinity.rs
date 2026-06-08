@@ -55,8 +55,47 @@ impl CpuSet {
     }
 
     /// Create from raw bitmask.
+    ///
+    /// # Security
+    ///
+    /// This constructor is **unchecked**: it stores the raw 64-bit mask
+    /// verbatim, including bits for offline or out-of-range CPUs. It
+    /// bypasses the bounded constructors ([`single`](Self::single),
+    /// [`set`](Self::set), [`from_range`](Self::from_range)) which all clamp
+    /// to [`MAX_CPUS`]. A user-supplied mask MUST instead be funnelled
+    /// through [`from_bits_checked`](Self::from_bits_checked) so a bit for a
+    /// CPU that is not online cannot be persisted into the affinity table
+    /// and later steer scheduling onto a non-existent CPU.
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
+    }
+
+    /// Create from a raw bitmask, masking off any CPU bit at or above
+    /// `online`.
+    ///
+    /// `online` is the count of online CPUs (capped at [`MAX_CPUS`]). Every
+    /// bit `>= online` is cleared before the value is stored, so an
+    /// attacker-supplied mask can never reference an offline or
+    /// out-of-range CPU. The result is empty if no in-range bit was set;
+    /// callers that require a non-empty set (e.g. `sched_setaffinity`)
+    /// detect this via the downstream [`AffinityTable::set_affinity`]
+    /// empty-set rejection.
+    ///
+    /// # Security
+    ///
+    /// This is the bounded counterpart to [`from_bits`](Self::from_bits) and
+    /// is the only constructor that should be applied to an
+    /// untrusted/user-supplied raw mask.
+    pub const fn from_bits_checked(bits: u64, online: usize) -> Self {
+        // Build a low-`online`-bits mask, saturating at the full 64-bit
+        // width when `online >= MAX_CPUS` to avoid a shift overflow.
+        let valid = if online >= MAX_CPUS {
+            u64::MAX
+        } else {
+            // online < MAX_CPUS (<= 64) ⇒ 1u64 << online is well-defined.
+            (1u64 << online) - 1
+        };
+        Self(bits & valid)
     }
 
     /// Return raw bitmask.
@@ -299,11 +338,80 @@ impl Default for AffinityTable {
 ///
 /// Sets the CPU affinity mask for the specified process.
 ///
+/// # SECURITY INVARIANT (unauthenticated entry point)
+///
+/// This function performs **no permission check** and **no online-CPU
+/// validation**: it pins an arbitrary `pid` to a caller-chosen `cpuset`.
+/// On Linux, `sched_setaffinity(2)` on a *foreign* task is privileged —
+/// the caller must hold `CAP_SYS_NICE` or have an effective UID equal to
+/// the target's real or effective UID; otherwise it is `EPERM`. No
+/// per-task credential is threaded into this signature and no out-of-file
+/// caller exists, so the gate cannot be applied here without a credential
+/// in scope.
+///
+/// The dispatcher MUST therefore call
+/// [`do_sched_setaffinity_checked`] instead, passing the authenticated
+/// caller credentials, the resolved target effective UID, and the online-
+/// CPU count. This bare wrapper is retained only for the privileged
+/// in-kernel self-pin path (caller acting on a task it already owns) and
+/// must never be reached directly from an untrusted syscall boundary.
+///
 /// # Errors
 ///
-/// Returns [`Error::InvalidArgument`] if the mask is empty or
-/// `cpusetsize` is 0.
+/// Returns [`Error::InvalidArgument`] if the mask is empty.
 pub fn do_sched_setaffinity(table: &mut AffinityTable, pid: Pid, cpuset: CpuSet) -> Result<()> {
+    table.set_affinity(pid, cpuset)
+}
+
+/// Handle `sched_setaffinity(pid, cpusetsize, mask)` with full
+/// authorization and online-CPU validation. This is the entry point a
+/// syscall dispatcher MUST use for any request crossing an untrusted
+/// boundary.
+///
+/// `caller` is the authenticated calling process's credentials.
+/// `cap_sys_nice` is `true` if the caller holds `CAP_SYS_NICE` in its
+/// effective set (the capability is resolved by the dispatcher, which owns
+/// the capability subsystem). `target_euid` is the effective UID of the
+/// process identified by `pid`. `mask_bits` is the raw, untrusted CPU
+/// bitmask supplied by user space and `online` is the current online-CPU
+/// count.
+///
+/// # Security
+///
+/// * **Authorization (fail-closed).** The pin is permitted only when the
+///   caller is privileged (`CAP_SYS_NICE` or effective UID 0) **or** the
+///   caller's effective UID equals the target's effective UID. Any other
+///   case is denied with [`Error::PermissionDenied`] before the table is
+///   touched, so an unprivileged process can never repin a foreign task.
+/// * **Mask validation.** The raw `mask_bits` are funnelled through
+///   [`CpuSet::from_bits_checked`] so bits for offline/out-of-range CPUs
+///   are dropped and can never be persisted.
+///
+/// # Errors
+///
+/// - [`Error::PermissionDenied`] if the caller may not pin `pid`
+/// - [`Error::InvalidArgument`] if the validated mask is empty (no online
+///   CPU selected) or the table cannot accept the entry
+pub fn do_sched_setaffinity_checked(
+    table: &mut AffinityTable,
+    caller: &crate::cred::Credentials,
+    cap_sys_nice: bool,
+    pid: Pid,
+    target_euid: crate::cred::Uid,
+    mask_bits: u64,
+    online: usize,
+) -> Result<()> {
+    // SECURITY: gate before any state mutation. Privileged (CAP_SYS_NICE or
+    // euid 0) or same-effective-UID callers only; everything else is denied.
+    let privileged = cap_sys_nice || caller.is_root();
+    if !privileged && caller.euid() != target_euid {
+        return Err(Error::PermissionDenied);
+    }
+
+    // SECURITY: clamp the untrusted mask to online CPUs before storing so an
+    // offline/out-of-range CPU bit cannot enter the affinity table. An empty
+    // result is rejected by `set_affinity` as `InvalidArgument`.
+    let cpuset = CpuSet::from_bits_checked(mask_bits, online);
     table.set_affinity(pid, cpuset)
 }
 
