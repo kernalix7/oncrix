@@ -115,15 +115,19 @@ pub fn dmb() {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: DMB ISH is the inner-shareable data memory barrier for AArch64.
+        // No nomem: dmb is a memory-ordering fence; nomem would let the compiler reorder
+        // Rust loads/stores across it, completely defeating its purpose.
         unsafe {
-            core::arch::asm!("dmb ish", options(nostack, nomem));
+            core::arch::asm!("dmb ish", options(nostack));
         }
     }
     #[cfg(target_arch = "riscv64")]
     {
         // SAFETY: fence rw,rw is the RISC-V data memory barrier.
+        // No nomem: this fence orders Rust loads/stores; nomem would let the compiler reorder
+        // them across it, completely defeating its purpose.
         unsafe {
-            core::arch::asm!("fence rw, rw", options(nostack, nomem));
+            core::arch::asm!("fence rw, rw", options(nostack));
         }
     }
 }
@@ -144,15 +148,19 @@ pub fn dsb() {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: DSB ISH ensures all memory accesses and cache ops complete.
+        // No nomem: this fence must order all preceding memory accesses against subsequent
+        // ones; nomem would let the compiler reorder Rust loads/stores across it.
         unsafe {
-            core::arch::asm!("dsb ish", options(nostack, nomem));
+            core::arch::asm!("dsb ish", options(nostack));
         }
     }
     #[cfg(target_arch = "riscv64")]
     {
         // SAFETY: fence iorw,iorw is the strongest RISC-V memory ordering.
+        // No nomem: this fence must order all preceding memory accesses against subsequent
+        // ones; nomem would let the compiler reorder Rust loads/stores across it.
         unsafe {
-            core::arch::asm!("fence iorw, iorw", options(nostack, nomem));
+            core::arch::asm!("fence iorw, iorw", options(nostack));
         }
     }
 }
@@ -289,8 +297,10 @@ fn cache_op_range(vaddr: usize, size: usize, op: CacheOp) {
             addr += line_size;
         }
         // SAFETY: DSB ISH ensures all DC operations complete.
+        // No nomem: this fence must order the preceding DC cache operations against subsequent
+        // memory accesses; nomem would let the compiler hoist stores past it.
         unsafe {
-            core::arch::asm!("dsb ish", options(nostack, nomem));
+            core::arch::asm!("dsb ish", options(nostack));
         }
     }
 
@@ -310,6 +320,8 @@ fn flush_all_aarch64() {
         );
         // Full set/way flush omitted for brevity — real implementation
         // would iterate all sets and ways per level.
-        core::arch::asm!("dsb ish", options(nostack, nomem));
+        // No nomem: this fence must order the preceding cache flush against subsequent memory
+        // accesses; nomem would let the compiler reorder stores across it.
+        core::arch::asm!("dsb ish", options(nostack));
     }
 }
