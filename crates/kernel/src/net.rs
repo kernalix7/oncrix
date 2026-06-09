@@ -555,11 +555,20 @@ pub struct IcmpHeader {
 /// # Errors
 ///
 /// - [`Error::InvalidArgument`] if `data` is shorter than the ICMP
-///   header or `reply_buf` is too small to hold the reply.
+///   header, has an invalid checksum, or `reply_buf` is too small to
+///   hold the reply.
 /// - [`Error::NotImplemented`] if the ICMP type is not an echo
 ///   request.
 pub fn handle_icmp(_header: &Ipv4Header, data: &[u8], reply_buf: &mut [u8]) -> Result<usize> {
     if data.len() < ICMP_HEADER_LEN {
+        return Err(Error::InvalidArgument);
+    }
+
+    // SECURITY: ICMP carries an Internet checksum over the entire
+    // message.  Drop corrupt or forged packets before we generate any
+    // response; otherwise an attacker can make us answer traffic that
+    // the receiver should have discarded at L4.
+    if ipv4_checksum(data) != 0 {
         return Err(Error::InvalidArgument);
     }
 
@@ -1039,13 +1048,16 @@ mod tests {
             src_addr: [10, 0, 0, 1],
             dst_addr: [10, 0, 0, 2],
         };
-        // Echo request: type=8, code=0, cksum=0, id=1, seq=1.
+        // Echo request: type=8, code=0, id=1, seq=1.
         #[rustfmt::skip]
-        let icmp_data: [u8; 12] = [
+        let mut icmp_data: [u8; 12] = [
             0x08, 0x00, 0x00, 0x00,
             0x00, 0x01, 0x00, 0x01,
             0xAA, 0xBB, 0xCC, 0xDD,
         ];
+        let checksum = ipv4_checksum(&icmp_data).to_be_bytes();
+        icmp_data[2] = checksum[0];
+        icmp_data[3] = checksum[1];
         let mut reply = [0u8; 64];
         let len = handle_icmp(&ip_hdr, &icmp_data, &mut reply).unwrap();
         assert_eq!(len, 12);
@@ -1055,6 +1067,31 @@ mod tests {
         assert_eq!(&reply[8..12], &[0xAA, 0xBB, 0xCC, 0xDD]);
         // Checksum should verify to zero.
         assert_eq!(ipv4_checksum(&reply[..len]), 0);
+    }
+
+    #[test]
+    fn test_icmp_bad_checksum_rejected() {
+        let ip_hdr = Ipv4Header {
+            version_ihl: 0x45,
+            tos: 0,
+            total_len: 28,
+            id: 1,
+            flags_frag: 0,
+            ttl: 64,
+            protocol: PROTO_ICMP,
+            checksum: 0,
+            src_addr: [10, 0, 0, 1],
+            dst_addr: [10, 0, 0, 2],
+        };
+        #[rustfmt::skip]
+        let icmp_data: [u8; 12] = [
+            0x08, 0x00, 0x12, 0x34,
+            0x00, 0x01, 0x00, 0x01,
+            0xAA, 0xBB, 0xCC, 0xDD,
+        ];
+        let mut reply = [0u8; 64];
+
+        assert!(handle_icmp(&ip_hdr, &icmp_data, &mut reply).is_err());
     }
 
     #[test]
