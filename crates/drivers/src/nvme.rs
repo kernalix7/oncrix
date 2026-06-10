@@ -925,7 +925,10 @@ impl NvmeNamespace {
         if buffer.len() < needed {
             return Err(Error::InvalidArgument);
         }
-        if lba + count as u64 > self.size_blocks {
+        if lba
+            .checked_add(count as u64)
+            .is_none_or(|end| end > self.size_blocks)
+        {
             return Err(Error::InvalidArgument);
         }
 
@@ -965,7 +968,10 @@ impl NvmeNamespace {
         if buffer.len() < needed {
             return Err(Error::InvalidArgument);
         }
-        if lba + count as u64 > self.size_blocks {
+        if lba
+            .checked_add(count as u64)
+            .is_none_or(|end| end > self.size_blocks)
+        {
             return Err(Error::InvalidArgument);
         }
 
@@ -1034,7 +1040,9 @@ impl NvmeNamespace {
 
     /// Returns the total capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
-        self.size_blocks * self.block_size as u64
+        // size_blocks is the device-supplied Identify-Namespace nsze (untrusted
+        // u64); saturate so a hostile value cannot overflow the multiply.
+        self.size_blocks.saturating_mul(self.block_size as u64)
     }
 }
 

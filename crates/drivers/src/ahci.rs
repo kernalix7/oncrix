@@ -1426,7 +1426,9 @@ impl AhciDisk {
 
     /// Return the disk capacity in bytes.
     pub const fn capacity_bytes(&self) -> u64 {
-        self.total_sectors * SECTOR_SIZE as u64
+        // total_sectors comes from device-supplied ATA IDENTIFY data (untrusted);
+        // saturate so a hostile value cannot overflow the multiply.
+        self.total_sectors.saturating_mul(SECTOR_SIZE as u64)
     }
 
     /// Identify the device by issuing the ATA IDENTIFY command.
