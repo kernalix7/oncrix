@@ -176,7 +176,8 @@ pub struct DiscInfo {
 impl DiscInfo {
     /// Returns the total capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
-        self.total_sectors * self.sector_size as u64
+        // total_sectors/sector_size come from the device TOC; saturate the mul.
+        self.total_sectors.saturating_mul(self.sector_size as u64)
     }
 }
 

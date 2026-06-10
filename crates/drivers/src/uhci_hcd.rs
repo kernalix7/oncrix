@@ -264,7 +264,7 @@ impl UhciHcd {
             unsafe {
                 core::arch::asm!(
                     "in al, dx",
-                    in("dx") self.io_base + offset,
+                    in("dx") self.io_base.wrapping_add(offset),
                     out("al") val,
                     options(nomem, nostack)
                 );
@@ -283,7 +283,7 @@ impl UhciHcd {
             unsafe {
                 core::arch::asm!(
                     "in ax, dx",
-                    in("dx") self.io_base + offset,
+                    in("dx") self.io_base.wrapping_add(offset),
                     out("ax") val,
                     options(nomem, nostack)
                 );

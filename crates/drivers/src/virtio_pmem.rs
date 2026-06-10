@@ -219,7 +219,9 @@ pub struct PmemInfo {
 impl PmemInfo {
     /// Return the (exclusive) end physical address of the pmem range.
     pub const fn end_pa(&self) -> u64 {
-        self.start_pa + self.size
+        // start_pa and size are device-MMIO config values; saturate so a hostile
+        // device cannot overflow the end-address computation.
+        self.start_pa.saturating_add(self.size)
     }
 
     /// Return whether the range is valid (non-zero size and aligned).
@@ -594,7 +596,7 @@ impl VirtioPmemRegistry {
             .iter()
             .flatten()
             .map(|d| d.pmem_info().size)
-            .sum()
+            .fold(0u64, |acc, sz| acc.saturating_add(sz))
     }
 
     /// Return the number of registered devices.

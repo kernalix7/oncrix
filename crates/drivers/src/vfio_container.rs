@@ -185,7 +185,9 @@ impl VfioDmaMap {
     /// Returns `None` if the address is outside this mapping.
     pub const fn translate(&self, iova_addr: u64) -> Option<u64> {
         if self.contains_iova(iova_addr) {
-            Some(self.phys_addr + (iova_addr - self.iova))
+            // contains_iova guarantees iova_addr >= self.iova (sub is safe);
+            // checked_add guards a phys_addr+offset overflow (returns None).
+            self.phys_addr.checked_add(iova_addr - self.iova)
         } else {
             None
         }
