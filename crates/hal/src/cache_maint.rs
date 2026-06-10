@@ -198,8 +198,11 @@ pub fn isb() {
     #[cfg(target_arch = "riscv64")]
     {
         // SAFETY: fence.i ensures the instruction cache is coherent with memory.
+        // No nomem: unlike aarch64 `isb` (a pure pipeline sync), fence.i orders
+        // prior data stores against the subsequent instruction fetch; nomem would
+        // let the compiler hoist code-writing stores past it -> stale fetch.
         unsafe {
-            core::arch::asm!("fence.i", options(nostack, nomem));
+            core::arch::asm!("fence.i", options(nostack));
         }
     }
 }
