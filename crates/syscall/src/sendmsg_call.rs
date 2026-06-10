@@ -190,7 +190,15 @@ impl MsgHdr {
 
     /// Calculate the total data length across all `iov` entries.
     pub fn total_data_len(&self) -> usize {
-        self.iov[..self.iov_count].iter().map(|v| v.size()).sum()
+        // `iov_count` is validated against IOV_MAX (1024) but the inline backing
+        // store holds only `iov.len()` (8) entries, so clamp the slice to the
+        // array bound to avoid an out-of-bounds panic, and saturate the sum so
+        // attacker-chosen iov_len values cannot overflow it.
+        let n = self.iov_count.min(self.iov.len());
+        self.iov[..n]
+            .iter()
+            .map(|v| v.size())
+            .fold(0usize, |acc, s| acc.saturating_add(s))
     }
 }
 

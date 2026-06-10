@@ -164,7 +164,9 @@ pub fn do_preadv2(
     }
 
     let bytes_read = total_req.min(available);
-    let new_offset = effective_offset + bytes_read as i64;
+    let new_offset = effective_offset
+        .checked_add(bytes_read as i64)
+        .ok_or(Error::InvalidArgument)?;
 
     Ok(PreadvResult {
         bytes_read,
@@ -231,7 +233,9 @@ pub fn do_pwritev2(
         offset
     };
 
-    let new_offset = write_offset + total as i64;
+    let new_offset = write_offset
+        .checked_add(total as i64)
+        .ok_or(Error::InvalidArgument)?;
     Ok(PwritevResult {
         bytes_written: total,
         new_offset,
