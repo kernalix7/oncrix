@@ -357,7 +357,9 @@ impl GicV3 {
             core::arch::asm!(
                 "msr ICC_EOIR1_EL1, {}",
                 in(reg) intid as u64,
-                options(nostack, nomem),
+                // No nomem: EOI signals interrupt completion and must order the
+                // handler's memory effects before it (release semantics).
+                options(nostack),
             );
         }
     }

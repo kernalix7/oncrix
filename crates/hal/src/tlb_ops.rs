@@ -76,7 +76,10 @@ pub fn flush_all_local() {
                 "tlbi vmalle1",
                 "dsb ish",
                 "isb",
-                options(nostack, nomem)
+                // No nomem: tlbi invalidates the TLB and the dsb barriers order
+                // page-table memory effects; nomem would let the compiler reorder
+                // page-table writes across the flush.
+                options(nostack)
             );
         }
     }
@@ -110,7 +113,8 @@ pub fn flush_page(vaddr: usize) {
                 "dsb ish",
                 "isb",
                 addr = in(reg) page,
-                options(nostack, nomem)
+                // No nomem: tlbi + dsb order page-table memory effects.
+                options(nostack)
             );
         }
     }
@@ -148,7 +152,8 @@ pub fn flush_asid(asid: u16) {
                 "dsb ish",
                 "isb",
                 asid = in(reg) asid_val,
-                options(nostack, nomem)
+                // No nomem: tlbi + dsb order page-table memory effects.
+                options(nostack)
             );
         }
     }
@@ -179,7 +184,8 @@ pub fn flush_page_asid(vaddr: usize, asid: u16) {
                 "dsb ish",
                 "isb",
                 val = in(reg) val,
-                options(nostack, nomem)
+                // No nomem: tlbi + dsb order page-table memory effects.
+                options(nostack)
             );
         }
     }
@@ -228,7 +234,8 @@ pub fn flush_global() {
                 "tlbi vmalle1is",
                 "dsb ish",
                 "isb",
-                options(nostack, nomem)
+                // No nomem: tlbi + dsb order page-table memory effects.
+                options(nostack)
             );
         }
     }
