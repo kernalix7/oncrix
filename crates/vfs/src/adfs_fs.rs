@@ -68,8 +68,15 @@ pub struct AdfsDiscRecord {
 
 impl AdfsDiscRecord {
     /// Sector size in bytes.
+    ///
+    /// `log2_sector_size` is an untrusted on-disk field (`u8`, up to 255); a
+    /// value `>= usize::BITS` would panic on the shift under overflow checks.
+    /// `checked_shl` yields `None` there, which maps to `0` so callers such as
+    /// [`AdfsSuperblock::from_disc_record`] reject it via their zero-size guard.
     pub fn sector_size(&self) -> usize {
-        1usize << self.log2_sector_size
+        1usize
+            .checked_shl(self.log2_sector_size as u32)
+            .unwrap_or(0)
     }
 
     /// Total disc size in bytes.
