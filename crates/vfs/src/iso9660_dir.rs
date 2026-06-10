@@ -211,8 +211,12 @@ impl<'a> IsoDirIter<'a> {
             }
             // Skip sector-padding zero bytes.
             if self.data[self.offset] == 0 {
-                // Advance to next 2048-byte boundary.
-                self.offset = (self.offset / ISO_BLOCK_SIZE + 1) * ISO_BLOCK_SIZE;
+                // Advance to next 2048-byte boundary. Saturating so a near-max
+                // offset on a 32-bit-usize target cannot overflow the round-up
+                // (the `offset >= data.len()` check at the top then ends iteration).
+                self.offset = (self.offset / ISO_BLOCK_SIZE)
+                    .saturating_add(1)
+                    .saturating_mul(ISO_BLOCK_SIZE);
                 return Ok(None);
             }
 

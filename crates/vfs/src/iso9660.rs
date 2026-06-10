@@ -142,6 +142,15 @@ impl PrimaryVolumeDescriptor {
 
         let volume_space_size = read_u32_lsb(&sector[80..84]);
         let logical_block_size = read_u16_lsb(&sector[128..130]);
+        // Reject a 0 / non-power-of-two / oversized block size: an attacker
+        // image could otherwise set 0 and any future use of this field as a
+        // divisor or shift would be a div-by-zero / out-of-range shift.
+        if logical_block_size == 0
+            || !logical_block_size.is_power_of_two()
+            || logical_block_size > 2048
+        {
+            return Err(Error::InvalidArgument);
+        }
         let path_table_size = read_u32_lsb(&sector[132..136]);
         let path_table_l_location = read_u32_lsb(&sector[140..144]);
         let path_table_l_opt_location = read_u32_lsb(&sector[144..148]);
@@ -797,8 +806,13 @@ impl<'a> Iso9660Fs<'a> {
 
         while pos < size && count < MAX_DIR_ENTRIES {
             if dir_data[pos] == 0 {
-                let next_sector = ((pos / SECTOR_SIZE) + 1) * SECTOR_SIZE;
-                if next_sector > size {
+                // Saturating: on a target where usize is 32-bit a near-max
+                // `pos` could overflow this round-up; saturate so the bound
+                // check below simply ends the walk instead of panicking.
+                let next_sector = (pos / SECTOR_SIZE)
+                    .saturating_add(1)
+                    .saturating_mul(SECTOR_SIZE);
+                if next_sector >= size {
                     break;
                 }
                 pos = next_sector;
