@@ -249,7 +249,7 @@ impl Psci {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: wfi is safe to execute on AArch64.
             unsafe {
-                core::arch::asm!("wfi", options(nostack, nomem));
+                core::arch::asm!("wfi", options(nostack));
             }
         }
     }
@@ -265,7 +265,7 @@ impl Psci {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: wfi safe to execute on AArch64.
             unsafe {
-                core::arch::asm!("wfi", options(nostack, nomem));
+                core::arch::asm!("wfi", options(nostack));
             }
         }
     }

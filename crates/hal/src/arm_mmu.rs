@@ -238,7 +238,9 @@ impl ArmMmu {
                     "tlbi vmalle1is",
                     "dsb ish",
                     "isb",
-                    options(nostack, nomem)
+                    // No nomem: tlbi + dsb order page-table memory effects;
+                    // nomem would let the compiler reorder PTE writes across the flush.
+                    options(nostack)
                 );
             }
         }
@@ -258,7 +260,8 @@ impl ArmMmu {
                     "dsb ish",
                     "isb",
                     addr = in(reg) page_addr,
-                    options(nostack, nomem)
+                    // No nomem: tlbi + dsb order page-table memory effects.
+                    options(nostack)
                 );
             }
         }

@@ -139,8 +139,11 @@ impl VgicHyp {
     pub fn save(&self) {
         // SAFETY: Writing ARM GICv3 virtualization system registers.
         unsafe {
-            core::arch::asm!("msr ich_hcr_el2, {0:x}", in(reg) self.hcr, options(nostack, nomem));
-            core::arch::asm!("msr ich_vmcr_el2, {0:x}", in(reg) self.vmcr, options(nostack, nomem));
+            // No nomem: writing the vGIC control registers updates hardware
+            // interrupt-delivery state and must order the surrounding guest-state
+            // memory operations on the exit path.
+            core::arch::asm!("msr ich_hcr_el2, {0:x}", in(reg) self.hcr, options(nostack));
+            core::arch::asm!("msr ich_vmcr_el2, {0:x}", in(reg) self.vmcr, options(nostack));
         }
     }
 
