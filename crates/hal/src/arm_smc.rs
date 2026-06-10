@@ -164,7 +164,9 @@ pub unsafe fn smc_call(fn_id: u32, x1: u64, x2: u64, x3: u64, x4: u64) -> SmcRes
             inout("x1") x1 => r1,
             inout("x2") x2 => r2,
             inout("x3") x3 => r3,
-            in("x4")    x4,
+            // x4 is caller-saved across the SMC just like x5-x17 below; declare
+            // it inout (discarded) so the compiler does not assume it survives.
+            inout("x4") x4 => _,
             // Clobber x5-x17 as per SMCCC (caller-saved across SMC)
             out("x5")  _,
             out("x6")  _,

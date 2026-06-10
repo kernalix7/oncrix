@@ -108,9 +108,12 @@ unsafe fn psci_call_0_3(conduit: PsciConduit, func: u64, arg0: u64, arg1: u64, a
                 core::arch::asm!(
                     "smc #0",
                     inout("x0") func => ret,
-                    in("x1") arg0,
-                    in("x2") arg1,
-                    in("x3") arg2,
+                    // x1-x3 are SMCCC result registers: the callee may overwrite
+                    // them, so declare them inout (discarded) rather than `in`,
+                    // which would wrongly assume the caller's values survive the call.
+                    inout("x1") arg0 => _,
+                    inout("x2") arg1 => _,
+                    inout("x3") arg2 => _,
                     options(nostack),
                 )
             }
@@ -121,9 +124,12 @@ unsafe fn psci_call_0_3(conduit: PsciConduit, func: u64, arg0: u64, arg1: u64, a
                 core::arch::asm!(
                     "hvc #0",
                     inout("x0") func => ret,
-                    in("x1") arg0,
-                    in("x2") arg1,
-                    in("x3") arg2,
+                    // x1-x3 are SMCCC result registers: the callee may overwrite
+                    // them, so declare them inout (discarded) rather than `in`,
+                    // which would wrongly assume the caller's values survive the call.
+                    inout("x1") arg0 => _,
+                    inout("x2") arg1 => _,
+                    inout("x3") arg2 => _,
                     options(nostack),
                 )
             }
