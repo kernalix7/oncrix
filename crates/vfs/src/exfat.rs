@@ -926,12 +926,18 @@ impl InodeOps for ExfatFs {
         fd.data[offset as usize..end].copy_from_slice(data);
 
         let new_size = fd.data.len() as u64;
-        // Compute required clusters.
+        // Compute required clusters. `bytes_per_cluster()` returns 0 if the
+        // boot-sector shift fields are out of range; guard before using it as a
+        // divisor so `/ bpc` cannot be a divide-by-zero and `bpc - 1` cannot
+        // underflow on a malformed image.
         let bpc = self.boot.bytes_per_cluster() as u64;
+        if bpc == 0 {
+            return Err(Error::InvalidArgument);
+        }
         let needed = if new_size == 0 {
             0
         } else {
-            ((new_size + bpc - 1) / bpc) as u32
+            (new_size.div_ceil(bpc)) as u32
         };
 
         let inode_mut = self.find_inode_mut(ino)?;
