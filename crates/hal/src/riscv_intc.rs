@@ -134,14 +134,18 @@ impl RiscvIntc {
                 PrivMode::Machine => {
                     // SAFETY: Setting mstatus.MIE enables machine-mode interrupt delivery.
                     // Must only be called when the interrupt handler is properly configured.
+                    // No nomem: the global irq-enable bit is cli/sti-class; it must act
+                    // as a compiler barrier so a critical-section caller's memory ops
+                    // are not reordered across the enable.
                     unsafe {
-                        core::arch::asm!("csrsi mstatus, 0x8", options(nomem, nostack));
+                        core::arch::asm!("csrsi mstatus, 0x8", options(nostack));
                     }
                 }
                 PrivMode::Supervisor => {
                     // SAFETY: Setting sstatus.SIE enables supervisor-mode interrupt delivery.
+                    // No nomem: global irq-enable (cli/sti-class) must be a compiler barrier.
                     unsafe {
-                        core::arch::asm!("csrsi sstatus, 0x2", options(nomem, nostack));
+                        core::arch::asm!("csrsi sstatus, 0x2", options(nostack));
                     }
                 }
             }
@@ -156,14 +160,16 @@ impl RiscvIntc {
             match self.mode {
                 PrivMode::Machine => {
                     // SAFETY: Clearing mstatus.MIE disables machine-mode interrupt delivery.
+                    // No nomem: global irq-disable (cli/sti-class) must be a compiler barrier.
                     unsafe {
-                        core::arch::asm!("csrci mstatus, 0x8", options(nomem, nostack));
+                        core::arch::asm!("csrci mstatus, 0x8", options(nostack));
                     }
                 }
                 PrivMode::Supervisor => {
                     // SAFETY: Clearing sstatus.SIE disables supervisor-mode interrupt delivery.
+                    // No nomem: global irq-disable (cli/sti-class) must be a compiler barrier.
                     unsafe {
-                        core::arch::asm!("csrci sstatus, 0x2", options(nomem, nostack));
+                        core::arch::asm!("csrci sstatus, 0x2", options(nostack));
                     }
                 }
             }
