@@ -447,6 +447,14 @@ impl PcmRingBuffer {
 /// Computes the pointer boundary (smallest multiple of `buf_size` >= 2^31).
 fn compute_boundary(buf_size: u64) -> u64 {
     const MIN_BOUNDARY: u64 = 1u64 << 31;
+    // A zero buffer size would spin this loop forever (0 * 2 == 0, ring-0 hang)
+    // and yield a zero boundary that is later used as a modulus (div-by-zero).
+    // The wired set_hw_params path rejects buffer_size == 0 via is_valid(), but
+    // the pub PcmRingBuffer::new constructor can be called directly, so guard
+    // here at the choke point.
+    if buf_size == 0 {
+        return MIN_BOUNDARY;
+    }
     let mut boundary = buf_size;
     while boundary < MIN_BOUNDARY {
         boundary *= 2;
