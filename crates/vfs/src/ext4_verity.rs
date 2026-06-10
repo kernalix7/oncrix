@@ -214,6 +214,15 @@ impl VerityState {
 
     /// Initialise the state from an on-disk descriptor.
     pub fn init(&mut self, desc: VerityDescriptor) -> Result<()> {
+        // `log_blocksize` is an untrusted on-disk field. `VerityDescriptor::
+        // block_size` evaluates `1u32 << log_blocksize`, which panics under
+        // overflow checks once the shift reaches the 32-bit type width, and
+        // `data_block_count` then divides by that block size. Reject anything
+        // outside the fs-verity range (1 KiB–64 KiB) before storing it so a
+        // crafted descriptor yields InvalidArgument instead of a ring-0 panic.
+        if !(10..=16).contains(&desc.log_blocksize) {
+            return Err(Error::InvalidArgument);
+        }
         self.desc = desc;
         self.compute_tree_levels()?;
         self.initialised = true;
