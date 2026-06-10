@@ -121,7 +121,10 @@ impl DaxDevice {
         if self.read_only {
             return Err(Error::PermissionDenied);
         }
-        if offset + src.len() as u64 > self.size {
+        if offset
+            .checked_add(src.len() as u64)
+            .is_none_or(|end| end > self.size)
+        {
             return Err(Error::InvalidArgument);
         }
         let dst = (self.virt_start + offset as usize) as *mut u8;
@@ -165,7 +168,10 @@ impl DaxDevice {
 
     /// Read bytes from the DAX device directly into `dst`.
     pub fn read_dax(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
-        if offset + dst.len() as u64 > self.size {
+        if offset
+            .checked_add(dst.len() as u64)
+            .is_none_or(|end| end > self.size)
+        {
             return Err(Error::InvalidArgument);
         }
         let src = (self.virt_start + offset as usize) as *const u8;
@@ -181,7 +187,10 @@ impl DaxDevice {
 
     /// Persist a range to non-volatile storage (cache flush + drain).
     pub fn persist(&self, offset: u64, len: usize) -> Result<()> {
-        if offset + len as u64 > self.size {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.size)
+        {
             return Err(Error::InvalidArgument);
         }
         let ptr = (self.virt_start + offset as usize) as *mut u8;

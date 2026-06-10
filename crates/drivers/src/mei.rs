@@ -721,7 +721,9 @@ impl MeiDevice {
         // Slots needed: header (1 dword) + ceil(data_len / 4) dwords
         let dwords_needed = 1 + (msg.data_len + 3) / 4;
         let used = wp.wrapping_sub(rp) as usize;
-        let free = depth as usize - used;
+        // depth (CBD) and wp/rp (CBWP/CBRP) are all device-MMIO fields; a device
+        // reporting used > depth would underflow this subtraction.
+        let free = (depth as usize).saturating_sub(used);
         if dwords_needed > free {
             return Err(Error::WouldBlock);
         }

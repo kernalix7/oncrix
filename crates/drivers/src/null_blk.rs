@@ -228,7 +228,8 @@ impl NullBlk {
         if buf.len() != bs {
             return Err(Error::InvalidArgument);
         }
-        self.read(lba * bs as u64, buf)
+        let offset = lba.checked_mul(bs as u64).ok_or(Error::InvalidArgument)?;
+        self.read(offset, buf)
     }
 
     /// Write one block at logical block address `lba` from `buf`.
@@ -239,7 +240,8 @@ impl NullBlk {
         if buf.len() != bs {
             return Err(Error::InvalidArgument);
         }
-        self.write(lba * bs as u64, buf)
+        let offset = lba.checked_mul(bs as u64).ok_or(Error::InvalidArgument)?;
+        self.write(offset, buf)
     }
 
     /// Flush — a no-op for the null device (always returns Ok).
