@@ -510,10 +510,10 @@ impl FileExtentMap {
     pub fn insert_extent_gap(&mut self, offset: u64, len: u64) {
         for i in 0..self.extent_count {
             if self.extents[i].offset >= offset {
-                self.extents[i].offset += len;
+                self.extents[i].offset = self.extents[i].offset.saturating_add(len);
             }
         }
-        self.size += len;
+        self.size = self.size.saturating_add(len);
     }
 }
 
@@ -789,7 +789,7 @@ impl FallocateContext {
 
         // Align to block boundaries.
         let aligned_offset = req.offset & !(BLOCK_SIZE - 1);
-        let aligned_end = (alloc_end + BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1);
+        let aligned_end = alloc_end.saturating_add(BLOCK_SIZE - 1) & !(BLOCK_SIZE - 1);
         let aligned_len = aligned_end - aligned_offset;
 
         // Add an unwritten extent for the allocated region.
