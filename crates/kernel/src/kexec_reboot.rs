@@ -140,8 +140,14 @@ impl RebootSegment {
     }
 
     /// Returns the end of the destination region.
+    ///
+    /// `mem` is an attacker-supplied page-aligned segment address with no
+    /// upper bound; saturate so a value near `usize::MAX` plus `memsz` cannot
+    /// overflow (a panic under overflow-checks). Fail-closed: an out-of-range
+    /// end is then rejected by the overlap/bound checks. Mirrors
+    /// `KexecSegment::dst_end`.
     pub const fn mem_end(&self) -> usize {
-        self.mem + self.memsz
+        self.mem.saturating_add(self.memsz)
     }
 
     /// Returns whether the destination is page-aligned.
@@ -262,7 +268,14 @@ impl CrashRegion {
 
     /// Returns whether an address range falls within this region.
     pub const fn contains_range(&self, addr: usize, len: usize) -> bool {
-        self.in_use && addr >= self.start && addr + len <= self.start + self.size
+        // addr/len are attacker-supplied (segment mem/memsz); use checked_add so
+        // a near-usize::MAX addr cannot overflow the bound check and panic.
+        self.in_use
+            && addr >= self.start
+            && match addr.checked_add(len) {
+                Some(end) => end <= self.start.saturating_add(self.size),
+                None => false,
+            }
     }
 }
 
