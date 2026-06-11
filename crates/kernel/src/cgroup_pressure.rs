@@ -308,8 +308,9 @@ impl PsiTrigger {
         }
         self.accum_us = self.accum_us.saturating_add(stall_delta_us);
         // Check threshold: accum / window >= threshold / 10000.
-        let scaled_accum = self.accum_us * 10000;
-        let exceeded = scaled_accum >= self.threshold_pct_x100 as u64 * self.window_us;
+        let scaled_accum = self.accum_us.saturating_mul(10000);
+        let exceeded =
+            scaled_accum >= (self.threshold_pct_x100 as u64).saturating_mul(self.window_us);
         if exceeded && !self.fired {
             self.fired = true;
             self.fire_count = self.fire_count.saturating_add(1);
@@ -417,12 +418,12 @@ impl CgroupPsi {
             self.raw_full[i] = self.raw_full[i].saturating_add(full_deltas[i]);
             // Convert to percentage * 100.
             let some_pct = if elapsed > 0 {
-                ((some_deltas[i] * 10000) / elapsed.max(1)) as u32
+                (some_deltas[i].saturating_mul(10000) / elapsed.max(1)) as u32
             } else {
                 0
             };
             let full_pct = if elapsed > 0 {
-                ((full_deltas[i] * 10000) / elapsed.max(1)) as u32
+                (full_deltas[i].saturating_mul(10000) / elapsed.max(1)) as u32
             } else {
                 0
             };

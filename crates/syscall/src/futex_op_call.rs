@@ -240,7 +240,7 @@ impl WakeOp {
     /// Apply the operation to `old_val` and return the new value.
     pub fn apply(&self, old_val: u32) -> u32 {
         let arg = if self.shift {
-            1u32 << self.oparg
+            1u32.checked_shl(self.oparg).unwrap_or(0)
         } else {
             self.oparg
         };

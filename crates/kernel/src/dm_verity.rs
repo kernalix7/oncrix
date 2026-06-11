@@ -223,7 +223,7 @@ impl VerityHashTree {
     fn hash_with_salt(&self, data: &[u8]) -> [u8; DIGEST_SIZE] {
         let mut hasher = Sha256::new();
         if self.salt_len > 0 {
-            hasher.update(&self.salt[..self.salt_len]);
+            hasher.update(&self.salt[..self.salt_len.min(SALT_LEN)]);
         }
         hasher.update(data);
         hasher.finalize()
@@ -233,7 +233,7 @@ impl VerityHashTree {
     fn hash_pair(&self, left: &[u8; DIGEST_SIZE], right: &[u8; DIGEST_SIZE]) -> [u8; DIGEST_SIZE] {
         let mut hasher = Sha256::new();
         if self.salt_len > 0 {
-            hasher.update(&self.salt[..self.salt_len]);
+            hasher.update(&self.salt[..self.salt_len.min(SALT_LEN)]);
         }
         hasher.update(left);
         hasher.update(right);

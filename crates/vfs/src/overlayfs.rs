@@ -721,7 +721,7 @@ pub fn overlay_write(
     data: &[u8],
 ) -> Result<usize> {
     let off = offset as usize;
-    let end = off + data.len();
+    let end = off.saturating_add(data.len());
     if end > MAX_FILE_SIZE {
         return Err(Error::OutOfMemory);
     }
@@ -981,7 +981,7 @@ impl InodeOps for OverlayFs {
 
     fn write(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<usize> {
         let off = offset as usize;
-        let end = off + data.len();
+        let end = off.saturating_add(data.len());
         if end > MAX_FILE_SIZE {
             return Err(Error::OutOfMemory);
         }
