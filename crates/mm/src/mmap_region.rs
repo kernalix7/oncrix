@@ -346,7 +346,7 @@ impl MmapRegion {
             if self.inode != other.inode {
                 return false;
             }
-            let expected_off = self.offset + self.size();
+            let expected_off = self.offset.saturating_add(self.size());
             if other.offset != expected_off {
                 return false;
             }
@@ -681,7 +681,7 @@ impl MmapRegionTable {
                 let mut upper = self.regions[i];
                 upper.start = end;
                 upper.end = orig_end;
-                upper.offset += end - orig_start;
+                upper.offset = upper.offset.saturating_add(end - orig_start);
                 // Now truncate the lower half and insert the tail; the
                 // capacity check above guarantees insertion succeeds.
                 self.regions[i].end = start;
@@ -704,7 +704,7 @@ impl MmapRegionTable {
                 let old_start = r.start;
                 let old_offset = r.offset;
                 self.regions[i].start = end;
-                self.regions[i].offset = old_offset + (end - old_start);
+                self.regions[i].offset = old_offset.saturating_add(end - old_start);
                 freed += end - old_start;
                 self.total_mapped = self.total_mapped.saturating_sub(end - old_start);
             }
@@ -747,7 +747,7 @@ impl MmapRegionTable {
         let mut upper = self.regions[idx];
         upper.start = addr;
         upper.end = orig_end;
-        upper.offset = orig_offset + (addr - orig_start);
+        upper.offset = orig_offset.saturating_add(addr - orig_start);
         let upper_idx = self.insert_sorted(upper)?;
         self.split_count = self.split_count.saturating_add(1);
 

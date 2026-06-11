@@ -217,7 +217,7 @@ impl VmaEntry {
             // Anonymous VMAs always have contiguous "offsets".
             return true;
         }
-        let a_end_pgoff = self.compat.pgoff + self.nr_pages();
+        let a_end_pgoff = self.compat.pgoff.saturating_add(self.nr_pages());
         a_end_pgoff == other.compat.pgoff
     }
 }

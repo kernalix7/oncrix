@@ -273,7 +273,7 @@ impl MincoreOps {
         }
 
         let end = start.saturating_add(len);
-        let aligned_end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let aligned_end = end.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let nr_pages = ((aligned_end - start) / PAGE_SIZE) as usize;
 
         if nr_pages > MAX_QUERY_PAGES {

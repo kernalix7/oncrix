@@ -286,8 +286,8 @@ impl MremapOps {
             return Err(Error::InvalidArgument);
         }
 
-        let aligned_old = (old_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let aligned_new = (new_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let aligned_old = old_size.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let aligned_new = new_size.saturating_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
         self.stats.total_calls += 1;
 
@@ -342,7 +342,7 @@ impl MremapOps {
     /// Try in-place expansion of a mapping.
     fn can_expand_in_place(&self, map_idx: usize, extra: u64) -> bool {
         let mapping = &self.mappings[map_idx];
-        let new_end = mapping.end() + extra;
+        let new_end = mapping.end().saturating_add(extra);
 
         for i in 0..self.mapping_count {
             if i == map_idx {
@@ -424,8 +424,9 @@ impl MremapOps {
             self.mappings[map_idx].state = MappingState::Free;
         }
 
-        if new_addr + new_size > self.next_va {
-            self.next_va = new_addr + new_size + PAGE_SIZE;
+        let new_end = new_addr.saturating_add(new_size);
+        if new_end > self.next_va {
+            self.next_va = new_end.saturating_add(PAGE_SIZE);
         }
 
         self.stats.moves += 1;
