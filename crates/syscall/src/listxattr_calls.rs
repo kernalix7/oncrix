@@ -194,7 +194,11 @@ impl XattrStore {
     /// If `buf` is empty, returns the total byte count needed.
     pub fn list(&self, buf: &mut [u8]) -> Result<usize> {
         // Calculate required size: sum of (name.len() + 1) for each entry.
-        let needed: usize = self.attrs.keys().map(|k| k.len() + 1).sum();
+        let needed: usize = self
+            .attrs
+            .keys()
+            .map(|k| k.len() + 1)
+            .fold(0usize, |a, n| a.saturating_add(n));
         if buf.is_empty() {
             return Ok(needed);
         }

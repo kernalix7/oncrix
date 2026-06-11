@@ -198,7 +198,7 @@ impl AclEntries {
 
     /// Return a slice of the valid entries.
     pub fn as_slice(&self) -> &[PosixAclXattrEntry] {
-        &self.entries[..self.count]
+        &self.entries[..self.count.min(MAX_ACL_ENTRIES)]
     }
 
     /// Find the first entry with the given `tag`.
@@ -252,7 +252,7 @@ pub fn posix_acl_from_xattr(data: &[u8]) -> Result<AclEntries> {
 ///
 /// - [`Error::InvalidArgument`] — `out` is too small.
 pub fn posix_acl_to_xattr(entries: &AclEntries, out: &mut [u8]) -> Result<usize> {
-    let needed = ACL_HEADER_SIZE + entries.count * ACL_ENTRY_SIZE;
+    let needed = ACL_HEADER_SIZE + entries.count.min(MAX_ACL_ENTRIES) * ACL_ENTRY_SIZE;
     if out.len() < needed {
         return Err(Error::InvalidArgument);
     }
