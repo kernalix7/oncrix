@@ -141,11 +141,11 @@ impl RmXattrFile {
     pub fn insert_attr(&mut self, name: &[u8], value: &[u8]) -> Result<()> {
         for slot in self.attrs.iter_mut() {
             if !slot.in_use {
-                let nlen = name.len();
-                let vlen = value.len();
-                slot.name[..nlen].copy_from_slice(name);
+                let nlen = name.len().min(slot.name.len());
+                let vlen = value.len().min(slot.value.len());
+                slot.name[..nlen].copy_from_slice(&name[..nlen]);
                 slot.name_len = nlen;
-                slot.value[..vlen].copy_from_slice(value);
+                slot.value[..vlen].copy_from_slice(&value[..vlen]);
                 slot.value_len = vlen;
                 slot.in_use = true;
                 return Ok(());

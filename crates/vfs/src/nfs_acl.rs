@@ -118,7 +118,7 @@ impl NfsAcl {
 
     /// Find the effective permissions for a given (tag, id) pair.
     pub fn lookup(&self, tag: AclTag, id: u32) -> Option<AclPerms> {
-        for slot in &self.entries[..self.count] {
+        for slot in &self.entries[..self.count.min(NFSACL_MAX_ENTRIES)] {
             if let Some(entry) = slot {
                 if entry.tag == tag && (!entry.has_id() || entry.id == id) {
                     return Some(entry.perms);
@@ -203,7 +203,7 @@ pub fn encode_nfsacl(acl: &NfsAcl, buf: &mut [u8]) -> Result<usize> {
     let count = acl.count as u32;
     buf[0..4].copy_from_slice(&count.to_be_bytes());
     let mut off = 4;
-    for slot in &acl.entries[..acl.count] {
+    for slot in &acl.entries[..acl.count.min(NFSACL_MAX_ENTRIES)] {
         if let Some(entry) = slot {
             buf[off..off + 4].copy_from_slice(&(entry.tag as u32).to_be_bytes());
             buf[off + 4..off + 8].copy_from_slice(&entry.id.to_be_bytes());
