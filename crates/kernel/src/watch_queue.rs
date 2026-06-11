@@ -785,7 +785,11 @@ impl WatchQueueSubsystem {
             return Err(Error::OutOfMemory);
         }
         let id = self.next_queue_id;
-        self.next_queue_id += 1;
+        // wrapping_add: the live-queue count is capped at MAX_QUEUES, so a
+        // monotonic id counter that wraps after u32::MAX create/destroy cycles
+        // cannot collide in practice; wrap instead of overflow-panicking
+        // (matches the next_*_id idiom in sysfs_attr.rs/perf_events.rs).
+        self.next_queue_id = self.next_queue_id.wrapping_add(1);
         let queue = WatchQueue::new(id, pipe_fd);
         self.queues.push(queue);
         Ok(id)
@@ -797,7 +801,11 @@ impl WatchQueueSubsystem {
             return Err(Error::OutOfMemory);
         }
         let id = self.next_queue_id;
-        self.next_queue_id += 1;
+        // wrapping_add: the live-queue count is capped at MAX_QUEUES, so a
+        // monotonic id counter that wraps after u32::MAX create/destroy cycles
+        // cannot collide in practice; wrap instead of overflow-panicking
+        // (matches the next_*_id idiom in sysfs_attr.rs/perf_events.rs).
+        self.next_queue_id = self.next_queue_id.wrapping_add(1);
         let queue = WatchQueue::with_capacity(id, pipe_fd, capacity)?;
         self.queues.push(queue);
         Ok(id)
@@ -845,7 +853,8 @@ impl WatchQueueSubsystem {
             .find(|&i| !self.groups[i].is_active())
             .ok_or(Error::OutOfMemory)?;
         let id = self.next_group_id;
-        self.next_group_id += 1;
+        // wrapping_add: see create_queue — bounded live count, wrap is safe.
+        self.next_group_id = self.next_group_id.wrapping_add(1);
         self.groups[slot] = WatchGroup::new(id);
         self.group_count += 1;
         Ok(id)
