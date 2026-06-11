@@ -194,7 +194,7 @@ impl CpuFreq {
         let min_idx = self.pstates[..self.num_pstates]
             .iter()
             .position(|ps| ps.freq_khz >= min_khz)
-            .unwrap_or(self.num_pstates - 1);
+            .unwrap_or(self.num_pstates.saturating_sub(1));
         let max_idx = self.pstates[..self.num_pstates]
             .iter()
             .rposition(|ps| ps.freq_khz <= max_khz)

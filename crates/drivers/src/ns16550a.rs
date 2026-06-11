@@ -246,7 +246,9 @@ impl Ns16550Uart {
     }
 
     fn reg_addr(&self, reg: usize) -> usize {
-        self.base + reg * self.config.reg_stride
+        // reg_stride is externally configured; wrap so a bad value cannot panic.
+        self.base
+            .wrapping_add(reg.wrapping_mul(self.config.reg_stride))
     }
 
     fn read_reg(&self, reg: usize) -> u8 {
