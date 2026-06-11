@@ -388,7 +388,7 @@ impl VirtioMem {
         }
 
         self.mark_blocks(addr, nb_blocks, true);
-        let bytes = nb_blocks as u64 * self.config.block_size;
+        let bytes = (nb_blocks as u64).saturating_mul(self.config.block_size);
         self.config.plugged_size = self.config.plugged_size.saturating_add(bytes);
 
         Ok(PlugEvent::Plugged {
@@ -417,7 +417,7 @@ impl VirtioMem {
         }
 
         self.mark_blocks(addr, nb_blocks, false);
-        let bytes = nb_blocks as u64 * self.config.block_size;
+        let bytes = (nb_blocks as u64).saturating_mul(self.config.block_size);
         self.config.plugged_size = self.config.plugged_size.saturating_sub(bytes);
 
         Ok(PlugEvent::Unplugged {
@@ -492,7 +492,7 @@ impl VirtioMem {
         if addr < self.config.addr || addr % block_size != 0 {
             return Err(Error::InvalidArgument);
         }
-        let end = addr.saturating_add(nb_blocks as u64 * block_size);
+        let end = addr.saturating_add((nb_blocks as u64).saturating_mul(block_size));
         let region_end = self
             .config
             .addr

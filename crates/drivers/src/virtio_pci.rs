@@ -477,8 +477,11 @@ impl VirtioPciDevice {
     pub unsafe fn notify_queue(&self, queue_index: u16, notify_off: u32) {
         // SAFETY: Doorbell write triggers device to process new descriptors.
         unsafe {
-            let offset = notify_off * self.notify_multiplier;
-            let ptr = (self.notify_base + offset as u64) as *mut u16;
+            // notify_off and notify_multiplier are both device-supplied (PCI
+            // config); widen to u64 before multiplying and wrap the base add so
+            // a hostile device cannot overflow the doorbell offset and panic.
+            let offset = u64::from(notify_off) * u64::from(self.notify_multiplier);
+            let ptr = self.notify_base.wrapping_add(offset) as *mut u16;
             core::ptr::write_volatile(ptr, queue_index);
         }
     }

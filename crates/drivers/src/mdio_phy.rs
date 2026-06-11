@@ -706,6 +706,11 @@ impl MdioBus {
     ///
     /// Returns [`Error::NotFound`] if the PHY is not tracked.
     pub fn start_autoneg(&mut self, phy_addr: u8) -> Result<()> {
+        // phys is [_; MAX_PHYS]; reject phy_addr > 31 like read/write/reset do,
+        // otherwise self.phys[phy_addr] below indexes out of bounds.
+        if phy_addr > MAX_PHY_ADDR {
+            return Err(Error::InvalidArgument);
+        }
         let phy = self.phys[phy_addr as usize]
             .as_ref()
             .ok_or(Error::NotFound)?;
