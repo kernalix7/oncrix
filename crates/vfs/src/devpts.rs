@@ -486,7 +486,9 @@ impl DevptsFs {
             name[pos] = b'0';
             pos += 1;
         } else {
-            let mut digits = [0u8; 5];
+            // u32 has up to 10 decimal digits; size for the worst case so a
+            // pts index >= 100000 cannot write past the buffer (OOB panic).
+            let mut digits = [0u8; 10];
             let mut n = idx;
             let mut dcount = 0;
             while n > 0 {
