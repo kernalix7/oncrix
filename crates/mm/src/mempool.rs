@@ -399,9 +399,8 @@ impl Default for MempoolAllocator {
 impl MempoolAllocator {
     /// Create an empty allocator.
     pub const fn new() -> Self {
-        const NONE: Option<Mempool> = None;
         Self {
-            pools: [NONE; MAX_POOLS],
+            pools: [const { None }; MAX_POOLS],
             count: 0,
         }
     }

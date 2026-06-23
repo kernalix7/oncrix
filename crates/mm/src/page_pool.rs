@@ -420,9 +420,8 @@ impl Default for PagePoolRegistry {
 impl PagePoolRegistry {
     /// Create an empty registry.
     pub const fn new() -> Self {
-        const NONE: Option<PagePool> = None;
         Self {
-            pools: [NONE; MAX_POOLS],
+            pools: [const { None }; MAX_POOLS],
             count: 0,
         }
     }

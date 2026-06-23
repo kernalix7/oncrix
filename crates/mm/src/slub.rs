@@ -675,9 +675,8 @@ impl Default for SlubAllocator {
 impl SlubAllocator {
     /// Create an empty allocator.
     pub fn new() -> Self {
-        const NONE: Option<SlubCache> = None;
         Self {
-            caches: [NONE; MAX_CACHES],
+            caches: [const { None }; MAX_CACHES],
             cache_count: 0,
         }
     }
