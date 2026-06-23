@@ -162,7 +162,7 @@ impl XfsExtent {
     pub fn contains(&self, logical_block: u64) -> bool {
         self.active
             && logical_block >= self.startoff
-            && logical_block < self.startoff + self.blockcount as u64
+            && logical_block < self.startoff.saturating_add(self.blockcount as u64)
     }
 
     /// Translate a logical block to a physical block.

@@ -82,7 +82,8 @@ impl XfsExtent {
 
     /// Last logical block in this extent (inclusive).
     pub fn last_off(&self) -> u64 {
-        self.startoff + self.blockcount as u64 - 1
+        // An empty extent (blockcount == 0, startoff == 0) would underflow.
+        (self.startoff + self.blockcount as u64).saturating_sub(1)
     }
 
     /// Whether the given logical block falls within this extent.
