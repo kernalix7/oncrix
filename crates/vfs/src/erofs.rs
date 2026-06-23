@@ -431,9 +431,12 @@ impl<'a> ErofsFs<'a> {
     /// nid addresses 32-byte slots within the metadata area starting at
     /// `meta_blkaddr`.
     fn nid_to_offset(&self, nid: u64) -> usize {
-        let meta_start = self.superblock.meta_blkaddr as u64 * self.block_size as u64;
-        // Each nid slot is 32 bytes (compact inode slot size).
-        (meta_start + nid * 32) as usize
+        let meta_start =
+            (self.superblock.meta_blkaddr as u64).saturating_mul(self.block_size as u64);
+        // Each nid slot is 32 bytes (compact inode slot size). nid is a parsed
+        // u64; saturate so an out-of-range nid yields a huge offset the caller's
+        // bounds check rejects, rather than overflowing (ring-0 panic).
+        meta_start.saturating_add(nid.saturating_mul(32)) as usize
     }
 
     /// Read the inode identified by `nid`.
@@ -447,7 +450,7 @@ impl<'a> ErofsFs<'a> {
         }
 
         let off = self.nid_to_offset(nid);
-        if off + 2 > self.data.len() {
+        if off.saturating_add(2) > self.data.len() {
             return Err(Error::IoError);
         }
 
@@ -456,7 +459,7 @@ impl<'a> ErofsFs<'a> {
         let format = InodeFormat::from_raw(i_format).ok_or(Error::InvalidArgument)?;
         let data_layout = DataLayout::from_raw(i_format);
 
-        if off + format.size() > self.data.len() {
+        if off.saturating_add(format.size()) > self.data.len() {
             return Err(Error::IoError);
         }
 
@@ -532,10 +535,10 @@ impl<'a> ErofsFs<'a> {
         let mut count = 0usize;
 
         // Directory data starts at raw_blkaddr.
-        let dir_start = inode.raw_blkaddr as usize * self.block_size as usize;
+        let dir_start = (inode.raw_blkaddr as usize).saturating_mul(self.block_size as usize);
         let dir_size = inode.size as usize;
 
-        if dir_start + dir_size > self.data.len() {
+        if dir_start.saturating_add(dir_size) > self.data.len() {
             return Err(Error::IoError);
         }
 
@@ -624,11 +627,13 @@ impl<'a> ErofsFs<'a> {
         if offset >= file_size {
             return Ok(0);
         }
-        let data_start = inode.raw_blkaddr as usize * self.block_size as usize + offset;
+        let data_start = (inode.raw_blkaddr as usize)
+            .saturating_mul(self.block_size as usize)
+            .saturating_add(offset);
         let available = file_size - offset;
         let to_copy = buf.len().min(available);
 
-        if data_start + to_copy > self.data.len() {
+        if data_start.saturating_add(to_copy) > self.data.len() {
             return Err(Error::IoError);
         }
 
@@ -655,16 +660,19 @@ impl<'a> ErofsFs<'a> {
 
         // Inline data is stored immediately after the inode in the metadata area.
         let inode_off = self.nid_to_offset(nid);
-        let inline_start = inode_off + inode.format.size();
+        let inline_start = inode_off.saturating_add(inode.format.size());
 
         if offset < full_blocks * block_size {
             // Reading from a full data block.
             let blk = offset / block_size;
             let blk_off = offset % block_size;
-            let blk_start = inode.raw_blkaddr as usize * block_size + blk * block_size + blk_off;
+            let blk_start = (inode.raw_blkaddr as usize)
+                .saturating_mul(block_size)
+                .saturating_add(blk.saturating_mul(block_size))
+                .saturating_add(blk_off);
             let available = (full_blocks * block_size - offset).min(file_size - offset);
             let to_copy = buf.len().min(available);
-            if blk_start + to_copy > self.data.len() {
+            if blk_start.saturating_add(to_copy) > self.data.len() {
                 return Err(Error::IoError);
             }
             buf[..to_copy].copy_from_slice(&self.data[blk_start..blk_start + to_copy]);
@@ -674,11 +682,11 @@ impl<'a> ErofsFs<'a> {
             let tail_off = offset - full_blocks * block_size;
             let avail = tail_size.saturating_sub(tail_off);
             let to_copy = buf.len().min(avail);
-            let src_start = inline_start + tail_off;
+            let src_start = inline_start.saturating_add(tail_off);
             if to_copy == 0 {
                 return Ok(0);
             }
-            if src_start + to_copy > self.data.len() {
+            if src_start.saturating_add(to_copy) > self.data.len() {
                 return Err(Error::IoError);
             }
             buf[..to_copy].copy_from_slice(&self.data[src_start..src_start + to_copy]);
