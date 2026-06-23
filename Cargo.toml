@@ -11,6 +11,13 @@ license = "Apache-2.0"
 authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
 repository = "https://github.com/kernalix7/oncrix"
 
+[workspace.lints.clippy]
+# `const X: Option<BigStruct> = None; [X; N]` is the project-wide idiom for
+# initializing fixed-capacity inline tables of non-Copy types. A newer nightly
+# clippy flags the large ones as `large_const_arrays` ("should be static"); the
+# const is intentional (a single inlined zero-initializer), so allow it workspace-wide.
+large_const_arrays = "allow"
+
 [workspace.dependencies]
 oncrix-kernel = { path = "crates/kernel" }
 oncrix-hal = { path = "crates/hal" }
