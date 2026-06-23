@@ -110,7 +110,7 @@ impl PtyPair {
             pos += 1;
         } else {
             // Write digits into a small stack buffer, then reverse.
-            let mut digits = [0u8; 5]; // up to 99999
+            let mut digits = [0u8; 10]; // u32 worst case: 10 decimal digits
             let mut n = index;
             let mut dcount = 0;
             while n > 0 {
