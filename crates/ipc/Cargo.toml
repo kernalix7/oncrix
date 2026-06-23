@@ -11,3 +11,6 @@ repository.workspace = true
 [dependencies]
 oncrix-lib.workspace = true
 oncrix-mm.workspace = true
+
+[lints]
+workspace = true

@@ -14,3 +14,6 @@ oncrix-mm.workspace = true
 oncrix-ipc.workspace = true
 oncrix-hal.workspace = true
 oncrix-vfs.workspace = true
+
+[lints]
+workspace = true
