@@ -355,7 +355,8 @@ impl XfsExtent {
 
     /// Whether this extent contains the given logical block offset.
     pub fn contains(&self, logical_block: u64) -> bool {
-        logical_block >= self.startoff && logical_block < self.startoff + self.blockcount as u64
+        logical_block >= self.startoff
+            && logical_block < self.startoff.saturating_add(self.blockcount as u64)
     }
 
     /// Translate a logical block offset to a physical block number.
@@ -624,8 +625,16 @@ impl<R: BlockReader> XfsFs<R> {
         }
         let ag = ino / ino_per_ag;
         let local = ino % ino_per_ag;
-        let ag_offset = ag * self.sb.sb_agblocks as u64 * self.sb.sb_blocksize as u64;
-        let byte_offset = ag_offset + local * self.sb.sb_inodesize as u64;
+        // A crafted inode number / superblock geometry can make this product
+        // overflow u64; reject such an inode rather than panicking (ring-0 halt).
+        let ag_offset = ag
+            .checked_mul(self.sb.sb_agblocks as u64)
+            .and_then(|v| v.checked_mul(self.sb.sb_blocksize as u64))
+            .ok_or(Error::InvalidArgument)?;
+        let byte_offset = local
+            .checked_mul(self.sb.sb_inodesize as u64)
+            .and_then(|v| ag_offset.checked_add(v))
+            .ok_or(Error::InvalidArgument)?;
         Ok(byte_offset)
     }
 
