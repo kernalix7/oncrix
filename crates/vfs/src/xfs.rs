@@ -581,11 +581,16 @@ impl<R: BlockReader> XfsFs<R> {
         let mut ags = [NONE_AG; MAX_AG_COUNT];
         let mut ag_buf = [0u8; 64];
         for (i, ag_slot) in ags.iter_mut().enumerate().take(ag_count) {
-            let offset = i as u64 * sb.sb_agblocks as u64 * sb.sb_blocksize as u64;
+            // Crafted superblock geometry can overflow this product; saturate
+            // so an out-of-range AG offset simply fails the read instead of
+            // panicking (ring-0 halt).
+            let offset = (i as u64)
+                .saturating_mul(sb.sb_agblocks as u64)
+                .saturating_mul(sb.sb_blocksize as u64);
             // AG header is in the first sector of each AG; skip the superblock
             // copy in AG 0 (it overlaps the first sector). For AG > 0 the
             // AG header follows the superblock copy.
-            let ag_hdr_offset = offset + sb.sb_sectsize as u64;
+            let ag_hdr_offset = offset.saturating_add(sb.sb_sectsize as u64);
             reader.read_bytes(ag_hdr_offset, &mut ag_buf)?;
             *ag_slot = Some(XfsAgHeader::from_bytes(&ag_buf)?);
         }

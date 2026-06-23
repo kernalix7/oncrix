@@ -176,7 +176,7 @@ impl XfsExtent {
 
     /// End offset (exclusive) of this extent in logical blocks.
     pub fn end_offset(&self) -> u64 {
-        self.startoff + self.blockcount as u64
+        self.startoff.saturating_add(self.blockcount as u64)
     }
 
     /// Whether this extent represents a preallocated (unwritten) range.
