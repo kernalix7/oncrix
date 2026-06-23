@@ -395,7 +395,10 @@ pub fn generate_statm(desc: &ProcPidDesc, buf: &mut [u8]) -> Result<usize> {
 /// Returns bytes written.
 pub fn generate_maps(desc: &ProcPidDesc, buf: &mut [u8]) -> Result<usize> {
     let mut p = 0;
-    for i in 0..desc.vma_count {
+    // vma_count is a public field; clamp to the backing array length so a
+    // descriptor reporting more VMAs than MAX_VMA cannot index out of bounds
+    // (siblings fd_count/cmdline_len/environ_len already clamp with .min()).
+    for i in 0..desc.vma_count.min(MAX_VMA) {
         let vma = &desc.vmas[i];
         p = write_hex(buf, p, vma.start, 12);
         p = write_byte(buf, p, b'-');

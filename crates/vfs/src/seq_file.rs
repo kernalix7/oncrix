@@ -184,9 +184,18 @@ impl SeqFile {
         }
         self.buf.reset();
         let mut pos_opt = ops.start(0);
+        // Hard iteration cap: a SeqOps whose next() never yields None while
+        // show() makes no progress (so the overflow break never fires) would
+        // otherwise spin forever on a /proc read. 1<<20 is far above any real
+        // /proc file's record count.
+        let mut guard = 0usize;
         while let Some(pos) = pos_opt {
             ops.show(pos, &mut self.buf)?;
             if self.buf.overflowed() {
+                break;
+            }
+            guard += 1;
+            if guard >= (1usize << 20) {
                 break;
             }
             pos_opt = ops.next(pos);
