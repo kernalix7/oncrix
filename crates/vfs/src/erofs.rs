@@ -243,7 +243,11 @@ impl ErofsSuperblock {
         } else {
             self.blkszbits as u32
         };
-        1u32 << bits
+        // `blkszbits` is an unvalidated on-disk byte (0..=255); a crafted value
+        // >= 32 would overflow the shift (ring-0 panic). Fall back to the
+        // default block size for out-of-range exponents.
+        1u32.checked_shl(bits)
+            .unwrap_or(1u32 << DEFAULT_BLOCK_SIZE_LOG)
     }
 }
 
