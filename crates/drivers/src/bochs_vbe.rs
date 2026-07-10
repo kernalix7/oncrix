@@ -290,11 +290,15 @@ impl BochsVbe {
                     out("ax") val,
                     options(nomem, nostack)
                 );
-                return val;
+                val
             }
         }
-        #[allow(unreachable_code)]
-        0
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: Bochs VBE is x86-legacy port I/O; not present.
+            let _ = index;
+            0
+        }
     }
 
     fn write_dispi(&mut self, index: u16, value: u16) {
@@ -314,6 +318,11 @@ impl BochsVbe {
                 in("ax") value,
                 options(nomem, nostack)
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: Bochs VBE is x86-legacy port I/O; not present.
+            let _ = (index, value);
         }
     }
 }

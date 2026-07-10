@@ -224,10 +224,15 @@ impl AcpiButton {
                     options(nomem, nostack)
                 );
             }
-            return val;
+            val
         }
-        #[allow(unreachable_code)]
-        0
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: ACPI PM1 I/O-space registers are x86-legacy
+            // port I/O; not present on this arch.
+            let _ = port;
+            0
+        }
     }
 
     fn write16(&mut self, port: u16, val: u16) {
@@ -240,6 +245,12 @@ impl AcpiButton {
                 in("ax") val,
                 options(nomem, nostack)
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: ACPI PM1 I/O-space registers are x86-legacy
+            // port I/O; not present on this arch.
+            let _ = (port, val);
         }
     }
 }

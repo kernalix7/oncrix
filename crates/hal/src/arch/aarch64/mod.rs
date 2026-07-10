@@ -7,3 +7,4 @@ pub mod boot;
 pub mod gic;
 pub mod pl011;
 pub mod timer;
+pub mod uart;

@@ -222,6 +222,12 @@ impl DaxDevice {
                 core::arch::asm!("sfence", options(nostack, nomem));
             }
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: CLFLUSH/SFENCE are x86-specific; not present on
+            // this arch.
+            let _ = (ptr, len);
+        }
     }
 
     /// Return whether a given offset/length pair is granularity-aligned.

@@ -87,8 +87,8 @@ impl RtcDriver {
         // ports accessible at Ring 0. NMI disable bit (0x80) is
         // preserved by masking the register address to 7 bits.
         unsafe {
-            super::arch::x86_64::io::outb(CMOS_ADDR_PORT, reg);
-            super::arch::x86_64::io::inb(CMOS_DATA_PORT)
+            super::arch::io::outb(CMOS_ADDR_PORT, reg);
+            super::arch::io::inb(CMOS_DATA_PORT)
         }
     }
 
@@ -98,8 +98,8 @@ impl RtcDriver {
         // SAFETY: CMOS ports 0x70/0x71 are standard x86_64 I/O
         // ports accessible at Ring 0.
         unsafe {
-            super::arch::x86_64::io::outb(CMOS_ADDR_PORT, reg);
-            super::arch::x86_64::io::outb(CMOS_DATA_PORT, val);
+            super::arch::io::outb(CMOS_ADDR_PORT, reg);
+            super::arch::io::outb(CMOS_DATA_PORT, val);
         }
     }
 

@@ -1907,7 +1907,7 @@ pub unsafe fn sys_sysinfo(info: u64) -> i64 {
     // concurrent mutation is possible.
     let ticks = unsafe {
         use oncrix_hal::timer::Timer;
-        let pit_ptr = &raw const crate::arch::x86_64::init::PIT_TIMER;
+        let pit_ptr = &raw const crate::arch::init::PIT_TIMER;
         (*pit_ptr).current_ticks()
     };
     /// PIT tick frequency: `init_pic_and_timer` programs divisor 11932 → ~100 Hz.

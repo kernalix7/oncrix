@@ -233,35 +233,42 @@ impl CpuFreq {
 
     /// Write the IA32_PERF_CTL MSR for a CPU.
     fn write_perf_ctl(&self, _cpu: usize, hw_val: u16) -> Result<()> {
-        let msr = if self.is_intel {
-            MSR_IA32_PERF_CTL
-        } else {
-            MSR_AMD_PSTATE_CTL
-        };
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: IA32_PERF_CTL / AMD_PSTATE_CTL MSRs control CPU P-state;
-        // hw_val is a validated hardware ratio from the P-state table.
-        unsafe {
-            core::arch::asm!(
-                "wrmsr",
-                in("ecx") msr,
-                in("eax") (hw_val as u32) << 8,
-                in("edx") 0u32,
-                options(nomem, nostack)
-            );
+        {
+            let msr = if self.is_intel {
+                MSR_IA32_PERF_CTL
+            } else {
+                MSR_AMD_PSTATE_CTL
+            };
+            // SAFETY: IA32_PERF_CTL / AMD_PSTATE_CTL MSRs control CPU P-state;
+            // hw_val is a validated hardware ratio from the P-state table.
+            unsafe {
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") msr,
+                    in("eax") (hw_val as u32) << 8,
+                    in("edx") 0u32,
+                    options(nomem, nostack)
+                );
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: MSR access is x86-specific; not present on this arch.
+            let _ = hw_val;
         }
         Ok(())
     }
 
     /// Read IA32_PERF_STATUS to get the current hardware frequency ratio.
     fn read_perf_status(&self, _cpu: usize) -> Result<u16> {
-        let msr = if self.is_intel {
-            MSR_IA32_PERF_STATUS
-        } else {
-            MSR_AMD_PSTATE_STATUS
-        };
         #[cfg(target_arch = "x86_64")]
         {
+            let msr = if self.is_intel {
+                MSR_IA32_PERF_STATUS
+            } else {
+                MSR_AMD_PSTATE_STATUS
+            };
             let lo: u32;
             let hi: u32;
             // SAFETY: IA32_PERF_STATUS is a read-only MSR reporting current frequency.
@@ -277,7 +284,7 @@ impl CpuFreq {
             let _ = hi;
             return Ok(((lo >> 8) & 0xFF) as u16);
         }
-        #[allow(unreachable_code)]
+        #[cfg(not(target_arch = "x86_64"))]
         Ok(0)
     }
 }

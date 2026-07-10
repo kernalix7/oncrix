@@ -59,8 +59,8 @@ use oncrix_mm::address_space::{USER_SPACE_END, USER_SPACE_START};
 use oncrix_process::signal::{Signal, SignalAction};
 use oncrix_syscall::dispatch::SyscallArgs;
 
-use crate::arch::x86_64::init_embed::SIGRETURN_TRAMPOLINE_VA;
-use crate::arch::x86_64::syscall_entry::{
+use crate::arch::init_embed::SIGRETURN_TRAMPOLINE_VA;
+use crate::arch::syscall_entry::{
     SYSCALL_SAVED_USER_RFLAGS, SYSCALL_SAVED_USER_RIP, SYSCALL_SAVED_USER_RSP,
 };
 

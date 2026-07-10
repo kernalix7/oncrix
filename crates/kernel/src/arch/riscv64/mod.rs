@@ -7,6 +7,18 @@
 //! RISC-V uses supervisor-mode CSRs (stvec, sie, satp) instead of x86
 //! GDT/IDT.  Exception/interrupt routing is via the trap vector installed
 //! in boot.rs (HAL).
+//!
+//! The `clone`, `context`, `init`, `init_embed`, `sched_glue`, and
+//! `syscall_entry` submodules are riscv64 build stubs that mirror the
+//! x86_64 public API so architecture-neutral kernel code type-checks; they
+//! are not yet functional.
+
+pub mod clone;
+pub mod context;
+pub mod init;
+pub mod init_embed;
+pub mod sched_glue;
+pub mod syscall_entry;
 
 use oncrix_hal::arch::riscv64::ns16550::{NS16550_BASE, Ns16550};
 use oncrix_hal::arch::riscv64::plic::{PLIC_BASE, Plic};

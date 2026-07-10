@@ -95,7 +95,7 @@ pub unsafe fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off:
         // pages on the next instruction without waiting for a context
         // switch.
         let pt_phys = uas.mmap_pt_phys().map(|p| p.as_u64());
-        crate::arch::x86_64::init::install_user_mmap_pt(pt_phys);
+        crate::arch::init::install_user_mmap_pt(pt_phys);
         va as i64
     }
 }
