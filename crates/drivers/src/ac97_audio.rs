@@ -286,10 +286,14 @@ impl Ac97Audio {
                     options(nomem, nostack)
                 );
             }
-            return val;
+            val
         }
-        #[allow(unreachable_code)]
-        0
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NAM is x86-legacy port I/O; not present.
+            let _ = offset;
+            0
+        }
     }
 
     fn write_nam16(&mut self, offset: u16, val: u16) {
@@ -302,6 +306,11 @@ impl Ac97Audio {
                 in("ax") val,
                 options(nomem, nostack)
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NAM is x86-legacy port I/O; not present.
+            let _ = (offset, val);
         }
     }
 
@@ -320,10 +329,14 @@ impl Ac97Audio {
                     options(nomem, nostack)
                 );
             }
-            return val;
+            val
         }
-        #[allow(unreachable_code)]
-        0
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NABM is x86-legacy port I/O; not present.
+            let _ = offset;
+            0
+        }
     }
 
     fn read_nabm16(&self, offset: u16) -> u16 {
@@ -339,10 +352,14 @@ impl Ac97Audio {
                     options(nomem, nostack)
                 );
             }
-            return val;
+            val
         }
-        #[allow(unreachable_code)]
-        0
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NABM is x86-legacy port I/O; not present.
+            let _ = offset;
+            0
+        }
     }
 
     fn read_nabm32(&self, offset: u16) -> u32 {
@@ -358,10 +375,14 @@ impl Ac97Audio {
                     options(nomem, nostack)
                 );
             }
-            return val;
+            val
         }
-        #[allow(unreachable_code)]
-        0
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NABM is x86-legacy port I/O; not present.
+            let _ = offset;
+            0
+        }
     }
 
     fn write_nabm8(&mut self, offset: u16, val: u8) {
@@ -374,6 +395,11 @@ impl Ac97Audio {
                 in("al") val,
                 options(nomem, nostack)
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NABM is x86-legacy port I/O; not present.
+            let _ = (offset, val);
         }
     }
 
@@ -388,6 +414,11 @@ impl Ac97Audio {
                 options(nomem, nostack)
             );
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NABM is x86-legacy port I/O; not present.
+            let _ = (offset, val);
+        }
     }
 
     fn write_nabm32(&mut self, offset: u16, val: u32) {
@@ -400,6 +431,11 @@ impl Ac97Audio {
                 in("eax") val,
                 options(nomem, nostack)
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: AC'97 NABM is x86-legacy port I/O; not present.
+            let _ = (offset, val);
         }
     }
 }

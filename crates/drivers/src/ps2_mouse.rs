@@ -295,6 +295,12 @@ impl Ps2Mouse {
                 options(nomem, nostack)
             );
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: the i8042 controller is x86-legacy port I/O;
+            // not present on this arch.
+            let _ = val;
+        }
         Ok(())
     }
 
@@ -310,6 +316,12 @@ impl Ps2Mouse {
                 in("al") val,
                 options(nomem, nostack)
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: the i8042 controller is x86-legacy port I/O;
+            // not present on this arch.
+            let _ = val;
         }
     }
 

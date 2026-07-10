@@ -16,9 +16,10 @@
 //!
 //! # Architecture
 //!
-//! Port I/O is x86_64-specific. This entire module is gated behind
-//! `#[cfg(target_arch = "x86_64")]` at the module level (see
-//! `lib.rs`).
+//! Port I/O is x86_64-specific. The low-level port helpers below are
+//! gated behind `#[cfg(target_arch = "x86_64")]`; on other architectures
+//! they compile to safe stand-ins so the rest of this module (which is
+//! architecture-agnostic bookkeeping) still builds.
 
 use oncrix_lib::{Error, Result};
 
@@ -31,6 +32,7 @@ use oncrix_lib::{Error, Result};
 /// # Safety
 ///
 /// Caller must ensure `port` is a valid I/O port.
+#[cfg(target_arch = "x86_64")]
 unsafe fn inb(port: u16) -> u8 {
     let val: u8;
     // SAFETY: Caller guarantees port validity.
@@ -45,11 +47,22 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+/// aarch64/riscv: ATA PIO is x86-legacy port I/O; not present on this arch.
+///
+/// # Safety
+///
+/// No hardware access is performed; any `port` value is accepted.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn inb(_port: u16) -> u8 {
+    0
+}
+
 /// Write a byte to an x86 I/O port.
 ///
 /// # Safety
 ///
 /// Caller must ensure `port` is a valid I/O port.
+#[cfg(target_arch = "x86_64")]
 unsafe fn outb(port: u16, val: u8) {
     // SAFETY: Caller guarantees port validity.
     unsafe {
@@ -62,11 +75,20 @@ unsafe fn outb(port: u16, val: u8) {
     }
 }
 
+/// aarch64/riscv: ATA PIO is x86-legacy port I/O; not present on this arch.
+///
+/// # Safety
+///
+/// No hardware access is performed; any `port`/`val` value is accepted.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn outb(_port: u16, _val: u8) {}
+
 /// Read a 16-bit word from an x86 I/O port.
 ///
 /// # Safety
 ///
 /// Caller must ensure `port` is a valid I/O port.
+#[cfg(target_arch = "x86_64")]
 unsafe fn inw(port: u16) -> u16 {
     let val: u16;
     // SAFETY: Caller guarantees port validity.
@@ -81,11 +103,22 @@ unsafe fn inw(port: u16) -> u16 {
     val
 }
 
+/// aarch64/riscv: ATA PIO is x86-legacy port I/O; not present on this arch.
+///
+/// # Safety
+///
+/// No hardware access is performed; any `port` value is accepted.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn inw(_port: u16) -> u16 {
+    0
+}
+
 /// Write a 16-bit word to an x86 I/O port.
 ///
 /// # Safety
 ///
 /// Caller must ensure `port` is a valid I/O port.
+#[cfg(target_arch = "x86_64")]
 unsafe fn outw(port: u16, val: u16) {
     // SAFETY: Caller guarantees port validity.
     unsafe {
@@ -97,6 +130,14 @@ unsafe fn outw(port: u16, val: u16) {
         );
     }
 }
+
+/// aarch64/riscv: ATA PIO is x86-legacy port I/O; not present on this arch.
+///
+/// # Safety
+///
+/// No hardware access is performed; any `port`/`val` value is accepted.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn outw(_port: u16, _val: u16) {}
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -119,6 +119,12 @@ impl PcSpeaker {
                 options(nomem, nostack)
             );
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: the 8253/8254 PIT is x86-legacy port I/O; not
+            // present on this arch.
+            let _ = divisor;
+        }
     }
 
     /// Enable the PC speaker (connect channel 2 output to speaker).

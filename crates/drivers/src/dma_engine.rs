@@ -256,10 +256,15 @@ impl DmaEngine {
                     options(nomem, nostack)
                 );
             }
-            return val;
+            val
         }
-        #[allow(unreachable_code)]
-        0
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: the 8237 DMA controller is x86-legacy port I/O;
+            // not present on this arch.
+            let _ = port;
+            0
+        }
     }
 
     fn write_port(&self, port: u16, val: u8) {
@@ -272,6 +277,12 @@ impl DmaEngine {
                 in("al") val,
                 options(nomem, nostack)
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: the 8237 DMA controller is x86-legacy port I/O;
+            // not present on this arch.
+            let _ = (port, val);
         }
     }
 }

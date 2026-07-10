@@ -233,6 +233,12 @@ impl NvramDriver {
                 options(nomem, nostack)
             );
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64/riscv: CMOS/RTC NVRAM is x86-legacy port I/O; not
+            // present on this arch.
+            let _ = val;
+        }
         Ok(())
     }
 

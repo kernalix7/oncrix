@@ -197,6 +197,7 @@ const MSR_LINK: u8 = 1 << 2;
 ///
 /// The caller must ensure that reading from `port` is valid and
 /// does not cause undefined hardware behavior.
+#[cfg(target_arch = "x86_64")]
 fn port_inb(port: u16) -> u8 {
     let val: u8;
     // SAFETY: Caller guarantees `port` is a valid I/O port.
@@ -212,12 +213,20 @@ fn port_inb(port: u16) -> u8 {
     val
 }
 
+/// aarch64/riscv: the RTL8139 is x86-legacy port-I/O only; not present on
+/// this arch.
+#[cfg(not(target_arch = "x86_64"))]
+fn port_inb(_port: u16) -> u8 {
+    0
+}
+
 /// Read a 16-bit value from an x86 I/O port.
 ///
 /// # Safety
 ///
 /// The caller must ensure that reading from `port` is valid and
 /// the port address is 16-bit aligned.
+#[cfg(target_arch = "x86_64")]
 fn port_inw(port: u16) -> u16 {
     let val: u16;
     // SAFETY: Caller guarantees `port` is a valid, aligned
@@ -233,12 +242,20 @@ fn port_inw(port: u16) -> u16 {
     val
 }
 
+/// aarch64/riscv: the RTL8139 is x86-legacy port-I/O only; not present on
+/// this arch.
+#[cfg(not(target_arch = "x86_64"))]
+fn port_inw(_port: u16) -> u16 {
+    0
+}
+
 /// Read a 32-bit value from an x86 I/O port.
 ///
 /// # Safety
 ///
 /// The caller must ensure that reading from `port` is valid and
 /// the port address is 32-bit aligned.
+#[cfg(target_arch = "x86_64")]
 fn port_inl(port: u16) -> u32 {
     let val: u32;
     // SAFETY: Caller guarantees `port` is a valid, aligned
@@ -254,12 +271,20 @@ fn port_inl(port: u16) -> u32 {
     val
 }
 
+/// aarch64/riscv: the RTL8139 is x86-legacy port-I/O only; not present on
+/// this arch.
+#[cfg(not(target_arch = "x86_64"))]
+fn port_inl(_port: u16) -> u32 {
+    0
+}
+
 /// Write an 8-bit value to an x86 I/O port.
 ///
 /// # Safety
 ///
 /// The caller must ensure that writing to `port` is valid and
 /// does not cause undefined hardware behavior.
+#[cfg(target_arch = "x86_64")]
 fn port_outb(port: u16, val: u8) {
     // SAFETY: Caller guarantees `port` is a valid I/O port.
     // Uses `out dx, al` to write one byte to the port.
@@ -273,12 +298,18 @@ fn port_outb(port: u16, val: u8) {
     }
 }
 
+/// aarch64/riscv: the RTL8139 is x86-legacy port-I/O only; not present on
+/// this arch.
+#[cfg(not(target_arch = "x86_64"))]
+fn port_outb(_port: u16, _val: u8) {}
+
 /// Write a 16-bit value to an x86 I/O port.
 ///
 /// # Safety
 ///
 /// The caller must ensure that writing to `port` is valid and
 /// the port address is 16-bit aligned.
+#[cfg(target_arch = "x86_64")]
 fn port_outw(port: u16, val: u16) {
     // SAFETY: Caller guarantees `port` is a valid, aligned
     // I/O port. Uses `out dx, ax` to write two bytes.
@@ -292,12 +323,18 @@ fn port_outw(port: u16, val: u16) {
     }
 }
 
+/// aarch64/riscv: the RTL8139 is x86-legacy port-I/O only; not present on
+/// this arch.
+#[cfg(not(target_arch = "x86_64"))]
+fn port_outw(_port: u16, _val: u16) {}
+
 /// Write a 32-bit value to an x86 I/O port.
 ///
 /// # Safety
 ///
 /// The caller must ensure that writing to `port` is valid and
 /// the port address is 32-bit aligned.
+#[cfg(target_arch = "x86_64")]
 fn port_outl(port: u16, val: u32) {
     // SAFETY: Caller guarantees `port` is a valid, aligned
     // I/O port. Uses `out dx, eax` to write four bytes.
@@ -310,6 +347,11 @@ fn port_outl(port: u16, val: u32) {
         );
     }
 }
+
+/// aarch64/riscv: the RTL8139 is x86-legacy port-I/O only; not present on
+/// this arch.
+#[cfg(not(target_arch = "x86_64"))]
+fn port_outl(_port: u16, _val: u32) {}
 
 // -----------------------------------------------------------------------
 // TX Descriptor
