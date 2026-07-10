@@ -17,6 +17,11 @@ repository = "https://github.com/kernalix7/oncrix"
 # clippy flags the large ones as `large_const_arrays` ("should be static"); the
 # const is intentional (a single inlined zero-initializer), so allow it workspace-wide.
 large_const_arrays = "allow"
+# `for slot in &mut self.table { *slot = None; }` (clearing fixed-capacity inline
+# tables) is used across the tree; a newer nightly clippy flags it as
+# `manual_slice_fill`. `.fill(None)` is not always applicable (non-Copy element
+# types) and the loop is clear, so allow it workspace-wide.
+manual_slice_fill = "allow"
 
 [workspace.dependencies]
 oncrix-kernel = { path = "crates/kernel" }
