@@ -43,6 +43,9 @@
 //! - Linux `fs/cachefiles/`, `include/linux/fscache.h`
 //! - `Documentation/filesystems/caching/cachefiles.rst`
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use oncrix_lib::{Error, Result};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -412,7 +415,12 @@ pub struct CacheBackend {
     root_path: [u8; MAX_ROOT_PATH],
     root_path_len: usize,
     /// Volume table.
-    volumes: [Option<CacheVolume>; MAX_VOLUMES],
+    ///
+    /// Each occupied slot is heap-allocated. A `CacheVolume` is multi-megabyte, so
+    /// storing them inline would make `CacheBackend` several gigabytes and overflow the
+    /// signed 32-bit stack-frame-offset limit on riscv64 whenever it is built by value.
+    /// Boxing keeps the backend itself pointer-sized while preserving the fixed capacity.
+    volumes: [Option<Box<CacheVolume>>; MAX_VOLUMES],
     volume_count: usize,
     /// Whether the backend is currently active.
     pub active: bool,
@@ -425,7 +433,7 @@ impl Default for CacheBackend {
         Self {
             root_path: [0u8; MAX_ROOT_PATH],
             root_path_len: 0,
-            volumes: core::array::from_fn(|_| None),
+            volumes: [const { None }; MAX_VOLUMES],
             volume_count: 0,
             active: false,
             stats: CacheStats::default(),
@@ -467,7 +475,7 @@ impl CacheBackend {
         let mut vol = CacheVolume::default();
         vol.set_key(vol_key)?;
         vol.active = true;
-        self.volumes[idx] = Some(vol);
+        self.volumes[idx] = Some(Box::new(vol));
         self.volume_count += 1;
         self.stats.volumes += 1;
         Ok(idx)
