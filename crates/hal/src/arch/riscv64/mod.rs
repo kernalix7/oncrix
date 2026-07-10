@@ -7,3 +7,4 @@ pub mod boot;
 pub mod ns16550;
 pub mod plic;
 pub mod timer;
+pub mod uart;

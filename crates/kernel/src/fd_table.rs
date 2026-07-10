@@ -27,7 +27,7 @@
 //! - `fork(3p)` — "the child inherits copies of the parent's set of
 //!   open file descriptors".
 
-use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
+use oncrix_hal::arch::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
 use oncrix_lib::{Error, Result};
 
@@ -47,7 +47,7 @@ pub use oncrix_process::fd_table::{
 /// reapable process, nothing in `Thread::Drop` rebalances the out-of-band
 /// counts. The fork failure paths call this helper for each inherited handle
 /// to release the bump with the matching close function, mirroring the bump
-/// set in [`crate::arch::x86_64::clone::arch_clone_thread`].
+/// set in [`crate::arch::clone::arch_clone_thread`].
 ///
 /// Backends without an out-of-band refcount (`Console`, `RamfsFile`,
 /// `DevFile`, `ProcFile`) are a no-op, exactly as they are skipped on the
@@ -2188,7 +2188,7 @@ unsafe fn poll_now_ticks() -> u64 {
     use oncrix_hal::timer::Timer;
     // SAFETY: see fn-level note.
     unsafe {
-        let pit_ptr = &raw const crate::arch::x86_64::init::PIT_TIMER;
+        let pit_ptr = &raw const crate::arch::init::PIT_TIMER;
         (*pit_ptr).current_ticks()
     }
 }
@@ -3108,7 +3108,11 @@ pub unsafe fn dispatch_read(fd: usize, buf_ptr: u64, count: u64) -> i64 {
                         // SAFETY: We hold no live borrows of any single-CPU-protected
                         // data in this branch. The IRQ handlers save/restore context.
                         unsafe {
+                            #[cfg(target_arch = "x86_64")]
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                            // aarch64/riscv build stub: park the CPU until the next interrupt.
+                            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                            core::arch::asm!("wfi", options(nomem, nostack));
                         }
                     }
                 }

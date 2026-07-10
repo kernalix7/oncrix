@@ -508,7 +508,7 @@ const CLK_TCK: u64 = 100;
 unsafe fn global_ticks() -> u64 {
     // SAFETY: see fn-level note.
     unsafe {
-        let pit_ptr = &raw const crate::arch::x86_64::init::PIT_TIMER;
+        let pit_ptr = &raw const crate::arch::init::PIT_TIMER;
         (*pit_ptr).current_ticks()
     }
 }

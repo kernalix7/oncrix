@@ -7,6 +7,18 @@
 //! aarch64 target.  AArch64 has no GDT; exception vectors are installed
 //! via VBAR_EL1 in the HAL boot stub (`crates/hal/src/arch/aarch64/boot.rs`).
 //! This module provides the Rust-side init functions called from `kernel_main`.
+//!
+//! The `clone`, `context`, `init`, `init_embed`, `sched_glue`, and
+//! `syscall_entry` submodules are aarch64 build stubs that mirror the
+//! x86_64 public API so architecture-neutral kernel code type-checks; they
+//! are not yet functional.
+
+pub mod clone;
+pub mod context;
+pub mod init;
+pub mod init_embed;
+pub mod sched_glue;
+pub mod syscall_entry;
 
 use oncrix_hal::arch::aarch64::gic::{GICD_BASE, GICR_BASE, Gicv3};
 use oncrix_hal::arch::aarch64::pl011::{PL011_BASE, Pl011};

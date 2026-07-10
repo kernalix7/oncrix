@@ -9,7 +9,7 @@
 //! is the thin bridge: it consults the global [`SCHEDULER`]
 //! populated during boot.
 //!
-//! [`SCHEDULER`]: crate::arch::x86_64::init::SCHEDULER
+//! [`SCHEDULER`]: crate::arch::init::SCHEDULER
 //!
 //! # Single-CPU caveat
 //!
@@ -18,9 +18,9 @@
 //! require per-CPU storage (`swapgs` / GSBASE) and a per-CPU
 //! `current_thread` pointer; that upgrade is deferred.
 
-use crate::arch::x86_64::clone::{ForkSnapshot, arch_clone_thread};
-use crate::arch::x86_64::init::{SCHEDULER, switch_tss_rsp0};
-use crate::arch::x86_64::sched_glue::sched_yield_once;
+use crate::arch::clone::{ForkSnapshot, arch_clone_thread};
+use crate::arch::init::{SCHEDULER, switch_tss_rsp0};
+use crate::arch::sched_glue::sched_yield_once;
 use oncrix_lib::{Error, Result};
 use oncrix_process::pid::{Pid, Tid};
 use oncrix_process::thread::Thread;

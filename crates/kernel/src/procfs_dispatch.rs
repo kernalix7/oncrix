@@ -26,7 +26,7 @@ unsafe fn pit_ticks() -> u64 {
     // SAFETY: same invariant as time_syscalls::current_ticks — single-CPU
     // SYSCALL context, no concurrent mutation of PIT_TIMER.
     unsafe {
-        let pit_ptr = &raw const crate::arch::x86_64::init::PIT_TIMER;
+        let pit_ptr = &raw const crate::arch::init::PIT_TIMER;
         (*pit_ptr).current_ticks()
     }
 }

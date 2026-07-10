@@ -43,16 +43,16 @@
 //! POSIX.1-2024 `fork(3p)`, `wait(3p)`, `waitid(3p)`, `execve(3p)`, `_exit(3p)`,
 //! `kill(3p)`. See `.priv-storage/.TheOpenGroup/susv5-html/functions/`.
 
-use oncrix_hal::arch::x86_64::uart::{COM1, Uart16550};
+use oncrix_hal::arch::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
 use oncrix_process::pid::{Pid, alloc_pid};
 use oncrix_process::process::Process;
 use oncrix_process::signal::Signal;
 use oncrix_process::table::{ExitStatus, ProcessEntry, ProcessTable};
 
-use crate::arch::x86_64::clone::ForkSnapshot;
-use crate::arch::x86_64::sched_glue::read_cr3;
-use crate::arch::x86_64::syscall_entry::{
+use crate::arch::clone::ForkSnapshot;
+use crate::arch::sched_glue::read_cr3;
+use crate::arch::syscall_entry::{
     saved_user_rflags, saved_user_rip, saved_user_rsp, set_saved_user_rflags, set_saved_user_rip,
     set_saved_user_rsp,
 };
@@ -230,7 +230,7 @@ pub unsafe fn sys_fork() -> i64 {
     // SAFETY: single-CPU SYSCALL context.
     unsafe {
         #[allow(static_mut_refs)]
-        let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+        let sched = &mut crate::arch::init::SCHEDULER;
         if let Some(child_thread) = sched.get_mut(child_tid) {
             child_thread.user_address_space = Some(child_uas);
         } else {
@@ -417,7 +417,7 @@ unsafe fn reap_zombie(zombie_pid: Pid) {
     // SAFETY: same context; SCHEDULER exclusively owned here.
     let zombie_tid = unsafe {
         #[allow(static_mut_refs)]
-        let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+        let sched = &mut crate::arch::init::SCHEDULER;
         let mut tid_opt: Option<oncrix_process::pid::Tid> = None;
         for slot in sched.threads_iter_mut() {
             if let Some(t) = slot
@@ -438,7 +438,7 @@ unsafe fn reap_zombie(zombie_pid: Pid) {
         // SAFETY: same single-CPU context.
         unsafe {
             #[allow(static_mut_refs)]
-            let _ = crate::arch::x86_64::init::SCHEDULER.remove(tid);
+            let _ = crate::arch::init::SCHEDULER.remove(tid);
         }
     }
 }
@@ -639,7 +639,7 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
     // Resolve `path` against the embedded binary set. Phase 23
     // recognises `/bin/{sh,echo,cat,true,false}` plus the matching
     // bare names (a primitive `$PATH=/bin` shortcut).
-    let elf_bytes = match crate::arch::x86_64::init_embed::embedded_lookup(path) {
+    let elf_bytes = match crate::arch::init_embed::embedded_lookup(path) {
         Some(bytes) => bytes,
         None => {
             let _ = serial.write_str("[exec] path not in embedded set: ");
@@ -724,7 +724,7 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
                 // address). Then release the old UAS.
                 if let Some(thread) = crate::current::current_thread() {
                     if let Some(uas) = thread.user_address_space.as_ref() {
-                        crate::arch::x86_64::init::install_user_pt(uas.user_pt_phys().as_u64());
+                        crate::arch::init::install_user_pt(uas.user_pt_phys().as_u64());
                     }
                 }
 
@@ -783,8 +783,8 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
                 // both writes target the same `backing` slice and the
                 // borrow checker rejects two `&mut` regions of it being
                 // live at once.
-                let tramp_off = crate::arch::x86_64::init_embed::SIGRETURN_TRAMPOLINE_OFFSET;
-                let tramp = &crate::arch::x86_64::init_embed::SIGRETURN_TRAMPOLINE_BYTES;
+                let tramp_off = crate::arch::init_embed::SIGRETURN_TRAMPOLINE_OFFSET;
+                let tramp = &crate::arch::init_embed::SIGRETURN_TRAMPOLINE_BYTES;
                 if tramp_off + tramp.len() <= region_size {
                     backing[tramp_off..tramp_off + tramp.len()].copy_from_slice(tramp);
                 }
@@ -1117,7 +1117,7 @@ pub unsafe fn sys_exit(code: u64) -> i64 {
     // SAFETY: Single-CPU SYSCALL context; no other code touches the scheduler.
     unsafe {
         #[allow(static_mut_refs)]
-        let sched = &mut crate::arch::x86_64::init::SCHEDULER;
+        let sched = &mut crate::arch::init::SCHEDULER;
         if let Some(t) = sched.current_mut() {
             t.set_state(oncrix_process::thread::ThreadState::Exited);
         }
@@ -1134,10 +1134,10 @@ pub unsafe fn sys_exit(code: u64) -> i64 {
         unsafe {
             let _ = crate::current::yield_now();
         }
-        // Spin to avoid a busy loop burning 100 % CPU when there are
-        // no other threads. `pause` is the x86_64 spin-wait hint.
-        // SAFETY: `pause` is a hint instruction with no side effects.
-        unsafe { core::arch::asm!("pause", options(nomem, nostack)) };
+        // Spin to avoid a busy loop burning 100 % CPU when there are no
+        // other threads. `spin_loop()` emits `pause` on x86_64, `yield`
+        // on aarch64, and a no-op hint on riscv64.
+        core::hint::spin_loop();
     }
 }
 

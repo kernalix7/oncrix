@@ -9,7 +9,10 @@
 //! as isolated user-space processes communicating via IPC.
 
 #![no_std]
-#![feature(abi_x86_interrupt)]
+// The `x86-interrupt` calling convention is only used by the x86_64
+// interrupt/exception handlers under `arch/x86_64/`; gating the feature to
+// that target avoids an `unused_features` warning on aarch64/riscv64.
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
 pub mod aio;
 pub mod apparmor;

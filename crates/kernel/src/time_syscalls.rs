@@ -30,7 +30,7 @@ unsafe fn current_ticks() -> u64 {
     // through this read path during SYSCALL dispatch (also IF=0 from
     // FMASK). No concurrent mutation on a single-CPU build.
     unsafe {
-        let pit_ptr = &raw const crate::arch::x86_64::init::PIT_TIMER;
+        let pit_ptr = &raw const crate::arch::init::PIT_TIMER;
         (*pit_ptr).current_ticks()
     }
 }
@@ -177,7 +177,11 @@ pub unsafe fn sys_nanosleep(req_ptr: u64, rem_ptr: u64) -> i64 {
         // immediately `cli` so the rest of the loop body re-enters
         // the syscall's IF=0 contract.
         unsafe {
+            #[cfg(target_arch = "x86_64")]
             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            // aarch64/riscv build stub: park the CPU until the next interrupt.
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            core::arch::asm!("wfi", options(nomem, nostack));
         }
     }
 
@@ -224,7 +228,11 @@ unsafe fn sleep_until_ticks(deadline: u64) {
         // `hlt` lets the 100 Hz timer advance the counter, then `cli`
         // restores the syscall's IF=0 contract before the next read.
         unsafe {
+            #[cfg(target_arch = "x86_64")]
             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            // aarch64/riscv build stub: park the CPU until the next interrupt.
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            core::arch::asm!("wfi", options(nomem, nostack));
         }
     }
 }

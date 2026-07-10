@@ -851,8 +851,8 @@ impl RtcDevice {
     fn cmos_read(&self, reg: u8) -> u8 {
         // SAFETY: CMOS ports 0x70/0x71 are standard x86_64 I/O ports.
         unsafe {
-            crate::arch::x86_64::io::outb(CMOS_ADDR_PORT, reg);
-            crate::arch::x86_64::io::inb(CMOS_DATA_PORT)
+            crate::arch::io::outb(CMOS_ADDR_PORT, reg);
+            crate::arch::io::inb(CMOS_DATA_PORT)
         }
     }
 
@@ -861,8 +861,8 @@ impl RtcDevice {
     fn cmos_write(&self, reg: u8, val: u8) {
         // SAFETY: CMOS ports 0x70/0x71 are standard x86_64 I/O ports.
         unsafe {
-            crate::arch::x86_64::io::outb(CMOS_ADDR_PORT, reg);
-            crate::arch::x86_64::io::outb(CMOS_DATA_PORT, val);
+            crate::arch::io::outb(CMOS_ADDR_PORT, reg);
+            crate::arch::io::outb(CMOS_DATA_PORT, val);
         }
     }
 
