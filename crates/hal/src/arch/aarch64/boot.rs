@@ -60,13 +60,21 @@ core::arch::global_asm!(
     "   ldr     x0, =0x000000000080351bULL",
     "   msr     tcr_el1, x0",
     "   isb",
-    // ── SCTLR_EL1: enable MMU (M=1), D-cache (C=1), I-cache (I=1) ────────
-    // Read current value, set M|C|I, write back.
-    "   mrs     x0, sctlr_el1",
-    "   orr     x0, x0, #(1 << 0)",  // M  — MMU enable
-    "   orr     x0, x0, #(1 << 2)",  // C  — D-cache enable
-    "   orr     x0, x0, #(1 << 12)", // I  — I-cache enable
-    "   msr     sctlr_el1, x0",
+    // ── MMU: left OFF for initial bring-up ───────────────────────────────
+    // The MAIR/TCR values above are staged, but enabling SCTLR_EL1.M
+    // without a valid TTBR0_EL1 translation table faults the very next
+    // instruction fetch (level-1 translation abort). Until an identity
+    // page table is installed in TTBR0_EL1, run with the MMU off (flat
+    // physical addressing), which is sufficient to reach the serial
+    // console and the per-arch init path on the QEMU `virt` machine.
+    // ── Enable FP/SIMD access at EL0/EL1 ─────────────────────────────────
+    // Rust codegen for aarch64 emits Advanced SIMD/NEON (memcpy, slice ops,
+    // formatting). Without CPACR_EL1.FPEN = 0b11 those instructions trap
+    // (ESR EC=0x07) the first time they execute, so this must run before any
+    // Rust code (kernel_main).
+    "   mrs     x0, cpacr_el1",
+    "   orr     x0, x0, #(0b11 << 20)",
+    "   msr     cpacr_el1, x0",
     "   isb",
     // ── Jump to Rust kernel_main ──────────────────────────────────────────
     "   bl      kernel_main",
