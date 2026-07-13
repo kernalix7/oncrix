@@ -43,6 +43,48 @@ core::arch::global_asm!(include_str!("arch/x86_64/boot.S"), options(att_syntax))
 //
 // No additional global_asm! is needed here; the HAL's boot.rs provides _start.
 
+/// AArch64 cooperative-scheduler bring-up demo: kernel thread A.
+///
+/// Prints a marker proving it executed, then cooperatively yields back
+/// to the scheduler. Never returns — parks in `wfi` if it is ever
+/// resumed a second time.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn demo_thread_a() -> ! {
+    let mut serial = Pl011::new(PL011_BASE);
+    let _ = serial.write_str("[ONCRIX/aarch64] cooperative scheduler: thread A ran\n");
+    loop {
+        // SAFETY: interrupts are masked for the whole demo and no
+        // scheduler borrow is held across this cooperative yield.
+        unsafe {
+            let _ = oncrix_kernel::current::yield_now();
+        }
+        // SAFETY: `wfi` parks the CPU until a wakeup event; it is
+        // harmless at EL1 and does not corrupt architectural state.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
+/// AArch64 cooperative-scheduler bring-up demo: kernel thread B.
+///
+/// Counterpart to [`demo_thread_a`]; prints its own marker then yields.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn demo_thread_b() -> ! {
+    let mut serial = Pl011::new(PL011_BASE);
+    let _ = serial.write_str("[ONCRIX/aarch64] cooperative scheduler: thread B ran\n");
+    loop {
+        // SAFETY: see `demo_thread_a`.
+        unsafe {
+            let _ = oncrix_kernel::current::yield_now();
+        }
+        // SAFETY: see `demo_thread_a`.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
 /// Main kernel initialization sequence.
 ///
 /// Called from the 64-bit trampoline in `boot.S` after the 32-bit stub
@@ -256,6 +298,78 @@ pub extern "C" fn kernel_main() -> ! {
         }
 
         let _ = serial.write_str("[ONCRIX/aarch64] All early initialization complete.\n");
+
+        // ─── Cooperative kernel-thread scheduling bring-up demo ───
+        //
+        // Proves the aarch64 `switch_context` (#139) actually schedules
+        // real kernel threads at runtime. Sequence:
+        //   1. Mask DAIF — `switch_context`/`sched_yield_once` require
+        //      interrupts masked, and a cooperative hand-off must not be
+        //      preempted by the generic timer.
+        //   2. Register the running boot context as a schedulable thread
+        //      and promote it to Running, so `prepare_switch` has a slot
+        //      to save the outgoing state into.
+        //   3. Spawn two kernel threads. `spawn_kthread` seeds each
+        //      stack's 96-byte switch frame (x30 = entry) plus a parallel
+        //      `CpuContext`; copy that context into the scheduler-owned
+        //      `Thread` before registering it.
+        //   4. Yield. Control flows boot → A → B → boot (round-robin), so
+        //      both thread bodies print before we return here and halt.
+        {
+            use oncrix_kernel::arch::aarch64::kthread::{kthread_context, spawn_kthread};
+            use oncrix_kernel::arch::init::SCHEDULER;
+            use oncrix_kernel::current::{spawn_thread, yield_now};
+            use oncrix_process::pid::{Pid, alloc_tid};
+            use oncrix_process::thread::{Priority, Thread};
+
+            // Step 1: mask all interrupts for the whole sequence.
+            // SAFETY: ring-0 (EL1) boot context; masking interrupts is the
+            // documented precondition of the switch/yield primitives.
+            unsafe {
+                core::arch::asm!("msr daifset, #0b1111", options(nomem, nostack));
+            }
+
+            let _ =
+                serial.write_str("[ONCRIX/aarch64] cooperative scheduler: bring-up demo start\n");
+
+            // Step 2: register + promote the boot thread.
+            // SAFETY: single-threaded boot; SCHEDULER is not aliased here,
+            // and each access below is a distinct, non-overlapping borrow.
+            unsafe {
+                let boot = Thread::new(alloc_tid(), Pid::KERNEL, Priority::NORMAL);
+                let _ = spawn_thread(boot);
+                let sched = &raw mut SCHEDULER;
+                let _ = (*sched).schedule();
+            }
+
+            // Step 3: spawn the two demo kernel threads and copy each
+            // seeded context into the scheduler-owned `Thread`.
+            // SAFETY: entry fns are valid `extern "C" fn() -> !`; single
+            // CPU with interrupts masked keeps the pool + scheduler
+            // exclusive to this code.
+            unsafe {
+                if let Ok((kt, mut thread)) = spawn_kthread(demo_thread_a, Priority::NORMAL) {
+                    thread.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(thread);
+                }
+                if let Ok((kt, mut thread)) = spawn_kthread(demo_thread_b, Priority::NORMAL) {
+                    thread.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(thread);
+                }
+            }
+
+            // Step 4: hand the CPU to the demo threads; returns once both
+            // A and B have run and yielded back to the boot thread.
+            // SAFETY: interrupts masked above; no scheduler borrow held.
+            unsafe {
+                let _ = yield_now();
+            }
+
+            let _ = serial.write_str(
+                "[ONCRIX/aarch64] cooperative scheduler: thread A/B ran, back on boot thread\n",
+            );
+        }
+
         let _ = serial.write_str("[ONCRIX/aarch64] Entering halt loop.\n");
     }
 

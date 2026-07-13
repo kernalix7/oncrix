@@ -8,15 +8,20 @@
 //! via VBAR_EL1 in the HAL boot stub (`crates/hal/src/arch/aarch64/boot.rs`).
 //! This module provides the Rust-side init functions called from `kernel_main`.
 //!
-//! The `clone`, `context`, `init`, `init_embed`, `sched_glue`, and
-//! `syscall_entry` submodules are aarch64 build stubs that mirror the
-//! x86_64 public API so architecture-neutral kernel code type-checks; they
-//! are not yet functional.
+//! The `context`, `kthread`, and `sched_glue` submodules are functional
+//! for **kernel-thread cooperative scheduling** (the [`switch_context`]
+//! primitive plus a seeded-stack spawn path). The `clone`, `init_embed`,
+//! and `syscall_entry` submodules remain aarch64 build stubs that mirror
+//! the x86_64 public API so architecture-neutral kernel code type-checks;
+//! the userspace/EL0 transition they need is not written yet.
+//!
+//! [`switch_context`]: context::switch_context
 
 pub mod clone;
 pub mod context;
 pub mod init;
 pub mod init_embed;
+pub mod kthread;
 pub mod sched_glue;
 pub mod syscall_entry;
 
