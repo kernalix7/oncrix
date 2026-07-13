@@ -118,34 +118,104 @@ core::arch::global_asm!(
     ".Lsecondary_spin:",
     "   wfi",
     "   b       .Lsecondary_spin",
-    // ── Exception vector table (minimal stub, 16 × 128-byte slots) ────────
+    // ── Exception vector table (16 × 128-byte slots, 2 KiB-aligned) ──────
+    // The kernel runs at EL1h (SP_EL1), so hardware IRQs are delivered to
+    // the "Current EL with SPx / IRQ" slot at offset 0x280 (index 5). That
+    // slot vectors to `el1h_irq`, which saves a full trap frame, calls the
+    // Rust handler `aarch64_handle_irq`, restores, and `eret`s. Every other
+    // slot vectors to `el1_default`, which spins so an unexpected exception
+    // stops at a known PC (visible under `qemu -d int`) instead of running
+    // off into garbage. Each slot is padded to its 128-byte boundary.
     ".balign 2048",
     ".global exception_vectors",
     "exception_vectors:",
-    // Current EL with SP0
-    ".rept 4",
-    "   .rept 32",
-    "   nop",
-    "   .endr",
-    ".endr",
-    // Current EL with SPx
-    ".rept 4",
-    "   .rept 32",
-    "   nop",
-    "   .endr",
-    ".endr",
-    // Lower EL using AArch64
-    ".rept 4",
-    "   .rept 32",
-    "   nop",
-    "   .endr",
-    ".endr",
-    // Lower EL using AArch32
-    ".rept 4",
-    "   .rept 32",
-    "   nop",
-    "   .endr",
-    ".endr",
+    // Current EL with SP0 (unused — we run on SPx)
+    "   b       el1_default", // 0x000 Sync
+    ".balign 0x80",
+    "   b       el1_default", // 0x080 IRQ
+    ".balign 0x80",
+    "   b       el1_default", // 0x100 FIQ
+    ".balign 0x80",
+    "   b       el1_default", // 0x180 SError
+    ".balign 0x80",
+    // Current EL with SPx (the kernel's own EL1h context)
+    "   b       el1_default", // 0x200 Sync
+    ".balign 0x80",
+    "   b       el1h_irq", // 0x280 IRQ  ← timer / device interrupts
+    ".balign 0x80",
+    "   b       el1_default", // 0x300 FIQ
+    ".balign 0x80",
+    "   b       el1_default", // 0x380 SError
+    ".balign 0x80",
+    // Lower EL using AArch64 (no userspace yet)
+    "   b       el1_default", // 0x400 Sync
+    ".balign 0x80",
+    "   b       el1_default", // 0x480 IRQ
+    ".balign 0x80",
+    "   b       el1_default", // 0x500 FIQ
+    ".balign 0x80",
+    "   b       el1_default", // 0x580 SError
+    ".balign 0x80",
+    // Lower EL using AArch32 (unsupported)
+    "   b       el1_default", // 0x600 Sync
+    ".balign 0x80",
+    "   b       el1_default", // 0x680 IRQ
+    ".balign 0x80",
+    "   b       el1_default", // 0x700 FIQ
+    ".balign 0x80",
+    "   b       el1_default", // 0x780 SError
+    ".balign 0x80",
+    // ── el1h_irq: save trap frame, call Rust handler, restore, eret ──────
+    // Frame (288 bytes, 16-byte aligned): x0..x30 in pairs, then ELR_EL1 +
+    // SPSR_EL1. ELR/SPSR MUST be stacked because sched_yield_once may switch
+    // to another thread whose own IRQ would otherwise clobber those system
+    // registers before this thread is re-elected and eret's.
+    "el1h_irq:",
+    "   sub     sp, sp, #0x120",
+    "   stp     x0, x1, [sp, #0x00]",
+    "   stp     x2, x3, [sp, #0x10]",
+    "   stp     x4, x5, [sp, #0x20]",
+    "   stp     x6, x7, [sp, #0x30]",
+    "   stp     x8, x9, [sp, #0x40]",
+    "   stp     x10, x11, [sp, #0x50]",
+    "   stp     x12, x13, [sp, #0x60]",
+    "   stp     x14, x15, [sp, #0x70]",
+    "   stp     x16, x17, [sp, #0x80]",
+    "   stp     x18, x19, [sp, #0x90]",
+    "   stp     x20, x21, [sp, #0xa0]",
+    "   stp     x22, x23, [sp, #0xb0]",
+    "   stp     x24, x25, [sp, #0xc0]",
+    "   stp     x26, x27, [sp, #0xd0]",
+    "   stp     x28, x29, [sp, #0xe0]",
+    "   str     x30, [sp, #0xf0]",
+    "   mrs     x0, elr_el1",
+    "   mrs     x1, spsr_el1",
+    "   stp     x0, x1, [sp, #0x100]",
+    "   bl      aarch64_handle_irq",
+    "   ldp     x0, x1, [sp, #0x100]",
+    "   msr     elr_el1, x0",
+    "   msr     spsr_el1, x1",
+    "   ldp     x0, x1, [sp, #0x00]",
+    "   ldp     x2, x3, [sp, #0x10]",
+    "   ldp     x4, x5, [sp, #0x20]",
+    "   ldp     x6, x7, [sp, #0x30]",
+    "   ldp     x8, x9, [sp, #0x40]",
+    "   ldp     x10, x11, [sp, #0x50]",
+    "   ldp     x12, x13, [sp, #0x60]",
+    "   ldp     x14, x15, [sp, #0x70]",
+    "   ldp     x16, x17, [sp, #0x80]",
+    "   ldp     x18, x19, [sp, #0x90]",
+    "   ldp     x20, x21, [sp, #0xa0]",
+    "   ldp     x22, x23, [sp, #0xb0]",
+    "   ldp     x24, x25, [sp, #0xc0]",
+    "   ldp     x26, x27, [sp, #0xd0]",
+    "   ldp     x28, x29, [sp, #0xe0]",
+    "   ldr     x30, [sp, #0xf0]",
+    "   add     sp, sp, #0x120",
+    "   eret",
+    // ── el1_default: park on an unexpected exception ─────────────────────
+    "el1_default:",
+    "   b       .",
     // ── Boot stack (64 KiB, BSS so the binary doesn't grow) ──────────────
     ".section .bss.stack",
     ".align 16",

@@ -20,6 +20,16 @@ pub const GICD_BASE: usize = 0x0800_0000;
 /// GIC redistributor MMIO base — first CPU frame (QEMU virt).
 pub const GICR_BASE: usize = 0x080A_0000;
 
+/// Spurious interrupt ID.
+///
+/// The GIC CPU interface returns this INTID from `ICC_IAR1_EL1` when no
+/// interrupt is pending (or the pending IRQ has insufficient priority),
+/// signalling that no acknowledgement or EOI is required.
+pub const SPURIOUS_INTID: u32 = 1023;
+
+/// Mask covering the valid INTID field of `ICC_IAR1_EL1` (bits [23:0]).
+const INTID_MASK: u32 = 0x00FF_FFFF;
+
 // ── Distributor register offsets ──────────────────────────────────────────────
 
 const GICD_CTLR: usize = 0x000;
@@ -185,4 +195,62 @@ impl Gicv3 {
 
     #[cfg(not(target_arch = "aarch64"))]
     unsafe fn init_cpu_interface(&self) {}
+
+    /// Acknowledge the highest-priority pending Group 1 interrupt.
+    ///
+    /// Reads `ICC_IAR1_EL1`, which the CPU interface treats as the
+    /// interrupt-acknowledge operation: it moves the highest-priority
+    /// pending Group 1 IRQ to the active state and returns its INTID.
+    /// A return value of [`SPURIOUS_INTID`] means no IRQ was pending and
+    /// the caller must not issue a matching [`Self::eoi_irq`].
+    ///
+    /// Only the low 24 bits carry the INTID; the upper bits are masked off.
+    #[cfg(target_arch = "aarch64")]
+    pub fn ack_irq(&self) -> u32 {
+        let iar: u64;
+        // SAFETY: Reading ICC_IAR1_EL1 acknowledges the highest-priority
+        // pending Group 1 IRQ and returns its INTID. This is a privileged
+        // EL1 system-register read whose side effect (moving the IRQ to the
+        // active state) is exactly the intended acknowledge operation.
+        unsafe {
+            core::arch::asm!(
+                "mrs {iar}, ICC_IAR1_EL1",
+                iar = out(reg) iar,
+                options(nostack, preserves_flags),
+            );
+        }
+        (iar as u32) & INTID_MASK
+    }
+
+    /// Signal end-of-interrupt for a previously acknowledged INTID.
+    ///
+    /// Writes `ICC_EOIR1_EL1` to drop the active priority and de-activate
+    /// the IRQ named by `intid`. `intid` must be the value returned by a
+    /// prior [`Self::ack_irq`] call and must not be [`SPURIOUS_INTID`].
+    #[cfg(target_arch = "aarch64")]
+    pub fn eoi_irq(&self, intid: u32) {
+        // SAFETY: Writing ICC_EOIR1_EL1 signals end-of-interrupt for an
+        // INTID previously returned by ack_irq(), de-activating it in the
+        // CPU interface. A prior `dsb`/`isb` is not required here: the CPU
+        // interface serialises the ack/EOI pair, and the timer re-arm that
+        // precedes this write already issued its own `isb` via CNTP_CTL.
+        unsafe {
+            core::arch::asm!(
+                "msr ICC_EOIR1_EL1, {intid}",
+                "isb",
+                intid = in(reg) intid as u64,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Non-aarch64 build stub for [`Self::ack_irq`].
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn ack_irq(&self) -> u32 {
+        SPURIOUS_INTID
+    }
+
+    /// Non-aarch64 build stub for [`Self::eoi_irq`].
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn eoi_irq(&self, _intid: u32) {}
 }

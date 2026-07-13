@@ -21,6 +21,7 @@ pub mod clone;
 pub mod context;
 pub mod init;
 pub mod init_embed;
+pub mod irq;
 pub mod kthread;
 pub mod sched_glue;
 pub mod syscall_entry;
