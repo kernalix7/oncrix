@@ -370,6 +370,26 @@ pub extern "C" fn kernel_main() -> ! {
             );
         }
 
+        // Preemptive bring-up: re-arm the generic timer and unmask IRQs so
+        // the EL1 vector takes physical-timer interrupts in the halt loop.
+        // `aarch64_handle_irq` acks at the GIC, re-arms, and announces the
+        // first few ticks — proving the full IRQ path (vector → trap frame →
+        // Rust handler → GIC EOI → eret) works end to end.
+        {
+            use oncrix_hal::arch::aarch64::timer::AArch64Timer;
+            use oncrix_hal::timer::Timer;
+            // SAFETY: single-threaded boot; arming the timer and clearing
+            // DAIF.I are the documented steps to enable interrupt delivery,
+            // and the GICv3 CPU interface + timer PPI were initialized above.
+            unsafe {
+                let mut timer = AArch64Timer::new();
+                let ticks = timer.nanos_to_ticks(10_000_000);
+                let _ = timer.set_oneshot(ticks);
+                core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack)); // unmask IRQ (I)
+            }
+            let _ = serial.write_str("[ONCRIX/aarch64] IRQs unmasked; timer preemption armed.\n");
+        }
+
         let _ = serial.write_str("[ONCRIX/aarch64] Entering halt loop.\n");
     }
 
