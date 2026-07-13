@@ -60,13 +60,48 @@ core::arch::global_asm!(
     "   ldr     x0, =0x000000000080351bULL",
     "   msr     tcr_el1, x0",
     "   isb",
-    // ── MMU: left OFF for initial bring-up ───────────────────────────────
-    // The MAIR/TCR values above are staged, but enabling SCTLR_EL1.M
-    // without a valid TTBR0_EL1 translation table faults the very next
-    // instruction fetch (level-1 translation abort). Until an identity
-    // page table is installed in TTBR0_EL1, run with the MMU off (flat
-    // physical addressing), which is sufficient to reach the serial
-    // console and the per-arch init path on the QEMU `virt` machine.
+    // ── Build a minimal identity page table in TTBR0_EL1 ─────────────────
+    // With TCR T0SZ=27 (37-bit VA) and a 4 KiB granule, the top level is
+    // L1 where each entry maps a 1 GiB block. We identity-map two 1 GiB
+    // blocks, which covers everything the QEMU `virt` machine needs:
+    //   entry 0: VA/PA 0x0000_0000..0x4000_0000 — device MMIO
+    //            (GICD 0x0800_0000, GICR 0x080A_0000, PL011 0x0900_0000),
+    //            MAIR index 1 (Device-nGnRnE).
+    //   entry 1: VA/PA 0x4000_0000..0x8000_0000 — RAM (kernel loads at
+    //            0x4008_0000), MAIR index 0 (Normal WB/WA).
+    // Block descriptor bits: bit0=1 (valid), bit1=0 (block, not table),
+    // AttrIndx = bits[4:2], NS=bit5, AP=0b00 bits[7:6] (EL1 RW), SH=0b11
+    // bits[9:8] (inner shareable), AF=bit10 (access flag) = 1.
+    // Normal block flags = AF|SH_inner|AttrIdx0|valid = (1<<10)|(3<<8)|(0<<2)|1
+    // Device block flags = AF|AttrIdx1|valid = (1<<10)|(1<<2)|1
+    // (device memory is outer-shareable implicitly; SH is ignored for it.)
+    "   adrp    x0, __ttbr0_l1",
+    "   add     x0, x0, :lo12:__ttbr0_l1",
+    // entry 0 → device block at PA 0
+    "   mov     x1, #0x0",
+    "   movz    x2, #0x0405", // (1<<10)|(1<<2)|1 = 0x405
+    "   orr     x1, x1, x2",
+    "   str     x1, [x0]",
+    // entry 1 → normal block at PA 0x4000_0000
+    "   movz    x1, #0x4000, lsl #16", // PA 0x4000_0000
+    "   movz    x2, #0x0701",          // (1<<10)|(3<<8)|1 = 0x701
+    "   orr     x1, x1, x2",
+    "   str     x1, [x0, #8]",
+    // TTBR0_EL1 = &__ttbr0_l1
+    "   msr     ttbr0_el1, x0",
+    "   isb",
+    // Invalidate TLB and ensure page-table writes are visible.
+    "   dsb     ish",
+    "   tlbi    vmalle1",
+    "   dsb     ish",
+    "   isb",
+    // ── SCTLR_EL1: enable MMU (M=1), D-cache (C=1), I-cache (I=1) ────────
+    "   mrs     x0, sctlr_el1",
+    "   orr     x0, x0, #(1 << 0)",  // M — MMU enable
+    "   orr     x0, x0, #(1 << 2)",  // C — D-cache enable
+    "   orr     x0, x0, #(1 << 12)", // I — I-cache enable
+    "   msr     sctlr_el1, x0",
+    "   isb",
     // ── Enable FP/SIMD access at EL0/EL1 ─────────────────────────────────
     // Rust codegen for aarch64 emits Advanced SIMD/NEON (memcpy, slice ops,
     // formatting). Without CPACR_EL1.FPEN = 0b11 those instructions trap
@@ -118,4 +153,12 @@ core::arch::global_asm!(
     "   .space  65536",
     ".global __stack_top",
     "__stack_top:",
+    // ── TTBR0_EL1 level-1 identity page table (4 KiB, 4 KiB-aligned) ─────
+    // 512 × 8-byte descriptors; only entries 0 (device) and 1 (RAM) are
+    // populated by _start, the rest stay zero (invalid). BSS-resident so
+    // it is zeroed by the boot BSS-clear before use.
+    ".section .bss.pagetable",
+    ".align 12",
+    "__ttbr0_l1:",
+    "   .space  4096",
 );
