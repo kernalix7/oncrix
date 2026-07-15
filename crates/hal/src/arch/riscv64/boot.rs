@@ -54,6 +54,30 @@ core::arch::global_asm!(
     // stvec[1:0] = 00 → Direct mode (all traps to BASE address).
     "   la      t0, riscv_trap_vector",
     "   csrw    stvec, t0",
+    // ── Enable Sv39 paging with a minimal identity map ───────────────────
+    // Sv39: 3-level, the root (L2) table has 512 entries, each mapping a
+    // 1 GiB gigapage. Two identity entries cover everything QEMU virt needs:
+    //   L2[0] → 0x0000_0000..0x4000_0000 — device MMIO (CLINT 0x0200_0000,
+    //           PLIC 0x0C00_0000, NS16550 0x1000_0000).
+    //   L2[2] → 0x8000_0000..0xC000_0000 — RAM (OpenSBI 0x8000_0000, kernel
+    //           0x8020_0000).
+    // Leaf PTE = (PPN << 10) | flags; flags V|R|W|X|A|D = 0xCF. A gigapage's
+    // PPN is (phys >> 12) with PPN[1:0] zero (1 GiB aligned).
+    "   la      t0, __riscv_root_pt",
+    // L2[0]: phys 0x0 → PTE = 0x0 | 0xCF
+    "   li      t1, 0xCF",
+    "   sd      t1, 0(t0)",
+    // L2[2]: phys 0x8000_0000 → PPN=0x80000, PTE=(0x80000<<10)|0xCF=0x200000CF
+    "   li      t1, 0x200000CF",
+    "   sd      t1, 16(t0)", // entry 2 = byte offset 16
+    // satp = MODE_SV39 (8 << 60) | PPN(root >> 12)
+    "   srli    t2, t0, 12", // root PPN
+    "   li      t1, 8",
+    "   slli    t1, t1, 60", // MODE = Sv39
+    "   or      t1, t1, t2",
+    "   sfence.vma",
+    "   csrw    satp, t1",
+    "   sfence.vma",
     // ── Restore hartid and FDT, jump to Rust kernel_main ─────────────────
     "   mv      a0, s0",
     "   mv      a1, s1",
@@ -72,4 +96,12 @@ core::arch::global_asm!(
     "   .zero   65536",
     ".global __stack_top",
     "__stack_top:",
+    // ── Sv39 root (L2) page table (4 KiB, 4 KiB-aligned) ─────────────────
+    // 512 × 8-byte PTEs; only entries 0 (MMIO) and 2 (RAM) are populated by
+    // _start, the rest stay zero (invalid). BSS-resident so the boot
+    // BSS-clear zeroes it before use.
+    ".section .bss.pagetable",
+    ".balign 4096",
+    "__riscv_root_pt:",
+    "   .zero   4096",
 );
