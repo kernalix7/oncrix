@@ -36,12 +36,33 @@ const GICD_CTLR: usize = 0x000;
 const GICD_TYPER: usize = 0x004;
 const GICD_ISENABLER: usize = 0x100;
 
-// ── Redistributor register offsets (LP frame) ─────────────────────────────────
+// ── Redistributor register offsets ────────────────────────────────────────────
+//
+// The redistributor is split into two 64 KiB frames:
+//   • RD_base   (GICR_BASE + 0x0)      — control/wake registers (GICR_WAKER …)
+//   • SGI_base  (GICR_BASE + 0x10000)  — the SGI/PPI banked registers that
+//     configure INTIDs 0..31 for this PE (IGROUPR0, IPRIORITYR, ICFGR1,
+//     ISENABLER0, IGRPMODR0, …).
+// All PPI-30 (CNTP) configuration therefore lives at SGI_base, i.e. every
+// offset below is added to `GICR_BASE + GICR_SGI_BASE`.
 
+/// GICR_WAKER lives in the RD_base frame (offset 0 from GICR_BASE).
 const GICR_WAKER: usize = 0x014;
-/// SGI frame offset within a redistributor stride (64 KiB).
+/// SGI_base frame offset within a redistributor stride (64 KiB).
 const GICR_SGI_BASE: usize = 0x0001_0000;
+/// Interrupt Group register for SGIs/PPIs (INTID 0..31): 1 bit each.
+const GICR_IGROUPR0: usize = GICR_SGI_BASE + 0x080;
+/// Set-enable register for SGIs/PPIs (INTID 0..31): 1 bit each.
 const GICR_ISENABLER0: usize = GICR_SGI_BASE + 0x100;
+/// Priority registers for SGIs/PPIs: 1 byte per INTID, 4 INTIDs per word.
+const GICR_IPRIORITYR: usize = GICR_SGI_BASE + 0x400;
+/// Config register for PPIs (INTID 16..31): 2 bits each (edge/level).
+const GICR_ICFGR1: usize = GICR_SGI_BASE + 0xC04;
+/// Interrupt Group-modifier register for SGIs/PPIs: 1 bit each.
+const GICR_IGRPMODR0: usize = GICR_SGI_BASE + 0xD00;
+
+/// The CNTP EL1 physical timer interrupt is PPI INTID 30.
+const PPI_TIMER_INTID: u32 = 30;
 
 // ── GICD_CTLR bits ────────────────────────────────────────────────────────────
 
@@ -154,10 +175,56 @@ impl Gicv3 {
             }
         }
 
-        // Enable SGI 0 (used for IPI) and PPI 30 (physical non-secure timer).
-        // Bit 0 = SGI0, bit 30 = PPI30 (CNTP interrupt).
+        // ── Configure the SGI/PPI bank BEFORE enabling any INTID ──────────────
+        //
+        // The CPU interface (ICC_IGRPEN1_EL1) only delivers Group 1 interrupts,
+        // and only when their priority is numerically LOWER than ICC_PMR_EL1.
+        // On reset QEMU leaves these banked registers at values that block a
+        // freshly-armed PPI: IGROUPR0 may default to Group 0 (never delivered
+        // via IGRPEN1), and IPRIORITYR defaults to 0xFF which is NOT lower than
+        // PMR=0xFF, so the interrupt is filtered out. We must program them.
+
+        // 1. Assign every SGI/PPI (INTID 0..31) to Group 1, and clear the
+        //    group-modifier so they are Non-secure Group 1 (not Secure G1).
+        //    IGRPMODR is RES0 when the GIC runs in a single security state, so
+        //    writing 0 is always safe and keeps a two-security-state GIC in NS.
+        // SAFETY: GICR_IGROUPR0 / GICR_IGRPMODR0 are the SGI_base group
+        // registers for this PE's banked INTIDs 0..31.
+        unsafe {
+            write32(base + GICR_IGROUPR0, 0xFFFF_FFFF);
+            write32(base + GICR_IGRPMODR0, 0x0000_0000);
+        }
+
+        // 2. Give PPI 30 a deliverable priority. IPRIORITYR is byte-addressable
+        //    (4 INTIDs per 32-bit word); INTID 30 lives in word 30/4 = 7 at
+        //    byte 30 % 4 = 2. We read-modify-write only that byte to 0x00 —
+        //    the highest priority, guaranteed lower than PMR=0xFF, and immune
+        //    to the single-security-state priority top-bit aliasing (a 0x00
+        //    field reads back as 0x00 regardless of the writable-bit view).
+        let pri_word = base + GICR_IPRIORITYR + (PPI_TIMER_INTID as usize / 4) * 4;
+        let pri_shift = (PPI_TIMER_INTID % 4) * 8;
+        // SAFETY: pri_word addresses IPRIORITYR7 within the SGI_base frame.
+        unsafe {
+            let cur = read32(pri_word);
+            write32(pri_word, cur & !(0xFFu32 << pri_shift));
+        }
+
+        // 3. Configure PPI 30 as level-sensitive. ICFGR1 covers PPIs 16..31
+        //    with 2 bits each; INTID 30 occupies bits [2*(30-16)+1 : 2*(30-16)]
+        //    = bits [29:28]. Level-sensitive is 0b00, so clear that field. This
+        //    matches the CNTP timer, whose interrupt line stays asserted while
+        //    CNTP_CTL_EL0.ISTATUS==1; edge config could miss a re-armed line.
+        let cfg_shift = 2 * (PPI_TIMER_INTID - 16);
+        // SAFETY: GICR_ICFGR1 is the PPI config register in the SGI_base frame.
+        unsafe {
+            let cur = read32(base + GICR_ICFGR1);
+            write32(base + GICR_ICFGR1, cur & !(0b11u32 << cfg_shift));
+        }
+
+        // 4. Enable SGI 0 (used for IPI) and PPI 30 (physical non-secure timer).
+        //    Bit 0 = SGI0, bit 30 = PPI30 (CNTP interrupt).
         // SAFETY: GICR_ISENABLER0 is the SGI/PPI enable register.
-        unsafe { write32(base + GICR_ISENABLER0, (1 << 0) | (1 << 30)) };
+        unsafe { write32(base + GICR_ISENABLER0, (1 << 0) | (1 << PPI_TIMER_INTID)) };
     }
 
     /// Configure ICC system registers to enable Group 1 interrupts.

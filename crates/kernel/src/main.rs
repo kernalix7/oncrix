@@ -52,14 +52,25 @@ core::arch::global_asm!(include_str!("arch/x86_64/boot.S"), options(att_syntax))
 extern "C" fn demo_thread_a() -> ! {
     let mut serial = Pl011::new(PL011_BASE);
     let _ = serial.write_str("[ONCRIX/aarch64] cooperative scheduler: thread A ran\n");
+    // Hand control back exactly once (interrupts still masked here), then
+    // park. It must NOT call yield_now again: once the preemptive phase
+    // unmasks IRQs, sched_yield_once's interrupts-off contract would be
+    // violated. `wfi` with IRQs on simply waits for the next tick.
+    // SAFETY: interrupts are masked during the cooperative hand-off and no
+    // scheduler borrow is held across the yield.
+    unsafe {
+        let _ = oncrix_kernel::current::yield_now();
+    }
+    // When the preemptive phase later re-elects this thread, it resumes here
+    // from inside a timer-IRQ context, so it inherits DAIF.I = 1 (masked).
+    // Unmask so the CPU can take the next tick and preempt us again; without
+    // this the wfi below would wait for an interrupt that can never arrive.
+    // SAFETY: kernel thread at EL1; clearing DAIF.I only enables IRQ delivery.
+    unsafe {
+        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+    }
     loop {
-        // SAFETY: interrupts are masked for the whole demo and no
-        // scheduler borrow is held across this cooperative yield.
-        unsafe {
-            let _ = oncrix_kernel::current::yield_now();
-        }
-        // SAFETY: `wfi` parks the CPU until a wakeup event; it is
-        // harmless at EL1 and does not corrupt architectural state.
+        // SAFETY: `wfi` parks the CPU until an interrupt; harmless at EL1.
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack));
         }
@@ -73,12 +84,89 @@ extern "C" fn demo_thread_a() -> ! {
 extern "C" fn demo_thread_b() -> ! {
     let mut serial = Pl011::new(PL011_BASE);
     let _ = serial.write_str("[ONCRIX/aarch64] cooperative scheduler: thread B ran\n");
+    // SAFETY: see `demo_thread_a` — single cooperative hand-off, then park.
+    unsafe {
+        let _ = oncrix_kernel::current::yield_now();
+    }
+    // SAFETY: see `demo_thread_a` — unmask IRQs so preemption can resume.
+    unsafe {
+        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+    }
     loop {
-        // SAFETY: see `demo_thread_a`.
+        // SAFETY: `wfi` parks the CPU until an interrupt; harmless at EL1.
         unsafe {
-            let _ = oncrix_kernel::current::yield_now();
+            core::arch::asm!("wfi", options(nomem, nostack));
         }
-        // SAFETY: see `demo_thread_a`.
+    }
+}
+
+/// Number of times each preemptive busy thread has announced itself.
+///
+/// Written by [`demo_preempt_c`]/[`demo_preempt_d`] and polled by the boot
+/// thread. Because those threads NEVER yield, any progress by both of them
+/// proves the generic timer preempted one to run the other.
+#[cfg(target_arch = "aarch64")]
+static PREEMPT_C_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "aarch64")]
+static PREEMPT_D_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Busy-spin duration between announcements (arbitrary, tuned so a 10 ms
+/// timer tick lands mid-spin and forces a preemptive switch, while still
+/// letting the boot thread be re-elected to report success promptly).
+#[cfg(target_arch = "aarch64")]
+const PREEMPT_SPIN: u32 = 4_000_000;
+
+/// AArch64 preemptive-scheduling demo: busy thread C.
+///
+/// Unlike the cooperative demo threads, this NEVER yields — it only
+/// busy-spins and prints. The only way control leaves it is a timer IRQ
+/// preempting it (via `aarch64_handle_irq` → `sched_yield_once`). It runs
+/// with IRQs unmasked (inherited from the preempting switch), announces
+/// itself a bounded number of times, then parks in `wfi`.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn demo_preempt_c() -> ! {
+    use core::sync::atomic::Ordering;
+    // This thread is first entered from a timer-IRQ context (DAIF.I = 1).
+    // Unmask so the timer can preempt us mid-spin — the whole point of the
+    // demo. SAFETY: kernel thread at EL1; only enables IRQ delivery.
+    unsafe {
+        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+    }
+    let mut serial = Pl011::new(PL011_BASE);
+    while PREEMPT_C_HITS.load(Ordering::Relaxed) < 3 {
+        // Busy work — deliberately no yield. A timer tick will preempt us.
+        for _ in 0..PREEMPT_SPIN {
+            core::hint::spin_loop();
+        }
+        PREEMPT_C_HITS.fetch_add(1, Ordering::Relaxed);
+        let _ = serial.write_str("[ONCRIX/aarch64] preemptive: thread C scheduled\n");
+    }
+    loop {
+        // SAFETY: `wfi` parks until an interrupt; harmless at EL1.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
+/// AArch64 preemptive-scheduling demo: busy thread D. See [`demo_preempt_c`].
+#[cfg(target_arch = "aarch64")]
+extern "C" fn demo_preempt_d() -> ! {
+    use core::sync::atomic::Ordering;
+    // SAFETY: see `demo_preempt_c` — unmask IRQs so the timer can preempt us.
+    unsafe {
+        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+    }
+    let mut serial = Pl011::new(PL011_BASE);
+    while PREEMPT_D_HITS.load(Ordering::Relaxed) < 3 {
+        for _ in 0..PREEMPT_SPIN {
+            core::hint::spin_loop();
+        }
+        PREEMPT_D_HITS.fetch_add(1, Ordering::Relaxed);
+        let _ = serial.write_str("[ONCRIX/aarch64] preemptive: thread D scheduled\n");
+    }
+    loop {
+        // SAFETY: `wfi` parks until an interrupt; harmless at EL1.
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack));
         }
@@ -370,24 +458,64 @@ pub extern "C" fn kernel_main() -> ! {
             );
         }
 
-        // Preemptive bring-up: re-arm the generic timer and unmask IRQs so
-        // the EL1 vector takes physical-timer interrupts in the halt loop.
-        // `aarch64_handle_irq` acks at the GIC, re-arms, and announces the
-        // first few ticks — proving the full IRQ path (vector → trap frame →
-        // Rust handler → GIC EOI → eret) works end to end.
+        // Preemptive scheduling demo: spawn two BUSY kernel threads that
+        // never yield, then re-arm the timer and unmask IRQs. Because C and
+        // D only busy-spin, the sole way both make progress is the generic
+        // timer preempting one to run the other (aarch64_handle_irq →
+        // sched_yield_once). The boot thread polls their atomic counters and
+        // reports success once both have printed — proving preemption, not
+        // just that interrupts arrive.
         {
+            use core::sync::atomic::Ordering;
             use oncrix_hal::arch::aarch64::timer::AArch64Timer;
             use oncrix_hal::timer::Timer;
-            // SAFETY: single-threaded boot; arming the timer and clearing
-            // DAIF.I are the documented steps to enable interrupt delivery,
-            // and the GICv3 CPU interface + timer PPI were initialized above.
+            use oncrix_kernel::arch::aarch64::kthread::{kthread_context, spawn_kthread};
+            use oncrix_kernel::current::spawn_thread;
+            use oncrix_process::thread::Priority;
+
+            // Spawn C and D while interrupts are still masked.
+            // SAFETY: single CPU, interrupts masked → pool + scheduler are
+            // exclusive to this code; entry fns are valid extern "C" fn()->!.
+            unsafe {
+                if let Ok((kt, mut t)) = spawn_kthread(demo_preempt_c, Priority::NORMAL) {
+                    t.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(t);
+                }
+                if let Ok((kt, mut t)) = spawn_kthread(demo_preempt_d, Priority::NORMAL) {
+                    t.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(t);
+                }
+            }
+
+            // Re-arm the timer and unmask IRQs. From here the generic timer
+            // rotates among the runnable threads.
+            // SAFETY: GICv3 CPU interface + timer PPI were initialized above;
+            // arming the timer and clearing DAIF.I are the documented steps
+            // to enable interrupt delivery.
             unsafe {
                 let mut timer = AArch64Timer::new();
                 let ticks = timer.nanos_to_ticks(10_000_000);
                 let _ = timer.set_oneshot(ticks);
                 core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack)); // unmask IRQ (I)
             }
-            let _ = serial.write_str("[ONCRIX/aarch64] IRQs unmasked; timer preemption armed.\n");
+            let _ = serial.write_str(
+                "[ONCRIX/aarch64] IRQs unmasked; preemptive scheduler armed (threads C, D).\n",
+            );
+
+            // Poll until both busy threads have run under preemption. Each
+            // timer tick that fires while the boot thread is current will
+            // preempt it into C or D; this loop re-checks after each wakeup.
+            while PREEMPT_C_HITS.load(Ordering::Relaxed) < 3
+                || PREEMPT_D_HITS.load(Ordering::Relaxed) < 3
+            {
+                // SAFETY: `wfi` parks until the next timer IRQ; harmless.
+                unsafe {
+                    core::arch::asm!("wfi", options(nomem, nostack));
+                }
+            }
+            let _ = serial.write_str(
+                "[ONCRIX/aarch64] preemptive: C and D both ran — timer preemption verified.\n",
+            );
         }
 
         let _ = serial.write_str("[ONCRIX/aarch64] Entering halt loop.\n");
