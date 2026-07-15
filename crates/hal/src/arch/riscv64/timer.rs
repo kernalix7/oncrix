@@ -60,12 +60,20 @@ impl RiscvTimer {
         Self
     }
 
-    /// Read mtime via CLINT MMIO.
+    /// Read the current time via the `time` CSR (`rdtime`).
     #[cfg(target_arch = "riscv64")]
     fn read_mtime() -> u64 {
-        // SAFETY: CLINT MMIO is mapped; mtime is always readable in S-mode
-        // on QEMU virt with the default memory map.
-        unsafe { core::ptr::read_volatile((CLINT_BASE + CLINT_MTIME) as *const u64) }
+        // The CLINT mtime MMIO register (0x0200_BFF8) is M-mode only — OpenSBI
+        // configures PMP so an S-mode read of it faults. The architectural
+        // `time` CSR (0xC01), provided by Zicntr and mirrored from mtime by the
+        // firmware, is the S-mode-accessible view; `rdtime` reads it.
+        let t: u64;
+        // SAFETY: `rdtime` (csrr time) is a side-effect-free read of the
+        // S-mode-readable time counter.
+        unsafe {
+            core::arch::asm!("rdtime {}", out(reg) t, options(nomem, nostack, preserves_flags));
+        }
+        t
     }
 
     /// Set the next timer interrupt via SBI `sbi_set_timer`.
