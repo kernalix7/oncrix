@@ -173,6 +173,141 @@ extern "C" fn demo_preempt_d() -> ! {
     }
 }
 
+/// RISC-V cooperative-scheduler bring-up demo: kernel thread A.
+///
+/// Prints a marker proving it executed, then cooperatively yields back
+/// to the scheduler. Never returns — parks in `wfi` if it is ever
+/// resumed a second time.
+#[cfg(target_arch = "riscv64")]
+extern "C" fn demo_thread_a() -> ! {
+    let mut serial = Ns16550::new(NS16550_BASE);
+    let _ = serial.write_str("[ONCRIX/riscv64] cooperative scheduler: thread A ran\n");
+    // Hand control back exactly once (interrupts still masked here), then
+    // park. It must NOT call yield_now again: once the preemptive phase
+    // enables SIE, sched_yield_once's interrupts-off contract would be
+    // violated. `wfi` with SIE set simply waits for the next tick.
+    // SAFETY: interrupts are masked during the cooperative hand-off and no
+    // scheduler borrow is held across the yield.
+    unsafe {
+        let _ = oncrix_kernel::current::yield_now();
+    }
+    // When the preemptive phase later re-elects this thread, it resumes here
+    // from inside a timer-trap context, so it inherits sstatus.SIE = 0
+    // (masked). Set SIE so the CPU can take the next tick and preempt us
+    // again; without this the wfi below would wait for an interrupt that can
+    // never arrive.
+    // SAFETY: kernel thread in S-mode; setting sstatus.SIE only enables IRQ
+    // delivery. No nomem: the SIE set is cli/sti-class and must act as a
+    // compiler barrier.
+    unsafe {
+        core::arch::asm!("csrsi sstatus, 0x2", options(nostack));
+    }
+    loop {
+        // SAFETY: `wfi` parks the CPU until an interrupt; harmless in S-mode.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
+/// RISC-V cooperative-scheduler bring-up demo: kernel thread B.
+///
+/// Counterpart to [`demo_thread_a`]; prints its own marker then yields.
+#[cfg(target_arch = "riscv64")]
+extern "C" fn demo_thread_b() -> ! {
+    let mut serial = Ns16550::new(NS16550_BASE);
+    let _ = serial.write_str("[ONCRIX/riscv64] cooperative scheduler: thread B ran\n");
+    // SAFETY: see `demo_thread_a` — single cooperative hand-off, then park.
+    unsafe {
+        let _ = oncrix_kernel::current::yield_now();
+    }
+    // SAFETY: see `demo_thread_a` — set SIE so preemption can resume us.
+    unsafe {
+        core::arch::asm!("csrsi sstatus, 0x2", options(nostack));
+    }
+    loop {
+        // SAFETY: `wfi` parks the CPU until an interrupt; harmless in S-mode.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
+/// Number of times each preemptive busy thread has announced itself.
+///
+/// Written by [`demo_preempt_c`]/[`demo_preempt_d`] and polled by the boot
+/// thread. Because those threads NEVER yield, any progress by both of them
+/// proves the SBI timer preempted one to run the other.
+#[cfg(target_arch = "riscv64")]
+static PREEMPT_C_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(target_arch = "riscv64")]
+static PREEMPT_D_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Busy-spin duration between announcements (arbitrary, tuned so a 10 ms
+/// timer tick lands mid-spin and forces a preemptive switch, while still
+/// letting the boot thread be re-elected to report success promptly).
+#[cfg(target_arch = "riscv64")]
+const PREEMPT_SPIN: u32 = 4_000_000;
+
+/// RISC-V preemptive-scheduling demo: busy thread C.
+///
+/// Unlike the cooperative demo threads, this NEVER yields — it only
+/// busy-spins and prints. The only way control leaves it is a timer
+/// interrupt preempting it (via `riscv_handle_trap` → `sched_yield_once`).
+/// It runs with SIE set (enabled on entry), announces itself a bounded
+/// number of times, then parks in `wfi`.
+#[cfg(target_arch = "riscv64")]
+extern "C" fn demo_preempt_c() -> ! {
+    use core::sync::atomic::Ordering;
+    // This thread is first entered from a timer-trap context (sstatus.SIE=0).
+    // Set SIE so the timer can preempt us mid-spin — the whole point of the
+    // demo. SAFETY: kernel thread in S-mode; setting sstatus.SIE only enables
+    // IRQ delivery. No nomem: the SIE set is cli/sti-class and must act as a
+    // compiler barrier.
+    unsafe {
+        core::arch::asm!("csrsi sstatus, 0x2", options(nostack));
+    }
+    let mut serial = Ns16550::new(NS16550_BASE);
+    while PREEMPT_C_HITS.load(Ordering::Relaxed) < 3 {
+        // Busy work — deliberately no yield. A timer tick will preempt us.
+        for _ in 0..PREEMPT_SPIN {
+            core::hint::spin_loop();
+        }
+        PREEMPT_C_HITS.fetch_add(1, Ordering::Relaxed);
+        let _ = serial.write_str("[ONCRIX/riscv64] preemptive: thread C scheduled\n");
+    }
+    loop {
+        // SAFETY: `wfi` parks until an interrupt; harmless in S-mode.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
+/// RISC-V preemptive-scheduling demo: busy thread D. See [`demo_preempt_c`].
+#[cfg(target_arch = "riscv64")]
+extern "C" fn demo_preempt_d() -> ! {
+    use core::sync::atomic::Ordering;
+    // SAFETY: see `demo_preempt_c` — set SIE so the timer can preempt us.
+    unsafe {
+        core::arch::asm!("csrsi sstatus, 0x2", options(nostack));
+    }
+    let mut serial = Ns16550::new(NS16550_BASE);
+    while PREEMPT_D_HITS.load(Ordering::Relaxed) < 3 {
+        for _ in 0..PREEMPT_SPIN {
+            core::hint::spin_loop();
+        }
+        PREEMPT_D_HITS.fetch_add(1, Ordering::Relaxed);
+        let _ = serial.write_str("[ONCRIX/riscv64] preemptive: thread D scheduled\n");
+    }
+    loop {
+        // SAFETY: `wfi` parks until an interrupt; harmless in S-mode.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
 /// Main kernel initialization sequence.
 ///
 /// Called from the 64-bit trampoline in `boot.S` after the 32-bit stub
@@ -548,6 +683,143 @@ pub extern "C" fn kernel_main() -> ! {
         }
 
         let _ = serial.write_str("[ONCRIX/riscv64] All early initialization complete.\n");
+
+        // ─── Cooperative kernel-thread scheduling bring-up demo ───
+        //
+        // Proves the riscv64 `switch_context` actually schedules real kernel
+        // threads at runtime. Sequence:
+        //   1. Mask sstatus.SIE — `switch_context`/`sched_yield_once` require
+        //      interrupts masked, and a cooperative hand-off must not be
+        //      preempted by the SBI timer.
+        //   2. Register the running boot context as a schedulable thread and
+        //      promote it to Running, so `prepare_switch` has a slot to save
+        //      the outgoing state into.
+        //   3. Spawn two kernel threads. `spawn_kthread` seeds each stack's
+        //      112-byte switch frame (ra = entry) plus a parallel
+        //      `CpuContext`; copy that context into the scheduler-owned
+        //      `Thread` before registering it.
+        //   4. Yield. Control flows boot → A → B → boot (round-robin), so
+        //      both thread bodies print before we return here.
+        {
+            use oncrix_kernel::arch::init::SCHEDULER;
+            use oncrix_kernel::arch::riscv64::kthread::{kthread_context, spawn_kthread};
+            use oncrix_kernel::current::{spawn_thread, yield_now};
+            use oncrix_process::pid::{Pid, alloc_tid};
+            use oncrix_process::thread::{Priority, Thread};
+
+            // Step 1: mask supervisor interrupts for the whole sequence.
+            // SAFETY: ring-0 (S-mode) boot context; masking interrupts is the
+            // documented precondition of the switch/yield primitives. No
+            // nomem: the SIE clear is cli/sti-class and must act as a compiler
+            // barrier.
+            unsafe {
+                core::arch::asm!("csrci sstatus, 0x2", options(nostack));
+            }
+
+            let _ =
+                serial.write_str("[ONCRIX/riscv64] cooperative scheduler: bring-up demo start\n");
+
+            // Step 2: register + promote the boot thread.
+            // SAFETY: single-threaded boot; SCHEDULER is not aliased here, and
+            // each access below is a distinct, non-overlapping borrow.
+            unsafe {
+                let boot = Thread::new(alloc_tid(), Pid::KERNEL, Priority::NORMAL);
+                let _ = spawn_thread(boot);
+                let sched = &raw mut SCHEDULER;
+                let _ = (*sched).schedule();
+            }
+
+            // Step 3: spawn the two demo kernel threads and copy each seeded
+            // context into the scheduler-owned `Thread`.
+            // SAFETY: entry fns are valid `extern "C" fn() -> !`; single CPU
+            // with interrupts masked keeps the pool + scheduler exclusive to
+            // this code.
+            unsafe {
+                if let Ok((kt, mut thread)) = spawn_kthread(demo_thread_a, Priority::NORMAL) {
+                    thread.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(thread);
+                }
+                if let Ok((kt, mut thread)) = spawn_kthread(demo_thread_b, Priority::NORMAL) {
+                    thread.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(thread);
+                }
+            }
+
+            // Step 4: hand the CPU to the demo threads; returns once both A
+            // and B have run and yielded back to the boot thread.
+            // SAFETY: interrupts masked above; no scheduler borrow held.
+            unsafe {
+                let _ = yield_now();
+            }
+
+            let _ = serial.write_str(
+                "[ONCRIX/riscv64] cooperative scheduler: thread A/B ran, back on boot thread\n",
+            );
+        }
+
+        // Preemptive scheduling demo: spawn two BUSY kernel threads that never
+        // yield, then re-arm the timer and set sstatus.SIE. Because C and D
+        // only busy-spin, the sole way both make progress is the SBI timer
+        // preempting one to run the other (riscv_handle_trap →
+        // sched_yield_once). The boot thread polls their atomic counters and
+        // reports success once both have printed — proving preemption, not
+        // just that interrupts arrive.
+        {
+            use core::sync::atomic::Ordering;
+            use oncrix_hal::arch::riscv64::timer::RiscvTimer;
+            use oncrix_hal::timer::Timer;
+            use oncrix_kernel::arch::riscv64::kthread::{kthread_context, spawn_kthread};
+            use oncrix_kernel::current::spawn_thread;
+            use oncrix_process::thread::Priority;
+
+            // Spawn C and D while interrupts are still masked.
+            // SAFETY: single CPU, interrupts masked → pool + scheduler are
+            // exclusive to this code; entry fns are valid extern "C" fn()->!.
+            unsafe {
+                if let Ok((kt, mut t)) = spawn_kthread(demo_preempt_c, Priority::NORMAL) {
+                    t.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(t);
+                }
+                if let Ok((kt, mut t)) = spawn_kthread(demo_preempt_d, Priority::NORMAL) {
+                    t.set_cpu_context(*kthread_context(kt.slot));
+                    let _ = spawn_thread(t);
+                }
+            }
+
+            // Re-arm the timer and set the global interrupt enable. From here
+            // the SBI timer rotates among the runnable threads. `set_oneshot`
+            // sets sie.STIE (the per-source enable); sstatus.SIE is the global
+            // gate.
+            // SAFETY: PLIC + SBI timer were initialized above; arming the
+            // timer and setting sstatus.SIE are the documented steps to enable
+            // interrupt delivery. No nomem on the SIE set: it is cli/sti-class
+            // and must act as a compiler barrier.
+            unsafe {
+                let mut timer = RiscvTimer::new();
+                let ticks = timer.nanos_to_ticks(10_000_000);
+                let _ = timer.set_oneshot(ticks);
+                core::arch::asm!("csrsi sstatus, 0x2", options(nostack)); // set SIE
+            }
+            let _ = serial.write_str(
+                "[ONCRIX/riscv64] IRQs unmasked; preemptive scheduler armed (threads C, D).\n",
+            );
+
+            // Poll until both busy threads have run under preemption. Each
+            // timer tick that fires while the boot thread is current will
+            // preempt it into C or D; this loop re-checks after each wakeup.
+            while PREEMPT_C_HITS.load(Ordering::Relaxed) < 3
+                || PREEMPT_D_HITS.load(Ordering::Relaxed) < 3
+            {
+                // SAFETY: `wfi` parks until the next timer interrupt; harmless.
+                unsafe {
+                    core::arch::asm!("wfi", options(nomem, nostack));
+                }
+            }
+            let _ = serial.write_str(
+                "[ONCRIX/riscv64] preemptive: C and D both ran — timer preemption verified.\n",
+            );
+        }
+
         let _ = serial.write_str("[ONCRIX/riscv64] Entering halt loop.\n");
     }
 

@@ -8,15 +8,22 @@
 //! GDT/IDT.  Exception/interrupt routing is via the trap vector installed
 //! in boot.rs (HAL).
 //!
-//! The `clone`, `context`, `init`, `init_embed`, `sched_glue`, and
-//! `syscall_entry` submodules are riscv64 build stubs that mirror the
-//! x86_64 public API so architecture-neutral kernel code type-checks; they
-//! are not yet functional.
+//! The `context`, `irq`, `kthread`, and `sched_glue` submodules are
+//! functional for **kernel-thread preemptive scheduling** (the
+//! [`switch_context`] primitive, a seeded-stack spawn path, and the
+//! supervisor-timer trap handler). The `clone`, `init_embed`, and
+//! `syscall_entry` submodules remain riscv64 build stubs that mirror the
+//! x86_64 public API so architecture-neutral kernel code type-checks; the
+//! userspace/U-mode transition they need is not written yet.
+//!
+//! [`switch_context`]: context::switch_context
 
 pub mod clone;
 pub mod context;
 pub mod init;
 pub mod init_embed;
+pub mod irq;
+pub mod kthread;
 pub mod sched_glue;
 pub mod syscall_entry;
 
