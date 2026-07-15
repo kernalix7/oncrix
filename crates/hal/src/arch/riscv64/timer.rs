@@ -18,9 +18,6 @@ use oncrix_lib::Result;
 /// CLINT MMIO base for QEMU virt machine.
 pub const CLINT_BASE: usize = 0x0200_0000;
 
-/// CLINT mtime register offset (64-bit).
-const CLINT_MTIME: usize = 0xBFF8;
-
 /// SBI extension ID for the Timer extension.
 const SBI_EXT_TIMER: usize = 0x5449_4D45;
 /// SBI function ID: sbi_set_timer.
