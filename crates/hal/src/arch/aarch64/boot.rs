@@ -8,8 +8,8 @@
 //!   2. Zero the BSS section.
 //!   3. Allocate a 64 KiB stack in the BOOT_STACK symbol.
 //!   4. Install the exception vector table via VBAR_EL1.
-//!   5. Configure TCR_EL1 / MAIR_EL1 / SCTLR_EL1 to enable the MMU with a
-//!      flat (identity) mapping in TTBR0_EL1.
+//!   5. Configure TCR_EL1 / MAIR_EL1 / SCTLR_EL1 and install the kernel and
+//!      user mappings in TTBR0_EL1 before enabling the MMU.
 //!   6. Call `kernel_main`.
 //!
 //! # Assumptions
@@ -17,7 +17,7 @@
 //! - The kernel image is loaded by QEMU at 0x4008_0000 (standard ELF load
 //!   address for `-kernel` mode on the `virt` machine).
 //! - QEMU places us in EL1 with the MMU off and caches off.
-//! - The linker script defines `__bss_start`, `__bss_end`, `__stack_top`.
+//! - The linker script defines the BSS, kernel stack, user text, and user stack symbols.
 
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
@@ -54,21 +54,22 @@ core::arch::global_asm!(
     "   mov     x0, #0xFF",
     "   msr     mair_el1, x0",
     "   isb",
-    // ── TCR_EL1: T0SZ=25 (39-bit VA), TG0=4K, IRGN0/ORGN0=WB/WA ─────────
-    // IPS=0b001 (36-bit PA, 64 GiB), TBI0=0, AS=0
-    // Value: IPS=001, TG1=10 (4K), TG0=00 (4K), T0SZ=25, T1SZ=25
+    // ── TCR_EL1: T0SZ=27 (37-bit VA), TG0=4K, IRGN0/ORGN0=WB/WA ─────────
+    // SH0=inner-shareable, EPD1=1 (disable TTBR1 walks), IPS=000 (32-bit PA).
+    // A 37-bit VA with a 4 KiB granule starts translation at level 1.
     "   ldr     x0, =0x000000000080351bULL",
     "   msr     tcr_el1, x0",
     "   isb",
-    // ── Build a minimal identity page table in TTBR0_EL1 ─────────────────
+    // ── Build the initial translation tables in TTBR0_EL1 ────────────────
     // With TCR T0SZ=27 (37-bit VA) and a 4 KiB granule, the top level is
-    // L1 where each entry maps a 1 GiB block. We identity-map two 1 GiB
-    // blocks, which covers everything the QEMU `virt` machine needs:
+    // L1 where each entry covers a 1 GiB range. We identity-map two 1 GiB
+    // blocks for the QEMU `virt` machine and use page tables for userspace:
     //   entry 0: VA/PA 0x0000_0000..0x4000_0000 — device MMIO
     //            (GICD 0x0800_0000, GICR 0x080A_0000, PL011 0x0900_0000),
     //            MAIR index 1 (Device-nGnRnE).
-    //   entry 1: VA/PA 0x4000_0000..0x8000_0000 — RAM (kernel loads at
-    //            0x4008_0000), MAIR index 0 (Normal WB/WA).
+    //   entry 1: VA/PA 0x4000_0000..0x8000_0000 — EL1-only RAM (kernel loads
+    //            at 0x4008_0000), MAIR index 0 (Normal WB/WA).
+    //   entry 3: VA 0xC000_0000..0x1_0000_0000 — L2/L3 user page tables.
     // Block descriptor bits: bit0=1 (valid), bit1=0 (block, not table),
     // AttrIndx = bits[4:2], NS=bit5, AP=0b00 bits[7:6] (EL1 RW), SH=0b11
     // bits[9:8] (inner shareable), AF=bit10 (access flag) = 1.
@@ -82,11 +83,41 @@ core::arch::global_asm!(
     "   movz    x2, #0x0405", // (1<<10)|(1<<2)|1 = 0x405
     "   orr     x1, x1, x2",
     "   str     x1, [x0]",
-    // entry 1 → normal block at PA 0x4000_0000
+    // entry 1 -> normal block at PA 0x4000_0000, EL1-only identity mapping.
+    // PTE 0x0701 uses AP=0b00 (bits[7:6]=00), so EL0 cannot access it.
     "   movz    x1, #0x4000, lsl #16", // PA 0x4000_0000
-    "   movz    x2, #0x0701",          // (1<<10)|(3<<8)|1 = 0x701
+    "   movz    x2, #0x0701",          // (1<<10)|(3<<8)|1 = 0x701 (EL1 RW/X)
     "   orr     x1, x1, x2",
     "   str     x1, [x0, #8]",
+    // entry 3 -> L2 table for the user VA range beginning at 0xC000_0000.
+    "   adrp    x1, __ttbr0_user_l2",
+    "   add     x1, x1, :lo12:__ttbr0_user_l2",
+    "   mov     x2, #0x3", // Valid level-1 table descriptor.
+    "   orr     x4, x1, x2",
+    "   str     x4, [x0, #24]",
+    // L2[0] -> L3 table covering VA 0xC000_0000..0xC020_0000.
+    "   adrp    x3, __ttbr0_user_l3",
+    "   add     x3, x3, :lo12:__ttbr0_user_l3",
+    "   orr     x4, x3, x2",
+    "   str     x4, [x1]",
+    // L3[0] maps the user text page read-only and executable only at EL0.
+    "   adrp    x4, __user_text_start",
+    "   add     x4, x4, :lo12:__user_text_start",
+    "   ldr     x5, =0x0020000000000FC3ULL", // PXN|nG|AF|SH|AP11|page.
+    "   orr     x4, x4, x5",
+    "   str     x4, [x3]",
+    // L3[1] stays invalid as a guard page. L3[2..5] map the 16 KiB user stack.
+    "   adrp    x4, __user_stack_start",
+    "   add     x4, x4, :lo12:__user_stack_start",
+    "   ldr     x5, =0x0060000000000F43ULL", // UXN|PXN|nG|AF|SH|AP01|page.
+    "   add     x3, x3, #16",
+    "   mov     x6, #4",
+    ".Lmap_user_stack:",
+    "   orr     x7, x4, x5",
+    "   str     x7, [x3], #8",
+    "   add     x4, x4, #1, lsl #12",
+    "   subs    x6, x6, #1",
+    "   b.ne    .Lmap_user_stack",
     // TTBR0_EL1 = &__ttbr0_l1
     "   msr     ttbr0_el1, x0",
     "   isb",
@@ -122,10 +153,10 @@ core::arch::global_asm!(
     // The kernel runs at EL1h (SP_EL1), so hardware IRQs are delivered to
     // the "Current EL with SPx / IRQ" slot at offset 0x280 (index 5). That
     // slot vectors to `el1h_irq`, which saves a full trap frame, calls the
-    // Rust handler `aarch64_handle_irq`, restores, and `eret`s. Every other
-    // slot vectors to `el1_default`, which spins so an unexpected exception
-    // stops at a known PC (visible under `qemu -d int`) instead of running
-    // off into garbage. Each slot is padded to its 128-byte boundary.
+    // Rust handler `aarch64_handle_irq`, restores, and `eret`s. Apart from that
+    // IRQ slot and the handled lower-EL AArch64 synchronous slot, vectors use
+    // `el1_default`, which spins so an unexpected exception stops at a known PC
+    // (visible under `qemu -d int`). Each slot is padded to 128 bytes.
     ".balign 2048",
     ".global exception_vectors",
     "exception_vectors:",
@@ -147,8 +178,8 @@ core::arch::global_asm!(
     ".balign 0x80",
     "   b       el1_default", // 0x380 SError
     ".balign 0x80",
-    // Lower EL using AArch64 (no userspace yet)
-    "   b       el1_default", // 0x400 Sync
+    // Lower EL using AArch64 (userspace)
+    "   b       el0_sync", // 0x400 Sync from EL0 (SVC / user fault)
     ".balign 0x80",
     "   b       el1_default", // 0x480 IRQ
     ".balign 0x80",
@@ -213,6 +244,55 @@ core::arch::global_asm!(
     "   ldr     x30, [sp, #0xf0]",
     "   add     sp, sp, #0x120",
     "   eret",
+    // ── el0_sync: synchronous exception from EL0 (SVC / user fault) ──────
+    // Same 288-byte trap frame as el1h_irq. The Rust handler reads ESR_EL1
+    // to classify the exception (SVC #imm for a syscall); on return we
+    // restore ELR_EL1/SPSR_EL1 (still pointing just past the SVC, in EL0
+    // state) and `eret` back to user. On EL0 entry the CPU is at EL1h, so
+    // SP is the kernel stack — the frame is pushed there.
+    "el0_sync:",
+    "   sub     sp, sp, #0x120",
+    "   stp     x0, x1, [sp, #0x00]",
+    "   stp     x2, x3, [sp, #0x10]",
+    "   stp     x4, x5, [sp, #0x20]",
+    "   stp     x6, x7, [sp, #0x30]",
+    "   stp     x8, x9, [sp, #0x40]",
+    "   stp     x10, x11, [sp, #0x50]",
+    "   stp     x12, x13, [sp, #0x60]",
+    "   stp     x14, x15, [sp, #0x70]",
+    "   stp     x16, x17, [sp, #0x80]",
+    "   stp     x18, x19, [sp, #0x90]",
+    "   stp     x20, x21, [sp, #0xa0]",
+    "   stp     x22, x23, [sp, #0xb0]",
+    "   stp     x24, x25, [sp, #0xc0]",
+    "   stp     x26, x27, [sp, #0xd0]",
+    "   stp     x28, x29, [sp, #0xe0]",
+    "   str     x30, [sp, #0xf0]",
+    "   mrs     x0, elr_el1",
+    "   mrs     x1, spsr_el1",
+    "   stp     x0, x1, [sp, #0x100]",
+    "   bl      aarch64_handle_sync_lower",
+    "   ldp     x0, x1, [sp, #0x100]",
+    "   msr     elr_el1, x0",
+    "   msr     spsr_el1, x1",
+    "   ldp     x0, x1, [sp, #0x00]",
+    "   ldp     x2, x3, [sp, #0x10]",
+    "   ldp     x4, x5, [sp, #0x20]",
+    "   ldp     x6, x7, [sp, #0x30]",
+    "   ldp     x8, x9, [sp, #0x40]",
+    "   ldp     x10, x11, [sp, #0x50]",
+    "   ldp     x12, x13, [sp, #0x60]",
+    "   ldp     x14, x15, [sp, #0x70]",
+    "   ldp     x16, x17, [sp, #0x80]",
+    "   ldp     x18, x19, [sp, #0x90]",
+    "   ldp     x20, x21, [sp, #0xa0]",
+    "   ldp     x22, x23, [sp, #0xb0]",
+    "   ldp     x24, x25, [sp, #0xc0]",
+    "   ldp     x26, x27, [sp, #0xd0]",
+    "   ldp     x28, x29, [sp, #0xe0]",
+    "   ldr     x30, [sp, #0xf0]",
+    "   add     sp, sp, #0x120",
+    "   eret",
     // ── el1_default: park on an unexpected exception ─────────────────────
     "el1_default:",
     "   b       .",
@@ -223,12 +303,17 @@ core::arch::global_asm!(
     "   .space  65536",
     ".global __stack_top",
     "__stack_top:",
-    // ── TTBR0_EL1 level-1 identity page table (4 KiB, 4 KiB-aligned) ─────
-    // 512 × 8-byte descriptors; only entries 0 (device) and 1 (RAM) are
-    // populated by _start, the rest stay zero (invalid). BSS-resident so
-    // it is zeroed by the boot BSS-clear before use.
+    // ── TTBR0_EL1 translation tables (three 4 KiB-aligned pages) ──────────
+    // L1 entries 0 and 1 are identity blocks; L1[3] points through L2[0] to
+    // the L3 user mappings. BSS zeroing leaves every other entry invalid.
     ".section .bss.pagetable",
     ".align 12",
     "__ttbr0_l1:",
+    "   .space  4096",
+    ".align 12",
+    "__ttbr0_user_l2:",
+    "   .space  4096",
+    ".align 12",
+    "__ttbr0_user_l3:",
     "   .space  4096",
 );

@@ -537,7 +537,7 @@ pub extern "C" fn kernel_main() -> ! {
         //      `CpuContext`; copy that context into the scheduler-owned
         //      `Thread` before registering it.
         //   4. Yield. Control flows boot → A → B → boot (round-robin), so
-        //      both thread bodies print before we return here and halt.
+        //      both thread bodies print before preemption and EL0 smoke run.
         {
             use oncrix_kernel::arch::aarch64::kthread::{kthread_context, spawn_kthread};
             use oncrix_kernel::arch::init::SCHEDULER;
@@ -653,7 +653,47 @@ pub extern "C" fn kernel_main() -> ! {
             );
         }
 
-        let _ = serial.write_str("[ONCRIX/aarch64] Entering halt loop.\n");
+        // ─── EL0 (userspace) smoke test ───
+        //
+        // Prove the EL1->EL0 transition on a dedicated 4KiB RX code page,
+        // followed by an invalid guard page and four RW/NX stack pages.
+        // The EL0 payload issues an SVC #7 canary, resumes after the vector's
+        // `eret`, then issues SVC #8 to prove a real EL0->EL1->EL0 round-trip.
+        // The handler is smoke-only and performs no syscall dispatch. After
+        // the proof EL0 idles, so this is the last action on the aarch64 path.
+        {
+            use oncrix_hal::arch::aarch64::timer::AArch64Timer;
+            use oncrix_hal::timer::Timer;
+            use oncrix_kernel::arch::aarch64::usermode::{
+                EL0_ENTRY_VA, EL0_STACK_TOP_VA, jump_to_el0,
+            };
+
+            // Mask DAIF before stopping the timer so a pending IRQ cannot land
+            // in the shutdown window. Intentionally omit `nomem`: the mask must
+            // be a compiler barrier so the timer stop cannot move ahead of it.
+            // SAFETY: EL1 boot context; nothing after this point needs interrupts.
+            unsafe {
+                core::arch::asm!("msr daifset, #0b1111", options(nostack));
+            }
+
+            // Disarm the generic timer after masking DAIF. EL0 PSTATE cannot
+            // mask a physical IRQ routed to EL1, so both steps are required for
+            // a deterministic smoke-only round-trip.
+            let mut timer = AArch64Timer::new();
+            let _ = timer.stop();
+
+            let _ = serial.write_str(
+                "[ONCRIX/aarch64] entering EL0 (dedicated-page smoke; no syscall dispatch)...\n",
+            );
+
+            // SAFETY: the boot tables map `EL0_ENTRY_VA` as the dedicated 4KiB
+            // RX code page and `EL0_STACK_TOP_VA` above four RW/NX stack pages,
+            // with an invalid guard page between them. The stack top is
+            // 16-byte aligned; `jump_to_el0` drops via `eret` and never returns.
+            unsafe {
+                jump_to_el0(EL0_ENTRY_VA, EL0_STACK_TOP_VA);
+            }
+        }
     }
 
     #[cfg(target_arch = "riscv64")]
@@ -823,6 +863,11 @@ pub extern "C" fn kernel_main() -> ! {
         let _ = serial.write_str("[ONCRIX/riscv64] Entering halt loop.\n");
     }
 
+    // x86_64 and riscv64 fall through to the shared halt loop. On aarch64,
+    // control descended to EL0 in the block above via `jump_to_el0` (`-> !`)
+    // and never reaches here, so the call is compiled out to avoid an
+    // unreachable-code warning; `halt_loop` stays live via the panic handler.
+    #[cfg(not(target_arch = "aarch64"))]
     halt_loop();
 }
 
