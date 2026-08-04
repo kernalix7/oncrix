@@ -10,12 +10,17 @@
 //!
 //! The `context`, `kthread`, and `sched_glue` submodules are functional
 //! for **kernel-thread cooperative scheduling** (the [`switch_context`]
-//! primitive plus a seeded-stack spawn path). The `clone`, `init_embed`,
-//! and `syscall_entry` submodules remain aarch64 build stubs that mirror
-//! the x86_64 public API so architecture-neutral kernel code type-checks;
-//! the userspace/EL0 transition they need is not written yet.
+//! primitive plus a seeded-stack spawn path). The `usermode` submodule
+//! provides a smoke-only EL1->EL0 transition on a dedicated 4KiB RX code
+//! page, followed by an invalid guard page and four RW/NX stack pages. Its
+//! SVC #7 canary and SVC #8 sequence proves a real exception-vector `eret`
+//! back to EL0 (see [`jump_to_el0`]); it performs no syscall dispatch. The
+//! `clone`, `init_embed`, and `syscall_entry` submodules remain aarch64 build
+//! stubs that mirror the x86_64 public API so architecture-neutral kernel
+//! code type-checks.
 //!
 //! [`switch_context`]: context::switch_context
+//! [`jump_to_el0`]: usermode::jump_to_el0
 
 pub mod clone;
 pub mod context;
@@ -25,6 +30,7 @@ pub mod irq;
 pub mod kthread;
 pub mod sched_glue;
 pub mod syscall_entry;
+pub mod usermode;
 
 use oncrix_hal::arch::aarch64::gic::{GICD_BASE, GICR_BASE, Gicv3};
 use oncrix_hal::arch::aarch64::pl011::{PL011_BASE, Pl011};
