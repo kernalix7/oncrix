@@ -331,6 +331,19 @@ pub fn do_sys_prlimit(
     // Resolve the effective PID.
     let effective_pid = if pid == 0 { cred.uid as u64 } else { pid };
 
+    // SECURITY: gate both directions, before touching the registry.
+    //
+    // `prlimit(2)` requires the caller to match the target's UID or to hold
+    // CAP_SYS_RESOURCE, and that applies to *reading* another process's limits
+    // just as much as to writing them. Keeping this check inside the
+    // `new_limit` branch left the read path completely ungated, so any process
+    // could enumerate any other process's resource limits. It also runs ahead
+    // of the registry lookup so a denied caller cannot learn whether the target
+    // is tracked at all.
+    if !cred.may_set() {
+        return Err(Error::PermissionDenied);
+    }
+
     // Get the current limit (default UNLIMITED if not yet tracked).
     let current = registry
         .get(effective_pid)
@@ -340,11 +353,6 @@ pub fn do_sys_prlimit(
     if let Some(nl) = new_limit {
         if nl.soft_exceeds_hard() {
             return Err(Error::InvalidArgument);
-        }
-
-        // Permission: must be allowed to set limits on the target.
-        if !cred.may_set() {
-            return Err(Error::PermissionDenied);
         }
 
         // Privilege: raising the hard limit requires CAP_SYS_RESOURCE.
