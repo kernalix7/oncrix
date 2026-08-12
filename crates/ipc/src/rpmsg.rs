@@ -514,6 +514,14 @@ impl RpmsgDevice {
     /// with `PermissionDenied`. This prevents source-address spoofing and
     /// cross-endpoint injection — a caller cannot forge a message that
     /// appears to originate from an endpoint it does not own.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::IoError`] — the device is offline. This is checked before
+    ///   endpoint lookup, so a caller on a downed transport is told the
+    ///   transport is down rather than that its endpoint is missing.
+    /// - [`Error::NotFound`] — the `src` or `dst` endpoint does not exist.
+    /// - [`Error::PermissionDenied`] — `owner` does not own `src`.
     pub fn send(&mut self, owner: u32, src: u32, dst: u32, payload: &[u8]) -> Result<()> {
         if !self.online {
             return Err(Error::IoError);
@@ -787,9 +795,18 @@ mod tests {
     #[test]
     fn test_send_offline_device() {
         let mut dev = RpmsgDevice::new(0);
-        dev.online = false;
         let src = 10;
-        // Cannot create endpoints on offline device easily, so test send.
+
+        // Device state is checked before endpoint lookup, so an offline
+        // device reports the downed transport rather than a missing endpoint.
+        dev.online = false;
+        assert_eq!(
+            dev.send(TEST_OWNER, src, 20, b"data").unwrap_err(),
+            Error::IoError
+        );
+
+        // Same call on an online device gets as far as the endpoint lookup.
+        dev.online = true;
         assert_eq!(
             dev.send(TEST_OWNER, src, 20, b"data").unwrap_err(),
             Error::NotFound

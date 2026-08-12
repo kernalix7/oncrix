@@ -33,7 +33,6 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # entry is the definition of done for that fix. Do not add to this list to make
 # a red build green.
 #
-#   oncrix-ipc      rpmsg send to an offline device reports IoError, not NotFound
 #   oncrix-kernel   nf_conntrack expectations — the table registers
 #                   the expected port as dst_port while the FTP-active-mode test
 #                   tuple carries it as src_port (server:20 -> client:50000), and
@@ -45,9 +44,6 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #                   and SEGFAULTS the whole test binary
 skips_for() {
     case "$1" in
-    oncrix-ipc)
-        echo "rpmsg::tests::test_send_offline_device"
-        ;;
     oncrix-kernel)
         echo "nf_conntrack::tests::test_expectation"
         ;;
