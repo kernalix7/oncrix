@@ -32,10 +32,8 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # place to silence a red build: an entry without a diagnosis, or added to avoid
 # fixing something, defeats the point of running the suite at all.
 #
-# oncrix-syscall - 14 of 3603, surfaced the first time the crate's tests ever
-# compiled. One is a security hole:
-#   shmat_call   a segment ending past the user-space limit was accepted
-# One is an entropy defect:
+# oncrix-syscall - 13 of 3603, surfaced the first time the crate's tests ever
+# compiled. One is an entropy defect:
 #   getrandom_call  two different pool offsets extracted identical bytes
 # The rest are logic or test-expectation defects:
 #   bind_call        127.0.0.1 not recognised as loopback
@@ -66,7 +64,6 @@ skips_for() {
         echo "rename_call::tests::rename_exchange"
         echo "setpgid_call::tests::setpgid_self"
         echo "setrlimit_call::tests::unpriv_lower_hard"
-        echo "shmat_call::tests::segment_end_past_user_space_end_rejected"
         ;;
     esac
 }

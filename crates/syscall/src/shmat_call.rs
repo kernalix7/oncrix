@@ -332,8 +332,13 @@ mod tests {
     fn segment_end_past_user_space_end_rejected() {
         // shmaddr is page-aligned and within the user window ...
         let start = USER_SPACE_END & !(SHMLBA as u64 - 1);
-        // ... but the segment extends one byte past the end.
-        let size = 1u64;
+        // ... but the segment runs past the end.
+        //
+        // `USER_SPACE_END` is the last valid byte and is not page-aligned, so
+        // aligning it down lands `start` 4095 bytes below the limit. The
+        // segment has to be at least a full page for `start + size` to clear
+        // it; a one-byte segment ends comfortably inside user space.
+        let size = SHMLBA as u64;
         let req = ShmatRequest::with_size(1, start, 0, size);
         assert_eq!(
             req.validate().unwrap_err(),
