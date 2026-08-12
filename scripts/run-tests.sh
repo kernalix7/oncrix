@@ -40,7 +40,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #                   the expected port as dst_port while the FTP-active-mode test
 #                   tuple carries it as src_port (server:20 -> client:50000), and
 #                   check_and_consume only compares dst_port, so which side the
-#                   API means is unresolved; tcp_bbr drain->probe_bw
+#                   API means is unresolved
 #   oncrix-drivers  the two virtio_vsock request tests build the driver with
 #                   mmio_base = 0 and hand-set `initialized`, a state `init()`
 #                   never produces, so `transmit_header` writes to address 0x50
@@ -61,7 +61,6 @@ skips_for() {
         ;;
     oncrix-kernel)
         echo "nf_conntrack::tests::test_expectation"
-        echo "tcp_bbr::tests::drain_to_probe_bw"
         ;;
     oncrix-drivers)
         echo "virtio_vsock::tests::handle_request_accepts_bound_port"

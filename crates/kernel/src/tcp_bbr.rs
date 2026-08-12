@@ -429,9 +429,14 @@ impl BbrState {
         self.pacing_rate = self.target_pacing_rate(DRAIN_GAIN_NUM);
         self.cwnd = self.target_cwnd(PROBE_BW_CWND_GAIN_NUM).max(BBR_MIN_CWND);
 
-        // Leave DRAIN when inflight ≤ BDP (approximated: cwnd from gain ≤ BDP).
-        let bdp_pkts = ((self.bdp_bytes() + self.mss as u64 - 1) / self.mss as u64) as u32;
-        if self.cwnd <= bdp_pkts.max(BBR_MIN_CWND) {
+        // Leave DRAIN when the drain-gain target has fallen to the unit-gain
+        // (BDP) target. Both sides go through `target_cwnd` so both carry its
+        // unconditional `+ BBR_MIN_CWND` headroom; comparing a `target_cwnd`
+        // result against a bare BDP packet count never holds, because the
+        // headroom alone puts the left side above it for any gain >= 1.0.
+        let drained = self.target_cwnd(DRAIN_GAIN_NUM);
+        let bdp_target = self.target_cwnd(GAIN_DENOM);
+        if drained <= bdp_target {
             self.enter_probe_bw(0);
         }
     }
