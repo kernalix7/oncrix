@@ -164,59 +164,51 @@ impl ConnTrackTuple {
         }
     }
 
-    /// Compute a simple hash of this tuple for table indexing.
+    /// Compute a direction-agnostic hash of this tuple for table indexing.
     ///
-    /// Uses a Jenkins one-at-a-time variant for reasonable
-    /// distribution across the fixed-size table.
+    /// The two endpoints are mixed in canonical (lowest-first) order so that a
+    /// flow and its reply land in the same bucket. That is load-bearing, not
+    /// cosmetic: [`ConnTrackTable`] keeps one entry per connection and tells
+    /// the directions apart by comparing against `original` and `reply`. If the
+    /// two directions hashed differently, a reply would start probing an
+    /// unrelated chain, hit an empty slot, and be recorded as a fresh
+    /// connection — pinning every flow at `New` forever.
+    ///
+    /// Uses a Jenkins one-at-a-time variant for reasonable distribution across
+    /// the fixed-size table.
     pub const fn hash(&self) -> usize {
+        const fn mix(h: u32, byte: u8) -> u32 {
+            let h = h.wrapping_add(byte as u32);
+            let h = h.wrapping_add(h << 10);
+            h ^ (h >> 6)
+        }
+
+        // IP in the high bytes, port in the low two, so ordering the packed
+        // keys orders the endpoints.
+        const fn endpoint(ip: [u8; 4], port: u16) -> u64 {
+            ((ip[0] as u64) << 40)
+                | ((ip[1] as u64) << 32)
+                | ((ip[2] as u64) << 24)
+                | ((ip[3] as u64) << 16)
+                | port as u64
+        }
+
+        let a = endpoint(self.src_ip, self.src_port);
+        let b = endpoint(self.dst_ip, self.dst_port);
+        let (first, second) = if a <= b { (a, b) } else { (b, a) };
+
         let mut h: u32 = 0;
+        let mut shift = 40;
+        loop {
+            h = mix(h, (first >> shift) as u8);
+            h = mix(h, (second >> shift) as u8);
+            if shift == 0 {
+                break;
+            }
+            shift -= 8;
+        }
 
-        // Mix source IP
-        h = h.wrapping_add(self.src_ip[0] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add(self.src_ip[1] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add(self.src_ip[2] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add(self.src_ip[3] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-
-        // Mix dest IP
-        h = h.wrapping_add(self.dst_ip[0] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add(self.dst_ip[1] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add(self.dst_ip[2] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add(self.dst_ip[3] as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-
-        // Mix ports
-        h = h.wrapping_add((self.src_port >> 8) as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add((self.src_port & 0xFF) as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add((self.dst_port >> 8) as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-        h = h.wrapping_add((self.dst_port & 0xFF) as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
-
-        // Mix protocol
-        h = h.wrapping_add(self.protocol.to_proto_num() as u32);
-        h = h.wrapping_add(h << 10);
-        h ^= h >> 6;
+        h = mix(h, self.protocol.to_proto_num());
 
         // Finalise
         h = h.wrapping_add(h << 3);
