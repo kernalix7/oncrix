@@ -1,9 +1,12 @@
 # ONCRIX — Copilot working instructions
 
-ONCRIX is a ~1.05M-line Rust **nightly, edition 2024, `#![no_std]`/`#![no_main]`
-microkernel** (primary target `x86_64-unknown-none`; secondary `aarch64`,
-`riscv64`). Also read the repo `CLAUDE.md` for full project rules (coding
-conventions §4, build/verify §5). Ignore the multi-agent / "TeamCreate"
+ONCRIX is a ~1.16M-line Rust **nightly, edition 2024, `#![no_std]`/`#![no_main]`
+microkernel**. All three targets boot in QEMU and are covered by CI:
+`x86_64-unknown-none` (primary — reaches ring 3 and runs a shell),
+`aarch64-unknown-none` and `riscv64gc-unknown-none-elf` (preemptive kernel-thread
+scheduling; aarch64 also does an EL0 round trip). Also read the repo `CLAUDE.md`
+for full project rules (coding conventions §4, build/verify §5) and the per-crate
+`AGENTS.md` for the crate you are touching. Ignore the multi-agent / "TeamCreate"
 material in CLAUDE.md §11 — that is Claude-Code-specific; **you work as a single
 agent: one focused change at a time.**
 
@@ -27,34 +30,39 @@ check, or a strict-progress / iteration cap for loops. **Never** introduce a new
 `.unwrap()`/`.expect()`/`panic!` — `unwrap_or`, `ok_or(...)?`, `is_some_and`,
 `saturating_*` are fine.
 
-Status: 39 fixes already merged (PRs #74–#111). The inline-assembly soundness
-sweep and the mounted-image filesystem parsers (ext2/btrfs/UDF/minix/romfs +
-fat/iso/ntfs/etc.) are essentially done. (Deeper history lives in the Claude
-memory log, not in the repo.)
+Status: the hardening sweep through PR #137 is done — the inline-assembly
+soundness pass and the mounted-image filesystem parsers (ext2/btrfs/UDF/minix/
+romfs + fat/iso/ntfs/etc.) are covered. PRs #138–#151 shifted to cross-architecture
+bring-up (aarch64/riscv64 boot, MMU, preemption, FP/SIMD state, CI boot coverage).
+Verify current state with `git log`, not with `WORK_STATUS.md` or `CHANGELOG.md` —
+both are months stale.
 
-## ▶ THE NEXT TASK: aarch64/riscv inline-asm barrier `nomem`
-File: `crates/hal/src/cache_maint.rs`. The x86_64 memory barriers had a bug
-(already fixed): a memory-ordering fence declared `options(..., nomem)` lets the
-compiler reorder loads/stores **across** the fence, silently neutering it and
-breaking DMA / device / cross-CPU ordering. The **same bug is copy-pasted into
-the aarch64 and riscv64 barrier blocks**, which were skipped earlier only
-because they don't build on an x86_64 host. They DO build now — verify with
-the cross-target builds below.
+## ▶ THE NEXT TASK: audit and wire one network protocol parser
+The live receive path is `NetStack::process_packet` at `crates/kernel/src/net.rs:663`.
+Its ethertype match (`net.rs:666`) handles **only** ARP and `ETHER_TYPE_IPV4`;
+everything else returns `NotImplemented`. Inside `handle_ipv4` (`net.rs:801`) the
+protocol match handles only `PROTO_ICMP` and `PROTO_UDP` (`net.rs:833-834`).
+Parsers for ipv6, tcp, igmp, dns, dhcp, sctp and gre exist as sibling modules in
+`crates/kernel/src/` but have **zero callers from `net.rs`** — dead surface today.
 
-**Remove `nomem`** (keep `nostack`) from these **DATA memory barriers**:
-- line ~119 `dmb ish` (aarch64), ~126 `fence rw, rw` (riscv)
-- line ~148 `dsb ish`, ~155 `fence iorw, iorw`
-- line ~293 `dsb ish`, ~313 `dsb ish`
+Wiring one makes it reachable from **remote, pre-authentication packet input**, so
+the parser must be audited against the bug classes above *before* it is dispatched.
+Do them one protocol per PR, in this order:
 
-So `options(nostack, nomem)` → `options(nostack)`, and add a `// No nomem:`
-comment explaining the fence must act as a compiler memory barrier (mirror the
-existing x86_64 comments at ~lines 109/138/258 in the same file).
+1. **Audit** the parser for every bug class listed above. Report each finding as
+   `file:line:function` + the attacker-controlled value + the bug class + the
+   minimal fix.
+2. **Fix** the findings (bound/guard that is a no-op for valid input).
+3. **Wire** it into the ethertype match (`net.rs:666`) or the IP protocol match
+   (`net.rs:833`), mirroring how `handle_udp_packet` (`net.rs:860`) delegates to
+   `crate::udp::parse_udp_datagram` and re-checks bounds at the call site.
 
-**Do NOT change** the **instruction-synchronisation** barriers at ~187 `isb`
-and ~194 `fence.i` — those serialise the instruction pipeline, not data memory,
-so `nomem` is correct there (just like the x86_64 `cpuid`-as-ISB kept `nomem`).
-Briefly confirm each is used for instruction-sync, not as a data fence, before
-leaving it.
+Start with **IPv6**: `ETHER_TYPE_IPV6` is already defined at `net.rs:42` and never
+matched, and the path mirrors the existing IPv4 one most closely. `9p`
+(`crates/vfs/src/plan9fs.rs`) is the other high-value unaudited surface.
+
+Note the existing defensive style at `net.rs:817-820`: bounds already validated by
+the parser are **re-checked at the call site**. Keep that — it is deliberate.
 
 ## How to make a change (single-agent loop)
 1. Branch: `git checkout -b fix/<short-name>` (never commit directly to `main`).
@@ -62,14 +70,21 @@ leaving it.
 3. **Gate — every command must pass; capture each exit code, do NOT pipe `cargo`
    through `| tail` (tail always exits 0 and hides failures):**
    ```
+   rustup update nightly             # CI installs the LATEST nightly every run
    cargo fmt --all -- --check        # or run `cargo fmt --all` first to auto-format
    cargo build --workspace
    cargo clippy --workspace -- -D warnings
-   cargo build -p oncrix-hal --target x86_64-unknown-none
-   # for THIS task, also cross-build the secondary targets you changed:
-   cargo build -p oncrix-hal --target aarch64-unknown-none
-   cargo build -p oncrix-hal --target riscv64gc-unknown-none-elf
+   # cross-build when touching crates/hal/ or crates/kernel/src/arch/ — these are
+   # NOT built by --workspace and break silently otherwise:
+   cargo build -p oncrix-kernel --bin oncrix-kernel --target aarch64-unknown-none
+   cargo build -p oncrix-kernel --bin oncrix-kernel --target riscv64gc-unknown-none-elf
+   bash scripts/run-qemu-test.sh     # boots all three arches; this is CI's second job
    ```
+   `rustup update nightly` is not optional. `rust-toolchain.toml` pins the floating
+   `nightly` channel and CI resolves it fresh, so a stale local toolchain passes
+   clippy locally and fails CI on lints that did not exist when you last updated.
+   `cargo test --workspace` **does not work** — it fails to compile. The QEMU
+   harness is the only end-to-end test.
 4. Commit with a Conventional-Commits message (`fix(hal): ...`). Atomic — list
    the exact files: `git commit -m "..." -- crates/hal/src/cache_maint.rs`.
 5. `git push -u origin <branch>` and open a PR; let CI (Rust Quality + QEMU boot)
@@ -88,11 +103,15 @@ leaving it.
 - Each PR is one focused change, builds clean, and passes the gate above before
   committing.
 
-## Finding more issues (when this task is done)
-Audit one wired attacker-controlled parser at a time for the bug classes listed
-at the top, fix it, and PR it. Highest-value remaining surfaces: any network
-protocol parser as it gets **wired** into the live receive path in
-`crates/kernel/src/net.rs` (today only IPv4→ICMP/UDP is dispatched; IPv6/TCP/
-IGMP/DNS/DHCP parsers exist but are unwired), and the `9p` filesystem. Report
-each finding with the exact `file:line:function`, the attacker value, the bug
-class, and the minimal fix; then implement it as its own PR.
+## Finding more issues (when the task above is done)
+Repeat the audit-then-wire loop for the next protocol, one per PR. After the
+network parsers, the remaining unaudited high-risk surfaces are, in rough order of
+value: `9p` (`crates/vfs/src/plan9fs.rs`), deeper `crates/mm/` (compaction, swap,
+numa, balloon, zswap), the remaining `crates/drivers/` classes (gpu, input,
+sensors), and HAL interrupt routing (APIC/IOAPIC).
+
+Two standing cleanups, both low risk:
+- `python3 scripts/check_safety.py` reports ~42 unsafe blocks without a `// SAFETY:`
+  comment, all in `crates/userspace/`. The checker is not wired into CI.
+- PR #25 (logo vector) has been open and mergeable for months; it needs a decision,
+  not code.
