@@ -745,6 +745,22 @@ const MAX_PKT_BUF: usize = 1500;
 /// Maximum NDP options per message.
 const MAX_NDP_OPTIONS: usize = 8;
 
+/// Hop limit that RFC 4861 requires on every NDP message, sent and received.
+const NDP_HOP_LIMIT: u8 = 255;
+
+/// Applies the RFC 4861 §7.1.1/§7.1.2 validity checks common to NS and NA.
+///
+/// SECURITY: the hop limit is the *only* thing confining NDP to the local
+/// link. 255 is the maximum a sender can set, and every router decrements, so
+/// a message still holding 255 provably never crossed one. Accepting a lower
+/// value lets an attacker anywhere on the internet drive the neighbor cache,
+/// which is what the Solicited/Override rules in `handle_advertisement` assume
+/// cannot happen. Length is already checked by each handler and the checksum
+/// by the caller, leaving the code field, which RFC 4861 fixes at 0.
+fn ndp_message_is_valid(ip_hdr: &Ipv6Header, icmp: &Icmpv6Header) -> bool {
+    ip_hdr.hop_limit == NDP_HOP_LIMIT && icmp.code == 0
+}
+
 /// IPv6 network stack with NDP support.
 pub struct Ipv6Stack {
     /// Our link-local address.
@@ -823,9 +839,15 @@ impl Ipv6Stack {
         match Icmpv6Type::from_u8(icmp.icmp_type) {
             Some(Icmpv6Type::EchoRequest) => self.handle_echo_request(ip_hdr, payload, response),
             Some(Icmpv6Type::NeighborSolicitation) => {
+                if !ndp_message_is_valid(ip_hdr, &icmp) {
+                    return Ok(None);
+                }
                 self.handle_neighbor_solicitation(ip_hdr, payload, response)
             }
             Some(Icmpv6Type::NeighborAdvertisement) => {
+                if !ndp_message_is_valid(ip_hdr, &icmp) {
+                    return Ok(None);
+                }
                 self.handle_neighbor_advertisement(payload)?;
                 Ok(None)
             }
@@ -947,6 +969,13 @@ impl Ipv6Stack {
         target_bytes.copy_from_slice(&payload[8..24]);
         let target = Ipv6Addr::from_bytes(target_bytes);
 
+        // RFC 4861 §7.1.2: the target of an NA is the address being resolved,
+        // so it must be unicast. A multicast target names no single neighbor
+        // and only serves to steer a cache entry the sender does not own.
+        if target.is_multicast() {
+            return Ok(());
+        }
+
         // Parse options for target link-layer address.
         let opt_data = &payload[24..];
         let mut options = [NdpOption::Mtu { mtu: 0 }; MAX_NDP_OPTIONS];
@@ -1000,7 +1029,7 @@ impl Ipv6Stack {
             self.local_addr,
             real_dst,
             NextHeader::Icmpv6 as u8,
-            255,
+            NDP_HOP_LIMIT,
             icmpv6_len as u16,
         );
         ip.serialize(&mut response[..IPV6_HEADER_LEN])?;
@@ -1059,7 +1088,7 @@ impl Ipv6Stack {
             self.local_addr,
             dst,
             NextHeader::Icmpv6 as u8,
-            255,
+            NDP_HOP_LIMIT,
             icmpv6_len as u16,
         );
         ip.serialize(&mut response[..IPV6_HEADER_LEN])?;
@@ -1244,5 +1273,201 @@ mod tests {
         msg[2] = 0xBE;
         msg[3] = 0xEF;
         assert_eq!(icmpv6_checksum(&src, &dst, &msg), c0, "field still skipped");
+    }
+
+    fn ndp_stack() -> Ipv6Stack {
+        Ipv6Stack::new(addr(9), MAC_A)
+    }
+
+    // Builds a 72-byte IPv6 + NDP packet whose ICMPv6 body is the 32 bytes
+    // common to NS and NA: header 4 + flags/reserved 4 + target 16 + option 8.
+    // The checksum is always correct, so acceptance turns solely on the field
+    // under test rather than on the checksum gate in handle_icmpv6.
+    #[allow(clippy::too_many_arguments)]
+    fn ndp_packet(
+        icmp_type: Icmpv6Type,
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        target: Ipv6Addr,
+        hop_limit: u8,
+        code: u8,
+        flags: u8,
+        opt_type: NdpOptionType,
+        opt_mac: [u8; 6],
+    ) -> [u8; IPV6_HEADER_LEN + 32] {
+        let icmp_len = 32usize;
+        let mut pkt = [0u8; IPV6_HEADER_LEN + 32];
+        let hdr = Ipv6Header::new(
+            src,
+            dst,
+            NextHeader::Icmpv6 as u8,
+            hop_limit,
+            icmp_len as u16,
+        );
+        hdr.serialize(&mut pkt[..IPV6_HEADER_LEN]).unwrap();
+        let s = IPV6_HEADER_LEN;
+        pkt[s] = icmp_type as u8;
+        pkt[s + 1] = code;
+        pkt[s + 4] = flags;
+        pkt[s + 8..s + 24].copy_from_slice(&target.to_bytes());
+        pkt[s + 24] = opt_type as u8;
+        pkt[s + 25] = 1;
+        pkt[s + 26..s + 32].copy_from_slice(&opt_mac);
+        let ck = icmpv6_checksum(&src, &dst, &pkt[s..s + icmp_len]);
+        pkt[s + 2..s + 4].copy_from_slice(&ck.to_be_bytes());
+        pkt
+    }
+
+    // SECURITY (RFC 4861 §7.1.1): NDP is confined to the local link by exactly
+    // one mechanism — Hop Limit 255. A router cannot forward a packet and leave
+    // it at 255, so anything lower provably crossed a router and must be
+    // dropped. Without this the Solicited/Override poisoning defences below are
+    // reachable by any off-link attacker.
+    #[test]
+    fn ns_that_crossed_a_router_is_dropped() {
+        let mut st = ndp_stack();
+        let mut resp = [0u8; MAX_PKT_BUF];
+        let pkt = ndp_packet(
+            Icmpv6Type::NeighborSolicitation,
+            addr(1),
+            addr(9),
+            addr(9),
+            64,
+            0,
+            0,
+            NdpOptionType::SourceLinkLayerAddr,
+            MAC_B,
+        );
+        let out = st.process_packet(&pkt, &mut resp).unwrap();
+        assert!(out.is_none(), "off-link NS must not be answered");
+        assert!(
+            st.neighbors.lookup(&addr(1)).is_none(),
+            "off-link NS must not populate the neighbor cache"
+        );
+    }
+
+    // RFC 4861 §7.1.1: a code other than 0 makes the NS invalid.
+    #[test]
+    fn ns_with_nonzero_code_is_dropped() {
+        let mut st = ndp_stack();
+        let mut resp = [0u8; MAX_PKT_BUF];
+        let pkt = ndp_packet(
+            Icmpv6Type::NeighborSolicitation,
+            addr(1),
+            addr(9),
+            addr(9),
+            255,
+            1,
+            0,
+            NdpOptionType::SourceLinkLayerAddr,
+            MAC_B,
+        );
+        let out = st.process_packet(&pkt, &mut resp).unwrap();
+        assert!(out.is_none(), "NS with code != 0 must not be answered");
+        assert!(st.neighbors.lookup(&addr(1)).is_none());
+    }
+
+    // The on-link path must keep working: a valid NS is answered and teaches
+    // the cache the solicitor's MAC.
+    #[test]
+    fn ns_at_hop_limit_255_is_still_answered() {
+        let mut st = ndp_stack();
+        let mut resp = [0u8; MAX_PKT_BUF];
+        let pkt = ndp_packet(
+            Icmpv6Type::NeighborSolicitation,
+            addr(1),
+            addr(9),
+            addr(9),
+            255,
+            0,
+            0,
+            NdpOptionType::SourceLinkLayerAddr,
+            MAC_B,
+        );
+        let out = st.process_packet(&pkt, &mut resp).unwrap();
+        assert!(out.is_some(), "on-link NS must still produce an NA");
+        assert_eq!(
+            st.neighbors.lookup(&addr(1)).unwrap().mac,
+            MAC_B,
+            "on-link NS must still teach the source MAC"
+        );
+    }
+
+    // SECURITY (RFC 4861 §7.1.2): same Hop Limit rule for NA. An off-link NA
+    // must not be able to resolve a pending entry — that is remote neighbor
+    // cache poisoning, i.e. on-link MITM driven from anywhere on the internet.
+    #[test]
+    fn na_that_crossed_a_router_cannot_touch_the_cache() {
+        let mut st = ndp_stack();
+        st.neighbors.insert_incomplete(addr(1), 0).unwrap();
+        let mut resp = [0u8; MAX_PKT_BUF];
+        let pkt = ndp_packet(
+            Icmpv6Type::NeighborAdvertisement,
+            addr(1),
+            addr(9),
+            addr(1),
+            64,
+            0,
+            0x60,
+            NdpOptionType::TargetLinkLayerAddr,
+            MAC_B,
+        );
+        st.process_packet(&pkt, &mut resp).unwrap();
+        let e = st.neighbors.lookup(&addr(1)).unwrap();
+        assert_eq!(
+            e.state,
+            NdpState::Incomplete,
+            "off-link NA must not resolve the entry"
+        );
+        assert_eq!(e.mac, [0u8; 6], "off-link NA must not install a MAC");
+    }
+
+    // The legitimate resolution path must survive the new gate.
+    #[test]
+    fn na_at_hop_limit_255_still_resolves() {
+        let mut st = ndp_stack();
+        st.neighbors.insert_incomplete(addr(1), 0).unwrap();
+        let mut resp = [0u8; MAX_PKT_BUF];
+        let pkt = ndp_packet(
+            Icmpv6Type::NeighborAdvertisement,
+            addr(1),
+            addr(9),
+            addr(1),
+            255,
+            0,
+            0x60,
+            NdpOptionType::TargetLinkLayerAddr,
+            MAC_B,
+        );
+        st.process_packet(&pkt, &mut resp).unwrap();
+        let e = st.neighbors.lookup(&addr(1)).unwrap();
+        assert_eq!(e.state, NdpState::Reachable);
+        assert_eq!(e.mac, MAC_B);
+    }
+
+    // RFC 4861 §7.1.2: the target of an NA must be a unicast address.
+    #[test]
+    fn na_for_multicast_target_is_dropped() {
+        let mut st = ndp_stack();
+        let mcast = Ipv6Addr::ALL_NODES;
+        st.neighbors.insert(mcast, MAC_A, 0).unwrap();
+        let mut resp = [0u8; MAX_PKT_BUF];
+        let pkt = ndp_packet(
+            Icmpv6Type::NeighborAdvertisement,
+            addr(1),
+            addr(9),
+            mcast,
+            255,
+            0,
+            0x60,
+            NdpOptionType::TargetLinkLayerAddr,
+            MAC_B,
+        );
+        st.process_packet(&pkt, &mut resp).unwrap();
+        assert_eq!(
+            st.neighbors.lookup(&mcast).unwrap().mac,
+            MAC_A,
+            "an NA naming a multicast target must be ignored"
+        );
     }
 }
