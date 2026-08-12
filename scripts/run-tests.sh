@@ -41,7 +41,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #                   tuple carries it as src_port (server:20 -> client:50000), and
 #                   check_and_consume only compares dst_port, so which side the
 #                   API means is unresolved; posix_cpu_timers reload;
-#                   task_delay_acct aggregation; tcp_bbr drain->probe_bw
+#                   tcp_bbr drain->probe_bw
 #   oncrix-drivers  the two virtio_vsock request tests build the driver with
 #                   mmio_base = 0 and hand-set `initialized`, a state `init()`
 #                   never produces, so `transmit_header` writes to address 0x50
@@ -65,9 +65,6 @@ skips_for() {
         echo "nf_conntrack::tests::test_expectation"
         echo "posix_cpu_timers::tests::test_interval_timer_reload"
         echo "posix_cpu_timers::tests::test_setitimer"
-        echo "task_delay_acct::tests::test_aggregate"
-        echo "task_delay_acct::tests::test_exit_finishes_active"
-        echo "task_delay_acct::tests::test_extreme_latency_log"
         echo "tcp_bbr::tests::drain_to_probe_bw"
         ;;
     oncrix-drivers)
