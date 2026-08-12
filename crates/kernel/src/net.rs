@@ -1161,8 +1161,8 @@ mod tests {
     }
 
     #[test]
-    fn test_network_stack_default() {
-        let stack = NetworkStack::default();
+    fn test_network_stack_zero_addresses() {
+        let stack = NetworkStack::new([0; 6], [0; 4], [0; 4], [0; 4]);
         assert_eq!(stack.local_mac, [0; 6]);
         assert_eq!(stack.local_ip, [0; 4]);
     }

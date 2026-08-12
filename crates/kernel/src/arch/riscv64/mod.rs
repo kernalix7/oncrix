@@ -41,7 +41,10 @@ const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
 static mut KERNEL_HEAP: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
 /// Global allocator.
-#[global_allocator]
+///
+/// Not registered under `cfg(test)` — see the x86_64 counterpart in
+/// `arch/x86_64/init.rs` for why an empty allocator faults a host test binary.
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: oncrix_mm::heap::LinkedListAllocator =
     oncrix_mm::heap::LinkedListAllocator::empty();
 

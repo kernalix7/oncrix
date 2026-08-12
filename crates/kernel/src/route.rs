@@ -876,7 +876,8 @@ mod tests {
 
         let entry = table.lookup(Ipv4Addr::from_octets(192, 168, 1, 42));
         assert!(entry.is_some());
-        let entry = entry.unwrap_or(&RouteEntry::empty());
+        let fallback = RouteEntry::empty();
+        let entry = entry.unwrap_or(&fallback);
         assert_eq!(entry.iface_index, 1);
     }
 
@@ -912,14 +913,16 @@ mod tests {
         // Lookup within /24 should match the more specific route.
         let entry = table.lookup(Ipv4Addr::from_octets(10, 0, 0, 50));
         assert!(entry.is_some());
-        let entry = entry.unwrap_or(&RouteEntry::empty());
+        let fallback = RouteEntry::empty();
+        let entry = entry.unwrap_or(&fallback);
         assert_eq!(entry.iface_index, 1);
         assert_eq!(entry.metric, 10);
 
         // Lookup outside /24 should match the default route.
         let entry = table.lookup(Ipv4Addr::from_octets(8, 8, 8, 8));
         assert!(entry.is_some());
-        let entry = entry.unwrap_or(&RouteEntry::empty());
+        let fallback = RouteEntry::empty();
+        let entry = entry.unwrap_or(&fallback);
         assert_eq!(entry.iface_index, 0);
         assert_eq!(entry.metric, 100);
     }
@@ -953,7 +956,8 @@ mod tests {
 
         let entry = table.lookup(Ipv4Addr::from_octets(10, 0, 0, 99));
         assert!(entry.is_some());
-        let entry = entry.unwrap_or(&RouteEntry::empty());
+        let fallback = RouteEntry::empty();
+        let entry = entry.unwrap_or(&fallback);
         // Should prefer the lower metric (50) route.
         assert_eq!(entry.iface_index, 2);
         assert_eq!(entry.metric, 50);
@@ -1033,7 +1037,8 @@ mod tests {
 
         let entry = table.lookup(Ipv4Addr::from_octets(10, 0, 0, 1));
         assert!(entry.is_some());
-        let entry = entry.unwrap_or(&RouteEntry::empty());
+        let fallback = RouteEntry::empty();
+        let entry = entry.unwrap_or(&fallback);
         assert_eq!(entry.gateway, Ipv4Addr::from_octets(10, 0, 0, 254));
         assert_eq!(entry.iface_index, 2);
         assert_eq!(entry.metric, 50);
@@ -1089,7 +1094,8 @@ mod tests {
 
         let iface = table.get(1);
         assert!(iface.is_some());
-        let iface = iface.unwrap_or(&InterfaceInfo::empty());
+        let fallback = InterfaceInfo::empty();
+        let iface = iface.unwrap_or(&fallback);
         assert_eq!(iface.name_str(), b"eth0");
         assert_eq!(iface.mtu, 1500);
         assert!(iface.flags.contains(InterfaceFlags::UP));
@@ -1115,7 +1121,8 @@ mod tests {
 
         let iface = table.get_by_name(b"lo");
         assert!(iface.is_some());
-        let iface = iface.unwrap_or(&InterfaceInfo::empty());
+        let fallback = InterfaceInfo::empty();
+        let iface = iface.unwrap_or(&fallback);
         assert_eq!(iface.index, 0);
         assert!(iface.flags.contains(InterfaceFlags::LOOPBACK));
     }

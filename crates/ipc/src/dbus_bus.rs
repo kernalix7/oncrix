@@ -204,6 +204,7 @@ pub struct DbusHeaderField {
 // ---------------------------------------------------------------------------
 
 /// A D-Bus message on the kernel bus.
+#[derive(Debug)]
 pub struct DbusMessage {
     /// Message type (method_call, method_return, error, signal).
     pub msg_type: u8,

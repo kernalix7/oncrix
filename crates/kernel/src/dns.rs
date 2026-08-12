@@ -984,7 +984,7 @@ mod tests {
     fn test_parse_response_a_record() {
         // Minimal DNS response for example.com -> 93.184.216.34
         #[rustfmt::skip]
-        let response: [u8; 43] = [
+        let response: [u8; 45] = [
             // Header
             0x12, 0x34, // ID
             0x81, 0x80, // QR=1, RD=1, RA=1
@@ -1088,7 +1088,7 @@ mod tests {
         let mut resolver = DnsResolver::new([8, 8, 8, 8]);
 
         #[rustfmt::skip]
-        let response: [u8; 43] = [
+        let response: [u8; 45] = [
             0x00, 0x01,
             0x81, 0x80,
             0x00, 0x01,

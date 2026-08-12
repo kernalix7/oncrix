@@ -444,7 +444,8 @@ mod tests {
                 LOCK_END_WHOLE_FILE,
             )
             .unwrap();
-        let mut out = [&ProcLockEntry::new(); 4];
+        let empty = ProcLockEntry::new();
+        let mut out = [&empty; 4];
         let n = table.find_by_pid(42, &mut out);
         assert_eq!(n, 1);
     }

@@ -78,13 +78,19 @@ the parser are **re-checked at the call site**. Keep that — it is deliberate.
    # NOT built by --workspace and break silently otherwise:
    cargo build -p oncrix-kernel --bin oncrix-kernel --target aarch64-unknown-none
    cargo build -p oncrix-kernel --bin oncrix-kernel --target riscv64gc-unknown-none-elf
-   bash scripts/run-qemu-test.sh     # boots all three arches; this is CI's second job
+   bash scripts/run-tests.sh         # 962 host unit tests across 9 crates
+   bash scripts/run-qemu-test.sh     # boots all three arches
    ```
    `rustup update nightly` is not optional. `rust-toolchain.toml` pins the floating
    `nightly` channel and CI resolves it fresh, so a stale local toolchain passes
    clippy locally and fails CI on lints that did not exist when you last updated.
-   `cargo test --workspace` **does not work** — it fails to compile. The QEMU
-   harness is the only end-to-end test.
+
+   `cargo test --workspace` **does not work** — the default target is bare metal and
+   libtest needs std. `scripts/run-tests.sh` builds each crate for the host triple
+   instead, sets the large `RUST_MIN_STACK` the inline-table idiom requires, and skips
+   ~20 tests that genuinely fail today. Each skip entry names its root cause; deleting
+   one is the definition of done for that fix. `oncrix-syscall` is not in the runner
+   yet — 118 test-compile errors, in the crate holding 373 of the 494 test files.
 4. Commit with a Conventional-Commits message (`fix(hal): ...`). Atomic — list
    the exact files: `git commit -m "..." -- crates/hal/src/cache_maint.rs`.
 5. `git push -u origin <branch>` and open a PR; let CI (Rust Quality + QEMU boot)
