@@ -32,10 +32,8 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # place to silence a red build: an entry without a diagnosis, or added to avoid
 # fixing something, defeats the point of running the suite at all.
 #
-# oncrix-syscall - 13 of 3603, surfaced the first time the crate's tests ever
-# compiled. One is an entropy defect:
-#   getrandom_call  two different pool offsets extracted identical bytes
-# The rest are logic or test-expectation defects:
+# oncrix-syscall - 12 of 3603, surfaced the first time the crate's tests ever
+# compiled. All are logic or test-expectation defects:
 #   bind_call        127.0.0.1 not recognised as loopback
 #   inotify_call     watch-descriptor allocation fails at the i32::MAX boundary
 #   mount_setattr    an invalid atime flag combination was accepted
@@ -52,7 +50,6 @@ skips_for() {
     case "$1" in
     oncrix-syscall)
         echo "bind_call::tests::sockaddr_in_is_loopback"
-        echo "getrandom_call::tests::test_entropy_pool_extract_differs_by_offset"
         echo "inotify_call::tests::test_wd_exhaustion_returns_error"
         echo "mount_setattr::tests::invalid_atime_combination_rejected"
         echo "perf_event_open_call::tests::test_attr_ext_watermark"
