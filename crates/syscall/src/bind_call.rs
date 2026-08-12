@@ -83,9 +83,15 @@ impl SockaddrIn {
         self.sin_addr == 0
     }
 
-    /// Check this is the loopback address (127.0.0.1).
+    /// Check this is a loopback address (127.0.0.0/8).
+    ///
+    /// `sin_addr` already holds network byte order, so it has to be converted
+    /// back to host order before the leading octet can be read. Calling
+    /// `to_be_bytes` on it directly re-serialises the *host* interpretation and
+    /// reverses the bytes again, which on a little-endian target yields the
+    /// last octet of the address instead of the first.
     pub fn is_loopback(&self) -> bool {
-        self.sin_addr.to_be_bytes()[0] == 127
+        u32::from_be(self.sin_addr).to_be_bytes()[0] == 127
     }
 }
 
