@@ -559,15 +559,31 @@ mod tests {
     #[test]
     fn invalid_atime_combination_rejected() {
         let mut t = make_table_with_tree();
-        // Set all three atime bits simultaneously — invalid.
+        // The atime constants are values of a field under
+        // `MOUNT_ATTR_ATIME_MASK`, not independent bits: NOATIME | RELATIME is
+        // 0x30, which *is* STRICTATIME. Use an encoding that sits inside the
+        // mask but names no mode.
         let attr = MountAttr {
-            attr_set: MOUNT_ATTR_NOATIME | MOUNT_ATTR_RELATIME,
+            attr_set: 0x0000_0040,
             ..MountAttr::default()
         };
         assert_eq!(
             do_mount_setattr(&mut t, 1, 0, &attr, MOUNT_ATTR_SIZE_VER0),
             Err(Error::InvalidArgument)
         );
+
+        // The three defined modes are accepted.
+        for mode in [
+            MOUNT_ATTR_NOATIME,
+            MOUNT_ATTR_RELATIME,
+            MOUNT_ATTR_STRICTATIME,
+        ] {
+            let attr = MountAttr {
+                attr_set: mode,
+                ..MountAttr::default()
+            };
+            assert!(do_mount_setattr(&mut t, 1, 0, &attr, MOUNT_ATTR_SIZE_VER0).is_ok());
+        }
     }
 
     #[test]
