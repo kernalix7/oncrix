@@ -38,18 +38,10 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #                   tuple carries it as src_port (server:20 -> client:50000), and
 #                   check_and_consume only compares dst_port, so which side the
 #                   API means is unresolved
-#   oncrix-drivers  the two virtio_vsock request tests build the driver with
-#                   mmio_base = 0 and hand-set `initialized`, a state `init()`
-#                   never produces, so `transmit_header` writes to address 0x50
-#                   and SEGFAULTS the whole test binary
 skips_for() {
     case "$1" in
     oncrix-kernel)
         echo "nf_conntrack::tests::test_expectation"
-        ;;
-    oncrix-drivers)
-        echo "virtio_vsock::tests::handle_request_accepts_bound_port"
-        echo "virtio_vsock::tests::handle_request_rejects_unbound_port"
         ;;
     esac
 }

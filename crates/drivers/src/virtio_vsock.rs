@@ -950,6 +950,27 @@ pub const VSOCK_VQ_EVENT: usize = VQ_EVENT;
 mod tests {
     use super::*;
 
+    /// Owned, 4-byte-aligned stand-in for the device's MMIO window.
+    ///
+    /// `VirtioVsock::new(0)` with a hand-set `initialized` is a state `init()`
+    /// never produces. Any path that reaches `transmit_header` then writes the
+    /// TX doorbell at address `0x050` and takes down the whole test binary with
+    /// a SIGSEGV, taking every other test in the crate with it. Point
+    /// `mmio_base` at real memory instead of the null page.
+    struct FakeMmio {
+        words: [u32; 1024],
+    }
+
+    impl FakeMmio {
+        fn new() -> Self {
+            Self { words: [0; 1024] }
+        }
+
+        fn base(&mut self) -> u64 {
+            self.words.as_mut_ptr() as u64
+        }
+    }
+
     #[test]
     fn packet_header_size() {
         assert_eq!(
@@ -1081,7 +1102,8 @@ mod tests {
     /// handle_request must reject packets for unbound ports.
     #[test]
     fn handle_request_rejects_unbound_port() {
-        let mut dev = VirtioVsock::new(0);
+        let mut mmio = FakeMmio::new();
+        let mut dev = VirtioVsock::new(mmio.base());
         dev.initialized = true;
         dev.guest_cid = 3;
 
@@ -1108,7 +1130,8 @@ mod tests {
     /// After binding a port, handle_request must accept the connection.
     #[test]
     fn handle_request_accepts_bound_port() {
-        let mut dev = VirtioVsock::new(0);
+        let mut mmio = FakeMmio::new();
+        let mut dev = VirtioVsock::new(mmio.base());
         dev.initialized = true;
         dev.guest_cid = 3;
         dev.bind(8080).unwrap();
