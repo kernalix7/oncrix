@@ -203,10 +203,15 @@ impl BtrfsInodeCache {
             count: 0,
             next_ino: 256, // Btrfs first user inode starts at 256.
         };
-        // Reserve inode 256 as the root directory.
+        // Reserve the first inode as the root directory. It must come from
+        // `alloc_ino` so the counter advances past the reservation: assigning
+        // the number literally left `next_ino` pointing at the root, so the
+        // first created file was handed the root's inode number and every
+        // lookup for it returned the root directory instead.
+        let root_ino = cache.alloc_ino();
         let root_item = BtrfsInodeItem::new_dir(0, 0, 0o755);
         cache
-            .insert_entry(BtrfsInodeCacheEntry::new(256, root_item))
+            .insert_entry(BtrfsInodeCacheEntry::new(root_ino, root_item))
             .ok();
         cache
     }
