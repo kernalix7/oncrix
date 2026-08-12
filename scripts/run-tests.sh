@@ -36,7 +36,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #   oncrix-mm       bootmem allocator returns the wrong block on reserve+alloc
 #   oncrix-ipc      rpmsg send to an offline device reports IoError, not NotFound
 #   oncrix-vfs      btrfs_inode create/lookup/unlink and shmem_fs truncate
-#   oncrix-kernel   netns routing; nf_conntrack expectations — the table registers
+#   oncrix-kernel   nf_conntrack expectations — the table registers
 #                   the expected port as dst_port while the FTP-active-mode test
 #                   tuple carries it as src_port (server:20 -> client:50000), and
 #                   check_and_consume only compares dst_port, so which side the
@@ -60,7 +60,6 @@ skips_for() {
         echo "shmem_fs::tests::truncate_frees_pages"
         ;;
     oncrix-kernel)
-        echo "netns::tests::test_routing"
         echo "nf_conntrack::tests::test_expectation"
         echo "tcp_bbr::tests::drain_to_probe_bw"
         ;;
