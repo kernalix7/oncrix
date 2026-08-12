@@ -23,6 +23,7 @@
 //!
 //! TCP is planned for future implementation.
 
+use crate::ipv6::{Ipv6Addr, Ipv6Stack, MAX_PKT_BUF};
 use oncrix_lib::{Error, Result};
 
 // =========================================================================
@@ -633,10 +634,17 @@ pub struct NetworkStack {
     pub subnet_mask: [u8; 4],
     /// ARP cache.
     pub arp_table: ArpTable,
+    /// IPv6 stack and NDP neighbor cache.
+    pub ipv6: Ipv6Stack,
 }
 
 impl NetworkStack {
     /// Create a new network stack with the given identity.
+    ///
+    /// The IPv6 identity is not passed in: a node's `fe80::/64` address is
+    /// derived from its MAC by RFC 4291 modified EUI-64, so `mac` already
+    /// determines it and accepting a second, separately-supplied value would
+    /// only allow the two to disagree.
     pub const fn new(mac: [u8; 6], ip: [u8; 4], gateway: [u8; 4], subnet: [u8; 4]) -> Self {
         Self {
             local_mac: mac,
@@ -644,6 +652,7 @@ impl NetworkStack {
             gateway_ip: gateway,
             subnet_mask: subnet,
             arp_table: ArpTable::new(),
+            ipv6: Ipv6Stack::new(Ipv6Addr::link_local_from_mac(&mac), mac),
         }
     }
 
@@ -666,6 +675,7 @@ impl NetworkStack {
         match eth.ether_type {
             ETHER_TYPE_ARP => self.handle_arp(&eth, payload, reply_buf),
             ETHER_TYPE_IPV4 => self.handle_ipv4(&eth, payload, reply_buf),
+            ETHER_TYPE_IPV6 => self.handle_ipv6(&eth, payload, reply_buf),
             _ => Err(Error::NotImplemented),
         }
     }
@@ -836,6 +846,40 @@ impl NetworkStack {
         }
     }
 
+    /// Handle an incoming IPv6 packet.
+    ///
+    /// Delegates to [`Ipv6Stack::process_packet`], which currently answers
+    /// ICMPv6 echo requests and Neighbor Solicitations. Returns the total
+    /// reply frame length (Ethernet + IPv6 + ICMPv6), or 0 when the packet was
+    /// consumed without a reply — including every packet the stack drops as
+    /// invalid, so a malformed or forged frame is never reported as an error
+    /// the caller has to distinguish from a transport failure.
+    fn handle_ipv6(
+        &mut self,
+        eth: &EtherHeader,
+        payload: &[u8],
+        reply_buf: &mut [u8],
+    ) -> Result<usize> {
+        // Scratch buffer for the IPv6 reply, mirroring handle_icmp_packet:
+        // process_packet writes a bare IPv6 datagram, which is only framed
+        // once its length is known.
+        let mut ipv6_buf = [0u8; MAX_PKT_BUF];
+        let Some(ipv6_len) = self.ipv6.process_packet(payload, &mut ipv6_buf)? else {
+            return Ok(0);
+        };
+
+        let total = ETHER_HEADER_LEN + ipv6_len;
+        if reply_buf.len() < total {
+            return Err(Error::InvalidArgument);
+        }
+
+        let mut offset = write_ether(reply_buf, &eth.src_mac, &self.local_mac, ETHER_TYPE_IPV6)?;
+        reply_buf[offset..offset + ipv6_len].copy_from_slice(&ipv6_buf[..ipv6_len]);
+        offset += ipv6_len;
+
+        Ok(offset)
+    }
+
     /// Validate an incoming UDP datagram before delivery.
     ///
     /// Re-parses the datagram so the on-wire UDP `length` field — not
@@ -925,6 +969,84 @@ impl NetworkStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PEER_MAC: [u8; 6] = [0xBB; 6];
+
+    fn ipv6_test_stack() -> NetworkStack {
+        NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0])
+    }
+
+    // Frames a Neighbor Solicitation built by a peer stack, so the checksum
+    // and hop limit are produced by the very code that validates them rather
+    // than hand-rolled in the test.
+    fn solicitation_frame(
+        target: &Ipv6Addr,
+        peer: &mut Ipv6Stack,
+        frame: &mut [u8; ETHER_HEADER_LEN + MAX_PKT_BUF],
+    ) -> usize {
+        let mut ns = [0u8; MAX_PKT_BUF];
+        let ns_len = peer.build_neighbor_solicitation(target, &mut ns).unwrap();
+        write_ether(frame, &[0xAA; 6], &PEER_MAC, ETHER_TYPE_IPV6).unwrap();
+        frame[ETHER_HEADER_LEN..ETHER_HEADER_LEN + ns_len].copy_from_slice(&ns[..ns_len]);
+        ETHER_HEADER_LEN + ns_len
+    }
+
+    // The IPv6 branch must carry a real NDP exchange end to end: a peer's
+    // Neighbor Solicitation arrives as an Ethernet frame and leaves as a
+    // framed Neighbor Advertisement.
+    #[test]
+    fn ipv6_frame_answers_neighbor_solicitation() {
+        let mut stack = ipv6_test_stack();
+        let our_addr = stack.ipv6.local_addr;
+        let mut peer = Ipv6Stack::new(Ipv6Addr::link_local_from_mac(&PEER_MAC), PEER_MAC);
+
+        let mut frame = [0u8; ETHER_HEADER_LEN + MAX_PKT_BUF];
+        let frame_len = solicitation_frame(&our_addr, &mut peer, &mut frame);
+
+        let mut reply = [0u8; ETHER_HEADER_LEN + MAX_PKT_BUF];
+        let len = stack
+            .process_packet(&frame[..frame_len], &mut reply)
+            .unwrap();
+
+        let ipv6_start = ETHER_HEADER_LEN + crate::ipv6::IPV6_HEADER_LEN;
+        assert_eq!(len, ipv6_start + 32, "Ethernet + IPv6 + 32-byte NA");
+        assert_eq!(&reply[..6], &PEER_MAC, "NA must go back to the solicitor");
+        assert_eq!(&reply[6..12], &[0xAA; 6]);
+        assert_eq!(u16::from_be_bytes([reply[12], reply[13]]), ETHER_TYPE_IPV6);
+        assert_eq!(reply[ipv6_start], 136, "ICMPv6 Neighbor Advertisement");
+        assert_eq!(
+            stack.ipv6.neighbors.lookup(&peer.local_addr).unwrap().mac,
+            PEER_MAC,
+            "the solicitor's MAC must be learned"
+        );
+    }
+
+    // SECURITY: wiring must not bypass the RFC 4861 hop-limit gate. The same
+    // frame with a forwarded hop limit must be dropped silently. The checksum
+    // is left untouched — the hop limit is not part of the ICMPv6
+    // pseudo-header — so this isolates the gate rather than the checksum.
+    #[test]
+    fn ipv6_frame_with_forwarded_hop_limit_is_dropped() {
+        let mut stack = ipv6_test_stack();
+        let our_addr = stack.ipv6.local_addr;
+        let mut peer = Ipv6Stack::new(Ipv6Addr::link_local_from_mac(&PEER_MAC), PEER_MAC);
+
+        let mut frame = [0u8; ETHER_HEADER_LEN + MAX_PKT_BUF];
+        let frame_len = solicitation_frame(&our_addr, &mut peer, &mut frame);
+        // Hop limit is byte 7 of the IPv6 header.
+        frame[ETHER_HEADER_LEN + 7] = 64;
+
+        let mut reply = [0u8; ETHER_HEADER_LEN + MAX_PKT_BUF];
+        let len = stack
+            .process_packet(&frame[..frame_len], &mut reply)
+            .unwrap();
+
+        assert_eq!(len, 0, "an off-link NS must be dropped, not answered");
+        assert!(
+            stack.ipv6.neighbors.lookup(&peer.local_addr).is_none(),
+            "an off-link NS must not populate the neighbor cache"
+        );
+    }
 
     #[test]
     fn test_parse_ether_valid() {

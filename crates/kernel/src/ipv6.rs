@@ -83,6 +83,27 @@ impl Ipv6Addr {
             && self.octets[12] == 0xff
     }
 
+    /// Derives the `fe80::/64` link-local address for a MAC (RFC 4291 §2.5.1
+    /// and Appendix A, modified EUI-64).
+    ///
+    /// The interface identifier is the MAC with `fffe` spliced into the middle
+    /// and the universal/local bit inverted — a globally unique MAC yields
+    /// u/l = 1, which is why the bit is flipped rather than set.
+    pub const fn link_local_from_mac(mac: &[u8; 6]) -> Self {
+        let mut octets = [0u8; 16];
+        octets[0] = 0xfe;
+        octets[1] = 0x80;
+        octets[8] = mac[0] ^ 0x02;
+        octets[9] = mac[1];
+        octets[10] = mac[2];
+        octets[11] = 0xff;
+        octets[12] = 0xfe;
+        octets[13] = mac[3];
+        octets[14] = mac[4];
+        octets[15] = mac[5];
+        Self { octets }
+    }
+
     /// Computes the solicited-node multicast address for this unicast address.
     pub fn solicited_node(&self) -> Self {
         let mut octets = [0u8; 16];
@@ -740,7 +761,7 @@ impl Default for NeighborTable {
 // =========================================================================
 
 /// Maximum packet buffer size.
-const MAX_PKT_BUF: usize = 1500;
+pub const MAX_PKT_BUF: usize = 1500;
 
 /// Maximum NDP options per message.
 const MAX_NDP_OPTIONS: usize = 8;
@@ -777,7 +798,7 @@ pub struct Ipv6Stack {
 
 impl Ipv6Stack {
     /// Creates a new IPv6 stack.
-    pub fn new(local_addr: Ipv6Addr, local_mac: [u8; 6]) -> Self {
+    pub const fn new(local_addr: Ipv6Addr, local_mac: [u8; 6]) -> Self {
         Self {
             local_addr,
             local_mac,
@@ -1273,6 +1294,25 @@ mod tests {
         msg[2] = 0xBE;
         msg[3] = 0xEF;
         assert_eq!(icmpv6_checksum(&src, &dst, &msg), c0, "field still skipped");
+    }
+
+    // RFC 4291 Appendix A: fffe is spliced into the middle of the MAC and the
+    // universal/local bit is INVERTED, not set — a globally unique MAC has it
+    // clear on the wire and set in the interface identifier.
+    #[test]
+    fn link_local_from_mac_follows_modified_eui64() {
+        let a = Ipv6Addr::link_local_from_mac(&[0x00, 0x1b, 0x63, 0x84, 0x45, 0xe6]);
+        assert_eq!(
+            a.to_bytes(),
+            [
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x1b, 0x63, 0xff, 0xfe, 0x84, 0x45, 0xe6
+            ]
+        );
+        assert!(a.is_link_local());
+        // Inversion is its own inverse, so a locally administered MAC clears
+        // the bit rather than leaving it set.
+        let b = Ipv6Addr::link_local_from_mac(&[0x02, 0, 0, 0, 0, 0]);
+        assert_eq!(b.to_bytes()[8], 0x00);
     }
 
     fn ndp_stack() -> Ipv6Stack {
