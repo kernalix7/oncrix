@@ -18,17 +18,21 @@
 #   [ONCRIX/aarch64] cooperative scheduler: bring-up demo start
 #   [ONCRIX/aarch64] cooperative scheduler: thread A ran
 #   [ONCRIX/aarch64] cooperative scheduler: thread B ran
+#   [ONCRIX/aarch64] callee-saved SIMD state preserved across context switch
 #   [ONCRIX/aarch64] cooperative scheduler: thread A/B ran, back on boot thread
 #   [ONCRIX/aarch64] IRQs unmasked; preemptive scheduler armed (threads C, D).
 #   [ONCRIX/aarch64] timer IRQ received (preemptive)
 #   [ONCRIX/aarch64] preemptive: thread C scheduled
 #   [ONCRIX/aarch64] preemptive: thread D scheduled
 #   [ONCRIX/aarch64] preemptive: C and D both ran - timer preemption verified.
+#   [ONCRIX/aarch64] kernel SIMD/FP state preserved across timer IRQ
 #   [ONCRIX/aarch64] entering EL0 (dedicated-page smoke; no syscall dispatch)...
 #   [ONCRIX/aarch64] Transitioning to EL0...
 #   [debug] entry=0xc0000000 sp=0xc0006000
-# SVC proof: #7 validates the canary; #8 runs only after returning to EL0.
+# SVC proof: #7 validates the canary and clobbers SIMD/FP state; #8 runs only
+# after returning to EL0 and validating full-width q0/q15/q31 plus FPCR/FPSR.
 #   [ONCRIX/aarch64] EL0 stack canary verified
+#   [ONCRIX/aarch64] EL0 SIMD/FP state preserved and round-trip verified
 #   [ONCRIX/aarch64] EL0 round trip verified
 
 set -euo pipefail

@@ -19,6 +19,8 @@ use oncrix_hal::arch::aarch64::gic::{GICD_BASE, GICR_BASE, Gicv3, SPURIOUS_INTID
 use oncrix_hal::arch::aarch64::timer::AArch64Timer;
 use oncrix_hal::timer::Timer;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 /// Physical (non-secure) EL1 timer PPI INTID.
 ///
 /// The CNTP interrupt is delivered as private peripheral interrupt 30,
@@ -35,6 +37,28 @@ const TICK_PERIOD_NS: u64 = 10_000_000;
 /// context), so a plain `static mut` counter is race-free.
 static mut TICK_LOG_COUNT: u32 = 0;
 
+/// Whether the next timer IRQ must deliberately overwrite representative
+/// SIMD/FP state before the exception epilogue restores its saved frame.
+static SIMD_FP_CLOBBER_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Set only after the armed timer handler has performed the deliberate
+/// overwrite, preventing the runtime probe from passing on an unrelated IRQ.
+static SIMD_FP_CLOBBER_CONSUMED: AtomicBool = AtomicBool::new(false);
+
+/// Arms one deliberate SIMD/FP overwrite in the next timer IRQ handler.
+///
+/// This bring-up-only hook is consumed once. Callers should mask IRQs while
+/// arming it and seeding the state that the exception frame must preserve.
+pub fn arm_simd_fp_clobber_on_next_timer_irq() {
+    SIMD_FP_CLOBBER_CONSUMED.store(false, Ordering::Release);
+    SIMD_FP_CLOBBER_ARMED.store(true, Ordering::Release);
+}
+
+/// Reports whether the armed timer handler performed its deliberate overwrite.
+pub fn simd_fp_clobber_was_consumed() -> bool {
+    SIMD_FP_CLOBBER_CONSUMED.load(Ordering::Acquire)
+}
+
 /// EL1 IRQ handler entry point.
 ///
 /// Called from the HAL exception vector (`bl aarch64_handle_irq`) with
@@ -46,6 +70,7 @@ static mut TICK_LOG_COUNT: u32 = 0;
 pub extern "C" fn aarch64_handle_irq() {
     let gic = Gicv3::new(GICD_BASE, GICR_BASE);
     let intid = gic.ack_irq();
+    let mut simd_fp_clobbered = false;
 
     // No IRQ was actually pending — nothing to service or EOI.
     if intid == SPURIOUS_INTID {
@@ -59,6 +84,30 @@ pub extern "C" fn aarch64_handle_irq() {
         let mut timer = AArch64Timer::new();
         let ticks = timer.nanos_to_ticks(TICK_PERIOD_NS);
         let _ = timer.set_oneshot(ticks);
+
+        if SIMD_FP_CLOBBER_ARMED.swap(false, Ordering::AcqRel) {
+            // Deliberately destroy the exact state classes checked by the
+            // bring-up probe. The exception frame must undo these writes.
+            // SAFETY: FP/SIMD is enabled at EL1. All overwritten registers
+            // are caller-saved here or explicitly declared as asm outputs.
+            unsafe {
+                core::arch::asm!(
+                    "movi v0.16b, #0xa5",
+                    "movi v15.16b, #0x5a",
+                    "movi v31.16b, #0x3c",
+                    "msr fpcr, {fpcr}",
+                    "msr fpsr, {fpsr}",
+                    fpcr = in(reg) 0x0080_0000u64,
+                    fpsr = in(reg) 0x0800_0080u64,
+                    lateout("v0") _,
+                    lateout("v15") _,
+                    lateout("v31") _,
+                    options(nostack),
+                );
+            }
+            SIMD_FP_CLOBBER_CONSUMED.store(true, Ordering::Release);
+            simd_fp_clobbered = true;
+        }
 
         // Bring-up visibility: announce the first few timer IRQs so a QEMU
         // boot log shows interrupts are actually being delivered, acked, and
@@ -99,6 +148,12 @@ pub extern "C" fn aarch64_handle_irq() {
     gic.eoi_irq(intid);
 
     if intid != TIMER_PPI {
+        return;
+    }
+
+    // Keep the preservation probe scoped to the IRQ exception frame rather
+    // than combining it with a scheduler switch on the same timer tick.
+    if simd_fp_clobbered {
         return;
     }
 

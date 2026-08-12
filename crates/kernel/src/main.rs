@@ -43,6 +43,112 @@ core::arch::global_asm!(include_str!("arch/x86_64/boot.S"), options(att_syntax))
 //
 // No additional global_asm! is needed here; the HAL's boot.rs provides _start.
 
+/// Calls the scheduler once from the naked cooperative SIMD verifier.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_cooperative_simd_yield() {
+    // SAFETY: the verifier is called with DAIF masked and holds no scheduler
+    // borrow. Its naked frame keeps the caller's ABI state valid.
+    unsafe {
+        let _ = oncrix_kernel::current::yield_now();
+    }
+}
+
+/// Seeds and verifies `d8-d15` across a real cooperative switch round trip.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn verify_cooperative_simd_state() -> u64 {
+    core::arch::naked_asm!(
+        // Preserve the caller's ABI state and link register around the test.
+        "sub sp, sp, #80",
+        "stp x29, x30, [sp, #0]",
+        "stp d8, d9, [sp, #16]",
+        "stp d10, d11, [sp, #32]",
+        "stp d12, d13, [sp, #48]",
+        "stp d14, d15, [sp, #64]",
+        // Give each callee-saved SIMD register a distinct 64-bit pattern.
+        "movz x9, #0x7700",
+        "movk x9, #0x5566, lsl #16",
+        "movk x9, #0x3344, lsl #32",
+        "movk x9, #0x1122, lsl #48",
+        "fmov d8, x9",
+        "add x9, x9, #1",
+        "fmov d9, x9",
+        "add x9, x9, #1",
+        "fmov d10, x9",
+        "add x9, x9, #1",
+        "fmov d11, x9",
+        "add x9, x9, #1",
+        "fmov d12, x9",
+        "add x9, x9, #1",
+        "fmov d13, x9",
+        "add x9, x9, #1",
+        "fmov d14, x9",
+        "add x9, x9, #1",
+        "fmov d15, x9",
+        "bl aarch64_cooperative_simd_yield",
+        // Recreate and compare the expected sequence after switching back.
+        "movz x9, #0x7700",
+        "movk x9, #0x5566, lsl #16",
+        "movk x9, #0x3344, lsl #32",
+        "movk x9, #0x1122, lsl #48",
+        "fmov x10, d8",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "fmov x10, d9",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "fmov x10, d10",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "fmov x10, d11",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "fmov x10, d12",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "fmov x10, d13",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "fmov x10, d14",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "fmov x10, d15",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "mov x0, #1",
+        "b 2f",
+        "1:",
+        "mov x0, xzr",
+        "2:",
+        "ldp d14, d15, [sp, #64]",
+        "ldp d12, d13, [sp, #48]",
+        "ldp d10, d11, [sp, #32]",
+        "ldp d8, d9, [sp, #16]",
+        "ldp x29, x30, [sp, #0]",
+        "add sp, sp, #80",
+        "ret",
+    );
+}
+
+/// Reports an AArch64 runtime-proof failure and parks at EL1.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_bringup_fail(serial: &mut Pl011, marker: &str) -> ! {
+    let _ = serial.write_str(marker);
+    // SAFETY: a local fail-stop intentionally prevents further bring-up after
+    // a preservation invariant has failed.
+    unsafe {
+        core::arch::asm!("b .", options(noreturn, nostack));
+    }
+}
+
 /// AArch64 cooperative-scheduler bring-up demo: kernel thread A.
 ///
 /// Prints a marker proving it executed, then cooperatively yields back
@@ -50,8 +156,35 @@ core::arch::global_asm!(include_str!("arch/x86_64/boot.S"), options(att_syntax))
 /// resumed a second time.
 #[cfg(target_arch = "aarch64")]
 extern "C" fn demo_thread_a() -> ! {
+    use core::sync::atomic::Ordering;
+
     let mut serial = Pl011::new(PL011_BASE);
     let _ = serial.write_str("[ONCRIX/aarch64] cooperative scheduler: thread A ran\n");
+    // Make a missing d8-d15 switch frame observable to the boot-thread probe.
+    // SAFETY: these are AAPCS64 callee-saved registers; this non-returning
+    // thread deliberately gives each one a distinct low-64-bit pattern.
+    unsafe {
+        core::arch::asm!(
+            "movi v8.8b, #0xa8",
+            "movi v9.8b, #0xa9",
+            "movi v10.8b, #0xaa",
+            "movi v11.8b, #0xab",
+            "movi v12.8b, #0xac",
+            "movi v13.8b, #0xad",
+            "movi v14.8b, #0xae",
+            "movi v15.8b, #0xaf",
+            lateout("v8") _,
+            lateout("v9") _,
+            lateout("v10") _,
+            lateout("v11") _,
+            lateout("v12") _,
+            lateout("v13") _,
+            lateout("v14") _,
+            lateout("v15") _,
+            options(nomem, nostack),
+        );
+    }
+    COOPERATIVE_A_RAN.store(true, Ordering::Release);
     // Hand control back exactly once (interrupts still masked here), then
     // park. It must NOT call yield_now again: once the preemptive phase
     // unmasks IRQs, sched_yield_once's interrupts-off contract would be
@@ -67,12 +200,12 @@ extern "C" fn demo_thread_a() -> ! {
     // this the wfi below would wait for an interrupt that can never arrive.
     // SAFETY: kernel thread at EL1; clearing DAIF.I only enables IRQ delivery.
     unsafe {
-        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+        core::arch::asm!("msr daifclr, #0b0010", options(nostack));
     }
     loop {
         // SAFETY: `wfi` parks the CPU until an interrupt; harmless at EL1.
         unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
+            core::arch::asm!("wfi", options(nostack));
         }
     }
 }
@@ -82,23 +215,58 @@ extern "C" fn demo_thread_a() -> ! {
 /// Counterpart to [`demo_thread_a`]; prints its own marker then yields.
 #[cfg(target_arch = "aarch64")]
 extern "C" fn demo_thread_b() -> ! {
+    use core::sync::atomic::Ordering;
+
     let mut serial = Pl011::new(PL011_BASE);
     let _ = serial.write_str("[ONCRIX/aarch64] cooperative scheduler: thread B ran\n");
+    // Use a second distinct register set so the boot state cannot survive by
+    // accident when the low-level switch omits callee-saved SIMD state.
+    // SAFETY: see `demo_thread_a`; this thread never returns to an ABI caller.
+    unsafe {
+        core::arch::asm!(
+            "movi v8.8b, #0xb8",
+            "movi v9.8b, #0xb9",
+            "movi v10.8b, #0xba",
+            "movi v11.8b, #0xbb",
+            "movi v12.8b, #0xbc",
+            "movi v13.8b, #0xbd",
+            "movi v14.8b, #0xbe",
+            "movi v15.8b, #0xbf",
+            lateout("v8") _,
+            lateout("v9") _,
+            lateout("v10") _,
+            lateout("v11") _,
+            lateout("v12") _,
+            lateout("v13") _,
+            lateout("v14") _,
+            lateout("v15") _,
+            options(nomem, nostack),
+        );
+    }
+    COOPERATIVE_B_RAN.store(true, Ordering::Release);
     // SAFETY: see `demo_thread_a` — single cooperative hand-off, then park.
     unsafe {
         let _ = oncrix_kernel::current::yield_now();
     }
     // SAFETY: see `demo_thread_a` — unmask IRQs so preemption can resume.
     unsafe {
-        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+        core::arch::asm!("msr daifclr, #0b0010", options(nostack));
     }
     loop {
         // SAFETY: `wfi` parks the CPU until an interrupt; harmless at EL1.
         unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
+            core::arch::asm!("wfi", options(nostack));
         }
     }
 }
+
+/// Whether each cooperative thread reached its deliberate SIMD overwrite.
+#[cfg(target_arch = "aarch64")]
+static COOPERATIVE_A_RAN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(target_arch = "aarch64")]
+static COOPERATIVE_B_RAN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Number of times each preemptive busy thread has announced itself.
 ///
@@ -130,7 +298,7 @@ extern "C" fn demo_preempt_c() -> ! {
     // Unmask so the timer can preempt us mid-spin — the whole point of the
     // demo. SAFETY: kernel thread at EL1; only enables IRQ delivery.
     unsafe {
-        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+        core::arch::asm!("msr daifclr, #0b0010", options(nostack));
     }
     let mut serial = Pl011::new(PL011_BASE);
     while PREEMPT_C_HITS.load(Ordering::Relaxed) < 3 {
@@ -144,7 +312,7 @@ extern "C" fn demo_preempt_c() -> ! {
     loop {
         // SAFETY: `wfi` parks until an interrupt; harmless at EL1.
         unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
+            core::arch::asm!("wfi", options(nostack));
         }
     }
 }
@@ -155,7 +323,7 @@ extern "C" fn demo_preempt_d() -> ! {
     use core::sync::atomic::Ordering;
     // SAFETY: see `demo_preempt_c` — unmask IRQs so the timer can preempt us.
     unsafe {
-        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+        core::arch::asm!("msr daifclr, #0b0010", options(nostack));
     }
     let mut serial = Pl011::new(PL011_BASE);
     while PREEMPT_D_HITS.load(Ordering::Relaxed) < 3 {
@@ -168,7 +336,7 @@ extern "C" fn demo_preempt_d() -> ! {
     loop {
         // SAFETY: `wfi` parks until an interrupt; harmless at EL1.
         unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
+            core::arch::asm!("wfi", options(nostack));
         }
     }
 }
@@ -541,7 +709,7 @@ pub extern "C" fn kernel_main() -> ! {
         {
             use oncrix_kernel::arch::aarch64::kthread::{kthread_context, spawn_kthread};
             use oncrix_kernel::arch::init::SCHEDULER;
-            use oncrix_kernel::current::{spawn_thread, yield_now};
+            use oncrix_kernel::current::spawn_thread;
             use oncrix_process::pid::{Pid, alloc_tid};
             use oncrix_process::thread::{Priority, Thread};
 
@@ -549,7 +717,7 @@ pub extern "C" fn kernel_main() -> ! {
             // SAFETY: ring-0 (EL1) boot context; masking interrupts is the
             // documented precondition of the switch/yield primitives.
             unsafe {
-                core::arch::asm!("msr daifset, #0b1111", options(nomem, nostack));
+                core::arch::asm!("msr daifset, #0b1111", options(nostack));
             }
 
             let _ =
@@ -581,12 +749,24 @@ pub extern "C" fn kernel_main() -> ! {
                 }
             }
 
-            // Step 4: hand the CPU to the demo threads; returns once both
-            // A and B have run and yielded back to the boot thread.
-            // SAFETY: interrupts masked above; no scheduler borrow held.
-            unsafe {
-                let _ = yield_now();
+            // Step 4: seed d8-d15 and hand the CPU to both demo threads. Each
+            // thread overwrites d8-d15 before yielding, so only a real saved
+            // boot-thread switch frame can restore the seeded values.
+            // SAFETY: interrupts are masked and no scheduler borrow is held.
+            let simd_preserved = unsafe { verify_cooperative_simd_state() != 0 };
+            if !simd_preserved
+                || !COOPERATIVE_A_RAN.load(core::sync::atomic::Ordering::Acquire)
+                || !COOPERATIVE_B_RAN.load(core::sync::atomic::Ordering::Acquire)
+            {
+                aarch64_bringup_fail(
+                    &mut serial,
+                    "[ONCRIX/aarch64] callee-saved SIMD state preservation FAILED\n",
+                );
             }
+
+            let _ = serial.write_str(
+                "[ONCRIX/aarch64] callee-saved SIMD state preserved across context switch\n",
+            );
 
             let _ = serial.write_str(
                 "[ONCRIX/aarch64] cooperative scheduler: thread A/B ran, back on boot thread\n",
@@ -631,7 +811,7 @@ pub extern "C" fn kernel_main() -> ! {
                 let mut timer = AArch64Timer::new();
                 let ticks = timer.nanos_to_ticks(10_000_000);
                 let _ = timer.set_oneshot(ticks);
-                core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack)); // unmask IRQ (I)
+                core::arch::asm!("msr daifclr, #0b0010", options(nostack)); // unmask IRQ (I)
             }
             let _ = serial.write_str(
                 "[ONCRIX/aarch64] IRQs unmasked; preemptive scheduler armed (threads C, D).\n",
@@ -645,12 +825,129 @@ pub extern "C" fn kernel_main() -> ! {
             {
                 // SAFETY: `wfi` parks until the next timer IRQ; harmless.
                 unsafe {
-                    core::arch::asm!("wfi", options(nomem, nostack));
+                    core::arch::asm!("wfi", options(nostack));
                 }
             }
             let _ = serial.write_str(
                 "[ONCRIX/aarch64] preemptive: C and D both ran — timer preemption verified.\n",
             );
+        }
+
+        // Deliberately overwrite representative kernel SIMD/FP state in one
+        // timer handler and prove the IRQ exception frame restores it.
+        {
+            use oncrix_hal::arch::aarch64::timer::AArch64Timer;
+            use oncrix_hal::timer::Timer;
+            use oncrix_kernel::arch::aarch64::irq::{
+                arm_simd_fp_clobber_on_next_timer_irq, simd_fp_clobber_was_consumed,
+            };
+
+            // Stop timer IRQ delivery while arming the one-shot probe. No
+            // `nomem`: changing DAIF.I is a compiler barrier around shared
+            // armed/consumed state and the WFI exception round trip below.
+            // SAFETY: EL1 boot context; only masks IRQ delivery on this CPU.
+            unsafe {
+                core::arch::asm!("msr daifset, #0b0010", options(nostack));
+            }
+
+            let mut timer = AArch64Timer::new();
+            let ticks = timer.nanos_to_ticks(10_000_000);
+            let _ = timer.set_oneshot(ticks);
+            arm_simd_fp_clobber_on_next_timer_irq();
+
+            let simd_fp_preserved: u64;
+            // Seed and validate within one asm block so the compiler cannot
+            // reuse the probe registers around IRQ unmask/WFI. Deliberately
+            // omit `nomem`: IRQ delivery and its atomic consumed marker are
+            // observable memory side effects and ordering barriers.
+            // SAFETY: FP/SIMD and the timer PPI are enabled at EL1. The IRQ
+            // handler restores this state before execution resumes after WFI.
+            unsafe {
+                core::arch::asm!(
+                    "movz x9, #0x6677",
+                    "movk x9, #0x4455, lsl #16",
+                    "movk x9, #0x2233, lsl #32",
+                    "movk x9, #0x0011, lsl #48",
+                    "mov v0.d[0], x9",
+                    "add x9, x9, #1",
+                    "mov v0.d[1], x9",
+                    "add x9, x9, #1",
+                    "mov v15.d[0], x9",
+                    "add x9, x9, #1",
+                    "mov v15.d[1], x9",
+                    "add x9, x9, #1",
+                    "mov v31.d[0], x9",
+                    "add x9, x9, #1",
+                    "mov v31.d[1], x9",
+                    "movz x11, #0x0040, lsl #16",
+                    "msr fpcr, x11",
+                    "movz x11, #0x0011",
+                    "movk x11, #0x0800, lsl #16",
+                    "msr fpsr, x11",
+                    "msr daifclr, #0b0010",
+                    "isb",
+                    "wfi",
+                    "msr daifset, #0b0010",
+                    "movz x9, #0x6677",
+                    "movk x9, #0x4455, lsl #16",
+                    "movk x9, #0x2233, lsl #32",
+                    "movk x9, #0x0011, lsl #48",
+                    "mov x10, v0.d[0]",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "add x9, x9, #1",
+                    "mov x10, v0.d[1]",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "add x9, x9, #1",
+                    "mov x10, v15.d[0]",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "add x9, x9, #1",
+                    "mov x10, v15.d[1]",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "add x9, x9, #1",
+                    "mov x10, v31.d[0]",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "add x9, x9, #1",
+                    "mov x10, v31.d[1]",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "mrs x10, fpcr",
+                    "movz x9, #0x0040, lsl #16",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "mrs x10, fpsr",
+                    "movz x9, #0x0011",
+                    "movk x9, #0x0800, lsl #16",
+                    "cmp x9, x10",
+                    "b.ne 1f",
+                    "mov x0, #1",
+                    "b 2f",
+                    "1:",
+                    "mov x0, xzr",
+                    "2:",
+                    lateout("x0") simd_fp_preserved,
+                    lateout("x9") _,
+                    lateout("x10") _,
+                    lateout("x11") _,
+                    lateout("v0") _,
+                    lateout("v15") _,
+                    lateout("v31") _,
+                    options(nostack),
+                );
+            }
+
+            if simd_fp_preserved == 0 || !simd_fp_clobber_was_consumed() {
+                aarch64_bringup_fail(
+                    &mut serial,
+                    "[ONCRIX/aarch64] kernel SIMD/FP state across timer IRQ FAILED\n",
+                );
+            }
+            let _ = serial
+                .write_str("[ONCRIX/aarch64] kernel SIMD/FP state preserved across timer IRQ\n");
         }
 
         // ─── EL0 (userspace) smoke test ───

@@ -8,13 +8,13 @@
 //! an unmapped guard page between code and stack. [`jump_to_el0`] seeds the
 //! exception-return state, clears every general-purpose and SIMD register plus
 //! the FP control/status registers, and uses `eret` to enter the payload at
-//! EL0t. This one-way confidentiality scrub does not provide SIMD/FP trap or
-//! context-switch preservation; that remains separate follow-up work.
+//! EL0t. The smoke payload then seeds and validates representative full-width
+//! SIMD registers plus `FPCR`/`FPSR` across its first SVC round trip.
 //!
-//! [`el0_test_entry`] verifies a stack canary, issues `svc #7`, and then issues
-//! `svc #8` only after the exception vector has restored its frame and returned
-//! to EL0. The two traps therefore prove both directions of the EL0/EL1 round
-//! trip without involving a syscall dispatcher.
+//! [`el0_test_entry`] verifies a stack canary, seeds SIMD/FP state, and issues
+//! `svc #7`. That handler deliberately overwrites the seeded state. The payload
+//! issues `svc #8` only after the exception vector restores the state and
+//! returns to EL0, proving the complete round trip without syscall dispatch.
 
 use oncrix_hal::arch::aarch64::pl011::{PL011_BASE, Pl011};
 use oncrix_hal::serial::SerialPort;
@@ -116,7 +116,7 @@ fn write_dec(serial: &mut Pl011, value: u16) {
 /// deterministic smoke-test scope. After `eret`, the CPU executes `entry` at
 /// EL0t using `user_sp`; later exceptions enter EL1 through the installed
 /// `VBAR_EL1` vector. This is a one-way confidentiality scrub for the smoke
-/// transition; SIMD/FP trap and context-switch save/restore remain follow-up.
+/// transition; the payload separately verifies exception preservation.
 ///
 /// # Safety
 ///
@@ -223,11 +223,10 @@ pub unsafe fn jump_to_el0(entry: u64, user_sp: u64) -> ! {
 /// Synchronous-exception handler for a *lower* Exception Level (EL0).
 ///
 /// The lower-EL synchronous vector calls this function with a saved trap
-/// frame. SVC #7 reports the validated stack canary and SVC #8 reports that
-/// execution returned to EL0 after SVC #7. Those two expected traps return to
-/// the vector so its `eret` can resume EL0. A canary failure, an unexpected
-/// SVC, or any other lower-EL synchronous exception reports diagnostics and
-/// fail-stops at EL1 rather than repeating a faulting EL0 instruction.
+/// frame. SVC #7 reports the validated stack canary and deliberately overwrites
+/// representative SIMD/FP state. SVC #8 reports that the vector restored that
+/// state and returned to EL0. A verification failure, unexpected SVC, or other
+/// lower-EL exception reports diagnostics and fail-stops at EL1.
 #[unsafe(no_mangle)]
 pub extern "C" fn aarch64_handle_sync_lower() {
     let esr: u64;
@@ -264,12 +263,34 @@ pub extern "C" fn aarch64_handle_sync_lower() {
     match imm {
         7 => {
             let _ = serial.write_str("[ONCRIX/aarch64] EL0 stack canary verified\n");
+            // Deliberately destroy every state item seeded by the EL0 payload.
+            // The lower-EL exception epilogue must restore its saved frame.
+            // SAFETY: FP/SIMD is enabled at EL1. The vector owns preservation
+            // across this handler; overwritten vector registers are declared.
+            unsafe {
+                core::arch::asm!(
+                    "movi v0.16b, #0xa5",
+                    "movi v15.16b, #0x5a",
+                    "movi v31.16b, #0x3c",
+                    "msr fpcr, {fpcr}",
+                    "msr fpsr, {fpsr}",
+                    fpcr = in(reg) 0x0080_0000u64,
+                    fpsr = in(reg) 0x0800_0080u64,
+                    lateout("v0") _,
+                    lateout("v15") _,
+                    lateout("v31") _,
+                    options(nostack),
+                );
+            }
         }
         8 => {
+            let _ = serial.write_str(
+                "[ONCRIX/aarch64] EL0 SIMD/FP state preserved and round-trip verified\n",
+            );
             let _ = serial.write_str("[ONCRIX/aarch64] EL0 round trip verified\n");
         }
         SVC_STACK_FAILURE => {
-            let _ = serial.write_str("[ONCRIX/aarch64] EL0 stack canary FAILED\n");
+            let _ = serial.write_str("[ONCRIX/aarch64] EL0 stack/SIMD/FP verification FAILED\n");
             fail_stop();
         }
         _ => {
@@ -293,11 +314,10 @@ fn fail_stop() -> ! {
 /// Self-contained entry point for the dedicated EL0 RX payload page.
 ///
 /// The naked body has no compiler-generated prologue, calls, external branch,
-/// or literal pool. It writes and reloads a 64-bit canary through `SP_EL0`,
-/// restores SP, and traps with SVC #7 on success. Reaching SVC #8 proves that
-/// the first exception frame was restored and `eret` resumed the next EL0
-/// instruction. A mismatch uses a distinct SVC and both terminal paths park
-/// with a local branch-to-self.
+/// or literal pool. It verifies a stack canary, seeds both 64-bit lanes of
+/// `q0`, `q15`, and `q31` plus nonzero valid `FPCR`/`FPSR` values, then traps
+/// with SVC #7. It compares every seeded value after `eret`; only complete
+/// restoration reaches SVC #8. A mismatch uses the existing failure SVC.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 #[unsafe(link_section = ".text.user")]
@@ -313,7 +333,66 @@ pub extern "C" fn el0_test_entry() -> ! {
         "add sp, sp, #16",
         "cmp x9, x10",
         "b.ne 1f",
+        // Seed six distinct 64-bit lanes across low/high SIMD banks.
+        "movz x9, #0x6677",
+        "movk x9, #0x4455, lsl #16",
+        "movk x9, #0x2233, lsl #32",
+        "movk x9, #0x0011, lsl #48",
+        "mov v0.d[0], x9",
+        "add x9, x9, #1",
+        "mov v0.d[1], x9",
+        "add x9, x9, #1",
+        "mov v15.d[0], x9",
+        "add x9, x9, #1",
+        "mov v15.d[1], x9",
+        "add x9, x9, #1",
+        "mov v31.d[0], x9",
+        "add x9, x9, #1",
+        "mov v31.d[1], x9",
+        // FPCR.RMode = 01; FPSR.QC/IXC/IOC are valid nonzero status bits.
+        "movz x11, #0x0040, lsl #16",
+        "msr fpcr, x11",
+        "movz x11, #0x0011",
+        "movk x11, #0x0800, lsl #16",
+        "msr fpsr, x11",
         "svc #7",
+        // Recreate expected values without relying on GPR trap restoration.
+        "movz x9, #0x6677",
+        "movk x9, #0x4455, lsl #16",
+        "movk x9, #0x2233, lsl #32",
+        "movk x9, #0x0011, lsl #48",
+        "mov x10, v0.d[0]",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "mov x10, v0.d[1]",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "mov x10, v15.d[0]",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "mov x10, v15.d[1]",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "mov x10, v31.d[0]",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "add x9, x9, #1",
+        "mov x10, v31.d[1]",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "mrs x10, fpcr",
+        "movz x9, #0x0040, lsl #16",
+        "cmp x9, x10",
+        "b.ne 1f",
+        "mrs x10, fpsr",
+        "movz x9, #0x0011",
+        "movk x9, #0x0800, lsl #16",
+        "cmp x9, x10",
+        "b.ne 1f",
         "svc #8",
         "b .",
         "1:",
