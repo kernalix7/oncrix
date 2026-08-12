@@ -1836,12 +1836,15 @@ mod tests {
         ct.process(&reply, 64, 0x12).unwrap();
         ct.process(&master, 64, 0x10).unwrap();
 
-        // Add expectation for a related FTP data connection
+        // Expect the FTP active-mode data connection 10.0.0.2:20 -> 10.0.0.1:50000.
+        // An expectation describes where the anticipated connection is *going*:
+        // the client's advertised data port (50000), with the server's source
+        // wildcarded. Port 20 is the server's source port, not the key.
         ct.expectations
             .add(
                 [0; 4],
                 [10, 0, 0, 1],
-                20,
+                50000,
                 ConnTrackProtocol::Tcp,
                 60,
                 master,

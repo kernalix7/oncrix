@@ -28,21 +28,12 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 
 # Tests that fail or crash today.
 #
-# These are NOT harness artifacts — they are real defects that were invisible
-# while the suite could not run at all. Each entry is a bug to fix; deleting the
-# entry is the definition of done for that fix. Do not add to this list to make
-# a red build green.
-#
-#   oncrix-kernel   nf_conntrack expectations — the table registers
-#                   the expected port as dst_port while the FTP-active-mode test
-#                   tuple carries it as src_port (server:20 -> client:50000), and
-#                   check_and_consume only compares dst_port, so which side the
-#                   API means is unresolved
+# This list is currently EMPTY: every test in the runner passes. It exists so a
+# genuinely broken test can be quarantined *with its root cause named*, not so a
+# red build can be made green. Adding an entry without a diagnosis, or to avoid
+# fixing a defect, defeats the purpose of running the suite at all.
 skips_for() {
     case "$1" in
-    oncrix-kernel)
-        echo "nf_conntrack::tests::test_expectation"
-        ;;
     esac
 }
 
