@@ -140,8 +140,14 @@ const _VIRTIO_VSOCK_F_SEQPACKET: u32 = 1;
 /// Vsock packet header as transmitted on the virtqueue.
 ///
 /// All fields are little-endian. The header immediately precedes any payload.
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
+///
+/// `packed` is load-bearing: virtio-vsock defines this header as exactly 44
+/// wire bytes, but the two leading `u64`s give plain `repr(C)` an alignment of
+/// 8, which rounds the size up to 48. Any descriptor length or payload offset
+/// derived from `size_of` would then be 4 bytes past the real header, shifting
+/// every field the device reads. `packet_header_size` guards the invariant.
+#[derive(Clone, Copy, Default)]
+#[repr(C, packed)]
 pub struct VsockPacketHeader {
     /// Source context ID (sender's CID).
     pub src_cid: u64,

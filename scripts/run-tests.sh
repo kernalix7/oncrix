@@ -41,9 +41,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #   oncrix-drivers  the two virtio_vsock request tests build the driver with
 #                   mmio_base = 0 and hand-set `initialized`, a state `init()`
 #                   never produces, so `transmit_header` writes to address 0x50
-#                   and SEGFAULTS the whole test binary; and VsockPacketHeader
-#                   is `#[repr(C)]`, so u64 alignment pads the 44 wire bytes to
-#                   48 — every descriptor length derived from size_of is off by 4
+#                   and SEGFAULTS the whole test binary
 skips_for() {
     case "$1" in
     oncrix-mm)
@@ -73,7 +71,6 @@ skips_for() {
     oncrix-drivers)
         echo "virtio_vsock::tests::handle_request_accepts_bound_port"
         echo "virtio_vsock::tests::handle_request_rejects_unbound_port"
-        echo "virtio_vsock::tests::packet_header_size"
         ;;
     esac
 }
