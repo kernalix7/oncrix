@@ -146,13 +146,7 @@ impl AudioStreamFormat {
     /// `frame_size` is computed automatically from the bit depth
     /// and channel count.
     pub fn new(sample_rate: AudioSampleRate, bit_depth: AudioBitDepth, channels: u8) -> Self {
-        let ch = if channels == 0 {
-            1
-        } else if channels > MAX_CHANNELS {
-            MAX_CHANNELS
-        } else {
-            channels
-        };
+        let ch = channels.clamp(1, MAX_CHANNELS);
         let frame_size = u16::from(ch) * u16::from(bit_depth.bytes());
         Self {
             sample_rate,
