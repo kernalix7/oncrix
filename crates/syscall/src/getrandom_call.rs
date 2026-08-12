@@ -575,10 +575,21 @@ mod tests {
     #[test]
     fn test_entropy_pool_extract_differs_by_offset() {
         let mut pool = EntropyPool::new();
-        pool.mix(&[0xFF; ENTROPY_POOL_SIZE]);
-        pool.mix(&[0xAA; ENTROPY_POOL_SIZE]);
-        pool.mix(&[0x55; ENTROPY_POOL_SIZE]);
-        pool.mix(&[0x11; ENTROPY_POOL_SIZE]);
+
+        // The mixed-in data has to vary across the pool. `mix` XORs each byte
+        // into a rotating position, so a full-pool *constant* lands the same
+        // value everywhere no matter where the rotation starts — the pool ends
+        // up uniform, and a uniform pool makes any offset extract identical
+        // bytes. That would pass whether or not `extract` honoured the offset.
+        for round in 0..4u8 {
+            let mut seed = [0u8; ENTROPY_POOL_SIZE];
+            for (i, b) in seed.iter_mut().enumerate() {
+                *b = (i as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add(round.wrapping_mul(7));
+            }
+            pool.mix(&seed);
+        }
 
         let mut out1 = [0u8; 16];
         let mut out2 = [0u8; 16];
