@@ -446,13 +446,16 @@ mod tests {
     #[test]
     fn pipe_buf_wrap_around() {
         let mut pb = PipeBuf::new();
-        // Fill all but 3 bytes.
+        // Fill all but 3 bytes, then drain the lot. The buffer must be left
+        // *empty* with head and tail parked near the end of the ring: the pipe
+        // is a FIFO, so any bytes still queued would be returned ahead of the
+        // marker below and the wrap would never be observed.
         let filler = [0u8; PIPE_BUF_SIZE];
-        pb.write(&filler[..PIPE_BUF_SIZE - 3]);
-        // Read some to move head forward.
+        assert_eq!(pb.write(&filler[..PIPE_BUF_SIZE - 3]), PIPE_BUF_SIZE - 3);
         let mut tmp = [0u8; PIPE_BUF_SIZE];
-        pb.read(&mut tmp[..PIPE_BUF_SIZE - 10]);
-        // Now write more data that wraps around.
+        assert_eq!(pb.read(&mut tmp[..PIPE_BUF_SIZE - 3]), PIPE_BUF_SIZE - 3);
+        // 3 bytes of room remain before the end of the ring, so this write is
+        // split across the wrap and the read below has to rejoin it.
         pb.write(b"WRAP");
         let mut out = [0u8; 4];
         let n = pb.read(&mut out);

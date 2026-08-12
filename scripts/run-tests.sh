@@ -32,14 +32,12 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # place to silence a red build: an entry without a diagnosis, or added to avoid
 # fixing something, defeats the point of running the suite at all.
 #
-# oncrix-syscall - 10 of 3603, surfaced the first time the crate's tests ever
+# oncrix-syscall - 9 of 3603, surfaced the first time the crate's tests ever
 # compiled. All are logic or test-expectation defects:
 #   inotify_call     watch-descriptor allocation fails at the i32::MAX boundary
 #   mount_setattr    an invalid atime flag combination was accepted
 #   perf_event_open  PerfEventAttrExt::from_config rejects valid input (x2) and
 #                    accepts an out-of-range mmap_pages (x1)
-#   pipe_call        the wrap-around test drains only part of the buffer, then
-#                    expects the newest bytes back out of a FIFO
 #   quotactl_call    QCMD encode/decode loses the type field; a NULL special is
 #                    rejected for SYNC
 #   rename_call      RENAME_EXCHANGE does not swap the inode numbers
@@ -52,7 +50,6 @@ skips_for() {
         echo "perf_event_open_call::tests::test_attr_ext_watermark"
         echo "perf_event_open_call::tests::test_perf_event_attr_ext"
         echo "perf_event_open_call::tests::test_perf_event_attr_ext_bad_mmap_pages"
-        echo "pipe_call::tests::pipe_buf_wrap_around"
         echo "quotactl_call::tests::qcmd_encode_decode"
         echo "quotactl_call::tests::sync_null_special_ok"
         echo "rename_call::tests::rename_exchange"
