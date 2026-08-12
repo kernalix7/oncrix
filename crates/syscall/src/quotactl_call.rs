@@ -51,8 +51,13 @@ pub const fn qcmd(cmd: i32, quota_type: i32) -> i32 {
 }
 
 /// Extract the base command from an encoded `cmd` value.
+///
+/// Only the quota *type* occupies the low 8 bits; the base command takes the
+/// whole of the rest. Masking the shifted value to 8 bits truncated every
+/// command from `Q_QUOTAON` (0x0100) upward to zero, which no longer matched
+/// any known command.
 pub const fn qcmd_base(cmd: i32) -> i32 {
-    (cmd >> 8) & 0xFF
+    cmd >> 8
 }
 
 /// Extract the quota type from an encoded `cmd` value.

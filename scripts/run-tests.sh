@@ -32,19 +32,15 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # place to silence a red build: an entry without a diagnosis, or added to avoid
 # fixing something, defeats the point of running the suite at all.
 #
-# oncrix-syscall - 4 of 3603, surfaced the first time the crate's tests ever
+# oncrix-syscall - 2 of 3603, surfaced the first time the crate's tests ever
 # compiled. All are logic or test-expectation defects:
 #   inotify_call     watch-descriptor allocation fails at the i32::MAX boundary
 #   mount_setattr    an invalid atime flag combination was accepted
-#   quotactl_call    QCMD encode/decode loses the type field; a NULL special is
-#                    rejected for SYNC
 skips_for() {
     case "$1" in
     oncrix-syscall)
         echo "inotify_call::tests::test_wd_exhaustion_returns_error"
         echo "mount_setattr::tests::invalid_atime_combination_rejected"
-        echo "quotactl_call::tests::qcmd_encode_decode"
-        echo "quotactl_call::tests::sync_null_special_ok"
         ;;
     esac
 }
