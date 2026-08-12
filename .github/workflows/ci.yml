@@ -83,4 +83,4 @@ jobs:
         env:
           ONCRIX_PROJECT_DIR: ${{ github.workspace }}
         run: bash scripts/run-qemu-test.sh
-        timeout-minutes: 6
+        timeout-minutes: 12

@@ -17,6 +17,17 @@ use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Budget for the aarch64/riscv64 bring-up demos.
+///
+/// Their final markers depend on the guest taking several *real* timer
+/// interrupts (each architecture waits for three preemptions of two busy
+/// threads), so wall-clock time here tracks host load rather than guest work.
+/// On an idle machine the sequence finishes in well under a second; on a loaded
+/// one QEMU can fall far enough behind to miss a 30 s budget. Polling stops the
+/// moment the last marker arrives, so a generous ceiling costs nothing on
+/// success and only lengthens a genuine failure.
+const CROSS_ARCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Markers that must all appear in serial output for a successful boot.
 ///
 /// `[init] hello from pid 1` confirms the embedded init binary actually
@@ -78,7 +89,7 @@ fn tool_available(bin: &str) -> bool {
 /// Spawn QEMU, stream its serial output, and watch for markers.
 ///
 /// Returns as soon as every marker in `required` has been seen, any marker in
-/// `failure` appears, or [`TIMEOUT`] elapses. QEMU is killed either way, so a
+/// `failure` appears, or `timeout` elapses. QEMU is killed either way, so a
 /// kernel that parks in a halt loop still terminates the test.
 fn spawn_and_watch(
     qemu: &str,
@@ -86,6 +97,7 @@ fn spawn_and_watch(
     required: &[&str],
     failure: &[&str],
     tag: &str,
+    timeout: Duration,
 ) -> BootResult {
     let mut child = match Command::new(qemu)
         .args(args)
@@ -128,7 +140,7 @@ fn spawn_and_watch(
     let mut remaining: Vec<&str> = required.to_vec();
 
     'poll: loop {
-        if start.elapsed() >= TIMEOUT {
+        if start.elapsed() >= timeout {
             break 'poll;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -165,7 +177,7 @@ fn spawn_and_watch(
         return BootResult {
             success: false,
             output,
-            failure_reason: format!("timeout after {TIMEOUT:?}; missing markers: {remaining:?}"),
+            failure_reason: format!("timeout after {timeout:?}; missing markers: {remaining:?}"),
         };
     }
 
@@ -249,6 +261,7 @@ fn run_x86_64_boot_test() -> BootResult {
         REQUIRED_MARKERS,
         &[PANIC_MARKER],
         "qemu",
+        TIMEOUT,
     )
 }
 
@@ -825,7 +838,14 @@ fn run_cross_arch_boot_test(spec: &ArchBootSpec, project_dir: &std::path::Path) 
     args.push("-kernel");
     args.push(kernel.to_str().expect("kernel path is not valid UTF-8"));
 
-    spawn_and_watch(spec.qemu, &args, spec.required, spec.failure, spec.name)
+    spawn_and_watch(
+        spec.qemu,
+        &args,
+        spec.required,
+        spec.failure,
+        spec.name,
+        CROSS_ARCH_TIMEOUT,
+    )
 }
 
 fn main() {
