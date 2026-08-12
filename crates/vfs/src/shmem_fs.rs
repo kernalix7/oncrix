@@ -409,13 +409,12 @@ impl ShmemFs {
     /// - [`Error::NotFound`] — inode does not exist.
     pub fn shmem_truncate(&mut self, ino: u64, new_size: u64) -> Result<()> {
         let slot = self.inode_slot(ino)?;
-        let old_size = self.inodes[slot].size;
-        if new_size >= old_size {
-            // Extending — just update size; pages are lazily allocated.
-            self.inodes[slot].size = new_size;
-            return Ok(());
-        }
-        // Free pages beyond the new end.
+        // Release everything at or past the new end regardless of how the
+        // recorded size compares. `size` is only advanced by `shmem_writepage`,
+        // while `shmem_getpage` allocates lazily without touching it, so a
+        // "not shrinking" size comparison says nothing about whether pages are
+        // resident — skipping the loop on that basis leaked every page an
+        // inode had faulted in but never written.
         let first_free_page =
             ((new_size + SHMEM_PAGE_SIZE as u64 - 1) / SHMEM_PAGE_SIZE as u64) as usize;
         let mut freed = 0u64;

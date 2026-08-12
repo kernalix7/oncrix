@@ -35,7 +35,6 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #
 #   oncrix-mm       bootmem allocator returns the wrong block on reserve+alloc
 #   oncrix-ipc      rpmsg send to an offline device reports IoError, not NotFound
-#   oncrix-vfs      shmem_fs truncate does not return blocks to the superblock
 #   oncrix-kernel   nf_conntrack expectations — the table registers
 #                   the expected port as dst_port while the FTP-active-mode test
 #                   tuple carries it as src_port (server:20 -> client:50000), and
@@ -52,9 +51,6 @@ skips_for() {
         ;;
     oncrix-ipc)
         echo "rpmsg::tests::test_send_offline_device"
-        ;;
-    oncrix-vfs)
-        echo "shmem_fs::tests::truncate_frees_pages"
         ;;
     oncrix-kernel)
         echo "nf_conntrack::tests::test_expectation"
