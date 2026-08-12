@@ -211,7 +211,12 @@ mod tests {
     #[test]
     fn setpgid_self() {
         let mut p = PgroupState::new_standalone(100);
-        // Move to a new group first by making it non-leader.
+        // `new_standalone` makes the process its own session leader, and a
+        // session leader may not change its process group — that is what
+        // `setpgid_session_leader_fails` pins. Clear the flag so this covers
+        // the ordinary case instead of duplicating that one with the opposite
+        // expectation.
+        p.is_session_leader = false;
         p.is_pgroup_leader = false;
         p.pgid = 50; // in another group but not leader
         do_setpgid(&mut p, None, 0, 200).unwrap();

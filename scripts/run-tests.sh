@@ -32,7 +32,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # place to silence a red build: an entry without a diagnosis, or added to avoid
 # fixing something, defeats the point of running the suite at all.
 #
-# oncrix-syscall - 9 of 3603, surfaced the first time the crate's tests ever
+# oncrix-syscall - 8 of 3603, surfaced the first time the crate's tests ever
 # compiled. All are logic or test-expectation defects:
 #   inotify_call     watch-descriptor allocation fails at the i32::MAX boundary
 #   mount_setattr    an invalid atime flag combination was accepted
@@ -41,7 +41,6 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #   quotactl_call    QCMD encode/decode loses the type field; a NULL special is
 #                    rejected for SYNC
 #   rename_call      RENAME_EXCHANGE does not swap the inode numbers
-#   setpgid_call     a process cannot set its own process group
 skips_for() {
     case "$1" in
     oncrix-syscall)
@@ -53,7 +52,6 @@ skips_for() {
         echo "quotactl_call::tests::qcmd_encode_decode"
         echo "quotactl_call::tests::sync_null_special_ok"
         echo "rename_call::tests::rename_exchange"
-        echo "setpgid_call::tests::setpgid_self"
         ;;
     esac
 }
