@@ -24,7 +24,7 @@
 //! │  │    │    count: u64           — number of delays         │    │  │
 //! │  │    │    total_ns: u64        — cumulative delay         │    │  │
 //! │  │    │    max_ns: u64          — worst-case delay         │    │  │
-//! │  │    │    start_ns: u64        — in-flight marker         │    │  │
+//! │  │    │    start_ns: Option<u64> — in flight               │    │  │
 //! │  │    └──────────────────────────────────────────────────┘    │  │
 //! │  └────────────────────────────────────────────────────────────┘  │
 //! │                                                                  │
@@ -155,8 +155,14 @@ pub struct DelayStat {
     total_ns: u64,
     /// Maximum single delay in nanoseconds.
     max_ns: u64,
-    /// Timestamp when the current delay started (0 = not in delay).
-    start_ns: u64,
+    /// Timestamp when the current delay started, or `None` when no delay of
+    /// this category is in flight.
+    ///
+    /// This must not collapse to a sentinel timestamp: a delay that begins at
+    /// `now_ns == 0` is legitimate, and encoding "idle" as `0` made it
+    /// indistinguishable from one, so `finish` rejected it and `exit_task`
+    /// silently discarded it.
+    start_ns: Option<u64>,
     /// Number of delays exceeding the high-latency threshold.
     high_latency_count: u64,
     /// Number of delays exceeding the extreme-latency threshold.
@@ -170,7 +176,7 @@ impl DelayStat {
             count: 0,
             total_ns: 0,
             max_ns: 0,
-            start_ns: 0,
+            start_ns: None,
             high_latency_count: 0,
             extreme_latency_count: 0,
         }
@@ -178,7 +184,7 @@ impl DelayStat {
 
     /// Check whether a delay is currently in progress.
     pub fn is_active(&self) -> bool {
-        self.start_ns != 0
+        self.start_ns.is_some()
     }
 
     /// Get the total delay count.
@@ -506,14 +512,14 @@ impl DelayAcctSubsystem {
         // Finish any active delays.
         for cat in &DelayCategory::ALL {
             let ci = cat.as_index();
-            if task.stats[ci].start_ns != 0 {
-                let duration = self.now_ns.saturating_sub(task.stats[ci].start_ns);
+            if let Some(started) = task.stats[ci].start_ns {
+                let duration = self.now_ns.saturating_sub(started);
                 task.stats[ci].total_ns += duration;
                 task.stats[ci].count += 1;
                 if duration > task.stats[ci].max_ns {
                     task.stats[ci].max_ns = duration;
                 }
-                task.stats[ci].start_ns = 0;
+                task.stats[ci].start_ns = None;
             }
         }
 
@@ -547,13 +553,13 @@ impl DelayAcctSubsystem {
         let ci = category.as_index();
         let task = &mut self.tasks[idx];
 
-        if task.stats[ci].start_ns != 0 {
+        if task.stats[ci].start_ns.is_some() {
             // Already in a delay of this category — record as missed.
             self.stats.missed_events += 1;
             return Ok(());
         }
 
-        task.stats[ci].start_ns = self.now_ns;
+        task.stats[ci].start_ns = Some(self.now_ns);
         task.active_mask |= 1 << ci;
         self.stats.delay_starts += 1;
 
@@ -570,20 +576,18 @@ impl DelayAcctSubsystem {
         let idx = self.find_task(pid).ok_or(Error::NotFound)?;
         let ci = category.as_index();
 
-        if self.tasks[idx].stats[ci].start_ns == 0 {
+        let Some(started) = self.tasks[idx].stats[ci].start_ns else {
             self.stats.missed_events += 1;
             return Err(Error::InvalidArgument);
-        }
+        };
 
-        let duration = self
-            .now_ns
-            .saturating_sub(self.tasks[idx].stats[ci].start_ns);
+        let duration = self.now_ns.saturating_sub(started);
         self.tasks[idx].stats[ci].count += 1;
         self.tasks[idx].stats[ci].total_ns += duration;
         if duration > self.tasks[idx].stats[ci].max_ns {
             self.tasks[idx].stats[ci].max_ns = duration;
         }
-        self.tasks[idx].stats[ci].start_ns = 0;
+        self.tasks[idx].stats[ci].start_ns = None;
         self.tasks[idx].active_mask &= !(1 << ci);
         self.stats.delay_finishes += 1;
 
