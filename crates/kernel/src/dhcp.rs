@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn test_parse_dhcp_options_basic() {
         #[rustfmt::skip]
-        let data: [u8; 20] = [
+        let data: [u8; 22] = [
             OPT_MSG_TYPE, 1, DHCPOFFER,
             OPT_SUBNET_MASK, 4, 255, 255, 255, 0,
             OPT_ROUTER, 4, 192, 168, 1, 1,

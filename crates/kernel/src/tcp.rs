@@ -1577,7 +1577,7 @@ mod tests {
             checksum: 0,
             urgent_ptr: 0,
         };
-        let action = conn.process_segment(&fin_hdr, &[]).ok().unwrap();
+        let _action = conn.process_segment(&fin_hdr, &[]).ok().unwrap();
         assert_eq!(conn.state, TcpState::Closing);
 
         // Receive ACK -> TimeWait

@@ -38,6 +38,26 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+  unit-tests:
+    name: Host Unit Tests
+    runs-on: ubuntu-latest
+    needs: quality
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+          targets: x86_64-unknown-none
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run host unit tests
+        run: bash scripts/run-tests.sh
+        timeout-minutes: 20
+
   qemu-boot:
     name: QEMU Boot Integration Test
     runs-on: ubuntu-latest

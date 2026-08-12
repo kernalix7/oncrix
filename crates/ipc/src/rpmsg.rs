@@ -133,7 +133,7 @@ impl RpmsgHeader {
 // ---------------------------------------------------------------------------
 
 /// A complete RPMSG message (header + payload).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RpmsgMessage {
     /// Message header.
     pub header: RpmsgHeader,

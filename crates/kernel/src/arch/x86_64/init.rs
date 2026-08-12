@@ -32,7 +32,13 @@ const KERNEL_HEAP_SIZE: usize = 16 * 1024 * 1024;
 static mut KERNEL_HEAP: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
 /// Global allocator for the kernel.
-#[global_allocator]
+///
+/// Registered as `#[global_allocator]` everywhere except `cfg(test)`. Host unit
+/// tests link against std and the harness allocates before `init_heap` can run,
+/// so an empty [`LinkedListAllocator`] would fault on the first allocation —
+/// before `main`, with no test output. Under `cfg(test)` the system allocator
+/// stays in place and this static is exercised through `init_heap` instead.
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: LinkedListAllocator = LinkedListAllocator::empty();
 
 // ── GDT ─────────────────────────────────────────────────────────

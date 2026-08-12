@@ -573,7 +573,7 @@ impl IpcCompatStats {
 /// Raw IPC compat syscall argument bundle.
 ///
 /// Represents the raw register arguments passed to a compat IPC syscall.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpcCompatCall {
     /// IPC call number (SHMCTL, SEMCTL, MSGCTL, etc.).
     pub call: u32,
