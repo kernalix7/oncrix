@@ -462,17 +462,21 @@ impl NetNamespace {
     /// specific mask). Returns `None` if no route matches.
     pub fn lookup_route(&self, dst: u32) -> Option<&NetNsRoute> {
         let mut best: Option<&NetNsRoute> = None;
-        let mut best_mask: u32 = 0;
 
         for route in &self.routes {
-            if route.in_use && (dst & route.mask) == (route.dst & route.mask) {
-                // Prefer the most specific (largest) mask, then lowest metric.
-                if route.mask > best_mask
-                    || (route.mask == best_mask && best.is_some_and(|b| route.metric < b.metric))
-                {
-                    best = Some(route);
-                    best_mask = route.mask;
-                }
+            if !route.in_use || (dst & route.mask) != (route.dst & route.mask) {
+                continue;
+            }
+            // Prefer the most specific (largest) mask, then lowest metric.
+            // "No candidate yet" has to be `best.is_none()` rather than a
+            // zero mask: the default route's mask *is* zero, so tracking the
+            // incumbent width in a separate `u32` made it unselectable.
+            let better = match best {
+                None => true,
+                Some(b) => route.mask > b.mask || (route.mask == b.mask && route.metric < b.metric),
+            };
+            if better {
+                best = Some(route);
             }
         }
         best
