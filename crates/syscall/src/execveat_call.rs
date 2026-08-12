@@ -94,7 +94,7 @@ impl ExecveatFlags {
 ///
 /// This structure is constructed after all user-supplied arguments pass
 /// validation and before the actual process image replacement begins.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExecveatArgs {
     /// Directory file descriptor (or `AT_FDCWD`).
     pub dirfd: i32,

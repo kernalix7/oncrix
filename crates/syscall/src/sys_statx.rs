@@ -126,7 +126,7 @@ pub const S_IFMT: u16 = 0o170000;
 /// Fields that were not requested by the caller, or that the filesystem cannot
 /// supply, are zero-initialised; only fields present in `mask` are valid.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Statx {
     /// Mask of bits indicating filled fields.
     pub mask: u32,

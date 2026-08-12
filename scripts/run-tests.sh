@@ -28,19 +28,51 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 
 # Tests that fail or crash today.
 #
-# This list is currently EMPTY: every test in the runner passes. It exists so a
-# genuinely broken test can be quarantined *with its root cause named*, not so a
-# red build can be made green. Adding an entry without a diagnosis, or to avoid
-# fixing a defect, defeats the purpose of running the suite at all.
+# Every entry is a real defect with its root cause named. This list is NOT a
+# place to silence a red build: an entry without a diagnosis, or added to avoid
+# fixing something, defeats the point of running the suite at all.
+#
+# oncrix-syscall - 15 of 3603, surfaced the first time the crate's tests ever
+# compiled. Two are security holes:
+#   sys_prlimit  cross-process prlimit succeeded without the capability
+#   shmat_call   a segment ending past the user-space limit was accepted
+# One is an entropy defect:
+#   getrandom_call  two different pool offsets extracted identical bytes
+# The rest are logic or test-expectation defects:
+#   bind_call        127.0.0.1 not recognised as loopback
+#   inotify_call     watch-descriptor allocation fails at the i32::MAX boundary
+#   mount_setattr    an invalid atime flag combination was accepted
+#   perf_event_open  PerfEventAttrExt::from_config rejects valid input (x2) and
+#                    accepts an out-of-range mmap_pages (x1)
+#   pipe_call        the wrap-around test drains only part of the buffer, then
+#                    expects the newest bytes back out of a FIFO
+#   quotactl_call    QCMD encode/decode loses the type field; a NULL special is
+#                    rejected for SYNC
+#   rename_call      RENAME_EXCHANGE does not swap the inode numbers
+#   setpgid_call     a process cannot set its own process group
+#   setrlimit_call   an unprivileged process cannot lower its own hard limit
 skips_for() {
     case "$1" in
+    oncrix-syscall)
+        echo "bind_call::tests::sockaddr_in_is_loopback"
+        echo "getrandom_call::tests::test_entropy_pool_extract_differs_by_offset"
+        echo "inotify_call::tests::test_wd_exhaustion_returns_error"
+        echo "mount_setattr::tests::invalid_atime_combination_rejected"
+        echo "perf_event_open_call::tests::test_attr_ext_watermark"
+        echo "perf_event_open_call::tests::test_perf_event_attr_ext"
+        echo "perf_event_open_call::tests::test_perf_event_attr_ext_bad_mmap_pages"
+        echo "pipe_call::tests::pipe_buf_wrap_around"
+        echo "quotactl_call::tests::qcmd_encode_decode"
+        echo "quotactl_call::tests::sync_null_special_ok"
+        echo "rename_call::tests::rename_exchange"
+        echo "setpgid_call::tests::setpgid_self"
+        echo "setrlimit_call::tests::unpriv_lower_hard"
+        echo "shmat_call::tests::segment_end_past_user_space_end_rejected"
+        echo "sys_prlimit::tests::cross_process_without_cap_denied"
+        ;;
     esac
 }
 
-# `oncrix-syscall` is deliberately absent: its test modules do not compile yet
-# (118 errors, by far the largest backlog, in the crate with the most tests —
-# 373 of its 450 files carry one). Adding it is its own piece of work; until
-# then it is excluded explicitly rather than silently.
 CRATES=(
     oncrix-lib
     oncrix-hal
@@ -51,6 +83,7 @@ CRATES=(
     oncrix-drivers
     oncrix-kernel
     oncrix-bootloader
+    oncrix-syscall
 )
 
 total_pass=0

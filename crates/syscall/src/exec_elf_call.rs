@@ -173,7 +173,7 @@ pub enum SegmentKind {
 }
 
 /// Mapped ELF segment descriptor.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoadSegment {
     /// Segment kind.
     pub kind: SegmentKind,
@@ -215,7 +215,7 @@ impl LoadSegment {
 // ---------------------------------------------------------------------------
 
 /// Result of parsing an ELF64 binary's program headers.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ElfParseResult {
     /// Loadable segments to map.
     pub segments: [Option<LoadSegment>; MAX_PHDRS],
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn too_many_phdrs() {
-        let phdrs = [const { Elf64Phdr::default() }; 65];
+        let phdrs = [Elf64Phdr::default(); 65];
         assert_eq!(
             parse_program_headers(&phdrs, 0, None, 0),
             Err(Error::InvalidArgument)

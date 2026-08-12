@@ -124,7 +124,7 @@ impl Timespec {
 // ---------------------------------------------------------------------------
 
 /// Parsed and validated sleep request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SleepRequest {
     /// Clock used for the sleep.
     pub clockid: u32,

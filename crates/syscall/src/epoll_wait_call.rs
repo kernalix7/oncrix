@@ -86,7 +86,7 @@ impl EpollEvent {
 // ---------------------------------------------------------------------------
 
 /// Parsed `epoll_wait` / `epoll_pwait` request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EpollWaitRequest {
     /// epoll instance file descriptor.
     pub epfd: i32,

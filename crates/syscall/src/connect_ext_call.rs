@@ -68,7 +68,7 @@ const SOCKADDR_MAX: usize = 128;
 // ---------------------------------------------------------------------------
 
 /// Validated `connect` arguments.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConnectArgs {
     /// File descriptor.
     pub sockfd: i32,

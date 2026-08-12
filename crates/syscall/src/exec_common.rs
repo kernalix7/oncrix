@@ -50,7 +50,7 @@ pub const MAX_ARG_COUNT: usize = 0x7FFF_FFFF;
 // ---------------------------------------------------------------------------
 
 /// Decoded ELF identification header (first 16 bytes).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ElfIdent {
     /// ELF class (32 or 64 bit).
     pub class: u8,

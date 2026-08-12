@@ -93,7 +93,7 @@ pub struct Itimerspec {
 // ---------------------------------------------------------------------------
 
 /// Kernel-side timerfd object.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Timerfd {
     /// Clock ID used for this timer.
     pub clockid: u32,

@@ -51,7 +51,7 @@ pub const MSGMNI: usize = 32;
 // ---------------------------------------------------------------------------
 
 /// A System V message.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MsgBuf {
     /// Message type (positive integer).
     pub mtype: i64,

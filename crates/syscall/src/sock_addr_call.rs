@@ -138,7 +138,7 @@ impl core::fmt::Debug for SockAddrUn {
 // ---------------------------------------------------------------------------
 
 /// Parsed and validated socket address.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParsedSockAddr {
     /// IPv4 address.
     Inet(SockAddrIn),

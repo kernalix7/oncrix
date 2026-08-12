@@ -151,7 +151,7 @@ impl ProcessState {
 ///
 /// Mirrors the upcoming `struct pidfd_info` from the Linux kernel.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PidfdInfo {
     /// PID in the caller's PID namespace.
     pub pid: u32,

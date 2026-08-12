@@ -148,7 +148,7 @@ impl MountId {
 ///
 /// Typically encodes `(inode_number, generation)` but the exact format is
 /// filesystem-dependent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HandleBytes {
     /// Raw handle data.
     data: [u8; MAX_HANDLE_BYTES],
@@ -208,7 +208,7 @@ impl Default for HandleBytes {
 /// Contains the mount identifier, the handle type, and the opaque handle
 /// bytes.  This structure is what the kernel returns to user space and what
 /// `open_by_handle_at` accepts to re-open the file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileHandle {
     /// Filesystem mount identifier.
     pub mount_id: MountId,

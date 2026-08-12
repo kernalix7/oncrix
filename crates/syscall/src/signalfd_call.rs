@@ -125,7 +125,7 @@ impl Sigset {
 ///
 /// Mirrors `struct signalfd_siginfo` from `<sys/signalfd.h>`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalfdSiginfo {
     /// Signal number.
     pub ssi_signo: u32,
@@ -187,7 +187,7 @@ impl SignalfdSiginfo {
 // ---------------------------------------------------------------------------
 
 /// Kernel-side signalfd state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Signalfd {
     /// Set of signals this fd watches.
     pub mask: Sigset,

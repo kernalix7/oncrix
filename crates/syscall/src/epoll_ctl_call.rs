@@ -131,7 +131,7 @@ impl EpollOp {
 // ---------------------------------------------------------------------------
 
 /// Parsed `epoll_ctl` request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EpollCtlRequest {
     /// epoll instance file descriptor.
     pub epfd: i32,

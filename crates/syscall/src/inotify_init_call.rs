@@ -99,7 +99,7 @@ pub const INOTIFY_MAX_QUEUE: usize = 512;
 const WATCH_PATH_MAX: usize = 128;
 
 /// Fixed-size path buffer.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct PathBuf {
     data: [u8; WATCH_PATH_MAX],
     len: usize,
@@ -128,6 +128,7 @@ impl PartialEq for PathBuf {
 // Watch entry
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, PartialEq)]
 struct WatchEntry {
     wd: i32,
     path: PathBuf,
@@ -144,7 +145,7 @@ struct WatchEntry {
 ///
 /// The `name` field (not included here) follows in the actual read buffer;
 /// `name_len` indicates its length including the NUL terminator.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct InotifyEvent {
     /// Watch descriptor.
     pub wd: i32,
@@ -161,6 +162,7 @@ pub struct InotifyEvent {
 // ---------------------------------------------------------------------------
 
 /// Kernel-side inotify instance.
+#[derive(Debug, PartialEq)]
 pub struct InotifyInstance {
     /// Watch list.
     watches: [Option<WatchEntry>; INOTIFY_MAX_WATCHES],

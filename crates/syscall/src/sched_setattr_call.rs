@@ -194,7 +194,7 @@ const SCHED_FLAGS_ALL: u64 = SCHED_FLAG_RESET_ON_FORK
 ///
 /// Matches `struct sched_attr` from the Linux UAPI.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SchedAttr {
     /// Structure size in bytes.
     pub size: u32,

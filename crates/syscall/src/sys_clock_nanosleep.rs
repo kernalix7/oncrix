@@ -231,7 +231,7 @@ impl SleepFlags {
 // ---------------------------------------------------------------------------
 
 /// A validated sleep request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SleepRequest {
     /// Clock source.
     pub clock: ClockId,

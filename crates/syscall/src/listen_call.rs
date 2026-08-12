@@ -38,7 +38,7 @@ pub const SOCK_TYPE_MASK: i32 = 0xF;
 // ---------------------------------------------------------------------------
 
 /// Validated arguments for a `listen` call.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ListenRequest {
     /// Socket file descriptor.
     pub sockfd: i32,

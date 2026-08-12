@@ -91,7 +91,7 @@ pub enum ListenState {
 // ---------------------------------------------------------------------------
 
 /// A connection pending on the accept queue.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PendingConnection {
     /// Peer IPv4 address (big-endian).
     pub peer_addr: u32,

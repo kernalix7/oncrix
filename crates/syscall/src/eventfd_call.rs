@@ -43,7 +43,7 @@ pub const EVENTFD_MAX_VAL: u64 = u64::MAX - 1;
 // ---------------------------------------------------------------------------
 
 /// Kernel-side eventfd state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Eventfd {
     /// Current counter value.
     pub counter: u64,

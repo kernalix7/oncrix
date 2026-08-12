@@ -86,6 +86,7 @@ pub struct CopyFileRangeExtArgs {
 }
 
 /// Validated copy_file_range_ext request.
+#[derive(Debug)]
 pub struct CopyFileRangeExtRequest {
     /// Source fd.
     pub fd_in: i32,
