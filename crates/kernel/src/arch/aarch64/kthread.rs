@@ -9,11 +9,11 @@
 //! for background tasks (idle loop, init, housekeeping).
 //!
 //! The distinguishing aarch64 detail is the **seeded switch frame**:
-//! [`spawn_kthread`] writes a 96-byte frame at the top of the new
+//! [`spawn_kthread`] writes a 160-byte frame at the top of the new
 //! thread's stack laid out exactly the way
 //! [`switch_context`](super::context::switch_context) pops it, so the
-//! very first switch *into* the thread restores zeroed callee-saved
-//! registers and `ret`s straight to the entry point.
+//! very first switch *into* the thread restores zeroed callee-saved GPRs
+//! and SIMD registers and `ret`s straight to the entry point.
 
 use super::context::CpuContext;
 use oncrix_process::pid::{Pid, Tid, alloc_tid};
@@ -29,10 +29,10 @@ const KTHREAD_STACK_SIZE: usize = 16384;
 const MAX_KTHREADS: usize = 32;
 
 /// Size of the seeded [`switch_context`](super::context::switch_context)
-/// restore frame, in bytes (12 × 8 = the `x19`–`x30` callee-saved set
-/// plus the frame pointer). A multiple of 16, so subtracting it from a
-/// 16-aligned stack top keeps `SP` 16-aligned as AArch64 requires.
-const SWITCH_FRAME_SIZE: u64 = 96;
+/// restore frame, in bytes (20 × 8 = 12 GPR slots plus the low 64 bits of
+/// `v8`–`v15`). A multiple of 16, so subtracting it from a 16-aligned stack
+/// top keeps `SP` 16-aligned as AArch64 requires.
+const SWITCH_FRAME_SIZE: u64 = 160;
 
 /// 16-byte aligned stack buffer.
 ///
@@ -114,10 +114,10 @@ pub struct KernelThread {
 /// `entry` is the function the thread will execute. It must be
 /// `extern "C" fn() -> !` (never returns).
 ///
-/// A 96-byte [`switch_context`](super::context::switch_context) restore
+/// A 160-byte [`switch_context`](super::context::switch_context) restore
 /// frame is seeded at the top of the thread's stack so that the first
-/// switch *into* the thread pops zeroed callee-saved registers and
-/// `ret`s to `entry`. The parallel [`CpuContext`] in the static pool is
+/// switch *into* the thread pops zeroed callee-saved GPRs and SIMD registers
+/// and `ret`s to `entry`. The parallel [`CpuContext`] in the static pool is
 /// initialised to point `SP` at that frame; callers copy it into the
 /// scheduler-owned [`Thread`] via [`kthread_context`].
 ///
@@ -169,26 +169,30 @@ pub unsafe fn spawn_kthread(
     // Seed the switch-context restore frame and the parallel CpuContext.
     //
     // `switch_context` restores the new thread with:
+    //   ldp d14, d15, [sp, #144]
+    //   ldp d12, d13, [sp, #128]
+    //   ldp d10, d11, [sp, #112]
+    //   ldp d8, d9, [sp, #96]
     //   ldp x19, x20, [sp, #80]
     //   ldp x21, x22, [sp, #64]
     //   ldp x23, x24, [sp, #48]
     //   ldp x25, x26, [sp, #32]
     //   ldp x27, x28, [sp, #16]
-    //   ldp x29, x30, [sp], #96   ; x29 <- [sp+0], x30 <- [sp+8], sp += 96
-    //   ret                        ; branch to x30
+    //   ldp x29, x30, [sp], #160  ; x29 <- [sp+0], x30 <- [sp+8], sp += 160
+    //   ret                         ; branch to x30
     //
     // So the only slot that matters is byte offset +8 (x30 = the address
-    // `ret` jumps to). Every other slot is a callee-saved GPR / frame
-    // pointer we simply zero.
+    // `ret` jumps to). Every other slot is a callee-saved GPR, frame pointer,
+    // or SIMD register value we simply zero.
     //
-    // SAFETY: Interrupts disabled; `frame_base .. frame_base + 96` lies
+    // SAFETY: Interrupts disabled; `frame_base .. frame_base + 160` lies
     // inside this slot's 16 KiB stack buffer, and we write our own
     // context array.
     let frame_base = stack_top - SWITCH_FRAME_SIZE;
     unsafe {
         with_interrupts_disabled(|| {
-            // Zero all twelve 8-byte slots of the frame.
-            for i in 0..12u64 {
+            // Zero all twenty 8-byte slots of the frame.
+            for i in 0..20u64 {
                 let slot_ptr = (frame_base + i * 8) as *mut u64;
                 *slot_ptr = 0;
             }

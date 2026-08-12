@@ -152,11 +152,12 @@ core::arch::global_asm!(
     // ── Exception vector table (16 × 128-byte slots, 2 KiB-aligned) ──────
     // The kernel runs at EL1h (SP_EL1), so hardware IRQs are delivered to
     // the "Current EL with SPx / IRQ" slot at offset 0x280 (index 5). That
-    // slot vectors to `el1h_irq`, which saves a full trap frame, calls the
-    // Rust handler `aarch64_handle_irq`, restores, and `eret`s. Apart from that
-    // IRQ slot and the handled lower-EL AArch64 synchronous slot, vectors use
-    // `el1_default`, which spins so an unexpected exception stops at a known PC
-    // (visible under `qemu -d int`). Each slot is padded to 128 bytes.
+    // slot vectors to `el1h_irq`, which saves the complete 800-byte GPR,
+    // control, and FP/SIMD trap frame, calls the Rust handler
+    // `aarch64_handle_irq`, restores, and `eret`s. Apart from that IRQ slot and
+    // the handled lower-EL AArch64 synchronous slot, vectors use `el1_default`,
+    // which spins so an unexpected exception stops at a known PC (visible under
+    // `qemu -d int`). Each slot is padded to 128 bytes.
     ".balign 2048",
     ".global exception_vectors",
     "exception_vectors:",
@@ -196,13 +197,14 @@ core::arch::global_asm!(
     ".balign 0x80",
     "   b       el1_default", // 0x780 SError
     ".balign 0x80",
-    // ── el1h_irq: save trap frame, call Rust handler, restore, eret ──────
-    // Frame (288 bytes, 16-byte aligned): x0..x30 in pairs, then ELR_EL1 +
-    // SPSR_EL1. ELR/SPSR MUST be stacked because sched_yield_once may switch
-    // to another thread whose own IRQ would otherwise clobber those system
-    // registers before this thread is re-elected and eret's.
+    // ── el1h_irq: save complete trap frame, call Rust, restore, eret ───────
+    // Frame (0x320 bytes, 16-byte aligned): x0..x30 at 0x000..0x0f0, padding
+    // at 0x0f8, ELR_EL1/SPSR_EL1 at 0x100/0x108, FPCR/FPSR at 0x110/0x118,
+    // and q0..q31 at 0x120..0x310. Control state MUST be stacked because
+    // sched_yield_once may switch to another thread whose own IRQ would
+    // otherwise clobber it before this thread is re-elected and eret's.
     "el1h_irq:",
-    "   sub     sp, sp, #0x120",
+    "   sub     sp, sp, #0x320",
     "   stp     x0, x1, [sp, #0x00]",
     "   stp     x2, x3, [sp, #0x10]",
     "   stp     x4, x5, [sp, #0x20]",
@@ -222,7 +224,45 @@ core::arch::global_asm!(
     "   mrs     x0, elr_el1",
     "   mrs     x1, spsr_el1",
     "   stp     x0, x1, [sp, #0x100]",
+    "   mrs     x0, fpcr",
+    "   mrs     x1, fpsr",
+    "   stp     x0, x1, [sp, #0x110]",
+    "   stp     q0, q1, [sp, #0x120]",
+    "   stp     q2, q3, [sp, #0x140]",
+    "   stp     q4, q5, [sp, #0x160]",
+    "   stp     q6, q7, [sp, #0x180]",
+    "   stp     q8, q9, [sp, #0x1a0]",
+    "   stp     q10, q11, [sp, #0x1c0]",
+    "   stp     q12, q13, [sp, #0x1e0]",
+    "   stp     q14, q15, [sp, #0x200]",
+    "   stp     q16, q17, [sp, #0x220]",
+    "   stp     q18, q19, [sp, #0x240]",
+    "   stp     q20, q21, [sp, #0x260]",
+    "   stp     q22, q23, [sp, #0x280]",
+    "   stp     q24, q25, [sp, #0x2a0]",
+    "   stp     q26, q27, [sp, #0x2c0]",
+    "   stp     q28, q29, [sp, #0x2e0]",
+    "   stp     q30, q31, [sp, #0x300]",
     "   bl      aarch64_handle_irq",
+    "   ldp     q0, q1, [sp, #0x120]",
+    "   ldp     q2, q3, [sp, #0x140]",
+    "   ldp     q4, q5, [sp, #0x160]",
+    "   ldp     q6, q7, [sp, #0x180]",
+    "   ldp     q8, q9, [sp, #0x1a0]",
+    "   ldp     q10, q11, [sp, #0x1c0]",
+    "   ldp     q12, q13, [sp, #0x1e0]",
+    "   ldp     q14, q15, [sp, #0x200]",
+    "   ldp     q16, q17, [sp, #0x220]",
+    "   ldp     q18, q19, [sp, #0x240]",
+    "   ldp     q20, q21, [sp, #0x260]",
+    "   ldp     q22, q23, [sp, #0x280]",
+    "   ldp     q24, q25, [sp, #0x2a0]",
+    "   ldp     q26, q27, [sp, #0x2c0]",
+    "   ldp     q28, q29, [sp, #0x2e0]",
+    "   ldp     q30, q31, [sp, #0x300]",
+    "   ldp     x0, x1, [sp, #0x110]",
+    "   msr     fpcr, x0",
+    "   msr     fpsr, x1",
     "   ldp     x0, x1, [sp, #0x100]",
     "   msr     elr_el1, x0",
     "   msr     spsr_el1, x1",
@@ -242,16 +282,16 @@ core::arch::global_asm!(
     "   ldp     x26, x27, [sp, #0xd0]",
     "   ldp     x28, x29, [sp, #0xe0]",
     "   ldr     x30, [sp, #0xf0]",
-    "   add     sp, sp, #0x120",
+    "   add     sp, sp, #0x320",
     "   eret",
     // ── el0_sync: synchronous exception from EL0 (SVC / user fault) ──────
-    // Same 288-byte trap frame as el1h_irq. The Rust handler reads ESR_EL1
-    // to classify the exception (SVC #imm for a syscall); on return we
-    // restore ELR_EL1/SPSR_EL1 (still pointing just past the SVC, in EL0
-    // state) and `eret` back to user. On EL0 entry the CPU is at EL1h, so
-    // SP is the kernel stack — the frame is pushed there.
+    // Same complete 0x320-byte GPR, control, and FP/SIMD frame as el1h_irq.
+    // The Rust handler reads ESR_EL1 to classify the exception (SVC #imm for a
+    // syscall); on return we restore all state and `eret` back to user. On EL0
+    // entry the CPU is at EL1h, so SP is the kernel stack and the frame is
+    // pushed there.
     "el0_sync:",
-    "   sub     sp, sp, #0x120",
+    "   sub     sp, sp, #0x320",
     "   stp     x0, x1, [sp, #0x00]",
     "   stp     x2, x3, [sp, #0x10]",
     "   stp     x4, x5, [sp, #0x20]",
@@ -271,7 +311,45 @@ core::arch::global_asm!(
     "   mrs     x0, elr_el1",
     "   mrs     x1, spsr_el1",
     "   stp     x0, x1, [sp, #0x100]",
+    "   mrs     x0, fpcr",
+    "   mrs     x1, fpsr",
+    "   stp     x0, x1, [sp, #0x110]",
+    "   stp     q0, q1, [sp, #0x120]",
+    "   stp     q2, q3, [sp, #0x140]",
+    "   stp     q4, q5, [sp, #0x160]",
+    "   stp     q6, q7, [sp, #0x180]",
+    "   stp     q8, q9, [sp, #0x1a0]",
+    "   stp     q10, q11, [sp, #0x1c0]",
+    "   stp     q12, q13, [sp, #0x1e0]",
+    "   stp     q14, q15, [sp, #0x200]",
+    "   stp     q16, q17, [sp, #0x220]",
+    "   stp     q18, q19, [sp, #0x240]",
+    "   stp     q20, q21, [sp, #0x260]",
+    "   stp     q22, q23, [sp, #0x280]",
+    "   stp     q24, q25, [sp, #0x2a0]",
+    "   stp     q26, q27, [sp, #0x2c0]",
+    "   stp     q28, q29, [sp, #0x2e0]",
+    "   stp     q30, q31, [sp, #0x300]",
     "   bl      aarch64_handle_sync_lower",
+    "   ldp     q0, q1, [sp, #0x120]",
+    "   ldp     q2, q3, [sp, #0x140]",
+    "   ldp     q4, q5, [sp, #0x160]",
+    "   ldp     q6, q7, [sp, #0x180]",
+    "   ldp     q8, q9, [sp, #0x1a0]",
+    "   ldp     q10, q11, [sp, #0x1c0]",
+    "   ldp     q12, q13, [sp, #0x1e0]",
+    "   ldp     q14, q15, [sp, #0x200]",
+    "   ldp     q16, q17, [sp, #0x220]",
+    "   ldp     q18, q19, [sp, #0x240]",
+    "   ldp     q20, q21, [sp, #0x260]",
+    "   ldp     q22, q23, [sp, #0x280]",
+    "   ldp     q24, q25, [sp, #0x2a0]",
+    "   ldp     q26, q27, [sp, #0x2c0]",
+    "   ldp     q28, q29, [sp, #0x2e0]",
+    "   ldp     q30, q31, [sp, #0x300]",
+    "   ldp     x0, x1, [sp, #0x110]",
+    "   msr     fpcr, x0",
+    "   msr     fpsr, x1",
     "   ldp     x0, x1, [sp, #0x100]",
     "   msr     elr_el1, x0",
     "   msr     spsr_el1, x1",
@@ -291,7 +369,7 @@ core::arch::global_asm!(
     "   ldp     x26, x27, [sp, #0xd0]",
     "   ldp     x28, x29, [sp, #0xe0]",
     "   ldr     x30, [sp, #0xf0]",
-    "   add     sp, sp, #0x120",
+    "   add     sp, sp, #0x320",
     "   eret",
     // ── el1_default: park on an unexpected exception ─────────────────────
     "el1_default:",
