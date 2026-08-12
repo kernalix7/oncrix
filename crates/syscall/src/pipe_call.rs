@@ -447,11 +447,11 @@ mod tests {
     fn pipe_buf_wrap_around() {
         let mut pb = PipeBuf::new();
         // Fill all but 3 bytes.
-        let filler = vec![0u8; PIPE_BUF_SIZE - 3];
-        pb.write(&filler);
+        let filler = [0u8; PIPE_BUF_SIZE];
+        pb.write(&filler[..PIPE_BUF_SIZE - 3]);
         // Read some to move head forward.
-        let mut tmp = vec![0u8; PIPE_BUF_SIZE - 10];
-        pb.read(&mut tmp);
+        let mut tmp = [0u8; PIPE_BUF_SIZE];
+        pb.read(&mut tmp[..PIPE_BUF_SIZE - 10]);
         // Now write more data that wraps around.
         pb.write(b"WRAP");
         let mut out = [0u8; 4];
@@ -505,7 +505,7 @@ mod tests {
     fn pipe_nonblocking_wouldblock_on_full() {
         let mut p = Pipe::new(true);
         // Fill the buffer.
-        let data = vec![1u8; PIPE_BUF_SIZE];
+        let data = [1u8; PIPE_BUF_SIZE];
         p.write_bytes(&data).unwrap();
         // Next write should return WouldBlock.
         let r = p.write_bytes(b"x");

@@ -163,7 +163,7 @@ impl Default for PidfdGetfdBatchArgs {
 /// Extends [`PidfdInfo`] with namespace and resource data that is not
 /// available from the basic `ioctl(PIDFD_GET_INFO)`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PidfdExtInfo {
     /// Core identity information (mirrors `struct pidfd_info`).
     pub core: PidfdInfo,

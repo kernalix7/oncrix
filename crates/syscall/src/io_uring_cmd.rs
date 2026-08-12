@@ -309,7 +309,7 @@ impl Default for FixedBufTable {
 // ---------------------------------------------------------------------------
 
 /// Resolved execution context derived from a validated SQE.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UringCmdCtx {
     /// Resolved file descriptor (after fixed-file indirection).
     pub fd: i32,

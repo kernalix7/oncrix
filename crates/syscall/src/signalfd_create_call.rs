@@ -76,7 +76,7 @@ impl Sigset {
 
 /// `struct signalfd_siginfo` as read from a signalfd fd.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SigfdSiginfo {
     /// Signal number.
     pub ssi_signo: u32,
@@ -130,7 +130,7 @@ const _: () = assert!(core::mem::size_of::<SigfdSiginfo>() == 128);
 // ---------------------------------------------------------------------------
 
 /// Kernel-side signalfd object.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Signalfd {
     /// Signal mask: signals this fd is interested in.
     pub mask: Sigset,

@@ -160,7 +160,7 @@ impl ChildState {
 ///
 /// Mirrors `struct rusage` from POSIX.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RUsage {
     /// User CPU time (microseconds).
     pub utime_usec: u64,
@@ -247,7 +247,7 @@ impl ChildEntry {
 // ---------------------------------------------------------------------------
 
 /// Successful result from a `wait4` or `waitpid` call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Wait4Result {
     /// PID of the child whose state change was reported.
     pub pid: u32,

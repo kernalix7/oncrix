@@ -64,7 +64,7 @@ pub const SCHED_DEADLINE: u32 = 6;
 ///
 /// Field layout matches `struct sched_attr` from the Linux UAPI.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SchedAttrSnapshot {
     /// Structure size (set to `SCHED_ATTR_SIZE_VER1` by kernel).
     pub size: u32,

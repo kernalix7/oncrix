@@ -71,7 +71,7 @@ pub const IPC_NOWAIT: i16 = 0o4000;
 // ---------------------------------------------------------------------------
 
 /// A System V semaphore set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SemSet {
     /// IPC key.
     pub key: i32,

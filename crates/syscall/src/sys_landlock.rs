@@ -81,6 +81,7 @@ pub use crate::landlock_calls::{
 /// session.allow_path(LANDLOCK_ACCESS_FS_READ_FILE, parent_fd)?;
 /// session.restrict(thread_id)?;
 /// ```
+#[derive(Debug, PartialEq)]
 pub struct LandlockSession {
     /// File descriptor (index) of the underlying ruleset.
     ruleset_fd: i32,

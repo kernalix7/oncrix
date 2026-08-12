@@ -70,7 +70,7 @@ impl ShutdownHow {
 // ---------------------------------------------------------------------------
 
 /// Validated `shutdown` request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShutdownRequest {
     /// Socket file descriptor.
     pub sockfd: i32,

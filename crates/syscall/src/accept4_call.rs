@@ -80,7 +80,7 @@ pub enum AcceptState {
 }
 
 /// Descriptor returned when `accept4` succeeds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AcceptedSocket {
     /// Peer address filled in by the kernel.
     pub peer_addr: SockaddrStorage,

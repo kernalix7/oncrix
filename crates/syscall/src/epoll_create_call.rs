@@ -76,7 +76,7 @@ pub struct EpollEvent {
 }
 
 /// Entry in the epoll interest list.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct InterestEntry {
     /// Watched file descriptor.
     fd: i32,
@@ -89,6 +89,7 @@ struct InterestEntry {
 }
 
 /// Kernel-side epoll instance.
+#[derive(Debug, PartialEq)]
 pub struct EpollInstance {
     /// Interest list.
     interest: [Option<InterestEntry>; EPOLL_MAX_EVENTS],

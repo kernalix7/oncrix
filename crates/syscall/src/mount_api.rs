@@ -250,7 +250,7 @@ const PARAM_KEY_LEN: usize = 64;
 const PARAM_VAL_LEN: usize = 256;
 
 /// A key-value filesystem configuration parameter.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FsParam {
     /// Parameter key (null-padded ASCII).
     key: [u8; PARAM_KEY_LEN],
@@ -279,6 +279,7 @@ impl FsParam {
 }
 
 /// An open filesystem context used to configure and create a mount.
+#[derive(Debug, PartialEq)]
 pub struct FsContext {
     /// Filesystem type name (e.g. `b"ext4"`).
     fs_type: [u8; FS_TYPE_NAME_LEN],

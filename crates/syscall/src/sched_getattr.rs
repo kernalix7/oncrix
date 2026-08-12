@@ -113,7 +113,7 @@ pub const SCHED_ATTR_SIZE_VER1: usize = 56;
 ///
 /// Matches `struct sched_attr` from `include/uapi/linux/sched/types.h`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SchedAttr {
     /// Structure size in bytes (caller fills in for `setattr`; kernel fills in for `getattr`).
     pub size: u32,

@@ -47,7 +47,7 @@ pub enum EndpointKind {
 // ---------------------------------------------------------------------------
 
 /// Validated `splice` request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpliceRequest {
     /// Source file descriptor.
     pub fd_in: i32,

@@ -152,7 +152,7 @@ pub struct SigInfo {
 ///
 /// Contains the matched child's signal information, whether a match was
 /// found (relevant for `WNOHANG`), and optional resource usage fields.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WaitResult {
     /// Whether a matching child was found.  When `WNOHANG` is set and
     /// no child has changed state, this is `false` and `siginfo`

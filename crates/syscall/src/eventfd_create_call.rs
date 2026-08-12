@@ -38,7 +38,7 @@ pub const EFD_SEMAPHORE: u32 = 0x0000_0001;
 // ---------------------------------------------------------------------------
 
 /// Kernel-side eventfd object.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Eventfd {
     /// Current counter value.
     pub counter: u64,

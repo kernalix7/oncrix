@@ -32,7 +32,7 @@ const VALID_FLAGS: u32 = SPLICE_F_NONBLOCK | SPLICE_F_MORE;
 // ---------------------------------------------------------------------------
 
 /// Validated `tee` request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TeeRequest {
     /// Source pipe file descriptor.
     pub fd_in: i32,

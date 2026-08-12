@@ -141,7 +141,7 @@ impl Default for ShadowStackPageFlags {
 ///
 /// Tracks the base address, size, flags, and page attributes of
 /// one shadow stack region.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShadowStackAllocation {
     /// Base virtual address of the allocation.
     pub base_addr: u64,

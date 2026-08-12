@@ -899,6 +899,7 @@ pub fn open_hw_group(ctx: &mut PerfEventContext, events: &[HardwareEvent]) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys_perf_event_open::PERF_COUNT_HW_CPU_CYCLES;
 
     #[test]
     fn test_perf_type_hardware_roundtrip() {

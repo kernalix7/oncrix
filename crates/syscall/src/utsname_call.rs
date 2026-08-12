@@ -55,7 +55,7 @@ pub const ONCRIX_MACHINE: &[u8] = b"x86_64";
 ///
 /// Mirrors `struct utsname` from `<sys/utsname.h>`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UtsName {
     /// Operating system name.
     pub sysname: [u8; UTS_FIELD_LEN],

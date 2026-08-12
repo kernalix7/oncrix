@@ -112,7 +112,7 @@ pub const IOCB_FLAG_IOPRIO: u32 = 1 << 1;
 ///
 /// Matches `struct io_event` from `include/uapi/linux/aio_abi.h`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct IoEvent {
     /// The `aio_data` tag from the originating [`Iocb`].
     pub data: u64,
@@ -524,7 +524,7 @@ pub fn do_io_submit(reg: &mut AioRegistry, ctx_id: AioContextId, iocbs: &[Iocb])
 // ---------------------------------------------------------------------------
 
 /// Result of an `io_pgetevents` call.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct PgeteventsResult {
     /// Events harvested into the caller's buffer.
     pub events: alloc::vec::Vec<IoEvent>,
