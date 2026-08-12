@@ -429,10 +429,19 @@ impl InotifyInstance {
         // SECURITY: never wrap/reuse watch descriptors.  A recycled wd
         // while an old watch still holds that wd would let rm_watch
         // silently remove the wrong watch.  Return exhaustion instead.
+        //
+        // Exhaustion is parked in the counter rather than derived from an
+        // overflow at allocation time: bumping first made the check fire while
+        // `next_wd` still held a perfectly good descriptor, so `i32::MAX` was
+        // never handed out. Valid descriptors are strictly positive, so 0 is
+        // free to mean "the previous allocation consumed the last one".
         let wd = self.next_wd;
-        self.next_wd = self.next_wd.checked_add(1).ok_or(Error::OutOfMemory)?;
+        if wd <= 0 {
+            return Err(Error::OutOfMemory);
+        }
         self.watches[slot] = Some(WatchEntry::new(wd, ino_id, mask));
         self.watch_count += 1;
+        self.next_wd = wd.checked_add(1).unwrap_or(0);
         Ok(wd)
     }
 
