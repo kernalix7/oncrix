@@ -316,23 +316,36 @@ impl BootmemAllocator {
 
         // Search each usable region for a suitable gap.
         for i in 0..self.region_count {
-            let region = &self.regions[i];
-            if !region.flags.contains(BootmemRegionFlags::USABLE) {
+            let (region_base, region_end, flags) = {
+                let region = &self.regions[i];
+                (region.base, region.end, region.flags)
+            };
+            if !flags.contains(BootmemRegionFlags::USABLE) {
                 continue;
             }
-            let start = (region.base.max(self.bump) + align - 1) & !(align - 1);
-            if start + size > region.end {
-                continue;
+            let mut start = align_up(region_base.max(self.bump), align);
+            // Step over reservations inside this region instead of abandoning
+            // it. A reservation that covers a region's start — the kernel
+            // image always does — would otherwise strand the entire remainder
+            // of that region, however large.
+            loop {
+                let Some(limit) = start.checked_add(size) else {
+                    break;
+                };
+                if limit > region_end {
+                    break;
+                }
+                match self.colliding_reservation_end(start, size) {
+                    Some(reserved_end) => start = align_up(reserved_end, align),
+                    None => {
+                        // Allocation found.
+                        self.bump = limit;
+                        self.stats.allocated_bytes += size;
+                        self.stats.alloc_count += 1;
+                        return Ok(start);
+                    }
+                }
             }
-            // Check that this range does not overlap any reservation.
-            if self.is_reserved(start, size) {
-                continue;
-            }
-            // Allocation found.
-            self.bump = start + size;
-            self.stats.allocated_bytes += size;
-            self.stats.alloc_count += 1;
-            return Ok(start);
         }
         Err(Error::OutOfMemory)
     }
@@ -385,10 +398,26 @@ impl BootmemAllocator {
     // ------------------------------------------------------------------
 
     /// Returns `true` if the range `[base, base+size)` overlaps any reservation.
-    fn is_reserved(&self, base: u64, size: u64) -> bool {
+    /// End of the furthest reservation overlapping `[base, base + size)`.
+    ///
+    /// Returns the maximum end rather than the first hit so a caller that
+    /// retries above it clears every overlapping reservation in one step.
+    fn colliding_reservation_end(&self, base: u64, size: u64) -> Option<u64> {
         self.reservations[..self.reservation_count]
             .iter()
-            .any(|r| r.overlaps(base, size))
+            .filter(|r| r.overlaps(base, size))
+            .map(|r| r.end)
+            .max()
+    }
+}
+
+/// Round `value` up to the next multiple of `align`, saturating on overflow.
+///
+/// `align` is a caller-validated power of two.
+const fn align_up(value: u64, align: u64) -> u64 {
+    match value.checked_add(align - 1) {
+        Some(v) => v & !(align - 1),
+        None => u64::MAX,
     }
 }
 

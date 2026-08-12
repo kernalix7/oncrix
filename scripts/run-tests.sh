@@ -33,7 +33,6 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # entry is the definition of done for that fix. Do not add to this list to make
 # a red build green.
 #
-#   oncrix-mm       bootmem allocator returns the wrong block on reserve+alloc
 #   oncrix-ipc      rpmsg send to an offline device reports IoError, not NotFound
 #   oncrix-kernel   nf_conntrack expectations — the table registers
 #                   the expected port as dst_port while the FTP-active-mode test
@@ -46,9 +45,6 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #                   and SEGFAULTS the whole test binary
 skips_for() {
     case "$1" in
-    oncrix-mm)
-        echo "bootmem::tests::test_reserve_blocks_alloc"
-        ;;
     oncrix-ipc)
         echo "rpmsg::tests::test_send_offline_device"
         ;;
