@@ -40,32 +40,144 @@ struct BootResult {
     failure_reason: String,
 }
 
-fn run_x86_64_boot_test() -> BootResult {
-    let project_dir = std::env::var("ONCRIX_PROJECT_DIR")
-        .unwrap_or_else(|_| {
-            // Resolve relative to this binary's location: tests/boot_tests/target/.../boot_test
-            // Walk up to find the repo root (contains Cargo.toml workspace marker).
-            let mut dir = std::env::current_exe()
-                .expect("cannot determine exe path")
-                .canonicalize()
-                .expect("canonicalize failed");
-            loop {
-                dir.pop();
-                let candidate = dir.join("Cargo.toml");
-                if candidate.exists() {
-                    let content = std::fs::read_to_string(&candidate).unwrap_or_default();
-                    if content.contains("[workspace]") {
-                        break;
-                    }
-                }
-                if dir.parent().is_none() {
-                    break;
-                }
+/// Locate the repo root.
+///
+/// `ONCRIX_PROJECT_DIR` wins when set; otherwise walk up from this binary
+/// (tests/boot_tests/target/.../boot_test) until a `Cargo.toml` containing
+/// `[workspace]` is found.
+fn find_project_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("ONCRIX_PROJECT_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let mut dir = std::env::current_exe()
+        .expect("cannot determine exe path")
+        .canonicalize()
+        .expect("canonicalize failed");
+    loop {
+        dir.pop();
+        let candidate = dir.join("Cargo.toml");
+        if candidate.exists() {
+            let content = std::fs::read_to_string(&candidate).unwrap_or_default();
+            if content.contains("[workspace]") {
+                break;
             }
-            dir.to_string_lossy().into_owned()
-        });
+        }
+        if dir.parent().is_none() {
+            break;
+        }
+    }
+    dir
+}
 
-    let project_dir = std::path::PathBuf::from(&project_dir);
+/// Return true when `bin` resolves to a file on `PATH`.
+fn tool_available(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+}
+
+/// Spawn QEMU, stream its serial output, and watch for markers.
+///
+/// Returns as soon as every marker in `required` has been seen, any marker in
+/// `failure` appears, or [`TIMEOUT`] elapses. QEMU is killed either way, so a
+/// kernel that parks in a halt loop still terminates the test.
+fn spawn_and_watch(
+    qemu: &str,
+    args: &[&str],
+    required: &[&str],
+    failure: &[&str],
+    tag: &str,
+) -> BootResult {
+    let mut child = match Command::new(qemu)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return BootResult {
+                success: false,
+                output: vec![],
+                failure_reason: format!("failed to spawn {qemu}: {e}"),
+            };
+        }
+    };
+
+    let stdout = child.stdout.take().expect("no stdout pipe");
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let lines_clone = Arc::clone(&lines);
+    let tag_owned = tag.to_string();
+
+    // Reader thread collects serial output.
+    let reader_handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    eprintln!("[{tag_owned}] {l}");
+                    lines_clone.lock().unwrap().push(l);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Poll until all markers seen, a failure marker appears, or timeout.
+    let start = Instant::now();
+    let mut failure_seen: Option<String> = None;
+    let mut remaining: Vec<&str> = required.to_vec();
+
+    'poll: loop {
+        if start.elapsed() >= TIMEOUT {
+            break 'poll;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let snapshot = lines.lock().unwrap().clone();
+        for line in &snapshot {
+            if let Some(marker) = failure.iter().find(|m| line.contains(**m)) {
+                failure_seen = Some(marker.to_string());
+                break 'poll;
+            }
+            remaining.retain(|m| !line.contains(m));
+        }
+        if remaining.is_empty() {
+            break 'poll;
+        }
+    }
+
+    // Kill QEMU regardless of outcome.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader_handle.join();
+
+    let output = lines.lock().unwrap().clone();
+
+    if let Some(marker) = failure_seen {
+        return BootResult {
+            success: false,
+            output,
+            failure_reason: format!("failure marker in serial output: {marker:?}"),
+        };
+    }
+
+    if !remaining.is_empty() {
+        return BootResult {
+            success: false,
+            output,
+            failure_reason: format!("timeout after {TIMEOUT:?}; missing markers: {remaining:?}"),
+        };
+    }
+
+    BootResult {
+        success: true,
+        output,
+        failure_reason: String::new(),
+    }
+}
+
+fn run_x86_64_boot_test() -> BootResult {
+    let project_dir = find_project_dir();
 
     // Step 1: build the kernel WITH the embed-init feature so the
     // ring-3 init binary is included. Without this flag the kernel
@@ -104,8 +216,7 @@ fn run_x86_64_boot_test() -> BootResult {
         }
     }
 
-    let kernel = project_dir
-        .join("target/x86_64-unknown-none/debug/oncrix-kernel");
+    let kernel = project_dir.join("target/x86_64-unknown-none/debug/oncrix-kernel");
 
     if !kernel.exists() {
         return BootResult {
@@ -116,102 +227,29 @@ fn run_x86_64_boot_test() -> BootResult {
     }
 
     // Step 2: launch QEMU.
-    eprintln!("[boot-test] Launching QEMU (kernel: {})...", kernel.display());
-    let mut child = match Command::new("qemu-system-x86_64")
-        .args([
-            "-kernel", kernel.to_str().unwrap(),
-            "-serial", "stdio",
-            "-display", "none",
+    eprintln!(
+        "[boot-test] Launching QEMU (kernel: {})...",
+        kernel.display()
+    );
+    spawn_and_watch(
+        "qemu-system-x86_64",
+        &[
+            "-kernel",
+            kernel.to_str().unwrap(),
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
             "-no-reboot",
-            "-m", "128M",
-            "-cpu", "qemu64",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return BootResult {
-                success: false,
-                output: vec![],
-                failure_reason: format!("failed to spawn qemu-system-x86_64: {e}"),
-            };
-        }
-    };
-
-    let stdout = child.stdout.take().expect("no stdout pipe");
-    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let lines_clone = Arc::clone(&lines);
-
-    // Reader thread collects serial output.
-    let reader_handle = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    eprintln!("[qemu] {l}");
-                    lines_clone.lock().unwrap().push(l);
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Poll until all markers seen, panic detected, or timeout.
-    let start = Instant::now();
-    let mut panic_seen = false;
-    let mut remaining_markers: Vec<&str> = REQUIRED_MARKERS.to_vec();
-
-    'poll: loop {
-        if start.elapsed() >= TIMEOUT {
-            break 'poll;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-
-        let snapshot = lines.lock().unwrap().clone();
-        for line in &snapshot {
-            if line.contains(PANIC_MARKER) {
-                panic_seen = true;
-                break 'poll;
-            }
-            remaining_markers.retain(|m| !line.contains(m));
-        }
-        if remaining_markers.is_empty() {
-            break 'poll;
-        }
-    }
-
-    // Kill QEMU regardless of outcome.
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = reader_handle.join();
-
-    let output = lines.lock().unwrap().clone();
-
-    if panic_seen {
-        return BootResult {
-            success: false,
-            output,
-            failure_reason: "KERNEL PANIC detected in serial output".to_string(),
-        };
-    }
-
-    if !remaining_markers.is_empty() {
-        return BootResult {
-            success: false,
-            output,
-            failure_reason: format!(
-                "timeout after {TIMEOUT:?}; missing markers: {remaining_markers:?}"
-            ),
-        };
-    }
-
-    BootResult {
-        success: true,
-        output,
-        failure_reason: String::new(),
-    }
+            "-m",
+            "128M",
+            "-cpu",
+            "qemu64",
+        ],
+        REQUIRED_MARKERS,
+        &[PANIC_MARKER],
+        "qemu",
+    )
 }
 
 /// Interactive shell test: types commands into QEMU stdin, validates stdout.
@@ -245,12 +283,17 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
     eprintln!("[boot-test] Launching QEMU for interactive shell test...");
     let mut child = match std::process::Command::new("qemu-system-x86_64")
         .args([
-            "-kernel", kernel.to_str().unwrap(),
-            "-serial", "stdio",
-            "-display", "none",
+            "-kernel",
+            kernel.to_str().unwrap(),
+            "-serial",
+            "stdio",
+            "-display",
+            "none",
             "-no-reboot",
-            "-m", "128M",
-            "-cpu", "qemu64",
+            "-m",
+            "128M",
+            "-cpu",
+            "qemu64",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -261,7 +304,9 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
         Err(e) => {
             return BootResult {
                 success: true,
-                output: vec![format!("[SKIPPED] interactive shell (qemu spawn failed: {e})")],
+                output: vec![format!(
+                    "[SKIPPED] interactive shell (qemu spawn failed: {e})"
+                )],
                 failure_reason: String::new(),
             };
         }
@@ -280,7 +325,10 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
             match stdout_reader.read(&mut tmp) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    shared_buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]);
+                    shared_buf_clone
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&tmp[..n]);
                 }
             }
         }
@@ -388,9 +436,8 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
         String::from_utf8_lossy(&buf1[inject_offset..p1_end.saturating_sub(2)]).into_owned();
     eprintln!("[qemu-interactive] {}", echo_region.trim());
 
-    let echo_ok = echo_region.contains("hi")
-        && echo_region.contains("from")
-        && echo_region.contains("sh");
+    let echo_ok =
+        echo_region.contains("hi") && echo_region.contains("from") && echo_region.contains("sh");
     if !echo_ok {
         let _ = child.kill();
         let _ = child.wait();
@@ -458,7 +505,10 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
             None => (String::new(), p2_end),
         };
     eprintln!("[qemu-interactive] pwd region A: {}", pwd_region_a.trim());
-    eprintln!("[qemu-interactive] pwd region B: {}", pwd_region_b_str.trim());
+    eprintln!(
+        "[qemu-interactive] pwd region B: {}",
+        pwd_region_b_str.trim()
+    );
 
     // POSIX pwd prints `/\n` followed by no other output, so a bare
     // `/` newline pair anywhere in either region is the signal.
@@ -510,8 +560,7 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
         }
     };
 
-    let ls_region =
-        String::from_utf8_lossy(&buf3[p2_end..p3_end.saturating_sub(2)]).into_owned();
+    let ls_region = String::from_utf8_lossy(&buf3[p2_end..p3_end.saturating_sub(2)]).into_owned();
     eprintln!("[qemu-interactive] {}", ls_region.trim());
 
     if !ls_region.contains("drwx") {
@@ -556,7 +605,9 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
             );
             return BootResult {
                 success: true,
-                output: vec!["[SKIPPED] interactive shell redirection (prompt timeout)".to_string()],
+                output: vec![
+                    "[SKIPPED] interactive shell redirection (prompt timeout)".to_string(),
+                ],
                 failure_reason: String::new(),
             };
         }
@@ -595,7 +646,10 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
 
     let cat_region =
         String::from_utf8_lossy(&buf_cat[p4_end..p5_end.saturating_sub(2)]).into_owned();
-    eprintln!("[qemu-interactive] cat /tmp/foo region: {}", cat_region.trim());
+    eprintln!(
+        "[qemu-interactive] cat /tmp/foo region: {}",
+        cat_region.trim()
+    );
 
     if !cat_region.contains("redirected") {
         let _ = child.kill();
@@ -613,7 +667,9 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
     let _ = child.kill();
     let _ = child.wait();
 
-    eprintln!("[boot-test] PASS: interactive shell redirection (echo redirected > /tmp/foo; cat /tmp/foo prints 'redirected')");
+    eprintln!(
+        "[boot-test] PASS: interactive shell redirection (echo redirected > /tmp/foo; cat /tmp/foo prints 'redirected')"
+    );
 
     BootResult {
         success: true,
@@ -622,24 +678,154 @@ fn run_interactive_shell_test(project_dir: &std::path::Path) -> BootResult {
     }
 }
 
-/// aarch64 boot test — skipped until Phase 6a (aarch64 HAL) lands.
-#[allow(dead_code)]
-fn run_aarch64_boot_test() -> BootResult {
-    BootResult {
-        success: true,
-        output: vec!["[SKIPPED] aarch64 boot test (Phase 6a not yet merged)".to_string()],
-        failure_reason: String::new(),
-    }
+/// A secondary architecture's boot test: what to build, how to launch it, and
+/// which serial markers prove bring-up ran to completion.
+///
+/// These kernels have no embedded init — they run their scheduler and EL0/U-mode
+/// bring-up demos, then park in a halt loop, so the markers are the only signal.
+struct ArchBootSpec {
+    name: &'static str,
+    target: &'static str,
+    qemu: &'static str,
+    qemu_args: &'static [&'static str],
+    required: &'static [&'static str],
+    failure: &'static [&'static str],
 }
 
-/// riscv64 boot test — skipped until Phase 6b (riscv64 HAL) lands.
-#[allow(dead_code)]
-fn run_riscv64_boot_test() -> BootResult {
-    BootResult {
-        success: true,
-        output: vec!["[SKIPPED] riscv64 boot test (Phase 6b not yet merged)".to_string()],
-        failure_reason: String::new(),
+/// Mirrors `scripts/run-qemu-aarch64.sh`. Asserts the full chain: boot, GICv3,
+/// cooperative switch, timer preemption, and the three FP/SIMD preservation
+/// proofs across context switch, timer IRQ, and the EL0 round trip.
+const AARCH64_SPEC: ArchBootSpec = ArchBootSpec {
+    name: "aarch64",
+    target: "aarch64-unknown-none",
+    qemu: "qemu-system-aarch64",
+    qemu_args: &[
+        "-M",
+        "virt,gic-version=3",
+        "-cpu",
+        "cortex-a72",
+        "-m",
+        "512M",
+        "-nographic",
+        "-monitor",
+        "none",
+        "-no-reboot",
+    ],
+    required: &[
+        "[ONCRIX/aarch64] Kernel booting",
+        "[ONCRIX/aarch64] GICv3 initialized",
+        "[ONCRIX/aarch64] cooperative scheduler: thread A/B ran, back on boot thread",
+        "[ONCRIX/aarch64] callee-saved SIMD state preserved across context switch",
+        "[ONCRIX/aarch64] preemptive: C and D both ran",
+        "[ONCRIX/aarch64] kernel SIMD/FP state preserved across timer IRQ",
+        "[ONCRIX/aarch64] EL0 stack canary verified",
+        "[ONCRIX/aarch64] EL0 SIMD/FP state preserved and round-trip verified",
+        "[ONCRIX/aarch64] EL0 round trip verified",
+    ],
+    failure: &["FAILED", PANIC_MARKER],
+};
+
+/// Mirrors `scripts/run-qemu-riscv64.sh`. Asserts boot through PLIC, SBI timer,
+/// cooperative hand-off, and timer preemption.
+const RISCV64_SPEC: ArchBootSpec = ArchBootSpec {
+    name: "riscv64",
+    target: "riscv64gc-unknown-none-elf",
+    qemu: "qemu-system-riscv64",
+    qemu_args: &[
+        "-M",
+        "virt",
+        "-m",
+        "512M",
+        "-nographic",
+        "-monitor",
+        "none",
+        "-no-reboot",
+        "-bios",
+        "default",
+    ],
+    required: &[
+        "[ONCRIX/riscv64] Kernel booting",
+        "[ONCRIX/riscv64] PLIC initialized",
+        "[ONCRIX/riscv64] Timer armed",
+        "[ONCRIX/riscv64] cooperative scheduler: thread A/B ran, back on boot thread",
+        "[ONCRIX/riscv64] preemptive: C and D both ran",
+        "[ONCRIX/riscv64] Entering halt loop",
+    ],
+    failure: &["FAILED", PANIC_MARKER],
+};
+
+/// Build and boot one secondary architecture.
+///
+/// Skips only when the matching QEMU binary is absent from `PATH`; a missing
+/// emulator is a local tooling gap, not a kernel regression. Everything else —
+/// build failure, missing marker, failure marker — fails the suite.
+fn run_cross_arch_boot_test(spec: &ArchBootSpec, project_dir: &std::path::Path) -> BootResult {
+    if !tool_available(spec.qemu) {
+        return BootResult {
+            success: true,
+            output: vec![format!(
+                "[SKIPPED] {} boot test ({} not on PATH)",
+                spec.name, spec.qemu
+            )],
+            failure_reason: String::new(),
+        };
     }
+
+    eprintln!("[boot-test] Building kernel ({})...", spec.target);
+    let build_status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "oncrix-kernel",
+            "--bin",
+            "oncrix-kernel",
+            "--target",
+            spec.target,
+        ])
+        .current_dir(project_dir)
+        .status();
+
+    match build_status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            return BootResult {
+                success: false,
+                output: vec![],
+                failure_reason: format!(
+                    "{} kernel build failed with exit code {:?}",
+                    spec.name,
+                    s.code()
+                ),
+            };
+        }
+        Err(e) => {
+            return BootResult {
+                success: false,
+                output: vec![],
+                failure_reason: format!("cargo build error for {}: {e}", spec.name),
+            };
+        }
+    }
+
+    let kernel = project_dir.join(format!("target/{}/debug/oncrix-kernel", spec.target));
+    if !kernel.exists() {
+        return BootResult {
+            success: false,
+            output: vec![],
+            failure_reason: format!("kernel binary not found at {}", kernel.display()),
+        };
+    }
+
+    eprintln!(
+        "[boot-test] Launching {} (kernel: {})...",
+        spec.qemu,
+        kernel.display()
+    );
+    let mut args: Vec<&str> = spec.qemu_args.to_vec();
+    args.push("-kernel");
+    args.push(kernel.to_str().expect("kernel path is not valid UTF-8"));
+
+    spawn_and_watch(spec.qemu, &args, spec.required, spec.failure, spec.name)
 }
 
 fn main() {
@@ -650,8 +836,14 @@ fn main() {
     if x86_result.success {
         eprintln!("[boot-test] PASS: x86_64 boot — all required markers seen");
     } else {
-        eprintln!("[boot-test] FAIL: x86_64 boot — {}", x86_result.failure_reason);
-        eprintln!("[boot-test] Serial output captured ({} lines):", x86_result.output.len());
+        eprintln!(
+            "[boot-test] FAIL: x86_64 boot — {}",
+            x86_result.failure_reason
+        );
+        eprintln!(
+            "[boot-test] Serial output captured ({} lines):",
+            x86_result.output.len()
+        );
         for line in &x86_result.output {
             eprintln!("  {line}");
         }
@@ -660,28 +852,7 @@ fn main() {
 
     // Interactive shell test — requires UART RX IRQ wired up.
     // Each sub-test prints its own PASS/SKIPPED line as it completes.
-    let project_dir = std::env::var("ONCRIX_PROJECT_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let mut dir = std::env::current_exe()
-                .expect("cannot determine exe path")
-                .canonicalize()
-                .expect("canonicalize failed");
-            loop {
-                dir.pop();
-                let candidate = dir.join("Cargo.toml");
-                if candidate.exists() {
-                    let content = std::fs::read_to_string(&candidate).unwrap_or_default();
-                    if content.contains("[workspace]") {
-                        break;
-                    }
-                }
-                if dir.parent().is_none() {
-                    break;
-                }
-            }
-            dir
-        });
+    let project_dir = find_project_dir();
     let interactive_result = run_interactive_shell_test(&project_dir);
     if !interactive_result.success {
         eprintln!(
@@ -698,12 +869,32 @@ fn main() {
         std::process::exit(1);
     }
 
-    // aarch64 / riscv64 are skipped (pending Phase 6a/6b).
-    let aarch64_result = run_aarch64_boot_test();
-    eprintln!("[boot-test] {}", aarch64_result.output.first().unwrap_or(&String::new()));
-
-    let riscv64_result = run_riscv64_boot_test();
-    eprintln!("[boot-test] {}", riscv64_result.output.first().unwrap_or(&String::new()));
+    for spec in [&AARCH64_SPEC, &RISCV64_SPEC] {
+        let result = run_cross_arch_boot_test(spec, &project_dir);
+        if !result.success {
+            eprintln!(
+                "[boot-test] FAIL: {} boot — {}",
+                spec.name, result.failure_reason
+            );
+            eprintln!(
+                "[boot-test] Serial output captured ({} lines):",
+                result.output.len()
+            );
+            for line in &result.output {
+                eprintln!("  {line}");
+            }
+            std::process::exit(1);
+        }
+        match result.output.first() {
+            Some(skipped) if skipped.starts_with("[SKIPPED]") => {
+                eprintln!("[boot-test] {skipped}");
+            }
+            _ => eprintln!(
+                "[boot-test] PASS: {} boot — all required markers seen",
+                spec.name
+            ),
+        }
+    }
 
     eprintln!("[boot-test] All tests passed.");
 }
