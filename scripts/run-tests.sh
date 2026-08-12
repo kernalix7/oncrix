@@ -32,7 +32,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 # place to silence a red build: an entry without a diagnosis, or added to avoid
 # fixing something, defeats the point of running the suite at all.
 #
-# oncrix-syscall - 12 of 3603, surfaced the first time the crate's tests ever
+# oncrix-syscall - 11 of 3603, surfaced the first time the crate's tests ever
 # compiled. All are logic or test-expectation defects:
 #   bind_call        127.0.0.1 not recognised as loopback
 #   inotify_call     watch-descriptor allocation fails at the i32::MAX boundary
@@ -45,7 +45,6 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #                    rejected for SYNC
 #   rename_call      RENAME_EXCHANGE does not swap the inode numbers
 #   setpgid_call     a process cannot set its own process group
-#   setrlimit_call   an unprivileged process cannot lower its own hard limit
 skips_for() {
     case "$1" in
     oncrix-syscall)
@@ -60,7 +59,6 @@ skips_for() {
         echo "quotactl_call::tests::sync_null_special_ok"
         echo "rename_call::tests::rename_exchange"
         echo "setpgid_call::tests::setpgid_self"
-        echo "setrlimit_call::tests::unpriv_lower_hard"
         ;;
     esac
 }

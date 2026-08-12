@@ -196,14 +196,14 @@ pub fn validate_setrlimit(
 
     // Unprivileged: may not raise the hard limit.
     if !cred.has_sys_resource {
-        let cur_hard = current.rlim_max;
-        let new_hard = new_limit.rlim_max;
-
-        // Raising = new > current (and current is not infinity).
-        let raises_hard = if cur_hard == RLIM_INFINITY {
-            new_hard != RLIM_INFINITY
-        } else {
-            new_hard != RLIM_INFINITY && new_hard > cur_hard
+        // `RLIM_INFINITY` is the maximum, so it orders above every finite
+        // value. Treating it as an ordinary integer gets both ends wrong:
+        // moving *from* infinity to a finite value is a lowering, not a
+        // raise, and moving *to* infinity is the largest raise there is.
+        let raises_hard = match (current.rlim_max, new_limit.rlim_max) {
+            (RLIM_INFINITY, _) => false,
+            (_, RLIM_INFINITY) => true,
+            (cur, new) => new > cur,
         };
 
         if raises_hard {
@@ -325,6 +325,36 @@ mod tests {
             ),
             Err(Error::PermissionDenied)
         );
+    }
+
+    #[test]
+    fn unpriv_raise_hard_to_infinity_denied() {
+        let mut t = RlimitTable::new();
+        sys_setrlimit(
+            &mut t,
+            RLIMIT_NOFILE,
+            &RLimit {
+                rlim_cur: 512,
+                rlim_max: 1024,
+            },
+            &priv_cred(),
+        )
+        .unwrap();
+        // Going from a finite hard limit to RLIM_INFINITY is the largest raise
+        // there is, so it must be denied just like any other raise.
+        assert_eq!(
+            sys_setrlimit(
+                &mut t,
+                RLIMIT_NOFILE,
+                &RLimit {
+                    rlim_cur: 512,
+                    rlim_max: RLIM_INFINITY
+                },
+                &unpriv_cred()
+            ),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(t.get(RLIMIT_NOFILE).unwrap().rlim_max, 1024);
     }
 
     #[test]
