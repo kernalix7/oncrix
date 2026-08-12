@@ -719,11 +719,15 @@ impl PerfEventAttrExt {
     /// # Arguments
     ///
     /// * `config` — validated event configuration
-    /// * `mmap_pages` — number of mmap pages (must be power of 2)
+    /// * `mmap_pages` — ring-buffer size in pages: one control page plus a
+    ///   power-of-two number of data pages, so `1 + 2^n` (2, 3, 5, 9, 17, …).
+    ///   `0` means no ring buffer.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArgument` if `mmap_pages` is not a power of 2.
+    /// Returns `InvalidArgument` unless `mmap_pages` is `0` or of the form
+    /// `1 + 2^n` with `n >= 1`, or if it exceeds [`MAX_MMAP_PAGES`]. A bare
+    /// power of two such as 16 is rejected: it describes 15 data pages.
     pub fn from_config(config: &PerfConfig, mmap_pages: u32) -> Result<Self> {
         // A perf ring buffer is one control page plus a power-of-two
         // number of data pages, i.e. `mmap_pages == 1 + 2^n`. A bare
@@ -1069,15 +1073,19 @@ mod tests {
     #[test]
     fn test_perf_event_attr_ext() {
         let config = PerfConfig::hardware_counter(HardwareEvent::CpuCycles).unwrap();
-        let ext = PerfEventAttrExt::from_config(&config, 16).unwrap();
+        // 17 = 1 control page + 16 data pages.
+        let ext = PerfEventAttrExt::from_config(&config, 17).unwrap();
         assert!(!ext.sampling_enabled);
-        assert_eq!(ext.mmap_pages, 16);
+        assert_eq!(ext.mmap_pages, 17);
     }
 
     #[test]
     fn test_perf_event_attr_ext_bad_mmap_pages() {
         let config = PerfConfig::hardware_counter(HardwareEvent::CpuCycles).unwrap();
-        assert!(PerfEventAttrExt::from_config(&config, 3).is_err());
+        // A bare power of two is the off-by-one layout: 16 pages leaves 15
+        // data pages once the control page is taken out. 3 (= 1 + 2) is valid.
+        assert!(PerfEventAttrExt::from_config(&config, 16).is_err());
+        assert!(PerfEventAttrExt::from_config(&config, 3).is_ok());
     }
 
     #[test]
@@ -1166,7 +1174,7 @@ mod tests {
     fn test_attr_ext_watermark() {
         let st = SampleType::from_raw(PERF_SAMPLE_IP).unwrap();
         let config = PerfConfig::hardware_sampled(HardwareEvent::CpuCycles, 1000, st).unwrap();
-        let mut ext = PerfEventAttrExt::from_config(&config, 16).unwrap();
+        let mut ext = PerfEventAttrExt::from_config(&config, 17).unwrap();
         ext.set_watermark(4096);
         assert_eq!(ext.watermark, 4096);
         assert_eq!(ext.attr.wakeup_events_or_watermark, 4096);
