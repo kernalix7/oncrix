@@ -80,6 +80,19 @@ pub const CLOCK_THREAD_CPUTIME_ID: u32 = 3;
 /// Minimum timer interval (1 microsecond in ns).
 const MIN_INTERVAL_NS: u64 = 1_000;
 
+/// Raise a periodic reload interval to [`MIN_INTERVAL_NS`].
+///
+/// `0` is preserved because it means "one-shot", not "as fast as possible".
+const fn clamp_interval(interval_ns: u64) -> u64 {
+    if interval_ns == 0 {
+        0
+    } else if interval_ns < MIN_INTERVAL_NS {
+        MIN_INTERVAL_NS
+    } else {
+        interval_ns
+    }
+}
+
 /// Signal number for CPU timer expiration (SIGPROF-like).
 const DEFAULT_SIGNAL: u32 = 27; // SIGPROF
 
@@ -628,9 +641,12 @@ impl PosixCpuTimerSubsystem {
         if expires_ns == 0 {
             return Err(Error::InvalidArgument);
         }
-        if interval_ns > 0 && interval_ns < MIN_INTERVAL_NS {
-            return Err(Error::InvalidArgument);
-        }
+        // A non-zero interval is raised to the floor rather than rejected.
+        // The floor is what stops a caller demanding per-nanosecond CPU
+        // re-arming, and clamping enforces it just as strictly; POSIX reserves
+        // EINVAL for a nanoseconds field that is negative or >= 1e9, so
+        // failing a small-but-legal interval would be non-conformant.
+        let interval_ns = clamp_interval(interval_ns);
 
         self.timers[idx].expires_ns = expires_ns;
         self.timers[idx].interval_ns = interval_ns;
@@ -813,12 +829,9 @@ impl PosixCpuTimerSubsystem {
             .iter()
             .position(|t| !t.is_free() && t.target_pid == pid && t.clock_id == clock_id);
 
-        // A non-zero interval must clear the minimum-interval floor so a
-        // caller cannot demand per-nanosecond CPU re-arming (matches the
-        // `arm_timer` guard used by the create path below).
-        if interval_ns > 0 && interval_ns < MIN_INTERVAL_NS {
-            return Err(Error::InvalidArgument);
-        }
+        // Matches the `arm_timer` floor used by the create path below; applied
+        // here too because the re-arm branch stores `interval_ns` directly.
+        let interval_ns = clamp_interval(interval_ns);
 
         if let Some(idx) = existing {
             if value_ns == 0 {
