@@ -357,10 +357,15 @@ pub fn do_sys_prlimit(
 
         // Privilege: raising the hard limit requires CAP_SYS_RESOURCE.
         if !cred.may_raise_hard() {
+            // `RLIM64_INFINITY` is the maximum, so it orders above every
+            // finite value. Treating it as an ordinary integer gets both ends
+            // wrong: moving *from* infinity to a finite value is a lowering,
+            // not a raise, and moving *to* infinity is the largest raise there
+            // is — the old `_ => false` arm waved that one straight through.
             let raises = match (current.rlim_max, nl.rlim_max) {
-                (RLIM64_INFINITY, v) => v != RLIM64_INFINITY,
-                (cur, new) if new != RLIM64_INFINITY => new > cur,
-                _ => false,
+                (RLIM64_INFINITY, _) => false,
+                (_, RLIM64_INFINITY) => true,
+                (cur, new) => new > cur,
             };
             if raises {
                 return Err(Error::PermissionDenied);
@@ -463,6 +468,26 @@ mod tests {
         let raise = RLimit64 {
             rlim_cur: 100,
             rlim_max: 2000,
+        };
+        assert_eq!(
+            do_sys_prlimit(&mut reg, 0, RLIMIT_NOFILE, Some(raise), &unpriv_cred()),
+            Err(Error::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn unpriv_raise_hard_to_infinity_denied() {
+        let mut reg = ProcessLimitRegistry::new();
+        let initial = RLimit64 {
+            rlim_cur: 100,
+            rlim_max: 1000,
+        };
+        do_sys_prlimit(&mut reg, 0, RLIMIT_NOFILE, Some(initial), &priv_cred()).unwrap();
+        // Going from a finite hard limit to RLIM64_INFINITY is the largest
+        // raise there is, so it must be denied just like any other raise.
+        let raise = RLimit64 {
+            rlim_cur: 100,
+            rlim_max: RLIM64_INFINITY,
         };
         assert_eq!(
             do_sys_prlimit(&mut reg, 0, RLIMIT_NOFILE, Some(raise), &unpriv_cred()),
