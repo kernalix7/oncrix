@@ -28,18 +28,13 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 
 # Tests that fail or crash today.
 #
-# Every entry is a real defect with its root cause named. This list is NOT a
-# place to silence a red build: an entry without a diagnosis, or added to avoid
-# fixing something, defeats the point of running the suite at all.
-#
-# oncrix-syscall - 1 of 3603, surfaced the first time the crate's tests ever
-# compiled. All are logic or test-expectation defects:
-#   inotify_call     watch-descriptor allocation fails at the i32::MAX boundary
+# This list is currently EMPTY: every test in the runner passes, across all ten
+# crates. It exists so a genuinely broken test can be quarantined *with its root
+# cause named*, not so a red build can be made green. Adding an entry without a
+# diagnosis, or to avoid fixing a defect, defeats the purpose of running the
+# suite at all.
 skips_for() {
     case "$1" in
-    oncrix-syscall)
-        echo "inotify_call::tests::test_wd_exhaustion_returns_error"
-        ;;
     esac
 }
 
