@@ -123,6 +123,28 @@ impl RenameTable {
             .find(|e| e.in_use && e.path_hash == hash)
     }
 
+    /// Swap the path hashes of the entries currently keyed by `a` and `b`.
+    ///
+    /// Both slots are resolved before either is written. Assigning one entry's
+    /// hash first would leave two entries sharing that value, and a subsequent
+    /// hash lookup would re-find the entry just written rather than the
+    /// intended target — undoing the first assignment instead of completing
+    /// the swap.
+    fn swap_hashes(&mut self, a: u64, b: u64) -> Result<()> {
+        let ia = self.index_of_hash(a).ok_or(Error::NotFound)?;
+        let ib = self.index_of_hash(b).ok_or(Error::NotFound)?;
+        self.entries[ia].path_hash = b;
+        self.entries[ib].path_hash = a;
+        Ok(())
+    }
+
+    /// Index of the entry with the given path hash.
+    fn index_of_hash(&self, hash: u64) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.in_use && e.path_hash == hash)
+    }
+
     /// Find a mutable entry by path hash.
     fn find_by_hash_mut(&mut self, hash: u64) -> Option<&mut RenameEntry> {
         self.entries
@@ -307,18 +329,9 @@ pub fn do_renameat2(
     }
 
     if flags.is_exchange() {
-        // Atomically swap the two dentries' path hashes.
-        // Both must exist.
-        let ne = new_entry_opt.ok_or(Error::NotFound)?;
-        {
-            let old_mut = table.find_by_hash_mut(old_hash).ok_or(Error::NotFound)?;
-            old_mut.path_hash = new_hash;
-        }
-        {
-            let new_mut = table.find_by_hash_mut(new_hash).ok_or(Error::NotFound)?;
-            new_mut.path_hash = old_hash;
-            let _ = ne; // consumed above
-        }
+        // Atomically swap the two dentries' path hashes. Both must exist.
+        new_entry_opt.ok_or(Error::NotFound)?;
+        table.swap_hashes(old_hash, new_hash)?;
         return Ok(());
     }
 
