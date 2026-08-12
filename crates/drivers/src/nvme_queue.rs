@@ -215,21 +215,19 @@ pub struct CqEntry {
     pub dw1: u32,
     /// SQ Head Pointer [15:0], SQ Identifier [31:16].
     pub dw2: u32,
-    /// Status Field [31:17], Phase Tag [0], Command ID [15:1].
+    /// Command ID [15:0], Phase Tag [16], Status Field [31:17].
     pub dw3: u32,
 }
 
 impl CqEntry {
-    /// Return the Phase Tag bit (bit 0 of DW3).
+    /// Return the Phase Tag bit (bit 16 of DW3).
     pub fn phase(&self) -> bool {
-        self.dw3 & 1 != 0
+        self.dw3 & (1 << 16) != 0
     }
 
-    /// Return the Command ID (bits 15:0 of DW3 — actually bits 31:16 of DW3).
-    ///
-    /// Per spec: CID is bits 31:16 of DW3.
+    /// Return the Command Identifier (bits 15:0 of DW3).
     pub fn command_id(&self) -> u16 {
-        (self.dw3 >> 16) as u16
+        (self.dw3 & 0xFFFF) as u16
     }
 
     /// Return the SQ Head Pointer (bits 15:0 of DW2).
@@ -242,16 +240,14 @@ impl CqEntry {
         (self.dw2 >> 16) as u16
     }
 
-    /// Return the Status Code Type (bits 11:9 of DW3, excluding DNR/More).
+    /// Return the Status Code Type (bits 27:25 of DW3).
     pub fn status_code_type(&self) -> u8 {
-        ((self.dw3 >> 9) & 0x7) as u8
+        ((self.dw3 >> 25) & 0x7) as u8
     }
 
-    /// Return the Status Code (bits 8:1 of DW3 >> 1, shifted by 1 for P bit).
-    ///
-    /// Per spec: bits 8:1 are the Status Code (SC). Bit 0 = Phase bit.
+    /// Return the Status Code (bits 24:17 of DW3).
     pub fn status_code(&self) -> u8 {
-        ((self.dw3 >> 1) & 0xFF) as u8
+        ((self.dw3 >> 17) & 0xFF) as u8
     }
 
     /// Return true if the completion indicates success.

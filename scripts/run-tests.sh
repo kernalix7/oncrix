@@ -38,10 +38,7 @@ export RUST_MIN_STACK="${RUST_MIN_STACK:-268435456}"
 #   oncrix-vfs      btrfs_inode create/lookup/unlink and shmem_fs truncate
 #   oncrix-kernel   netns routing, nf_conntrack state tracking, posix_cpu_timers
 #                   reload, task_delay_acct aggregation, tcp_bbr drain->probe_bw
-#   oncrix-drivers  nvme_cq CQE DW3 bit layout contradicts the NVMe spec
-#                   (command_id reads 31:16 and status_field reads 31:17 — they
-#                   overlap; the spec says 31:17 status, 16 phase, 15:0 CID);
-#                   the two virtio_vsock request tests build the driver with
+#   oncrix-drivers  the two virtio_vsock request tests build the driver with
 #                   mmio_base = 0 and hand-set `initialized`, a state `init()`
 #                   never produces, so `transmit_header` writes to address 0x50
 #                   and SEGFAULTS the whole test binary; and VsockPacketHeader
@@ -74,7 +71,6 @@ skips_for() {
         echo "tcp_bbr::tests::drain_to_probe_bw"
         ;;
     oncrix-drivers)
-        echo "nvme_cq::tests::cqe_success_check"
         echo "virtio_vsock::tests::handle_request_accepts_bound_port"
         echo "virtio_vsock::tests::handle_request_rejects_unbound_port"
         echo "virtio_vsock::tests::packet_header_size"

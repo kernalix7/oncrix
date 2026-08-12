@@ -83,20 +83,20 @@ pub struct CqEntry {
     pub dw1: u32,
     /// DW2\[15:0\] = SQ Head Pointer; DW2\[31:16\] = SQ Identifier.
     pub dw2: u32,
-    /// DW3\[0\] = Phase Tag; DW3\[15:1\] = Command Identifier;
-    /// DW3\[31:17\] = Status Field (DNR, More, SCT, SC).
+    /// DW3\[15:0\] = Command Identifier; DW3\[16\] = Phase Tag;
+    /// DW3\[31:17\] = Status Field (DNR, More, CRD, SCT, SC).
     pub dw3: u32,
 }
 
 impl CqEntry {
-    /// Return the Phase Tag (bit 0 of DW3).
+    /// Return the Phase Tag (bit 16 of DW3).
     pub fn phase(&self) -> bool {
-        self.dw3 & 1 != 0
+        self.dw3 & (1 << 16) != 0
     }
 
-    /// Return the Command Identifier (bits 31:16 of DW3).
+    /// Return the Command Identifier (bits 15:0 of DW3).
     pub fn command_id(&self) -> u16 {
-        (self.dw3 >> 16) as u16
+        (self.dw3 & 0xFFFF) as u16
     }
 
     /// Return the full 15-bit Status Field (bits 31:17 of DW3).
@@ -119,14 +119,14 @@ impl CqEntry {
         (self.dw2 >> 16) as u16
     }
 
-    /// Return the Status Code Type (bits 11:9 of DW3).
+    /// Return the Status Code Type (bits 27:25 of DW3).
     pub fn status_code_type(&self) -> u8 {
-        ((self.dw3 >> 9) & 0x7) as u8
+        ((self.dw3 >> 25) & 0x7) as u8
     }
 
-    /// Return the Status Code (bits 8:1 of DW3).
+    /// Return the Status Code (bits 24:17 of DW3).
     pub fn status_code(&self) -> u8 {
-        ((self.dw3 >> 1) & 0xFF) as u8
+        ((self.dw3 >> 17) & 0xFF) as u8
     }
 }
 
@@ -623,10 +623,9 @@ mod tests {
             dw0: 0,
             dw1: 0,
             dw2: 0,
-            dw3: 0x0001_0001, // CID=0x0000, Phase=1
+            dw3: (1 << 16) | 0x0001, // Phase=1 (bit 16), CID=0x0001 (bits 15:0)
         };
         assert!(cqe.phase());
-        // CID is bits 31:16.
         assert_eq!(cqe.command_id(), 0x0001);
     }
 
@@ -636,17 +635,25 @@ mod tests {
             dw0: 0,
             dw1: 0,
             dw2: 0,
-            dw3: 0x0000_0001, // status=0, phase=1
+            dw3: (1 << 16) | 0x0001, // SF=0 (bits 31:17), phase=1, CID=1
         };
         assert!(ok.is_success());
+        assert_eq!(ok.status_code(), 0);
+        assert_eq!(ok.status_code_type(), 0);
 
+        // SC = 0x81 (Invalid Field in Command) at bits 24:17,
+        // SCT = 0 (Generic) at bits 27:25.
         let err = CqEntry {
             dw0: 0,
             dw1: 0,
             dw2: 0,
-            dw3: 0x0000_0003, // status bits set, phase=1
+            dw3: (0x81 << 17) | (1 << 16) | 0x0001,
         };
         assert!(!err.is_success());
+        assert_eq!(err.status_code(), 0x81);
+        assert_eq!(err.status_code_type(), 0);
+        assert!(err.phase());
+        assert_eq!(err.command_id(), 0x0001);
     }
 
     #[test]
