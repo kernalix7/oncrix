@@ -624,6 +624,69 @@ pub fn parse_response(data: &[u8]) -> Result<DnsResponse> {
     Ok(response)
 }
 
+/// Structurally validate a DNS message (query or response) without
+/// interpreting it.
+///
+/// Walks the header and every declared section — `qd_count` questions, then
+/// `an_count` + `ns_count` + `ar_count` resource records — checking that each
+/// name parses within bounds (via the pointer-hardened
+/// [`decode_domain_name`]) and that fixed fields and `RDLENGTH` stay inside
+/// the message. `RDATA` is treated as opaque bytes: record-type-specific names
+/// inside `CNAME`/`MX`/`SOA` and similar are *not* followed, since that is
+/// semantic parsing beyond framing.
+///
+/// Unlike [`parse_response`], this accepts both queries and responses, imposes
+/// no answer-count cap, and validates the authority and additional sections,
+/// so it is a sound admission gate for any DNS datagram regardless of the QR
+/// bit or response code.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if the message is truncated, a name or
+/// record field runs past the end, a compression pointer is malformed, or
+/// bytes remain after the last declared record (`pos != data.len()`).
+pub fn validate_message(data: &[u8]) -> Result<()> {
+    let header = parse_header(data)?;
+    let mut pos = DNS_HEADER_LEN;
+    // Scratch for decoded names; only the consumed length matters here.
+    let mut name_buf = [0u8; 256];
+
+    for _ in 0..header.qd_count {
+        let (consumed, _) = decode_domain_name(data, pos, &mut name_buf)?;
+        pos = pos.saturating_add(consumed);
+        // QTYPE + QCLASS.
+        pos = pos.saturating_add(4);
+        if pos > data.len() {
+            return Err(Error::InvalidArgument);
+        }
+    }
+
+    let rr_total = (header.an_count as usize)
+        .saturating_add(header.ns_count as usize)
+        .saturating_add(header.ar_count as usize);
+    for _ in 0..rr_total {
+        let (consumed, _) = decode_domain_name(data, pos, &mut name_buf)?;
+        pos = pos.saturating_add(consumed);
+        // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2).
+        if pos.saturating_add(10) > data.len() {
+            return Err(Error::InvalidArgument);
+        }
+        let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos = pos.saturating_add(10);
+        if pos.saturating_add(rdlength) > data.len() {
+            return Err(Error::InvalidArgument);
+        }
+        pos = pos.saturating_add(rdlength);
+    }
+
+    // Reject trailing bytes: a well-formed message ends exactly at the last
+    // declared record, so anything left over is padding or a smuggled tail.
+    if pos != data.len() {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
 // =========================================================================
 // DnsCache
 // =========================================================================
@@ -1051,6 +1114,59 @@ mod tests {
             skip_name(&data, 0).is_err(),
             "pointer at the final byte has no second byte; must not return offset 2"
         );
+    }
+
+    // ---- validate_message -------------------------------------------------
+
+    // A real query built by build_query must validate.
+    #[test]
+    fn test_validate_message_accepts_built_query() {
+        let mut buf = [0u8; 512];
+        let len = build_query(0x1234, b"example.com", TYPE_A, &mut buf).unwrap();
+        validate_message(&buf[..len]).unwrap();
+    }
+
+    // A query whose question name uses a forward pointer must be rejected even
+    // though the rest of the framing is well-formed.
+    #[test]
+    fn test_validate_message_rejects_forward_pointer_in_question() {
+        let mut data = [0u8; 32];
+        // Header: qd_count = 1.
+        data[5] = 1;
+        // Question name at offset 12 is a forward pointer to offset 20.
+        data[12] = 0xC0;
+        data[13] = 0x14;
+        // QTYPE + QCLASS at 14..18.
+        data[18] = 0;
+        // A label at offset 20 that the forward pointer would wrongly reach.
+        data[20] = 1;
+        data[21] = b'x';
+        data[22] = 0;
+        assert!(validate_message(&data).is_err());
+    }
+
+    // A declared answer whose RDLENGTH overruns the message must be rejected.
+    #[test]
+    fn test_validate_message_rejects_rdlength_overrun() {
+        let mut data = [0u8; 64];
+        // Header: qd_count = 0, an_count = 1.
+        data[7] = 1;
+        // Owner name at 12: a single root label (1 byte).
+        data[12] = 0;
+        // TYPE(2)+CLASS(2)+TTL(4) at 13..23, RDLENGTH at 23..25.
+        data[23] = 0;
+        data[24] = 200; // RDLENGTH = 200, but only ~39 bytes remain.
+        assert!(validate_message(&data).is_err());
+    }
+
+    // Trailing bytes after the last declared record must be rejected.
+    #[test]
+    fn test_validate_message_rejects_trailing_bytes() {
+        let mut buf = [0u8; 512];
+        let len = build_query(0x1234, b"example.com", TYPE_A, &mut buf).unwrap();
+        // Append a stray byte beyond the well-formed query.
+        buf[len] = 0xAA;
+        assert!(validate_message(&buf[..len + 1]).is_err());
     }
 
     #[test]
