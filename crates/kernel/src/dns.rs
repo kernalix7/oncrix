@@ -344,6 +344,15 @@ pub fn decode_domain_name(data: &[u8], offset: usize, out: &mut [u8]) -> Result<
             if ptr >= data.len() {
                 return Err(Error::InvalidArgument);
             }
+            // SECURITY (RFC 1035 §4.1.4, RFC 9267): a compression pointer names
+            // a PRIOR occurrence, so it must point strictly backward. `cur` is
+            // the position of the pointer just read, so on a chain each hop
+            // must target a strictly earlier offset. This rejects forward and
+            // self pointers outright and makes cycles unreachable, rather than
+            // relying on the hop cap to terminate them.
+            if ptr >= cur {
+                return Err(Error::InvalidArgument);
+            }
             cur = ptr;
             jumped = true;
             pointer_count = pointer_count.saturating_add(1);
@@ -490,7 +499,12 @@ fn skip_name(data: &[u8], offset: usize) -> Result<usize> {
         }
         let b = data[cur];
         if (b & 0xC0) == 0xC0 {
-            // Pointer: 2 bytes total, then we are done.
+            // Pointer: 2 bytes total, then we are done. The second byte must
+            // actually be present; a pointer at the final byte would otherwise
+            // return an offset one past the end of the message.
+            if cur.saturating_add(2) > data.len() {
+                return Err(Error::InvalidArgument);
+            }
             return Ok(cur.saturating_add(2));
         }
         if b == 0 {
@@ -957,6 +971,86 @@ mod tests {
         let (consumed, name_len) = decode_domain_name(&data, 13, &mut out).unwrap();
         assert_eq!(consumed, 2);
         assert_eq!(&out[..name_len], b"example.com");
+    }
+
+    // SECURITY (RFC 1035 §4.1.4, RFC 9267): a compression pointer must name a
+    // PRIOR occurrence, i.e. point strictly backward. A forward pointer reads
+    // bytes that were never labels and reconstructs an attacker-controlled
+    // "name". Rejecting `ptr >= cur` is the BIND/tcpdump (CVE-2017-12995) rule.
+    #[test]
+    fn test_decode_domain_name_rejects_forward_pointer() {
+        // At offset 0 sits a pointer that points FORWARD to offset 6, where a
+        // label actually lives. Without a backward-only rule this resolves.
+        let mut data = [0u8; 16];
+        data[0] = 0xC0;
+        data[1] = 0x06; // forward pointer to offset 6
+        // A label "evil" at offset 6 (after a gap of attacker padding).
+        data[6] = 4;
+        data[7..11].copy_from_slice(b"evil");
+        data[11] = 0;
+
+        let mut out = [0u8; 256];
+        let r = decode_domain_name(&data, 0, &mut out);
+        assert!(
+            r.is_err(),
+            "forward pointer must be rejected (RFC 1035 §4.1.4 prior-occurrence rule)"
+        );
+    }
+
+    // SECURITY: a self-referential pointer (ptr == its own position) is a cycle
+    // of length one. The hop cap bounds it, but it must be rejected outright.
+    #[test]
+    fn test_decode_domain_name_rejects_self_pointer() {
+        let mut data = [0u8; 8];
+        data[2] = 0xC0;
+        data[3] = 0x02; // pointer at 2 -> targets 2 (itself)
+        let mut out = [0u8; 256];
+        assert!(decode_domain_name(&data, 2, &mut out).is_err());
+    }
+
+    // SECURITY: a pointer cycle across two offsets must terminate with an
+    // error, never hang. ptr at 4 -> 6, ptr at 6 -> 4.
+    #[test]
+    fn test_decode_domain_name_rejects_pointer_cycle() {
+        let mut data = [0u8; 8];
+        data[4] = 0xC0;
+        data[5] = 0x06; // 4 -> 6
+        data[6] = 0xC0;
+        data[7] = 0x04; // 6 -> 4
+        let mut out = [0u8; 256];
+        assert!(decode_domain_name(&data, 4, &mut out).is_err());
+    }
+
+    // A strictly backward pointer chain longer than MAX_POINTERS must error,
+    // proving the hop bound holds even when every individual hop is legal.
+    #[test]
+    fn test_decode_domain_name_hop_cap_on_legal_backward_chain() {
+        // Lay out N positions, each a pointer to the previous, all backward.
+        // data[i*2] = 0xC0, data[i*2+1] = (i-1)*2. Starting at the last.
+        let mut data = [0u8; 256];
+        let hops = 20; // > MAX_POINTERS (16)
+        for i in 1..=hops {
+            data[i * 2] = 0xC0;
+            data[i * 2 + 1] = ((i - 1) * 2) as u8;
+        }
+        data[0] = 0; // root terminator at the very start
+        let mut out = [0u8; 256];
+        assert!(
+            decode_domain_name(&data, hops * 2, &mut out).is_err(),
+            "chain exceeding MAX_POINTERS must error even when all hops are backward"
+        );
+    }
+
+    // skip_name returns the offset after a compression pointer without checking
+    // the pointer's second byte is present, yielding an offset past the message.
+    #[test]
+    fn test_skip_name_rejects_truncated_pointer() {
+        // A single pointer byte at the very end: no second byte follows.
+        let data = [0xC0u8];
+        assert!(
+            skip_name(&data, 0).is_err(),
+            "pointer at the final byte has no second byte; must not return offset 2"
+        );
     }
 
     #[test]
