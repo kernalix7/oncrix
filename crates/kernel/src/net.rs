@@ -905,11 +905,26 @@ impl NetworkStack {
         // The UDP length field is authoritative; `datagram` is trimmed
         // to exactly that length so the checksum covers no trailing
         // bytes from the IP payload.
-        let (_hdr, datagram) = crate::udp::parse_udp_datagram(udp_payload)?;
+        let (hdr, datagram) = crate::udp::parse_udp_datagram(udp_payload)?;
 
         // Verify against the real IPs from the IP header; drop on a
         // checksum mismatch.
         crate::udp::verify_udp_checksum(&ip_hdr.src_addr, &ip_hdr.dst_addr, datagram)?;
+
+        // DNS admission check: a datagram on the DNS port (query to us, or a
+        // response from a server) must be a structurally well-formed DNS
+        // message. This mirrors the file's parse-and-validate convention and
+        // drops malformed frames silently (`Ok(0)`) rather than surfacing them
+        // as errors. It is framing validation only — RDATA is not interpreted
+        // and no resolver state is touched here.
+        if hdr.src_port == crate::dns::DNS_PORT || hdr.dst_port == crate::dns::DNS_PORT {
+            let Some(dns_payload) = datagram.get(crate::udp::UDP_HEADER_LEN..) else {
+                return Ok(0);
+            };
+            if crate::dns::validate_message(dns_payload).is_err() {
+                return Ok(0);
+            }
+        }
 
         Ok(0)
     }
@@ -1415,5 +1430,109 @@ mod tests {
         let mut reply = [0u8; 128];
         let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
         assert_eq!(r, 0);
+    }
+
+    /// Build an Ethernet+IPv4+UDP frame for a specific destination port.
+    ///
+    /// Same construction as [`build_udp_frame`] but with caller-chosen ports,
+    /// so DNS (port 53) traffic can be exercised.
+    #[allow(clippy::too_many_arguments)]
+    fn build_udp_frame_to_port(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+        good_checksum: bool,
+        frame: &mut [u8],
+    ) -> usize {
+        let mut udp = [0u8; 256];
+        let udp_len = crate::udp::write_udp(src_port, dst_port, payload, &mut udp)
+            .ok()
+            .unwrap();
+        let cksum = crate::udp::udp_checksum(&src_ip, &dst_ip, &udp[..udp_len]);
+        let ck = if good_checksum {
+            cksum.to_be_bytes()
+        } else {
+            (cksum ^ 0x0100).to_be_bytes()
+        };
+        udp[6] = ck[0];
+        udp[7] = ck[1];
+
+        frame[..6].copy_from_slice(&[0xAA; 6]);
+        frame[6..12].copy_from_slice(&[0xBB; 6]);
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        let ip = Ipv4Header {
+            version_ihl: 0x45,
+            tos: 0,
+            total_len: (IPV4_HEADER_MIN_LEN + udp_len) as u16,
+            id: 0,
+            flags_frag: 0,
+            ttl: 64,
+            protocol: PROTO_UDP,
+            checksum: 0,
+            src_addr: src_ip,
+            dst_addr: dst_ip,
+        };
+        let ip_off = ETHER_HEADER_LEN;
+        write_ipv4(&mut frame[ip_off..], &ip).ok().unwrap();
+        let udp_off = ip_off + IPV4_HEADER_MIN_LEN;
+        frame[udp_off..udp_off + udp_len].copy_from_slice(&udp[..udp_len]);
+        udp_off + udp_len
+    }
+
+    // A structurally valid DNS query on port 53 must be admitted (consumed,
+    // Ok(0)) — validation must not reject legitimate DNS traffic.
+    #[test]
+    fn dns_valid_query_on_port53_accepted() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        let mut qbuf = [0u8; 128];
+        let qlen = crate::dns::build_query(0x1234, b"example.com", crate::dns::TYPE_A, &mut qbuf)
+            .ok()
+            .unwrap();
+        let mut frame = [0u8; 256];
+        let n = build_udp_frame_to_port(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            12345,
+            crate::dns::DNS_PORT,
+            &qbuf[..qlen],
+            true,
+            &mut frame,
+        );
+        let mut reply = [0u8; 256];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0, "valid DNS query must be consumed, not error");
+    }
+
+    // A DNS datagram with a valid UDP checksum but a malformed (forward-pointer)
+    // message must be dropped silently by the admission gate, not error.
+    #[test]
+    fn dns_forward_pointer_on_port53_dropped_not_error() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        // Hand-build a DNS message whose question name is a forward pointer.
+        let mut msg = [0u8; 32];
+        msg[5] = 1; // qd_count = 1
+        msg[12] = 0xC0;
+        msg[13] = 0x14; // forward pointer to offset 20
+        msg[20] = 1;
+        msg[21] = b'x';
+        msg[22] = 0;
+        let mut frame = [0u8; 256];
+        let n = build_udp_frame_to_port(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            12345,
+            crate::dns::DNS_PORT,
+            &msg,
+            true,
+            &mut frame,
+        );
+        let mut reply = [0u8; 256];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0, "malformed DNS must be dropped (Ok(0)), not an error");
     }
 }

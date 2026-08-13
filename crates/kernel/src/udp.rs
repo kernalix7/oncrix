@@ -17,7 +17,7 @@ use oncrix_lib::{Error, Result};
 // =========================================================================
 
 /// UDP header size in bytes (src_port + dst_port + length + checksum).
-const UDP_HEADER_LEN: usize = 8;
+pub(crate) const UDP_HEADER_LEN: usize = 8;
 
 /// Maximum number of UDP sockets in the socket table.
 const UDP_TABLE_SIZE: usize = 32;
