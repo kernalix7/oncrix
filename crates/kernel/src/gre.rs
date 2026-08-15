@@ -1011,6 +1011,75 @@ mod tests {
         assert!(validate_gre_packet(&f[..n]).is_err());
     }
 
+    /// Build a C|K GRE packet: flags=0xA000, proto=IPv4, `checksum`, reserved1,
+    /// key=0xDEADBEEF, then `payload`. Length is header (12) + payload.
+    fn ck_frame(checksum: u16, payload: &[u8]) -> ([u8; 64], usize) {
+        let mut f = [0u8; 64];
+        let flags = GreFlags::CHECKSUM_BIT | GreFlags::KEY_BIT;
+        f[0..2].copy_from_slice(&flags.to_be_bytes());
+        f[2..4].copy_from_slice(&IPV4_PROTO.to_be_bytes());
+        f[4..6].copy_from_slice(&checksum.to_be_bytes());
+        f[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        f[12..12 + payload.len()].copy_from_slice(payload);
+        (f, 12 + payload.len())
+    }
+
+    /// Build a C|K|S GRE packet: flags=0xB000, proto=IPv4, `checksum`,
+    /// reserved1, key=0xDEADBEEF, sequence=1, then `payload`. Length is header
+    /// (16) + payload.
+    fn cks_frame(checksum: u16, payload: &[u8]) -> ([u8; 64], usize) {
+        let mut f = [0u8; 64];
+        let flags = GreFlags::CHECKSUM_BIT | GreFlags::KEY_BIT | GreFlags::SEQUENCE_BIT;
+        f[0..2].copy_from_slice(&flags.to_be_bytes());
+        f[2..4].copy_from_slice(&IPV4_PROTO.to_be_bytes());
+        f[4..6].copy_from_slice(&checksum.to_be_bytes());
+        f[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        f[12..16].copy_from_slice(&1u32.to_be_bytes());
+        f[16..16 + payload.len()].copy_from_slice(payload);
+        (f, 16 + payload.len())
+    }
+
+    // A C|K frame with nonzero key 0xDEADBEEF and a checksum covering the key
+    // must verify. The pinned 0x7561 matches build_gre_cksum (non-tautological),
+    // and the payload offset is 12 (base 4 + checksum 4 + key 4).
+    #[test]
+    fn validate_accepts_ck_valid_checksum() {
+        let (f, n) = ck_frame(0x7561, &[0x45, 0x00]);
+        assert_eq!(build_gre_cksum(&f[..n]), 0x7561);
+        let (hdr, off) = validate_gre_packet(&f[..n]).unwrap();
+        assert_eq!(off, 12);
+        assert_eq!(hdr.key, 0xDEAD_BEEF);
+    }
+
+    // A single-bit checksum corruption (0x7561 -> 0x7562) on the C|K frame must
+    // be rejected, proving the checksum covers the key field.
+    #[test]
+    fn validate_rejects_ck_corrupt_checksum() {
+        let (f, n) = ck_frame(0x7562, &[0x45, 0x00]);
+        assert!(validate_gre_packet(&f[..n]).is_err());
+    }
+
+    // A C|K|S frame with nonzero key 0xDEADBEEF and sequence 1 and a checksum
+    // covering both must verify. The pinned 0x6560 matches build_gre_cksum, and
+    // the payload offset is 16 (base 4 + checksum 4 + key 4 + sequence 4).
+    #[test]
+    fn validate_accepts_cks_valid_checksum() {
+        let (f, n) = cks_frame(0x6560, &[0x45, 0x00]);
+        assert_eq!(build_gre_cksum(&f[..n]), 0x6560);
+        let (hdr, off) = validate_gre_packet(&f[..n]).unwrap();
+        assert_eq!(off, 16);
+        assert_eq!(hdr.key, 0xDEAD_BEEF);
+        assert_eq!(hdr.sequence_number, 1);
+    }
+
+    // A single-bit checksum corruption (0x6560 -> 0x6561) on the C|K|S frame
+    // must be rejected, proving the checksum covers the sequence field.
+    #[test]
+    fn validate_rejects_cks_corrupt_checksum() {
+        let (f, n) = cks_frame(0x6561, &[0x45, 0x00]);
+        assert!(validate_gre_packet(&f[..n]).is_err());
+    }
+
     // An odd-length payload ([0x45]) is right-padded with zero per RFC 1071,
     // yielding the same 0x32ff checksum as the even [0x45,0x00] case.
     #[test]
