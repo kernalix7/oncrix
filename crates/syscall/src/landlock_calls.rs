@@ -884,16 +884,14 @@ use test_helpers::acquire_and_reset;
 mod tests {
     extern crate std;
 
-    use std::vec::Vec;
-
     use super::*;
 
     #[test]
     fn concurrent_create_add_restrict_check_is_race_free() {
         let _ser = acquire_and_reset();
-        let handles: Vec<_> = (0u64..4)
-            .map(|tid| {
-                std::thread::spawn(move || {
+        std::thread::scope(|scope| {
+            for tid in 0u64..4 {
+                scope.spawn(move || {
                     for round in 0u64..4 {
                         let vtid = tid * 100 + round;
                         let parent_fd = (tid * 50 + round) as i32;
@@ -928,11 +926,8 @@ mod tests {
                         );
                         sys_landlock_close_ruleset(fd).unwrap();
                     }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
+                });
+            }
+        });
     }
 }
