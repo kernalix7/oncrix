@@ -638,6 +638,10 @@ pub struct NetworkStack {
     pub arp_table: ArpTable,
     /// IPv6 stack and NDP neighbor cache.
     pub ipv6: Ipv6Stack,
+    /// Count of GRE frames admitted by [`crate::gre::validate_gre_packet`].
+    gre_admitted: u64,
+    /// Count of GRE frames rejected by [`crate::gre::validate_gre_packet`].
+    gre_dropped: u64,
 }
 
 impl NetworkStack {
@@ -655,7 +659,19 @@ impl NetworkStack {
             subnet_mask: subnet,
             arp_table: ArpTable::new(),
             ipv6: Ipv6Stack::new(Ipv6Addr::link_local_from_mac(&mac), mac),
+            gre_admitted: 0,
+            gre_dropped: 0,
         }
+    }
+
+    /// Number of GRE frames admitted by the protocol-47 admission gate.
+    pub const fn gre_admitted(&self) -> u64 {
+        self.gre_admitted
+    }
+
+    /// Number of GRE frames dropped by the protocol-47 admission gate.
+    pub const fn gre_dropped(&self) -> u64 {
+        self.gre_dropped
     }
 
     /// Process an incoming Ethernet frame.
@@ -850,7 +866,10 @@ impl NetworkStack {
             PROTO_ICMP => self.handle_icmp_packet(eth, &ip_hdr, ip_payload, reply_buf),
             PROTO_UDP => self.handle_udp_packet(&ip_hdr, ip_payload),
             PROTO_GRE => {
-                let _ = self.handle_gre_packet(ip_payload);
+                match self.handle_gre_packet(ip_payload) {
+                    Ok(()) => self.gre_admitted = self.gre_admitted.saturating_add(1),
+                    Err(_) => self.gre_dropped = self.gre_dropped.saturating_add(1),
+                }
                 Ok(0)
             }
             _ => Err(Error::NotImplemented),
@@ -1695,6 +1714,39 @@ mod tests {
         let n = build_ip_proto_frame([10, 0, 0, 1], [10, 0, 0, 2], PROTO_GRE, &gre, &mut frame);
         let mut reply = [0u8; 128];
         assert_eq!(stack.process_packet(&frame[..n], &mut reply), Ok(0));
+    }
+
+    // Given a valid C-only GRE frame dispatched through the public boundary,
+    // When process_packet consumes it,
+    // Then only the admitted counter advances and dropped stays zero, proving
+    // validation has an observable effect on NetworkStack state.
+    #[test]
+    fn gre_valid_frame_increments_admitted_only() {
+        let gre = [0x80u8, 0x00, 0x08, 0x00, 0x32, 0xff, 0x00, 0x00, 0x45, 0x00];
+        let mut stack = gre_stack();
+        let mut frame = [0u8; 128];
+        let n = build_ip_proto_frame([10, 0, 0, 1], [10, 0, 0, 2], PROTO_GRE, &gre, &mut frame);
+        let mut reply = [0u8; 128];
+        assert_eq!(stack.process_packet(&frame[..n], &mut reply), Ok(0));
+        assert_eq!(stack.gre_admitted(), 1);
+        assert_eq!(stack.gre_dropped(), 0);
+    }
+
+    // Given a corrupt-checksum GRE frame dispatched through the public boundary,
+    // When process_packet drops it,
+    // Then only the dropped counter advances and admitted stays zero. This
+    // fails if validate_gre_packet is bypassed, because a bypassed gate would
+    // admit the corrupt frame and increment admitted instead.
+    #[test]
+    fn gre_corrupt_frame_increments_dropped_only() {
+        let gre = [0x80u8, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00];
+        let mut stack = gre_stack();
+        let mut frame = [0u8; 128];
+        let n = build_ip_proto_frame([10, 0, 0, 1], [10, 0, 0, 2], PROTO_GRE, &gre, &mut frame);
+        let mut reply = [0u8; 128];
+        assert_eq!(stack.process_packet(&frame[..n], &mut reply), Ok(0));
+        assert_eq!(stack.gre_dropped(), 1);
+        assert_eq!(stack.gre_admitted(), 0);
     }
 
     // A structurally valid DNS query on port 53 must be admitted (consumed,
