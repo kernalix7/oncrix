@@ -298,12 +298,15 @@ pub fn decompose_fs_access(access: u64) -> [(&'static str, bool); 15] {
 
 #[cfg(test)]
 mod tests {
+    use crate::landlock_calls::test_helpers::acquire_and_reset;
+
     use super::*;
 
     // ---- LandlockSession ----
 
     #[test]
     fn session_create_and_info() {
+        let _ser = acquire_and_reset();
         let session = LandlockSession::new(
             LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
             0,
@@ -321,6 +324,7 @@ mod tests {
 
     #[test]
     fn session_allow_path_adds_rule() {
+        let _ser = acquire_and_reset();
         let mut session = LandlockSession::new(LANDLOCK_ACCESS_FS_READ_FILE, 0).unwrap();
         session.allow_path(LANDLOCK_ACCESS_FS_READ_FILE, 5).unwrap();
         let (_, _, count) = session.info().unwrap();
@@ -330,6 +334,7 @@ mod tests {
 
     #[test]
     fn session_allow_port_adds_rule() {
+        let _ser = acquire_and_reset();
         let mut session = LandlockSession::new(0, LANDLOCK_ACCESS_NET_BIND_TCP).unwrap();
         session
             .allow_port(LANDLOCK_ACCESS_NET_BIND_TCP, 8080)
@@ -341,6 +346,7 @@ mod tests {
 
     #[test]
     fn session_restrict_marks_restricted() {
+        let _ser = acquire_and_reset();
         let mut session = LandlockSession::new(LANDLOCK_ACCESS_FS_EXECUTE, 0).unwrap();
         session.allow_path(LANDLOCK_ACCESS_FS_EXECUTE, 0).unwrap();
         assert!(!session.is_restricted());
@@ -351,6 +357,7 @@ mod tests {
 
     #[test]
     fn session_add_rule_after_restrict_rejected() {
+        let _ser = acquire_and_reset();
         let mut session = LandlockSession::new(LANDLOCK_ACCESS_FS_EXECUTE, 0).unwrap();
         session.allow_path(LANDLOCK_ACCESS_FS_EXECUTE, 0).unwrap();
         session.restrict(2000).unwrap();
@@ -378,6 +385,7 @@ mod tests {
 
     #[test]
     fn add_fs_rules_batch() {
+        let _ser = acquire_and_reset();
         let mut session =
             LandlockSession::new(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE, 0)
                 .unwrap();
@@ -399,6 +407,7 @@ mod tests {
 
     #[test]
     fn add_net_rules_batch() {
+        let _ser = acquire_and_reset();
         let mut session = LandlockSession::new(
             0,
             LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
@@ -460,11 +469,13 @@ mod tests {
     #[test]
     fn check_access_unrestricted_thread_allowed() {
         // Thread 9999 has no restrictions.
+        let _ser = acquire_and_reset();
         assert!(check_fs_access(9999, LANDLOCK_ACCESS_FS_READ_FILE, 5).is_ok());
     }
 
     #[test]
     fn check_access_restricted_thread_denied_without_rule() {
+        let _ser = acquire_and_reset();
         let mut session = LandlockSession::new(LANDLOCK_ACCESS_FS_READ_FILE, 0).unwrap();
         // No rules added — restrict_self means all covered accesses are denied.
         session.restrict(77_777).unwrap();
@@ -475,6 +486,7 @@ mod tests {
 
     #[test]
     fn check_access_allowed_by_rule() {
+        let _ser = acquire_and_reset();
         let mut session = LandlockSession::new(LANDLOCK_ACCESS_FS_READ_FILE, 0).unwrap();
         session
             .allow_path(LANDLOCK_ACCESS_FS_READ_FILE, 20)
@@ -487,6 +499,7 @@ mod tests {
 
     #[test]
     fn restriction_depth_increments() {
+        let _ser = acquire_and_reset();
         let mut s1 = LandlockSession::new(LANDLOCK_ACCESS_FS_READ_FILE, 0).unwrap();
         s1.allow_path(LANDLOCK_ACCESS_FS_READ_FILE, 0).unwrap();
         let mut s2 = LandlockSession::new(LANDLOCK_ACCESS_FS_EXECUTE, 0).unwrap();

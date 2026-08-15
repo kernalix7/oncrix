@@ -17,7 +17,14 @@
 //!
 //! Landlock is stackable: multiple restrict_self calls narrow access
 //! monotonically.
+//!
+//! # Concurrency
+//!
+//! All global Landlock state is protected by a single [`oncrix_lib::sync::SpinLock`]
+//! wrapping a [`LandlockState`] value. Stateful operations acquire the lock
+//! once and pass borrowed state to helpers, preventing nested acquisition.
 
+use oncrix_lib::sync::SpinLock;
 use oncrix_lib::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -305,46 +312,63 @@ impl Default for ThreadRestriction {
 }
 
 // ---------------------------------------------------------------------------
-// Global state
+// Aggregate state type
 // ---------------------------------------------------------------------------
 
-/// Global registry of Landlock rulesets.
-static mut RULESETS: [LandlockRuleset; MAX_RULESETS] = {
-    const EMPTY: LandlockRuleset = LandlockRuleset {
-        active: false,
-        handled_access_fs: 0,
-        handled_access_net: 0,
-        nr_rules: 0,
-        rules: [LandlockRuleStorage {
-            kind: 0,
-            allowed_access: 0,
-            parent_fd: 0,
-            port: 0,
-        }; MAX_RULES_PER_RULESET],
-    };
-    [EMPTY; MAX_RULESETS]
-};
+/// All mutable Landlock kernel state, owned by the global spinlock.
+///
+/// Placing both registries in a single struct guarantees that any
+/// operation touching both (e.g. `restrict_self` reads the ruleset
+/// registry then writes the thread registry) does so under one lock
+/// acquisition with no window for interleaving writes.
+struct LandlockState {
+    /// Global registry of Landlock rulesets.
+    rulesets: [LandlockRuleset; MAX_RULESETS],
+    /// Per-thread restriction state.
+    thread_restrictions: [ThreadRestriction; MAX_RESTRICTED_THREADS],
+}
 
-/// Per-thread restriction state.
-static mut THREAD_RESTRICTIONS: [ThreadRestriction; MAX_RESTRICTED_THREADS] = {
-    const EMPTY: ThreadRestriction = ThreadRestriction {
-        active: false,
-        thread_id: 0,
-        nr_stacked: 0,
-        stacked_rulesets: [0; MAX_STACKED_RULESETS],
-    };
-    [EMPTY; MAX_RESTRICTED_THREADS]
-};
+impl LandlockState {
+    const fn new() -> Self {
+        const EMPTY_RS: LandlockRuleset = LandlockRuleset {
+            active: false,
+            handled_access_fs: 0,
+            handled_access_net: 0,
+            nr_rules: 0,
+            rules: [LandlockRuleStorage {
+                kind: 0,
+                allowed_access: 0,
+                parent_fd: 0,
+                port: 0,
+            }; MAX_RULES_PER_RULESET],
+        };
+        const EMPTY_TR: ThreadRestriction = ThreadRestriction {
+            active: false,
+            thread_id: 0,
+            nr_stacked: 0,
+            stacked_rulesets: [0; MAX_STACKED_RULESETS],
+        };
+        Self {
+            rulesets: [EMPTY_RS; MAX_RULESETS],
+            thread_restrictions: [EMPTY_TR; MAX_RESTRICTED_THREADS],
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Helper functions
+// Global state — single spinlock-protected instance
+// ---------------------------------------------------------------------------
+
+/// Global Landlock state.  All operations acquire this lock exactly once.
+static LANDLOCK: SpinLock<LandlockState> = SpinLock::new(LandlockState::new());
+
+// ---------------------------------------------------------------------------
+// Private helpers — operate on &mut LandlockState, never re-acquire the lock
 // ---------------------------------------------------------------------------
 
 /// Find a free ruleset slot.
-fn alloc_ruleset_slot() -> Result<usize> {
-    // SAFETY: single-threaded kernel init; no concurrent mutation.
-    let rulesets = unsafe { &mut *core::ptr::addr_of_mut!(RULESETS) };
-    for (idx, rs) in rulesets.iter().enumerate() {
+fn alloc_ruleset_slot(state: &LandlockState) -> Result<usize> {
+    for (idx, rs) in state.rulesets.iter().enumerate() {
         if !rs.active {
             return Ok(idx);
         }
@@ -352,42 +376,51 @@ fn alloc_ruleset_slot() -> Result<usize> {
     Err(Error::OutOfMemory)
 }
 
-/// Look up an active ruleset by fd (index).
-fn get_ruleset(fd: i32) -> Result<&'static mut LandlockRuleset> {
+/// Look up an active ruleset by fd (index), returning a mutable reference.
+fn get_ruleset_mut(state: &mut LandlockState, fd: i32) -> Result<&mut LandlockRuleset> {
     if fd < 0 || (fd as usize) >= MAX_RULESETS {
         return Err(Error::InvalidArgument);
     }
-    // SAFETY: single-threaded kernel; bounds checked above.
-    let rulesets = unsafe { &mut *core::ptr::addr_of_mut!(RULESETS) };
-    let rs = &mut rulesets[fd as usize];
+    let rs = &mut state.rulesets[fd as usize];
     if !rs.active {
         return Err(Error::InvalidArgument);
     }
     Ok(rs)
 }
 
-/// Find the thread restriction entry for a given thread ID, or allocate one.
-fn get_or_alloc_thread_restriction(tid: u64) -> Result<&'static mut ThreadRestriction> {
-    // SAFETY: single-threaded kernel; no concurrent mutation.
-    let restrictions = unsafe { &mut *core::ptr::addr_of_mut!(THREAD_RESTRICTIONS) };
+/// Look up an active ruleset by fd (index), returning a shared reference.
+fn get_ruleset(state: &LandlockState, fd: i32) -> Result<&LandlockRuleset> {
+    if fd < 0 || (fd as usize) >= MAX_RULESETS {
+        return Err(Error::InvalidArgument);
+    }
+    let rs = &state.rulesets[fd as usize];
+    if !rs.active {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(rs)
+}
 
-    // Find existing or first free slot in a single pass.
+/// Find the thread restriction entry for `tid`, or allocate a fresh slot.
+fn get_or_alloc_thread_restriction(
+    state: &mut LandlockState,
+    tid: u64,
+) -> Result<&mut ThreadRestriction> {
+    // Single pass: remember the first free slot while scanning for `tid`.
     let mut free_idx: Option<usize> = None;
-    for (i, entry) in restrictions.iter().enumerate() {
+    for (i, entry) in state.thread_restrictions.iter().enumerate() {
         if entry.active && entry.thread_id == tid {
-            return Ok(&mut restrictions[i]);
+            return Ok(&mut state.thread_restrictions[i]);
         }
         if !entry.active && free_idx.is_none() {
             free_idx = Some(i);
         }
     }
 
-    // Allocate a new slot.
     let idx = free_idx.ok_or(Error::OutOfMemory)?;
-    restrictions[idx].active = true;
-    restrictions[idx].thread_id = tid;
-    restrictions[idx].nr_stacked = 0;
-    Ok(&mut restrictions[idx])
+    state.thread_restrictions[idx].active = true;
+    state.thread_restrictions[idx].thread_id = tid;
+    state.thread_restrictions[idx].nr_stacked = 0;
+    Ok(&mut state.thread_restrictions[idx])
 }
 
 /// Validate that an access bitmask contains only known filesystem bits.
@@ -445,9 +478,8 @@ pub fn sys_landlock_create_ruleset(
         return Err(Error::InvalidArgument);
     }
 
-    // Version query: return ABI version.
+    // Version query: no state mutation needed.
     if flags & LANDLOCK_CREATE_RULESET_VERSION != 0 {
-        // For version query, attr must be None and size must be 0.
         if attr.is_some() || size != 0 {
             return Err(Error::InvalidArgument);
         }
@@ -467,16 +499,14 @@ pub fn sys_landlock_create_ruleset(
         return Err(Error::InvalidArgument);
     }
 
-    // Validate access bitmasks.
+    // Validate access bitmasks before acquiring the lock.
     validate_fs_access(attr.handled_access_fs)?;
     validate_net_access(attr.handled_access_net)?;
 
-    let slot = alloc_ruleset_slot()?;
+    let mut guard = LANDLOCK.lock();
+    let slot = alloc_ruleset_slot(&*guard)?;
 
-    // SAFETY: slot within bounds; single-threaded mutation.
-    let rulesets = unsafe { &mut *core::ptr::addr_of_mut!(RULESETS) };
-    let rs = &mut rulesets[slot];
-
+    let rs = &mut guard.rulesets[slot];
     rs.active = true;
     rs.handled_access_fs = attr.handled_access_fs;
     rs.handled_access_net = attr.handled_access_net;
@@ -513,7 +543,8 @@ pub fn sys_landlock_add_rule(
         return Err(Error::InvalidArgument);
     }
 
-    let rs = get_ruleset(ruleset_fd)?;
+    let mut guard = LANDLOCK.lock();
+    let rs = get_ruleset_mut(&mut *guard, ruleset_fd)?;
 
     if rs.nr_rules >= MAX_RULES_PER_RULESET {
         return Err(Error::OutOfMemory);
@@ -529,7 +560,6 @@ pub fn sys_landlock_add_rule(
         ) => {
             validate_fs_access(*allowed_access)?;
 
-            // Allowed access must be a subset of handled access.
             if *allowed_access & !rs.handled_access_fs != 0 {
                 return Err(Error::InvalidArgument);
             }
@@ -638,15 +668,17 @@ pub fn sys_landlock_restrict_self(ruleset_fd: i32, flags: u32, thread_id: u64) -
         return Err(Error::InvalidArgument);
     }
 
-    // Verify the ruleset exists and is valid.
-    let rs = get_ruleset(ruleset_fd)?;
+    let mut guard = LANDLOCK.lock();
 
-    // Ensure the ruleset has at least one handled access type.
-    if rs.handled_access_fs == 0 && rs.handled_access_net == 0 {
-        return Err(Error::InvalidArgument);
+    // Verify the ruleset exists and has at least one handled access type.
+    {
+        let rs = get_ruleset(&*guard, ruleset_fd)?;
+        if rs.handled_access_fs == 0 && rs.handled_access_net == 0 {
+            return Err(Error::InvalidArgument);
+        }
     }
 
-    let restriction = get_or_alloc_thread_restriction(thread_id)?;
+    let restriction = get_or_alloc_thread_restriction(&mut *guard, thread_id)?;
 
     if restriction.nr_stacked >= MAX_STACKED_RULESETS {
         return Err(Error::OutOfMemory);
@@ -678,12 +710,10 @@ pub fn sys_landlock_restrict_self(ruleset_fd: i32, flags: u32, thread_id: u64) -
 ///
 /// `Ok(())` if access is allowed, `Err(PermissionDenied)` otherwise.
 pub fn check_fs_access(thread_id: u64, access: u64, parent_fd: i32) -> Result<()> {
-    // SAFETY: single-threaded access to global state.
-    let restrictions = unsafe { &*core::ptr::addr_of!(THREAD_RESTRICTIONS) };
-    let rulesets = unsafe { &*core::ptr::addr_of!(RULESETS) };
+    let guard = LANDLOCK.lock();
 
-    // Find the restriction for this thread.
-    let restriction = restrictions
+    let restriction = guard
+        .thread_restrictions
         .iter()
         .find(|r| r.active && r.thread_id == thread_id);
 
@@ -692,26 +722,22 @@ pub fn check_fs_access(thread_id: u64, access: u64, parent_fd: i32) -> Result<()
         None => return Ok(()), // No restrictions = allowed.
     };
 
-    // For each stacked ruleset that handles this access type,
-    // we need at least one rule that grants it.
     for i in 0..restriction.nr_stacked {
         let rs_idx = restriction.stacked_rulesets[i];
         if rs_idx >= MAX_RULESETS {
             continue;
         }
 
-        let rs = &rulesets[rs_idx];
+        let rs = &guard.rulesets[rs_idx];
         if !rs.active {
             continue;
         }
 
-        // Check if this ruleset handles the requested access.
         let handled = access & rs.handled_access_fs;
         if handled == 0 {
-            continue; // This ruleset does not cover the requested access.
+            continue;
         }
 
-        // Find a rule that grants the handled subset.
         let mut granted = 0u64;
         for j in 0..rs.nr_rules {
             let rule = &rs.rules[j];
@@ -744,11 +770,10 @@ pub fn check_fs_access(thread_id: u64, access: u64, parent_fd: i32) -> Result<()
 ///
 /// `Ok(())` if access is allowed, `Err(PermissionDenied)` otherwise.
 pub fn check_net_access(thread_id: u64, access: u64, port: u16) -> Result<()> {
-    // SAFETY: single-threaded access to global state.
-    let restrictions = unsafe { &*core::ptr::addr_of!(THREAD_RESTRICTIONS) };
-    let rulesets = unsafe { &*core::ptr::addr_of!(RULESETS) };
+    let guard = LANDLOCK.lock();
 
-    let restriction = restrictions
+    let restriction = guard
+        .thread_restrictions
         .iter()
         .find(|r| r.active && r.thread_id == thread_id);
 
@@ -763,7 +788,7 @@ pub fn check_net_access(thread_id: u64, access: u64, port: u16) -> Result<()> {
             continue;
         }
 
-        let rs = &rulesets[rs_idx];
+        let rs = &guard.rulesets[rs_idx];
         if !rs.active {
             continue;
         }
@@ -799,7 +824,8 @@ pub fn check_net_access(thread_id: u64, access: u64, port: u16) -> Result<()> {
 ///
 /// * `InvalidArgument` — invalid or inactive ruleset fd
 pub fn sys_landlock_close_ruleset(ruleset_fd: i32) -> Result<()> {
-    let rs = get_ruleset(ruleset_fd)?;
+    let mut guard = LANDLOCK.lock();
+    let rs = get_ruleset_mut(&mut *guard, ruleset_fd)?;
     rs.active = false;
     rs.handled_access_fs = 0;
     rs.handled_access_net = 0;
@@ -813,7 +839,8 @@ pub fn sys_landlock_close_ruleset(ruleset_fd: i32) -> Result<()> {
 ///
 /// * `InvalidArgument` — invalid or inactive ruleset fd
 pub fn sys_landlock_ruleset_info(ruleset_fd: i32) -> Result<(u64, u64, usize)> {
-    let rs = get_ruleset(ruleset_fd)?;
+    let guard = LANDLOCK.lock();
+    let rs = get_ruleset(&*guard, ruleset_fd)?;
     Ok((rs.handled_access_fs, rs.handled_access_net, rs.nr_rules))
 }
 
@@ -821,12 +848,91 @@ pub fn sys_landlock_ruleset_info(ruleset_fd: i32) -> Result<(u64, u64, usize)> {
 ///
 /// Returns `0` if the thread has no restrictions.
 pub fn landlock_restriction_depth(thread_id: u64) -> usize {
-    // SAFETY: single-threaded access to global state.
-    let restrictions = unsafe { &*core::ptr::addr_of!(THREAD_RESTRICTIONS) };
-
-    restrictions
+    let guard = LANDLOCK.lock();
+    guard
+        .thread_restrictions
         .iter()
         .find(|r| r.active && r.thread_id == thread_id)
         .map(|r| r.nr_stacked)
         .unwrap_or(0)
+}
+
+/// Shared test helpers: serializer + reset for parallel-safe Landlock tests.
+///
+/// All stateful tests hold the guard for their full duration; worker threads
+/// spawned inside a test still race through `LANDLOCK` (exercising the fix).
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    extern crate std;
+
+    use super::{LANDLOCK, LandlockState};
+
+    static SER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialize a stateful test and restore an empty Landlock registry.
+    pub(crate) fn acquire_and_reset() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SER.lock().unwrap_or_else(|error| error.into_inner());
+        *LANDLOCK.lock() = LandlockState::new();
+        guard
+    }
+}
+
+#[cfg(test)]
+use test_helpers::acquire_and_reset;
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::vec::Vec;
+
+    use super::*;
+
+    #[test]
+    fn concurrent_create_add_restrict_check_is_race_free() {
+        let _ser = acquire_and_reset();
+        let handles: Vec<_> = (0u64..4)
+            .map(|tid| {
+                std::thread::spawn(move || {
+                    for round in 0u64..4 {
+                        let vtid = tid * 100 + round;
+                        let parent_fd = (tid * 50 + round) as i32;
+                        let attr = LandlockRulesetAttr {
+                            handled_access_fs: LANDLOCK_ACCESS_FS_READ_FILE,
+                            handled_access_net: 0,
+                        };
+                        let fd = sys_landlock_create_ruleset(
+                            Some(&attr),
+                            core::mem::size_of::<LandlockRulesetAttr>(),
+                            0,
+                        )
+                        .unwrap();
+                        sys_landlock_add_rule(
+                            fd,
+                            LANDLOCK_RULE_PATH_BENEATH,
+                            &LandlockRule::PathBeneath {
+                                allowed_access: LANDLOCK_ACCESS_FS_READ_FILE,
+                                parent_fd,
+                            },
+                            0,
+                        )
+                        .unwrap();
+                        sys_landlock_restrict_self(fd, 0, vtid).unwrap();
+                        assert_eq!(
+                            check_fs_access(vtid, LANDLOCK_ACCESS_FS_READ_FILE, parent_fd),
+                            Ok(()),
+                        );
+                        assert_eq!(
+                            check_fs_access(vtid, LANDLOCK_ACCESS_FS_READ_FILE, parent_fd + 9999),
+                            Err(Error::PermissionDenied),
+                        );
+                        sys_landlock_close_ruleset(fd).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 }
