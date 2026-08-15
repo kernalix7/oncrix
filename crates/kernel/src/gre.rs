@@ -1051,8 +1051,8 @@ mod tests {
         assert_eq!(hdr.key, 0xDEAD_BEEF);
     }
 
-    // A single-bit checksum corruption (0x7561 -> 0x7562) on the C|K frame must
-    // be rejected, proving the checksum covers the key field.
+    // A checksum corruption (0x7561 -> 0x7562) on the C|K frame must be rejected,
+    // proving the checksum covers the key field.
     #[test]
     fn validate_rejects_ck_corrupt_checksum() {
         let (f, n) = ck_frame(0x7562, &[0x45, 0x00]);
