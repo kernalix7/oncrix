@@ -926,6 +926,23 @@ impl NetworkStack {
             }
         }
 
+        // DHCP admission check, mirroring the DNS gate above. Unlike DNS (one
+        // shared port), DHCP is directional: a server replies from port 67 to
+        // the client on port 68, so only that exact pair is client-side
+        // inbound traffic worth validating. This is framing validation only —
+        // no DhcpClient state, lease, or transaction correlation is touched,
+        // and malformed frames drop silently per the Ok(0) convention.
+        if hdr.src_port == crate::dhcp::DHCP_SERVER_PORT
+            && hdr.dst_port == crate::dhcp::DHCP_CLIENT_PORT
+        {
+            let Some(dhcp_payload) = datagram.get(crate::udp::UDP_HEADER_LEN..) else {
+                return Ok(0);
+            };
+            if crate::dhcp::validate_message(dhcp_payload).is_err() {
+                return Ok(0);
+            }
+        }
+
         Ok(0)
     }
 
@@ -1534,5 +1551,107 @@ mod tests {
         let mut reply = [0u8; 256];
         let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
         assert_eq!(r, 0, "malformed DNS must be dropped (Ok(0)), not an error");
+    }
+
+    // A structurally valid DHCP OFFER from server(67) to client(68) must be
+    // admitted (consumed, Ok(0)) — the gate must not reject real DHCP traffic.
+    #[test]
+    fn dhcp_valid_offer_on_67_to_68_accepted() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        // Build a minimal valid OFFER via the crate's own client builder is a
+        // discover (BOOTREQUEST); instead construct the reply framing inline.
+        let mut msg = [0u8; 240 + 4];
+        msg[0] = 2; // BOOTREPLY
+        msg[1] = 1; // htype Ethernet
+        msg[2] = 6; // hlen 6
+        msg[4..8].copy_from_slice(&0xAABBCCDDu32.to_be_bytes());
+        msg[236..240].copy_from_slice(&crate::dhcp::DHCP_MAGIC_COOKIE);
+        let o = 240;
+        msg[o] = crate::dhcp::OPT_MSG_TYPE;
+        msg[o + 1] = 1;
+        msg[o + 2] = crate::dhcp::DHCPOFFER;
+        msg[o + 3] = crate::dhcp::OPT_END;
+        let mut frame = [0u8; 512];
+        let n = build_udp_frame_to_port(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            crate::dhcp::DHCP_SERVER_PORT,
+            crate::dhcp::DHCP_CLIENT_PORT,
+            &msg[..o + 4],
+            true,
+            &mut frame,
+        );
+        let mut reply = [0u8; 512];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0, "valid DHCP OFFER must be consumed, not error");
+    }
+
+    // A DHCP datagram on 67->68 with a bad magic cookie must be dropped
+    // silently by the admission gate, not surfaced as an error.
+    #[test]
+    fn dhcp_bad_cookie_on_67_to_68_dropped_not_error() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        let mut msg = [0u8; 240 + 4];
+        msg[0] = 2; // BOOTREPLY
+        msg[1] = 1;
+        msg[2] = 6;
+        msg[4..8].copy_from_slice(&0xAABBCCDDu32.to_be_bytes());
+        msg[236] = 0xFF; // corrupt the magic cookie
+        let o = 240;
+        msg[o] = crate::dhcp::OPT_MSG_TYPE;
+        msg[o + 1] = 1;
+        msg[o + 2] = crate::dhcp::DHCPOFFER;
+        msg[o + 3] = crate::dhcp::OPT_END;
+        let mut frame = [0u8; 512];
+        let n = build_udp_frame_to_port(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            crate::dhcp::DHCP_SERVER_PORT,
+            crate::dhcp::DHCP_CLIENT_PORT,
+            &msg[..o + 4],
+            true,
+            &mut frame,
+        );
+        let mut reply = [0u8; 512];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(
+            r, 0,
+            "bad-cookie DHCP must be dropped (Ok(0)), not an error"
+        );
+    }
+
+    // Traffic between two non-DHCP ports that happens to carry DHCP-shaped
+    // bytes must NOT be validated as DHCP (wrong direction/ports) — it should
+    // sail through untouched. Guards the `&&` direction predicate.
+    #[test]
+    fn dhcp_shaped_bytes_on_wrong_ports_not_validated() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        // Deliberately malformed (bad cookie) but on wrong ports: no DHCP gate.
+        let mut msg = [0u8; 240 + 4];
+        msg[0] = 2;
+        msg[1] = 1;
+        msg[2] = 6;
+        msg[236] = 0xFF; // bad cookie — would fail DHCP validation
+        let o = 240;
+        msg[o] = crate::dhcp::OPT_MSG_TYPE;
+        msg[o + 1] = 1;
+        msg[o + 2] = crate::dhcp::DHCPOFFER;
+        msg[o + 3] = crate::dhcp::OPT_END;
+        let mut frame = [0u8; 512];
+        let n = build_udp_frame_to_port(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            12345,
+            54321, // neither port is 67/68
+            &msg[..o + 4],
+            true,
+            &mut frame,
+        );
+        let mut reply = [0u8; 512];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0, "non-DHCP-port traffic must bypass the DHCP gate");
     }
 }

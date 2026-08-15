@@ -307,7 +307,9 @@ pub enum DhcpEvent {
 /// data.
 pub fn parse_dhcp_options(data: &[u8]) -> Result<DhcpOptions> {
     let mut opts = DhcpOptions::default();
-    parse_dhcp_options_into(data, &mut opts)?;
+    // The public lenient parser tolerates a missing END terminator; the
+    // strict receive-path gate (validate_message) is what requires it.
+    let _ = parse_dhcp_options_into(data, &mut opts)?;
     Ok(opts)
 }
 
@@ -325,13 +327,15 @@ pub fn parse_dhcp_options(data: &[u8]) -> Result<DhcpOptions> {
 /// Returns [`Error::InvalidArgument`] if the options data is
 /// truncated or an option's declared length exceeds the remaining
 /// data.
-fn parse_dhcp_options_into(data: &[u8], opts: &mut DhcpOptions) -> Result<()> {
+fn parse_dhcp_options_into(data: &[u8], opts: &mut DhcpOptions) -> Result<bool> {
     let mut pos: usize = 0;
+    let mut saw_end = false;
 
     while pos < data.len() {
         let code = data[pos];
 
         if code == OPT_END {
+            saw_end = true;
             break;
         }
 
@@ -392,7 +396,7 @@ fn parse_dhcp_options_into(data: &[u8], opts: &mut DhcpOptions) -> Result<()> {
         pos = pos.saturating_add(opt_len);
     }
 
-    Ok(())
+    Ok(saw_end)
 }
 
 /// Parse DHCP options with RFC 2132 section 9.3 option-overload support.
@@ -424,7 +428,7 @@ fn parse_options_with_overload(data: &[u8]) -> Result<DhcpOptions> {
 
     // Primary options field follows the magic cookie.
     let mut opts = DhcpOptions::default();
-    parse_dhcp_options_into(&data[cookie_end..], &mut opts)?;
+    let _ = parse_dhcp_options_into(&data[cookie_end..], &mut opts)?;
 
     let overload = opts.overload;
     if overload != OVERLOAD_FILE && overload != OVERLOAD_SNAME && overload != OVERLOAD_BOTH {
@@ -447,6 +451,58 @@ fn parse_options_with_overload(data: &[u8]) -> Result<DhcpOptions> {
     }
 
     Ok(opts)
+}
+
+/// Structurally validate a DHCP message without interpreting it.
+///
+/// Receive-path admission gate for DHCP traffic. Checks the fixed header
+/// length (236) plus magic cookie, the operation code (`BOOTREQUEST` or
+/// `BOOTREPLY`), the Ethernet link-layer address model (`htype`/`hlen`), the
+/// magic cookie, and that the options field is bounded and terminated by an
+/// `END` option (RFC 2131 §4.1 requires END as the last option).
+///
+/// This is framing validation only. It does **not** validate the transaction
+/// ID, client MAC, server identity, or message-type semantics, and it does not
+/// touch any client state or lease — those require a [`DhcpClient`] and are a
+/// separate, stateful concern.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] if the message is shorter than the fixed
+/// header plus cookie, has an unsupported op/htype/hlen, a wrong magic cookie,
+/// a malformed option, or an options field with no terminating `END`.
+pub fn validate_message(data: &[u8]) -> Result<()> {
+    let cookie_end = DHCP_HEADER_LEN.saturating_add(4);
+    if data.len() < cookie_end {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Op must be a real BOOTP message in either direction (a query we send
+    // echoed back, or a server reply); both are valid framing on the wire.
+    if data[0] != BOOTREQUEST && data[0] != BOOTREPLY {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Reject frames whose link-layer address model we cannot interpret (same
+    // invariant as DhcpClient::process_response).
+    if data[1] != HTYPE_ETHERNET || data[2] != HLEN_ETHERNET {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Magic cookie.
+    if data[DHCP_HEADER_LEN..cookie_end] != DHCP_MAGIC_COOKIE {
+        return Err(Error::InvalidArgument);
+    }
+
+    // Options must be well-formed AND terminated by END. A field that runs to
+    // the end of the buffer without END is truncated, not merely short.
+    let mut opts = DhcpOptions::default();
+    let saw_end = parse_dhcp_options_into(&data[cookie_end..], &mut opts)?;
+    if !saw_end {
+        return Err(Error::InvalidArgument);
+    }
+
+    Ok(())
 }
 
 // =========================================================================
@@ -593,6 +649,15 @@ impl DhcpClient {
 
         // Verify operation is BOOTREPLY.
         if data[0] != BOOTREPLY {
+            return Err(Error::InvalidArgument);
+        }
+
+        // SECURITY: `htype`/`hlen` declare the link-layer address model that
+        // determines how `chaddr` is read. RFC 2131 §2 fixes them at 1/6 for
+        // Ethernet; any other value means `chaddr` is not the 6-byte MAC this
+        // client binds the lease to, so the reply must be rejected rather than
+        // interpreted against the wrong link-layer identity.
+        if data[1] != HTYPE_ETHERNET || data[2] != HLEN_ETHERNET {
             return Err(Error::InvalidArgument);
         }
 
@@ -942,6 +1007,122 @@ mod tests {
         }
     }
 
+    /// Build a minimal valid OFFER frame with caller-chosen htype/hlen.
+    ///
+    /// The default arguments produce the canonical Ethernet reply; tests
+    /// override `htype`/`hlen` to probe the address-model validation.
+    fn make_offer(htype: u8, hlen: u8, xid: u32) -> ([u8; 300], usize) {
+        let mut pkt = [0u8; 300];
+        pkt[0] = BOOTREPLY;
+        pkt[1] = htype;
+        pkt[2] = hlen;
+        pkt[4..8].copy_from_slice(&xid.to_be_bytes());
+        pkt[16..20].copy_from_slice(&[192, 168, 1, 100]); // yiaddr
+        pkt[20..24].copy_from_slice(&[192, 168, 1, 1]); // siaddr
+        pkt[DHCP_HEADER_LEN..DHCP_HEADER_LEN + 4].copy_from_slice(&DHCP_MAGIC_COOKIE);
+        let o = DHCP_HEADER_LEN + 4;
+        pkt[o] = OPT_MSG_TYPE;
+        pkt[o + 1] = 1;
+        pkt[o + 2] = DHCPOFFER;
+        pkt[o + 3] = OPT_END;
+        (pkt, o + 4)
+    }
+
+    // SECURITY: an OFFER whose hardware type is not Ethernet (htype != 1) does
+    // not describe a MAC address in chaddr, so the 6-byte address model this
+    // client applies to it is invalid. Accepting it would bind a lease to a
+    // frame whose link-layer semantics we cannot interpret.
+    #[test]
+    fn test_process_response_rejects_non_ethernet_htype() {
+        let client = DhcpClient::new([0x02, 0, 0, 0, 0, 1], 0xAABBCCDD);
+        let (pkt, len) = make_offer(6, HLEN_ETHERNET, 0xAABBCCDD); // htype 6 = not Ethernet
+        assert!(
+            client.process_response(&pkt[..len]).is_err(),
+            "htype != Ethernet must be rejected"
+        );
+    }
+
+    // SECURITY: hlen != 6 means the hardware address length differs from
+    // Ethernet's, so chaddr is not a 6-byte MAC and the reply is not for this
+    // client's address model.
+    #[test]
+    fn test_process_response_rejects_wrong_hlen() {
+        let client = DhcpClient::new([0x02, 0, 0, 0, 0, 1], 0xAABBCCDD);
+        let (pkt, len) = make_offer(HTYPE_ETHERNET, 16, 0xAABBCCDD); // hlen 16 != 6
+        assert!(
+            client.process_response(&pkt[..len]).is_err(),
+            "hlen != 6 must be rejected"
+        );
+    }
+
+    // A well-formed Ethernet OFFER must still be accepted after the new gates.
+    #[test]
+    fn test_process_response_accepts_valid_ethernet_offer() {
+        let client = DhcpClient::new([0x02, 0, 0, 0, 0, 1], 0xAABBCCDD);
+        let (pkt, len) = make_offer(HTYPE_ETHERNET, HLEN_ETHERNET, 0xAABBCCDD);
+        assert!(
+            client.process_response(&pkt[..len]).is_ok(),
+            "canonical Ethernet OFFER must still parse"
+        );
+    }
+
+    // ---- validate_message -------------------------------------------------
+
+    // A real DISCOVER produced by build_discover must validate (it has a
+    // proper header, cookie, msg-type option, and END).
+    #[test]
+    fn test_validate_message_accepts_built_discover() {
+        let client = DhcpClient::new([0x02, 0, 0, 0, 0, 1], 0xDEADBEEF);
+        let mut buf = [0u8; 512];
+        let len = client.build_discover(&mut buf).unwrap();
+        validate_message(&buf[..len]).unwrap();
+    }
+
+    // A valid OFFER (BOOTREPLY) must also validate — both directions are
+    // well-formed framing.
+    #[test]
+    fn test_validate_message_accepts_offer() {
+        let (pkt, len) = make_offer(HTYPE_ETHERNET, HLEN_ETHERNET, 1);
+        validate_message(&pkt[..len]).unwrap();
+    }
+
+    // Truncated below header+cookie must be rejected.
+    #[test]
+    fn test_validate_message_rejects_truncated_header() {
+        let pkt = [0u8; 200]; // < 240
+        assert!(validate_message(&pkt).is_err());
+    }
+
+    // A wrong magic cookie must be rejected.
+    #[test]
+    fn test_validate_message_rejects_bad_cookie() {
+        let (mut pkt, len) = make_offer(HTYPE_ETHERNET, HLEN_ETHERNET, 1);
+        pkt[DHCP_HEADER_LEN] = 0xFF; // corrupt first cookie byte
+        assert!(validate_message(&pkt[..len]).is_err());
+    }
+
+    // A non-Ethernet htype must be rejected at the framing gate too.
+    #[test]
+    fn test_validate_message_rejects_non_ethernet_htype() {
+        let (pkt, len) = make_offer(6, HLEN_ETHERNET, 1);
+        assert!(validate_message(&pkt[..len]).is_err());
+    }
+
+    // An options field with no terminating END (runs off the buffer) is
+    // truncated framing and must be rejected by the strict gate, even though
+    // the lenient public parser tolerates it.
+    #[test]
+    fn test_validate_message_rejects_missing_end() {
+        let (mut pkt, len) = make_offer(HTYPE_ETHERNET, HLEN_ETHERNET, 1);
+        // make_offer ends with END at o+3; overwrite it with a PAD so no END
+        // remains and the options run to the buffer boundary.
+        let o = DHCP_HEADER_LEN + 4;
+        pkt[o + 3] = OPT_PAD;
+        // Extend to the full frame so the walker exhausts the buffer.
+        let _ = len;
+        assert!(validate_message(&pkt).is_err(), "no END -> reject");
+    }
+
     #[test]
     fn test_process_response_ack() {
         let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -988,6 +1169,10 @@ mod tests {
 
         let mut pkt = [0u8; 250];
         pkt[0] = BOOTREPLY;
+        // A real NAK is an Ethernet reply; the htype/hlen fields are part of a
+        // well-formed frame, so set them (the new address-model gate requires it).
+        pkt[1] = HTYPE_ETHERNET;
+        pkt[2] = HLEN_ETHERNET;
         pkt[4..8].copy_from_slice(&xid.to_be_bytes());
         pkt[DHCP_HEADER_LEN..DHCP_HEADER_LEN + 4].copy_from_slice(&DHCP_MAGIC_COOKIE);
         let opt = DHCP_HEADER_LEN + 4;
