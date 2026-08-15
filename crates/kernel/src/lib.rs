@@ -118,6 +118,7 @@ pub mod sched;
 #[allow(dead_code, clippy::all)]
 pub mod sched_syscalls;
 pub mod sctp;
+pub mod sctp_packet;
 pub mod seccomp;
 pub mod seccomp_filter;
 pub mod seccomp_notifier;
