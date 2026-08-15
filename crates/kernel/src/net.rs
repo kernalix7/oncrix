@@ -347,6 +347,9 @@ pub const PROTO_TCP: u8 = 6;
 /// IP protocol number for UDP.
 pub const PROTO_UDP: u8 = 17;
 
+/// IP protocol number for GRE (RFC 2784).
+pub const PROTO_GRE: u8 = 47;
+
 /// Parsed IPv4 header.
 ///
 /// Stored in host byte order; the raw on-wire format uses
@@ -842,6 +845,7 @@ impl NetworkStack {
         match ip_hdr.protocol {
             PROTO_ICMP => self.handle_icmp_packet(eth, &ip_hdr, ip_payload, reply_buf),
             PROTO_UDP => self.handle_udp_packet(&ip_hdr, ip_payload),
+            PROTO_GRE => self.handle_gre_packet(&ip_hdr, ip_payload),
             _ => Err(Error::NotImplemented),
         }
     }
@@ -901,6 +905,22 @@ impl NetworkStack {
     /// [`crate::udp::parse_udp_datagram`] for a malformed length field,
     /// and from [`crate::udp::verify_udp_checksum`] for a datagram whose
     /// non-zero checksum does not verify.
+    /// Handle an incoming GRE packet (IP protocol 47, RFC 2784).
+    ///
+    /// Framing validation only: parse the GRE header (base + C/K/S optional
+    /// fields) and drop malformed frames silently via `Ok(0)`. GRE has no
+    /// length field — the payload extent is the enclosing IPv4 payload, whose
+    /// bounds `parse_ipv4` already enforced — so `parse_gre` only needs to
+    /// validate the header shape and optional-field offsets. No tunnel
+    /// decapsulation or inner-packet dispatch is performed here; that requires
+    /// a tunnel table and is a separate concern.
+    fn handle_gre_packet(&self, _ip_hdr: &Ipv4Header, gre_payload: &[u8]) -> Result<usize> {
+        if crate::gre::parse_gre(gre_payload).is_err() {
+            return Ok(0);
+        }
+        Ok(0)
+    }
+
     fn handle_udp_packet(&self, ip_hdr: &Ipv4Header, udp_payload: &[u8]) -> Result<usize> {
         // The UDP length field is authoritative; `datagram` is trimmed
         // to exactly that length so the checksum covers no trailing
@@ -1497,6 +1517,117 @@ mod tests {
         let udp_off = ip_off + IPV4_HEADER_MIN_LEN;
         frame[udp_off..udp_off + udp_len].copy_from_slice(&udp[..udp_len]);
         udp_off + udp_len
+    }
+
+    /// Build an Ethernet+IPv4 frame carrying a raw IP payload of a chosen
+    /// protocol (no transport header). Used for GRE (protocol 47).
+    fn build_ip_proto_frame(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        protocol: u8,
+        payload: &[u8],
+        frame: &mut [u8],
+    ) -> usize {
+        frame[..6].copy_from_slice(&[0xAA; 6]);
+        frame[6..12].copy_from_slice(&[0xBB; 6]);
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        let ip = Ipv4Header {
+            version_ihl: 0x45,
+            tos: 0,
+            total_len: (IPV4_HEADER_MIN_LEN + payload.len()) as u16,
+            id: 0,
+            flags_frag: 0,
+            ttl: 64,
+            protocol,
+            checksum: 0,
+            src_addr: src_ip,
+            dst_addr: dst_ip,
+        };
+        let ip_off = ETHER_HEADER_LEN;
+        write_ipv4(&mut frame[ip_off..], &ip).ok().unwrap();
+        let p_off = ip_off + IPV4_HEADER_MIN_LEN;
+        frame[p_off..p_off + payload.len()].copy_from_slice(payload);
+        p_off + payload.len()
+    }
+
+    /// Build a GRE header (flags word + protocol type) + inner payload.
+    fn gre_bytes(flags_version: u16, proto: u16, inner: &[u8], out: &mut [u8]) -> usize {
+        out[0..2].copy_from_slice(&flags_version.to_be_bytes());
+        out[2..4].copy_from_slice(&proto.to_be_bytes());
+        out[4..4 + inner.len()].copy_from_slice(inner);
+        4 + inner.len()
+    }
+
+    // A structurally valid GRE packet (base header, no optional fields) must
+    // be admitted (consumed, Ok(0)) — the gate must not reject real GRE.
+    #[test]
+    fn gre_valid_base_header_accepted() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        let mut gre = [0u8; 64];
+        let glen = gre_bytes(0x0000, 0x0800, &[0x45, 0x00, 0x00, 0x14], &mut gre);
+        let mut frame = [0u8; 128];
+        let n = build_ip_proto_frame(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            PROTO_GRE,
+            &gre[..glen],
+            &mut frame,
+        );
+        let mut reply = [0u8; 128];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0, "valid GRE must be consumed, not error");
+    }
+
+    // A GRE packet with a reserved/deprecated flag bit set must be dropped
+    // silently by the admission gate, not surfaced as an error.
+    #[test]
+    fn gre_reserved_flag_dropped_not_error() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        let mut gre = [0u8; 64];
+        // Bit 11 = a Reserved0 bit, rejected by the supported-bits mask.
+        let glen = gre_bytes(1 << 11, 0x0800, &[0x45, 0x00, 0x00, 0x14], &mut gre);
+        let mut frame = [0u8; 128];
+        let n = build_ip_proto_frame(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            PROTO_GRE,
+            &gre[..glen],
+            &mut frame,
+        );
+        let mut reply = [0u8; 128];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0, "reserved-flag GRE must be dropped (Ok(0)), not error");
+    }
+
+    // A GRE packet with K+S optional fields must parse the correct offset and
+    // be admitted — optional-field flags are valid framing.
+    #[test]
+    fn gre_key_sequence_optional_fields_accepted() {
+        let mut stack =
+            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
+        // flags_version with K (bit 13) + S (bit 12) set; 4+4 optional bytes.
+        let mut gre = [0u8; 64];
+        let flags: u16 = (1 << 13) | (1 << 12);
+        gre[0..2].copy_from_slice(&flags.to_be_bytes());
+        gre[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
+        // key(4) + sequence(4) + a little inner payload.
+        gre[4..8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        gre[8..12].copy_from_slice(&1u32.to_be_bytes());
+        gre[12] = 0x45;
+        let mut frame = [0u8; 128];
+        let n = build_ip_proto_frame(
+            [10, 0, 0, 1],
+            [10, 0, 0, 2],
+            PROTO_GRE,
+            &gre[..13],
+            &mut frame,
+        );
+        let mut reply = [0u8; 128];
+        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
+        assert_eq!(r, 0, "K+S GRE must be consumed, not error");
     }
 
     // A structurally valid DNS query on port 53 must be admitted (consumed,

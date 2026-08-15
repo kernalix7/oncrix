@@ -268,6 +268,19 @@ pub fn parse_gre(data: &[u8]) -> Result<(GreHeader, usize)> {
         return Err(Error::InvalidArgument);
     }
 
+    // SECURITY (RFC 2784 §2.3, RFC 2890 §2): only the C/K/S optional-field
+    // bits (15/13/12) and the 3 version bits (0-2) are meaningful. Every other
+    // flag bit is Reserved0 or a deprecated RFC 1701 field (Routing Present,
+    // strict source route) that this parser does not implement. Accepting
+    // them would leave the payload offset computed only from C/K/S while the
+    // sender intended extra fields, mis-aligning the payload. Reject any bit
+    // outside the supported mask rather than parse against a guessed layout.
+    const GRE_SUPPORTED_BITS: u16 =
+        GreFlags::CHECKSUM_BIT | GreFlags::KEY_BIT | GreFlags::SEQUENCE_BIT | 0x07;
+    if (flags_version & !GRE_SUPPORTED_BITS) != 0 {
+        return Err(Error::InvalidArgument);
+    }
+
     let flags = GreFlags::from_bits(flags_version);
     let required_len = flags.header_len();
     if data.len() < required_len {
@@ -791,5 +804,102 @@ impl GreRegistry {
             }
         }
         count
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IPV4_PROTO: u16 = 0x0800;
+
+    /// Build a GRE header+payload with the given raw flags_version word.
+    fn frame(flags_version: u16, payload: &[u8]) -> ([u8; 64], usize) {
+        let mut f = [0u8; 64];
+        f[0..2].copy_from_slice(&flags_version.to_be_bytes());
+        f[2..4].copy_from_slice(&IPV4_PROTO.to_be_bytes());
+        f[4..4 + payload.len()].copy_from_slice(payload);
+        (f, 4 + payload.len())
+    }
+
+    // A plain base header (no optional fields) must parse and return offset 4.
+    #[test]
+    fn parse_base_header_returns_offset_4() {
+        let (f, n) = frame(0x0000, &[0x45, 0x00]);
+        let (hdr, off) = parse_gre(&f[..n]).unwrap();
+        assert_eq!(off, 4);
+        assert_eq!(hdr.protocol_type, IPV4_PROTO);
+        assert!(!hdr.flags().checksum_present());
+    }
+
+    // All C/K/S combinations must parse with the correct payload offset.
+    #[test]
+    fn parse_all_optional_field_offsets() {
+        // K only: 4 + 4 = 8
+        let (f, n) = frame(GreFlags::KEY_BIT, &[0u8; 4]);
+        assert_eq!(parse_gre(&f[..n]).unwrap().1, 8);
+        // K+S: 4 + 4 + 4 = 12
+        let (f, n) = frame(GreFlags::KEY_BIT | GreFlags::SEQUENCE_BIT, &[0u8; 8]);
+        assert_eq!(parse_gre(&f[..n]).unwrap().1, 12);
+        // C+K+S: 4 + 4 + 4 + 4 = 16
+        let (f, n) = frame(
+            GreFlags::CHECKSUM_BIT | GreFlags::KEY_BIT | GreFlags::SEQUENCE_BIT,
+            &[0u8; 12],
+        );
+        assert_eq!(parse_gre(&f[..n]).unwrap().1, 16);
+    }
+
+    // Truncated optional fields must be rejected before any read.
+    #[test]
+    fn parse_rejects_truncated_optional_field() {
+        // K bit set but only 2 of the 4 key bytes present.
+        let mut f = [0u8; 6];
+        f[0..2].copy_from_slice(&GreFlags::KEY_BIT.to_be_bytes());
+        f[2..4].copy_from_slice(&IPV4_PROTO.to_be_bytes());
+        assert!(parse_gre(&f).is_err());
+    }
+
+    // Version != 0 must be rejected.
+    #[test]
+    fn parse_rejects_nonzero_version() {
+        let (f, n) = frame(0x0001, &[0u8; 0]); // version = 1
+        assert!(parse_gre(&f[..n]).is_err());
+    }
+
+    // SECURITY (RFC 2784 §2.3): reserved/unknown flag bits must be rejected,
+    // not silently accepted. A bit set in the Reserved0 region (bits 3-11)
+    // indicates a non-conformant or RFC 1701-era packet this parser does not
+    // implement; accepting it would mis-align the payload offset.
+    #[test]
+    fn parse_rejects_reserved_flag_bits() {
+        // Bit 11 (a Reserved0 bit, not C/K/S/version) set.
+        let (f, n) = frame(1 << 11, &[0u8; 0]);
+        assert!(
+            parse_gre(&f[..n]).is_err(),
+            "reserved flag bit must be rejected"
+        );
+    }
+
+    // RFC 1701 Routing Present (bit 14 in this layout) is deprecated and not
+    // implemented; it must be rejected, not skipped with a guessed length.
+    #[test]
+    fn parse_rejects_rfc1701_routing_bit() {
+        let (f, n) = frame(1 << 14, &[0u8; 0]);
+        assert!(
+            parse_gre(&f[..n]).is_err(),
+            "RFC 1701 routing bit must be rejected"
+        );
+    }
+
+    // A valid header with only C/K/S/version bits must still parse (the
+    // reserved-bit gate must not over-reject).
+    #[test]
+    fn parse_accepts_valid_flag_combination() {
+        let (f, n) = frame(GreFlags::KEY_BIT, &[0u8; 4]);
+        assert!(parse_gre(&f[..n]).is_ok(), "valid flags must parse");
     }
 }
