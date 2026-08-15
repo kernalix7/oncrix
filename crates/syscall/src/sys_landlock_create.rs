@@ -263,6 +263,8 @@ pub fn net_access_supported_by_abi(access: u64, abi: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::landlock_calls::test_helpers::acquire_and_reset;
+
     use super::*;
 
     // --- version query ---
@@ -301,6 +303,7 @@ mod tests {
 
     #[test]
     fn create_with_fs_access_succeeds() {
+        let _ser = acquire_and_reset();
         let attr = LandlockRulesetAttr {
             handled_access_fs: LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE,
             handled_access_net: 0,
@@ -311,6 +314,7 @@ mod tests {
 
     #[test]
     fn create_with_net_access_succeeds() {
+        let _ser = acquire_and_reset();
         let attr = LandlockRulesetAttr {
             handled_access_fs: 0,
             handled_access_net: LANDLOCK_ACCESS_NET_BIND_TCP,
