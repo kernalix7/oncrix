@@ -253,8 +253,9 @@ impl GreHeader {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidArgument`] if `data` is too short for
-/// the indicated optional fields or if the GRE version is not 0.
+/// Returns [`Error::InvalidArgument`] if `data` is too short for the
+/// indicated optional fields, if the GRE version is not 0, or if any
+/// RFC 2784 §2.3 discard bit (`0x4c00`) is set.
 pub fn parse_gre(data: &[u8]) -> Result<(GreHeader, usize)> {
     if data.len() < GRE_HEADER_MIN_LEN {
         return Err(Error::InvalidArgument);
@@ -268,16 +269,16 @@ pub fn parse_gre(data: &[u8]) -> Result<(GreHeader, usize)> {
         return Err(Error::InvalidArgument);
     }
 
-    // SECURITY (RFC 2784 §2.3, RFC 2890 §2): only the C/K/S optional-field
-    // bits (15/13/12) and the 3 version bits (0-2) are meaningful. Every other
-    // flag bit is Reserved0 or a deprecated RFC 1701 field (Routing Present,
-    // strict source route) that this parser does not implement. Accepting
-    // them would leave the payload offset computed only from C/K/S while the
-    // sender intended extra fields, mis-aligning the payload. Reject any bit
-    // outside the supported mask rather than parse against a guessed layout.
-    const GRE_SUPPORTED_BITS: u16 =
-        GreFlags::CHECKSUM_BIT | GreFlags::KEY_BIT | GreFlags::SEQUENCE_BIT | 0x07;
-    if (flags_version & !GRE_SUPPORTED_BITS) != 0 {
+    // RFC 2784 §2.3: a conformant receiver MUST discard a packet that sets a
+    // bit whose RFC 1701 meaning implies extra header fields this parser does
+    // not decode — RFC bit 1 (0x4000, Routing Present), bit 4 (0x0800, strict
+    // source route), and bit 5 (0x0400, recursion control). Accepting any of
+    // these would leave the payload offset computed only from C/K/S while the
+    // sender intended additional fields, mis-aligning the payload. Reserved0
+    // bits 6-12 (0x03f8) carry no length implication and MUST be ignored, so
+    // they are deliberately absent from this discard mask.
+    const GRE_DISCARD_BITS: u16 = 0x4c00;
+    if (flags_version & GRE_DISCARD_BITS) != 0 {
         return Err(Error::InvalidArgument);
     }
 
@@ -401,6 +402,27 @@ fn verify_gre_checksum(packet: &[u8], payload_offset: usize, wire_checksum: u16)
     }
 
     Ok(())
+}
+
+/// Shared receive-side GRE gate: [`parse_gre`] plus, when C=1, an RFC 2784
+/// §2.1 checksum over the whole header and payload (checksum field zeroed).
+///
+/// Header-only frames are valid; payload-requiring callers check that
+/// separately. Nonzero Reserved1 is accepted (RFC 2784 mandates transmit
+/// zero, not receiver discard) when the checksum that covers it verifies.
+///
+/// Returns the [`GreHeader`] and payload offset from [`parse_gre`].
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] if the header is malformed (see [`parse_gre`])
+/// or if C=1 and the checksum does not verify.
+pub(crate) fn validate_gre_packet(packet: &[u8]) -> Result<(GreHeader, usize)> {
+    let (header, payload_offset) = parse_gre(packet)?;
+    if header.flags().checksum_present() {
+        verify_gre_checksum(packet, payload_offset, header.checksum)?;
+    }
+    Ok((header, payload_offset))
 }
 
 /// Serialise a GRE header into `buf`.
@@ -635,17 +657,12 @@ impl GreTunnel {
             return Err(Error::InvalidArgument);
         }
 
-        let (header, payload_offset) = parse_gre(outer_packet)?;
-
-        // SECURITY: when the Checksum-Present (C) flag is set, verify the
-        // RFC 1071 one's-complement checksum over the full GRE header +
-        // payload *before* trusting any of the packet.  A forged frame
-        // with C set and a bogus checksum is dropped here, so its inner
-        // payload is never returned for re-injection into the stack.
-        // The C-clear path skips this entirely and is unaffected.
-        if header.flags().checksum_present() {
-            verify_gre_checksum(outer_packet, payload_offset, header.checksum)?;
-        }
+        // SECURITY: run the shared receive-side validator, which structurally
+        // parses the header and — when C=1 — verifies the RFC 1071 checksum
+        // over the full GRE header + payload before any of the packet is
+        // trusted. A forged frame with C set and a bogus checksum is dropped
+        // here, so its inner payload is never returned for re-injection.
+        let (header, payload_offset) = validate_gre_packet(outer_packet)?;
 
         // Validate key if configured.
         if let Some(expected_key) = self.key
@@ -836,23 +853,6 @@ mod tests {
         assert!(!hdr.flags().checksum_present());
     }
 
-    // All C/K/S combinations must parse with the correct payload offset.
-    #[test]
-    fn parse_all_optional_field_offsets() {
-        // K only: 4 + 4 = 8
-        let (f, n) = frame(GreFlags::KEY_BIT, &[0u8; 4]);
-        assert_eq!(parse_gre(&f[..n]).unwrap().1, 8);
-        // K+S: 4 + 4 + 4 = 12
-        let (f, n) = frame(GreFlags::KEY_BIT | GreFlags::SEQUENCE_BIT, &[0u8; 8]);
-        assert_eq!(parse_gre(&f[..n]).unwrap().1, 12);
-        // C+K+S: 4 + 4 + 4 + 4 = 16
-        let (f, n) = frame(
-            GreFlags::CHECKSUM_BIT | GreFlags::KEY_BIT | GreFlags::SEQUENCE_BIT,
-            &[0u8; 12],
-        );
-        assert_eq!(parse_gre(&f[..n]).unwrap().1, 16);
-    }
-
     // Truncated optional fields must be rejected before any read.
     #[test]
     fn parse_rejects_truncated_optional_field() {
@@ -863,43 +863,211 @@ mod tests {
         assert!(parse_gre(&f).is_err());
     }
 
-    // Version != 0 must be rejected.
+    // RFC 2784 §2.3: Reserved0 bits 6-12 (0x03f8) MUST be ignored on receipt,
+    // not rejected. Each such bit alone, and all of them together, must parse.
     #[test]
-    fn parse_rejects_nonzero_version() {
-        let (f, n) = frame(0x0001, &[0u8; 0]); // version = 1
-        assert!(parse_gre(&f[..n]).is_err());
+    fn parse_ignores_reserved0_bits_6_to_12() {
+        for fv in [0x0200u16, 0x0008u16, 0x03f8u16] {
+            let (f, n) = frame(fv, &[0x45, 0x00]);
+            let (hdr, off) = parse_gre(&f[..n]).unwrap();
+            assert_eq!(off, 4, "ignored bits must not shift payload offset");
+            assert_eq!(hdr.protocol_type, IPV4_PROTO);
+        }
     }
 
-    // SECURITY (RFC 2784 §2.3): reserved/unknown flag bits must be rejected,
-    // not silently accepted. A bit set in the Reserved0 region (bits 3-11)
-    // indicates a non-conformant or RFC 1701-era packet this parser does not
-    // implement; accepting it would mis-align the payload offset.
+    // RFC 2784 §2.3 receive-discard bits: bit 1 (0x4000), bit 4 (0x0800,
+    // strict source route), bit 5 (0x0400), and their union (0x4c00) each
+    // require the packet to be discarded without RFC 1701 support.
     #[test]
-    fn parse_rejects_reserved_flag_bits() {
-        // Bit 11 (a Reserved0 bit, not C/K/S/version) set.
-        let (f, n) = frame(1 << 11, &[0u8; 0]);
-        assert!(
-            parse_gre(&f[..n]).is_err(),
-            "reserved flag bit must be rejected"
-        );
+    fn parse_rejects_each_discard_bit() {
+        for fv in [0x4000u16, 0x0800u16, 0x0400u16, 0x4c00u16] {
+            let (f, n) = frame(fv, &[0u8; 0]);
+            assert!(parse_gre(&f[..n]).is_err(), "discard bit must be rejected");
+        }
     }
 
-    // RFC 1701 Routing Present (bit 14 in this layout) is deprecated and not
-    // implemented; it must be rejected, not skipped with a guessed length.
+    // Every nonzero GRE version (1..=7) must be rejected.
     #[test]
-    fn parse_rejects_rfc1701_routing_bit() {
-        let (f, n) = frame(1 << 14, &[0u8; 0]);
-        assert!(
-            parse_gre(&f[..n]).is_err(),
-            "RFC 1701 routing bit must be rejected"
-        );
+    fn parse_rejects_all_nonzero_versions() {
+        for ver in 1u16..=7 {
+            let (f, n) = frame(ver, &[0u8; 0]);
+            assert!(parse_gre(&f[..n]).is_err(), "nonzero version must reject");
+        }
     }
 
-    // A valid header with only C/K/S/version bits must still parse (the
-    // reserved-bit gate must not over-reject).
+    // All eight C/K/S layouts must parse with the RFC-correct payload offset.
     #[test]
-    fn parse_accepts_valid_flag_combination() {
-        let (f, n) = frame(GreFlags::KEY_BIT, &[0u8; 4]);
-        assert!(parse_gre(&f[..n]).is_ok(), "valid flags must parse");
+    fn parse_cks_layouts_have_correct_offsets() {
+        let c = GreFlags::CHECKSUM_BIT;
+        let k = GreFlags::KEY_BIT;
+        let s = GreFlags::SEQUENCE_BIT;
+        let cases: [(u16, usize); 8] = [
+            (0, 4),
+            (c, 8),
+            (k, 8),
+            (s, 8),
+            (c | k, 12),
+            (c | s, 12),
+            (k | s, 12),
+            (c | k | s, 16),
+        ];
+        for (fv, expected_off) in cases {
+            let (f, n) = frame(fv, &[0u8; 12]);
+            let (_hdr, off) = parse_gre(&f[..n]).unwrap();
+            assert_eq!(off, expected_off, "offset for flags {fv:#06x}");
+        }
+    }
+
+    /// Compute the RFC 2784 checksum over `packet` with its checksum field
+    /// (bytes 4-5) treated as zero — an independent reference builder so the
+    /// checksum tests below are not tautological against the parser's own path.
+    fn build_gre_cksum(packet: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < packet.len() {
+            let word = if i == 4 {
+                0
+            } else {
+                u16::from_be_bytes([packet[i], packet[i + 1]])
+            };
+            sum = sum.wrapping_add(u32::from(word));
+            i += 2;
+        }
+        if i < packet.len() {
+            sum = sum.wrapping_add(u32::from(packet[i]) << 8);
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Build a C-flag GRE packet: flags=0x8000, proto=IPv4, `checksum`,
+    /// reserved1, then `payload`. Length is header (8) + payload.
+    fn c_frame(checksum: u16, reserved1: u16, payload: &[u8]) -> ([u8; 64], usize) {
+        let mut f = [0u8; 64];
+        f[0..2].copy_from_slice(&GreFlags::CHECKSUM_BIT.to_be_bytes());
+        f[2..4].copy_from_slice(&IPV4_PROTO.to_be_bytes());
+        f[4..6].copy_from_slice(&checksum.to_be_bytes());
+        f[6..8].copy_from_slice(&reserved1.to_be_bytes());
+        f[8..8 + payload.len()].copy_from_slice(payload);
+        (f, 8 + payload.len())
+    }
+
+    // The validator must accept all eight C/K/S layouts. C-clear cases skip
+    // checksum verification; each C-set case gets a real checksum computed
+    // over its full optional-field layout and written at bytes 4-5, so the
+    // C path is exercised end-to-end (not merely the C=0 skip).
+    #[test]
+    fn validate_accepts_all_cks_layouts() {
+        let c = GreFlags::CHECKSUM_BIT;
+        let k = GreFlags::KEY_BIT;
+        let s = GreFlags::SEQUENCE_BIT;
+        let cases: [(u16, usize); 8] = [
+            (0, 4),
+            (c, 8),
+            (k, 8),
+            (s, 8),
+            (c | k, 12),
+            (c | s, 12),
+            (k | s, 12),
+            (c | k | s, 16),
+        ];
+        for (fv, expected_off) in cases {
+            let mut f = [0u8; 64];
+            f[0..2].copy_from_slice(&fv.to_be_bytes());
+            f[2..4].copy_from_slice(&IPV4_PROTO.to_be_bytes());
+            let n = expected_off + 2;
+            f[expected_off..n].copy_from_slice(&[0x45, 0x00]);
+            if (fv & c) != 0 {
+                let ck = build_gre_cksum(&f[..n]);
+                f[4..6].copy_from_slice(&ck.to_be_bytes());
+            }
+            let (_hdr, off) = validate_gre_packet(&f[..n]).unwrap();
+            assert_eq!(off, expected_off, "offset for flags {fv:#06x}");
+        }
+    }
+
+    // A C-set packet whose checksum verifies must be accepted; the pinned
+    // 0x32ff / 0x77ff constants match an independent builder (non-tautological).
+    #[test]
+    fn validate_accepts_valid_checksum() {
+        let (f, n) = c_frame(0x32ff, 0x0000, &[0x45, 0x00]);
+        assert_eq!(build_gre_cksum(&f[..n]), 0x32ff);
+        let (hdr, off) = validate_gre_packet(&f[..n]).unwrap();
+        assert_eq!(off, 8);
+        assert_eq!(hdr.checksum, 0x32ff);
+
+        // C-only header-only (no payload) still has a defined checksum 0x77ff.
+        let (f, n) = c_frame(0x77ff, 0x0000, &[]);
+        assert_eq!(build_gre_cksum(&f[..n]), 0x77ff);
+        assert_eq!(validate_gre_packet(&f[..n]).unwrap().1, 8);
+    }
+
+    // A single-bit checksum corruption (0x32ff -> 0x32fe) must be rejected.
+    #[test]
+    fn validate_rejects_corrupt_checksum() {
+        let (f, n) = c_frame(0x32fe, 0x0000, &[0x45, 0x00]);
+        assert!(validate_gre_packet(&f[..n]).is_err());
+    }
+
+    // An odd-length payload ([0x45]) is right-padded with zero per RFC 1071,
+    // yielding the same 0x32ff checksum as the even [0x45,0x00] case.
+    #[test]
+    fn validate_accepts_odd_length_payload() {
+        let (f, n) = c_frame(0x32ff, 0x0000, &[0x45]);
+        assert_eq!(build_gre_cksum(&f[..n]), 0x32ff);
+        assert_eq!(validate_gre_packet(&f[..n]).unwrap().1, 8);
+    }
+
+    // A base (C-clear) header-only packet is structurally valid to the generic
+    // validator: no payload requirement, no checksum to verify.
+    #[test]
+    fn validate_accepts_base_header_only() {
+        let (f, n) = frame(0x0000, &[]);
+        let (_hdr, off) = validate_gre_packet(&f[..n]).unwrap();
+        assert_eq!(off, 4);
+    }
+
+    // C=0 must skip checksum verification entirely: a garbage checksum-field
+    // value is irrelevant because the C-clear frame carries no checksum word.
+    #[test]
+    fn validate_c_clear_skips_checksum() {
+        let (f, n) = frame(0x0000, &[0xFF, 0xFF]);
+        assert!(validate_gre_packet(&f[..n]).is_ok());
+    }
+
+    // Structural errors from parse_gre propagate through the validator:
+    // truncated optional field and nonzero version.
+    #[test]
+    fn validate_propagates_structural_errors() {
+        let mut trunc = [0u8; 6];
+        trunc[0..2].copy_from_slice(&GreFlags::KEY_BIT.to_be_bytes());
+        trunc[2..4].copy_from_slice(&IPV4_PROTO.to_be_bytes());
+        assert!(validate_gre_packet(&trunc).is_err());
+
+        let (f, n) = frame(0x0001, &[0u8; 0]);
+        assert!(validate_gre_packet(&f[..n]).is_err());
+    }
+
+    // RFC 2784 mandates Reserved1 transmit-zero but NOT receiver discard: a
+    // nonzero Reserved1 must be accepted when it is covered by a valid
+    // checksum (0x20cb over reserved1=0x1234 + [0x45,0x00]).
+    #[test]
+    fn validate_accepts_nonzero_reserved1() {
+        let (f, n) = c_frame(0x20cb, 0x1234, &[0x45, 0x00]);
+        assert_eq!(build_gre_cksum(&f[..n]), 0x20cb);
+        assert!(validate_gre_packet(&f[..n]).is_ok());
+    }
+
+    // decapsulate_depth requires payload even though the generic validator
+    // accepts header-only framing: a C-clear header-only packet validates
+    // structurally but is rejected by tunnel decapsulation.
+    #[test]
+    fn decapsulate_rejects_header_only_packet() {
+        let (f, n) = frame(0x0000, &[]);
+        assert!(validate_gre_packet(&f[..n]).is_ok());
+        let tunnel = GreTunnel::new(1, 0, 0, None);
+        assert!(tunnel.decapsulate_depth(&f[..n], MAX_ENCAP_LIMIT).is_err());
     }
 }
