@@ -405,8 +405,10 @@ impl Ipv4Header {
 /// # Errors
 ///
 /// - [`Error::InvalidArgument`] if `data` is shorter than the
-///   minimum IPv4 header (20 bytes), the version is not 4, or the
-///   IHL-declared length exceeds the available data.
+///   minimum IPv4 header (20 bytes), the version is not 4, the
+///   IHL-declared header length exceeds the available data, or the
+///   declared `total_len` is below the header length or beyond the
+///   available data.
 pub fn parse_ipv4(data: &[u8]) -> Result<(Ipv4Header, &[u8])> {
     if data.len() < IPV4_HEADER_MIN_LEN {
         return Err(Error::InvalidArgument);
@@ -437,19 +439,16 @@ pub fn parse_ipv4(data: &[u8]) -> Result<(Ipv4Header, &[u8])> {
         dst_addr: [data[16], data[17], data[18], data[19]],
     };
 
-    // Determine actual payload range.  A crafted frame can carry a
-    // `total_len` smaller than the header it declares (large IHL plus a
-    // tiny non-zero `total_len`); clamping must keep
-    // `hdr_len <= payload_end <= data.len()` so the slice below never has
-    // start > end (which would panic).
+    // SECURITY: `total_len` is attacker-controlled. Reject a datagram that
+    // declares a length below its own header or beyond the received frame
+    // rather than clamping, so bytes outside the declared datagram (e.g.
+    // trailing Ethernet padding) can never reach protocol dispatch.
     let total = header.total_len as usize;
-    let payload_end = if total >= hdr_len && total <= data.len() {
-        total
-    } else {
-        data.len()
-    };
+    if total < hdr_len || total > data.len() {
+        return Err(Error::InvalidArgument);
+    }
 
-    Ok((header, &data[hdr_len..payload_end]))
+    Ok((header, &data[hdr_len..total]))
 }
 
 /// Compute the RFC 1071 internet checksum over `header` bytes.
@@ -808,9 +807,14 @@ impl NetworkStack {
 
     /// Handle an incoming IPv4 packet.
     ///
-    /// Currently only ICMP echo requests are processed.  Returns
-    /// the total reply frame length (Ethernet + IP + ICMP), or 0
-    /// if the packet was consumed silently.
+    /// Dispatches by IP protocol after verifying the IPv4 header checksum and
+    /// that the datagram is addressed to us: ICMP echo requests are answered
+    /// (returning the reply frame length), UDP datagrams pass a checksum and
+    /// per-port framing admission gate, and GRE (protocol 47) is validated
+    /// structurally with C-bit checksum verification. Only ICMP produces a
+    /// reply; UDP and GRE are consumed and return `Ok(0)`, which also covers
+    /// every silently dropped malformed frame. Any other protocol returns
+    /// [`Error::NotImplemented`].
     fn handle_ipv4(
         &mut self,
         eth: &EtherHeader,
@@ -845,7 +849,10 @@ impl NetworkStack {
         match ip_hdr.protocol {
             PROTO_ICMP => self.handle_icmp_packet(eth, &ip_hdr, ip_payload, reply_buf),
             PROTO_UDP => self.handle_udp_packet(&ip_hdr, ip_payload),
-            PROTO_GRE => self.handle_gre_packet(&ip_hdr, ip_payload),
+            PROTO_GRE => {
+                let _ = self.handle_gre_packet(ip_payload);
+                Ok(0)
+            }
             _ => Err(Error::NotImplemented),
         }
     }
@@ -884,6 +891,29 @@ impl NetworkStack {
         Ok(offset)
     }
 
+    /// Handle an incoming GRE packet (IP protocol 47, RFC 2784).
+    ///
+    /// Admission gate only: run the shared [`crate::gre::validate_gre_packet`],
+    /// which structurally parses the GRE header (base + C/K/S optional fields,
+    /// version 0, RFC 2784 §2.3 discard mask) and, when the C bit is set,
+    /// verifies the whole-packet RFC 1071 checksum. A header-only GRE frame is
+    /// valid framing. No tunnel decapsulation or inner-packet dispatch is
+    /// performed here — that requires a tunnel table and is a separate concern.
+    ///
+    /// Returns `Ok(())` on a validated frame. The caller ([`handle_ipv4`])
+    /// maps both this success and any validation error to the `Ok(0)` boundary
+    /// contract so a malformed frame is dropped silently, never surfaced.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Error::InvalidArgument`] from
+    /// [`crate::gre::validate_gre_packet`] for a malformed header or a C-bit
+    /// checksum that does not verify.
+    fn handle_gre_packet(&self, gre_payload: &[u8]) -> Result<()> {
+        crate::gre::validate_gre_packet(gre_payload)?;
+        Ok(())
+    }
+
     /// Validate an incoming UDP datagram before delivery.
     ///
     /// Re-parses the datagram so the on-wire UDP `length` field — not
@@ -905,22 +935,6 @@ impl NetworkStack {
     /// [`crate::udp::parse_udp_datagram`] for a malformed length field,
     /// and from [`crate::udp::verify_udp_checksum`] for a datagram whose
     /// non-zero checksum does not verify.
-    /// Handle an incoming GRE packet (IP protocol 47, RFC 2784).
-    ///
-    /// Framing validation only: parse the GRE header (base + C/K/S optional
-    /// fields) and drop malformed frames silently via `Ok(0)`. GRE has no
-    /// length field — the payload extent is the enclosing IPv4 payload, whose
-    /// bounds `parse_ipv4` already enforced — so `parse_gre` only needs to
-    /// validate the header shape and optional-field offsets. No tunnel
-    /// decapsulation or inner-packet dispatch is performed here; that requires
-    /// a tunnel table and is a separate concern.
-    fn handle_gre_packet(&self, _ip_hdr: &Ipv4Header, gre_payload: &[u8]) -> Result<usize> {
-        if crate::gre::parse_gre(gre_payload).is_err() {
-            return Ok(0);
-        }
-        Ok(0)
-    }
-
     fn handle_udp_packet(&self, ip_hdr: &Ipv4Header, udp_payload: &[u8]) -> Result<usize> {
         // The UDP length field is authoritative; `datagram` is trimmed
         // to exactly that length so the checksum covers no trailing
@@ -1206,6 +1220,52 @@ mod tests {
         let mut pkt = [0u8; 20];
         pkt[0] = 0x65; // version 6
         assert!(parse_ipv4(&pkt).is_err());
+    }
+
+    #[test]
+    fn test_parse_ipv4_rejects_total_len_below_header() {
+        // IHL=5 (hdr_len=20) but total_len=19 (< hdr_len): fail closed.
+        #[rustfmt::skip]
+        let pkt: [u8; 20] = [
+            0x45, 0x00, 0x00, 0x13, // ver/ihl, tos, len=19
+            0x00, 0x01, 0x00, 0x00, // id, flags/frag
+            0x40, 0x01, 0x00, 0x00, // ttl=64, proto=ICMP
+            0x0A, 0x00, 0x00, 0x01, // src 10.0.0.1
+            0x0A, 0x00, 0x00, 0x02, // dst 10.0.0.2
+        ];
+        assert_eq!(parse_ipv4(&pkt), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn test_parse_ipv4_rejects_total_len_beyond_data() {
+        // total_len=40 declared but only 24 bytes of frame available.
+        #[rustfmt::skip]
+        let pkt: [u8; 24] = [
+            0x45, 0x00, 0x00, 0x28, // ver/ihl, tos, len=40
+            0x00, 0x01, 0x00, 0x00, // id, flags/frag
+            0x40, 0x01, 0x00, 0x00, // ttl=64, proto=ICMP
+            0x0A, 0x00, 0x00, 0x01, // src 10.0.0.1
+            0x0A, 0x00, 0x00, 0x02, // dst 10.0.0.2
+            0xDE, 0xAD, 0xBE, 0xEF, // payload
+        ];
+        assert_eq!(parse_ipv4(&pkt), Err(Error::InvalidArgument));
+    }
+
+    #[test]
+    fn test_parse_ipv4_slices_payload_to_total_len() {
+        // total_len=22 (20 hdr + 2 payload); frame has 2 trailing bytes of
+        // Ethernet padding that must be excluded from the payload slice.
+        #[rustfmt::skip]
+        let pkt: [u8; 24] = [
+            0x45, 0x00, 0x00, 0x16, // ver/ihl, tos, len=22
+            0x00, 0x01, 0x00, 0x00, // id, flags/frag
+            0x40, 0x01, 0x00, 0x00, // ttl=64, proto=ICMP
+            0x0A, 0x00, 0x00, 0x01, // src 10.0.0.1
+            0x0A, 0x00, 0x00, 0x02, // dst 10.0.0.2
+            0xDE, 0xAD, 0x00, 0x00, // 2 payload bytes + 2 padding bytes
+        ];
+        let (_hdr, payload) = parse_ipv4(&pkt).unwrap();
+        assert_eq!(payload, &[0xDE, 0xAD]);
     }
 
     #[test]
@@ -1551,83 +1611,90 @@ mod tests {
         p_off + payload.len()
     }
 
-    /// Build a GRE header (flags word + protocol type) + inner payload.
-    fn gre_bytes(flags_version: u16, proto: u16, inner: &[u8], out: &mut [u8]) -> usize {
-        out[0..2].copy_from_slice(&flags_version.to_be_bytes());
-        out[2..4].copy_from_slice(&proto.to_be_bytes());
-        out[4..4 + inner.len()].copy_from_slice(inner);
-        4 + inner.len()
+    /// A network stack instance for direct handler-method tests.
+    fn gre_stack() -> NetworkStack {
+        NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0])
     }
 
-    // A structurally valid GRE packet (base header, no optional fields) must
-    // be admitted (consumed, Ok(0)) — the gate must not reject real GRE.
+    // Direct handler call: a C-only GRE frame with a valid whole-packet
+    // checksum (0x32ff over flags=0x8000, proto=IPv4, reserved1=0, payload
+    // [0x45,0x00]) validates, so the handler returns Ok(()).
     #[test]
-    fn gre_valid_base_header_accepted() {
-        let mut stack =
-            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
-        let mut gre = [0u8; 64];
-        let glen = gre_bytes(0x0000, 0x0800, &[0x45, 0x00, 0x00, 0x14], &mut gre);
-        let mut frame = [0u8; 128];
-        let n = build_ip_proto_frame(
-            [10, 0, 0, 1],
-            [10, 0, 0, 2],
-            PROTO_GRE,
-            &gre[..glen],
-            &mut frame,
-        );
-        let mut reply = [0u8; 128];
-        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
-        assert_eq!(r, 0, "valid GRE must be consumed, not error");
+    fn gre_handler_accepts_valid_checksum() {
+        let gre = [0x80u8, 0x00, 0x08, 0x00, 0x32, 0xff, 0x00, 0x00, 0x45, 0x00];
+        assert_eq!(gre_stack().handle_gre_packet(&gre), Ok(()));
     }
 
-    // A GRE packet with a reserved/deprecated flag bit set must be dropped
-    // silently by the admission gate, not surfaced as an error.
+    // Direct handler call: a corrupt checksum (0x32fe) fails validation, so the
+    // handler propagates Err(InvalidArgument) — proving rejection at the source
+    // rather than relying on the Ok(0) boundary mapping.
     #[test]
-    fn gre_reserved_flag_dropped_not_error() {
-        let mut stack =
-            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
-        let mut gre = [0u8; 64];
-        // Bit 11 = a Reserved0 bit, rejected by the supported-bits mask.
-        let glen = gre_bytes(1 << 11, 0x0800, &[0x45, 0x00, 0x00, 0x14], &mut gre);
-        let mut frame = [0u8; 128];
-        let n = build_ip_proto_frame(
-            [10, 0, 0, 1],
-            [10, 0, 0, 2],
-            PROTO_GRE,
-            &gre[..glen],
-            &mut frame,
+    fn gre_handler_rejects_corrupt_checksum() {
+        let gre = [0x80u8, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00];
+        assert_eq!(
+            gre_stack().handle_gre_packet(&gre),
+            Err(Error::InvalidArgument)
         );
-        let mut reply = [0u8; 128];
-        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
-        assert_eq!(r, 0, "reserved-flag GRE must be dropped (Ok(0)), not error");
     }
 
-    // A GRE packet with K+S optional fields must parse the correct offset and
-    // be admitted — optional-field flags are valid framing.
+    // Direct handler call: RFC 2784 §2.3 ignored Reserved0 bit 6 (0x0200) is
+    // admitted by the validator, so the handler returns Ok(()).
     #[test]
-    fn gre_key_sequence_optional_fields_accepted() {
-        let mut stack =
-            NetworkStack::new([0xAA; 6], [10, 0, 0, 2], [10, 0, 0, 1], [255, 255, 255, 0]);
-        // flags_version with K (bit 13) + S (bit 12) set; 4+4 optional bytes.
-        let mut gre = [0u8; 64];
-        let flags: u16 = (1 << 13) | (1 << 12);
-        gre[0..2].copy_from_slice(&flags.to_be_bytes());
-        gre[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
-        // key(4) + sequence(4) + a little inner payload.
-        gre[4..8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
-        gre[8..12].copy_from_slice(&1u32.to_be_bytes());
-        gre[12] = 0x45;
-        let mut frame = [0u8; 128];
-        let n = build_ip_proto_frame(
-            [10, 0, 0, 1],
-            [10, 0, 0, 2],
-            PROTO_GRE,
-            &gre[..13],
-            &mut frame,
+    fn gre_handler_accepts_ignored_reserved0_bit() {
+        let gre = [0x02u8, 0x00, 0x08, 0x00, 0x45, 0x00];
+        assert_eq!(gre_stack().handle_gre_packet(&gre), Ok(()));
+    }
+
+    // Direct handler call: RFC 2784 §2.3 discard bit 4 / strict-source-route
+    // (0x0800) is rejected by the validator, so the handler returns
+    // Err(InvalidArgument).
+    #[test]
+    fn gre_handler_rejects_discard_bit() {
+        let gre = [0x08u8, 0x00, 0x08, 0x00, 0x45, 0x00];
+        assert_eq!(
+            gre_stack().handle_gre_packet(&gre),
+            Err(Error::InvalidArgument)
         );
+    }
+
+    // End-to-end dispatch: an unsupported IP protocol (99) returns
+    // NotImplemented, while a byte-identical payload carried as PROTO_GRE (47)
+    // is routed to the GRE gate and consumed (Ok(0)). The differing outcomes
+    // prove protocol 47 reaches handle_gre_packet, not the fallthrough arm.
+    #[test]
+    fn gre_protocol_dispatched_distinctly_from_unsupported() {
+        let gre = [0x80u8, 0x00, 0x08, 0x00, 0x32, 0xff, 0x00, 0x00, 0x45, 0x00];
+        let mut frame = [0u8; 128];
         let mut reply = [0u8; 128];
-        let r = stack.process_packet(&frame[..n], &mut reply).ok().unwrap();
-        assert_eq!(r, 0, "K+S GRE must be consumed, not error");
+
+        let mut stack = gre_stack();
+        let n = build_ip_proto_frame([10, 0, 0, 1], [10, 0, 0, 2], 99, &gre, &mut frame);
+        assert_eq!(
+            stack.process_packet(&frame[..n], &mut reply),
+            Err(Error::NotImplemented),
+            "protocol 99 must hit the unsupported arm"
+        );
+
+        let mut stack = gre_stack();
+        let n = build_ip_proto_frame([10, 0, 0, 1], [10, 0, 0, 2], PROTO_GRE, &gre, &mut frame);
+        assert_eq!(
+            stack.process_packet(&frame[..n], &mut reply),
+            Ok(0),
+            "PROTO_GRE must be dispatched to the gate and consumed"
+        );
+    }
+
+    // End-to-end boundary contract: a malformed GRE frame (corrupt checksum)
+    // whose handler returns Err is mapped by handle_ipv4 to Ok(0), so the
+    // public boundary drops it silently and never surfaces the error.
+    #[test]
+    fn gre_malformed_frame_dropped_at_boundary() {
+        let gre = [0x80u8, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00];
+        let mut stack = gre_stack();
+        let mut frame = [0u8; 128];
+        let n = build_ip_proto_frame([10, 0, 0, 1], [10, 0, 0, 2], PROTO_GRE, &gre, &mut frame);
+        let mut reply = [0u8; 128];
+        assert_eq!(stack.process_packet(&frame[..n], &mut reply), Ok(0));
     }
 
     // A structurally valid DNS query on port 53 must be admitted (consumed,
