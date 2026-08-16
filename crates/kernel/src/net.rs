@@ -19,9 +19,8 @@
 //! | L2.5      | ARP (IPv4/Ether)  | Request + reply   |
 //! | L3        | IPv4              | Parse + checksum  |
 //! | L3        | ICMP              | Echo reply (ping) |
+//! | L4        | TCP               | Stateless admit  |
 //! | L4        | UDP               | Rx checksum check |
-//!
-//! TCP is planned for future implementation.
 
 use crate::ipv6::{Ipv6Addr, Ipv6Stack, MAX_PKT_BUF};
 use oncrix_lib::{Error, Result};
@@ -645,6 +644,10 @@ pub struct NetworkStack {
     gre_admitted: u64,
     /// Count of GRE frames rejected by [`crate::gre::validate_gre_packet`].
     gre_dropped: u64,
+    /// Count of TCP segments admitted by the protocol-6 gate.
+    tcp_admitted: u64,
+    /// Count of TCP segments rejected by the protocol-6 gate.
+    tcp_dropped: u64,
     /// Count of SCTP packets admitted by the protocol-132 gate.
     sctp_admitted: u64,
     /// Count of SCTP packets rejected by the protocol-132 gate.
@@ -668,6 +671,8 @@ impl NetworkStack {
             ipv6: Ipv6Stack::new(Ipv6Addr::link_local_from_mac(&mac), mac),
             gre_admitted: 0,
             gre_dropped: 0,
+            tcp_admitted: 0,
+            tcp_dropped: 0,
             sctp_admitted: 0,
             sctp_dropped: 0,
         }
@@ -683,6 +688,16 @@ impl NetworkStack {
         self.gre_dropped
     }
 
+    /// Number of TCP segments admitted by the protocol-6 gate.
+    pub const fn tcp_admitted(&self) -> u64 {
+        self.tcp_admitted
+    }
+
+    /// Number of TCP segments dropped by the protocol-6 gate.
+    pub const fn tcp_dropped(&self) -> u64 {
+        self.tcp_dropped
+    }
+
     /// Number of SCTP packets admitted by the protocol-132 gate.
     pub const fn sctp_admitted(&self) -> u64 {
         self.sctp_admitted
@@ -696,16 +711,19 @@ impl NetworkStack {
     /// Process an incoming Ethernet frame.
     ///
     /// Parses the Ethernet header and dispatches to the appropriate
-    /// protocol handler (ARP or IPv4/ICMP).  If a reply is
+    /// protocol handler (ARP, IPv4, or IPv6). If a reply is
     /// generated it is written into `reply_buf` as a complete
     /// Ethernet frame and the total frame length is returned.
     ///
     /// Returns `Ok(0)` when the packet is consumed but no reply is
-    /// needed (e.g., an ARP reply that merely updates the cache).
+    /// needed. This includes stateless TCP, GRE, and SCTP admission
+    /// failures that are intentionally dropped silently.
     ///
     /// # Errors
     ///
-    /// Propagates errors from the individual protocol parsers.
+    /// Returns an error when link or network-layer parsing fails, UDP
+    /// framing or checksum validation fails, a dispatched protocol is
+    /// unsupported, or a replying handler cannot encode its response.
     pub fn process_packet(&mut self, data: &[u8], reply_buf: &mut [u8]) -> Result<usize> {
         let (eth, payload) = parse_ether(data)?;
 
@@ -844,12 +862,14 @@ impl NetworkStack {
     ///
     /// Dispatches by IP protocol after verifying the IPv4 header checksum and
     /// that the datagram is addressed to us: ICMP echo requests are answered
-    /// (returning the reply frame length), UDP datagrams pass a checksum and
-    /// per-port framing admission gate, GRE (protocol 47) is validated with
-    /// C-bit checksum verification, and SCTP (protocol 132) passes a stateless
-    /// CRC32c and chunk-chain gate. Only ICMP produces a reply; UDP, GRE, and
-    /// SCTP are consumed and return `Ok(0)`, including silently dropped
-    /// malformed frames. Any other protocol returns [`Error::NotImplemented`].
+    /// (returning the reply frame length), TCP segments pass a stateless
+    /// fragment, framing, and checksum admission gate, UDP datagrams pass a
+    /// checksum and per-port framing admission gate, GRE (protocol 47) is
+    /// validated with C-bit checksum verification, and SCTP (protocol 132)
+    /// passes a stateless CRC32c and chunk-chain gate. Only ICMP produces a
+    /// reply; TCP, UDP, GRE, and SCTP are consumed and return `Ok(0)`, including
+    /// silently dropped malformed frames. Any other protocol returns
+    /// [`Error::NotImplemented`].
     fn handle_ipv4(
         &mut self,
         eth: &EtherHeader,
@@ -883,6 +903,13 @@ impl NetworkStack {
 
         match ip_hdr.protocol {
             PROTO_ICMP => self.handle_icmp_packet(eth, &ip_hdr, ip_payload, reply_buf),
+            PROTO_TCP => {
+                match self.handle_tcp_packet(&ip_hdr, ip_payload) {
+                    Ok(()) => self.tcp_admitted = self.tcp_admitted.saturating_add(1),
+                    Err(_) => self.tcp_dropped = self.tcp_dropped.saturating_add(1),
+                }
+                Ok(0)
+            }
             PROTO_UDP => self.handle_udp_packet(&ip_hdr, ip_payload),
             PROTO_GRE => {
                 match self.handle_gre_packet(ip_payload) {
@@ -956,6 +983,24 @@ impl NetworkStack {
     /// checksum that does not verify.
     fn handle_gre_packet(&self, gre_payload: &[u8]) -> Result<()> {
         crate::gre::validate_gre_packet(gre_payload)?;
+        Ok(())
+    }
+
+    /// Validate a TCP segment before protocol-6 admission.
+    ///
+    /// This stack has no IPv4 reassembly, so MF or a nonzero fragment offset
+    /// is rejected locally. DF and the reserved IPv4 flag remain admissible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] for fragments, malformed TCP framing,
+    /// or an invalid IPv4 TCP checksum.
+    fn handle_tcp_packet(&self, ip_hdr: &Ipv4Header, segment: &[u8]) -> Result<()> {
+        if ip_hdr.flags_frag & 0x3FFF != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        crate::tcp::parse_tcp(segment)?;
+        crate::tcp::verify_tcp_checksum(ip_hdr.src_addr, ip_hdr.dst_addr, segment)?;
         Ok(())
     }
 
@@ -1091,6 +1136,18 @@ impl NetworkStack {
 #[cfg(test)]
 #[path = "net_sctp_tests.rs"]
 mod sctp_tests;
+
+#[cfg(test)]
+#[path = "net_tcp_test_support.rs"]
+mod net_tcp_test_support;
+
+#[cfg(test)]
+#[path = "net_tcp_tests.rs"]
+mod tcp_tests;
+
+#[cfg(test)]
+#[path = "net_tcp_counter_tests.rs"]
+mod tcp_counter_tests;
 
 // =========================================================================
 // Tests
