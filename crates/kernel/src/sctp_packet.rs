@@ -1,48 +1,49 @@
 // Copyright 2026 ONCRIX Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! SCTP packet CRC32c (Castagnoli) checksum.
+//! SCTP packet CRC32c checksum and stateless structural validator.
 //!
-//! Standalone, tableless, `no_std` implementation of the CRC32c checksum
-//! that SCTP uses to protect every packet (RFC 4960 §6.8, RFC 3309). This
-//! module intentionally lives beside [`crate::sctp`] rather than inside it,
-//! so the frozen protocol module does not grow.
+//! This tableless `no_std` module validates the RFC 9260 packet checksum and
+//! chunk chain without association state, allocation, or response generation.
 //!
-//! # Algorithm
-//!
-//! Reflected Castagnoli CRC32c: reversed polynomial `0x82F6_3B78`, initial
-//! register `!0`, an LSB-first (right-shifting) bit loop, and a final `!crc`
-//! complement. No lookup table, no allocation, no `unsafe`.
-//!
-//! # SCTP wire-format exception
-//!
-//! The SCTP common header carries the checksum in bytes 8..12. On the wire
-//! that field is serialized **little-endian**: Linux types it as `__le32`
-//! (`struct sctphdr.checksum`) and [`sctp_compute_cksum`] returns
-//! `cpu_to_le32(...)`. This is a property of the header field's declared
-//! type, *not* of CRC reflection — the reflected bit loop computes a plain
-//! `u32`; how that `u32` is placed on the wire is a separate serialization
-//! decision. Every other SCTP integer field (ports, verification tag,
-//! chunk lengths) remains in network (big-endian) byte order.
-//!
-//! When computing a packet checksum the four checksum bytes (indices 8..12)
-//! are treated as zero, as required by RFC 3309, without copying or mutating
-//! the caller's buffer.
+//! SCTP serializes its CRC32c field as little-endian (`__le32` in Linux),
+//! while ports, verification tags, chunk lengths, and other integer fields
+//! remain in network byte order. CRC reflection and field serialization are
+//! separate concerns.
 
-/// Reflected Castagnoli polynomial (CRC32c).
+use crate::sctp::{SctpChunkType, parse_sctp_header};
+use oncrix_lib::{Error, Result};
+
+#[path = "sctp_packet_shape.rs"]
+mod shape;
+
+#[path = "sctp_packet_params.rs"]
+mod params;
+
 const CRC32C_POLY: u32 = 0x82F6_3B78;
-
-/// Byte range of the checksum field within the SCTP common header.
+const SCTP_HEADER_LEN: usize = 12;
+const CHUNK_HEADER_LEN: usize = 4;
+const CHUNK_DATA: u8 = 0;
+const CHUNK_INIT: u8 = 1;
+const CHUNK_INIT_ACK: u8 = 2;
+const CHUNK_ABORT: u8 = 6;
+const CHUNK_SHUTDOWN: u8 = 7;
+const CHUNK_SHUTDOWN_ACK: u8 = 8;
+const CHUNK_COOKIE_ECHO: u8 = 10;
+const CHUNK_SHUTDOWN_COMPLETE: u8 = 14;
 const SCTP_CHECKSUM_RANGE: core::ops::Range<usize> = 8..12;
 
-/// Fold a single input byte into the running reflected CRC32c register.
-///
-/// This is the shared algorithmic seam: both [`crc32c`] and
-/// [`sctp_packet_crc32c`] drive their bytes through it, so there is one
-/// implementation of the bit loop and no test-only dead code.
+/// Round `len` up to a four-byte boundary, rejecting arithmetic overflow.
+const fn pad4(len: usize) -> Option<usize> {
+    match len.checked_add(3) {
+        Some(rounded) => Some(rounded & !3),
+        None => None,
+    }
+}
+
 #[inline]
 fn crc32c_step(crc: u32, byte: u8) -> u32 {
-    let mut crc = crc ^ byte as u32;
+    let mut crc = crc ^ u32::from(byte);
     let mut bit = 0;
     while bit < 8 {
         crc = if crc & 1 != 0 {
@@ -55,128 +56,145 @@ fn crc32c_step(crc: u32, byte: u8) -> u32 {
     crc
 }
 
-/// Compute the CRC32c (Castagnoli) checksum of `data`.
+/// Compute a tableless reflected CRC32c (Castagnoli) checksum.
 ///
-/// Uses the reflected polynomial `0x82F6_3B78`, initial register `!0`, an
-/// LSB-first bit loop, and a final `!crc` complement — matching RFC 3309
-/// and the Linux `crc32c` implementation. The returned value is a plain
-/// host-order `u32`; callers that place it on the wire are responsible for
-/// the byte order their protocol requires.
-pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc: u32 = !0;
+/// Uses polynomial `0x82F6_3B78`, initial register `!0`, and final complement.
+/// The returned value is host order; protocol serialization is separate.
+#[cfg(test)]
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0;
     for &byte in data {
         crc = crc32c_step(crc, byte);
     }
     !crc
 }
 
-/// Compute the SCTP packet CRC32c over `packet`, treating the checksum
-/// field (bytes 8..12) as zero.
-///
-/// RFC 3309 requires the checksum field to be logically zero while the
-/// checksum is computed. This feeds `0` for indices 8..12 without copying
-/// or mutating `packet`, so a caller may pass a buffer that still holds a
-/// stale or garbage checksum and receive the correct result.
-///
-/// The returned `u32` is host-order. To serialize it into the SCTP header
-/// (a `__le32` field) use [`u32::to_le_bytes`].
-pub fn sctp_packet_crc32c(packet: &[u8]) -> u32 {
-    let mut crc: u32 = !0;
+fn sctp_packet_crc32c(packet: &[u8]) -> u32 {
+    let mut crc = !0;
     for (index, &byte) in packet.iter().enumerate() {
-        let fed = if SCTP_CHECKSUM_RANGE.contains(&index) {
+        let input = if SCTP_CHECKSUM_RANGE.contains(&index) {
             0
         } else {
             byte
         };
-        crc = crc32c_step(crc, fed);
+        crc = crc32c_step(crc, input);
     }
     !crc
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Validate an SCTP packet without association state or response generation.
+///
+/// The gate verifies the little-endian CRC32c field, nonzero ports, complete
+/// chunk framing and padding, unknown-chunk action bits, INIT invariants, and
+/// the RFC 9260 no-bundling rule for INIT-family chunks.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] for any malformed or inadmissible packet.
+pub(crate) fn validate_sctp_packet(packet: &[u8]) -> Result<()> {
+    let (header, _chunks) = parse_sctp_header(packet)?;
 
-    /// A 32-byte SCTP INIT packet. Common header (12 bytes) followed by a
-    /// 20-byte INIT chunk. Checksum field (bytes 8..12) holds the real
-    /// little-endian checksum `[0x12, 0xF6, 0xF6, 0xE9]`.
-    const SCTP_INIT_PACKET: [u8; 32] = [
-        // Common header: src port 0x1388, dst port 0x0050
-        0x13, 0x88, 0x00, 0x50, //
-        // Verification tag 0x00000000 (INIT)
-        0x00, 0x00, 0x00, 0x00, //
-        // Checksum (__le32): 0xE9F6F612 little-endian on the wire
-        0x12, 0xF6, 0xF6, 0xE9, //
-        // INIT chunk: type 1, flags 0, length 20
-        0x01, 0x00, 0x00, 0x14, //
-        // Initiate tag 0xDEADBEEF
-        0xDE, 0xAD, 0xBE, 0xEF, //
-        // a_rwnd 0x00010000
-        0x00, 0x01, 0x00, 0x00, //
-        // outbound streams 2, inbound streams 2
-        0x00, 0x02, 0x00, 0x02, //
-        // initial TSN 0x715B5A94 (pseudo-random per RFC 4960 §5.3.1)
-        0x71, 0x5B, 0x5A, 0x94,
-    ];
-
-    #[test]
-    fn crc32c_empty_input_is_zero() {
-        // Given an empty slice / When CRC32c is computed / Then the KAT holds.
-        assert_eq!(crc32c(&[]), 0x0000_0000);
+    let wire_checksum = u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]);
+    if wire_checksum != sctp_packet_crc32c(packet) {
+        return Err(Error::InvalidArgument);
+    }
+    if header.src_port == 0 || header.dst_port == 0 {
+        return Err(Error::InvalidArgument);
     }
 
-    #[test]
-    fn crc32c_check_string_matches_kat() {
-        // Given the canonical "123456789" check vector.
-        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
-    }
-
-    #[test]
-    fn crc32c_thirty_two_zero_bytes() {
-        // Given 32 zero bytes.
-        assert_eq!(crc32c(&[0x00u8; 32]), 0x8A91_36AA);
-    }
-
-    #[test]
-    fn crc32c_thirty_two_ff_bytes() {
-        // Given 32 0xFF bytes.
-        assert_eq!(crc32c(&[0xFFu8; 32]), 0x62A8_AB43);
-    }
-
-    #[test]
-    fn crc32c_ascending_and_descending_bytes() {
-        // Given 0x00..=0x1F ascending.
-        let mut ascending = [0u8; 32];
-        for (i, b) in ascending.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        assert_eq!(crc32c(&ascending), 0x46DD_794E);
-
-        // And 0x1F..=0x00 descending.
-        let mut descending = [0u8; 32];
-        for (i, b) in descending.iter_mut().enumerate() {
-            *b = (31 - i) as u8;
-        }
-        assert_eq!(crc32c(&descending), 0x113F_DB5C);
-    }
-
-    #[test]
-    fn sctp_packet_crc32c_zeros_checksum_field() {
-        // Given the INIT packet with its real little-endian checksum field,
-        // When the packet CRC is computed (bytes 8..12 fed as zero),
-        // Then it equals the pinned value.
-        assert_eq!(sctp_packet_crc32c(&SCTP_INIT_PACKET), 0xE9F6_F612);
-
-        // And the on-wire checksum field is little-endian 0xE9F6F612.
-        assert_eq!(&SCTP_INIT_PACKET[8..12], &[0x12, 0xF6, 0xF6, 0xE9]);
-        assert_eq!(0xE9F6_F612u32.to_le_bytes(), [0x12, 0xF6, 0xF6, 0xE9]);
-
-        // And garbage in bytes 8..12 does not change the result.
-        let mut garbled = SCTP_INIT_PACKET;
-        garbled[8] = 0xAA;
-        garbled[9] = 0xBB;
-        garbled[10] = 0xCC;
-        garbled[11] = 0xDD;
-        assert_eq!(sctp_packet_crc32c(&garbled), 0xE9F6_F612);
-    }
+    validate_chunk_chain(packet, header.verification_tag)
 }
+
+fn validate_chunk_chain(packet: &[u8], verification_tag: u32) -> Result<()> {
+    let mut offset = SCTP_HEADER_LEN;
+    let mut chunk_count = 0usize;
+    let mut has_singleton = false;
+    let mut has_data = false;
+    let mut has_abort = false;
+    let mut has_shutdown_family = false;
+
+    while offset < packet.len() {
+        if packet.len() - offset < CHUNK_HEADER_LEN {
+            return Err(Error::InvalidArgument);
+        }
+
+        let raw_type = packet[offset];
+        let declared_len =
+            usize::from(u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]));
+        if declared_len < CHUNK_HEADER_LEN {
+            return Err(Error::InvalidArgument);
+        }
+
+        let declared_end = offset
+            .checked_add(declared_len)
+            .ok_or(Error::InvalidArgument)?;
+        if declared_end > packet.len() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let padded_len = pad4(declared_len).ok_or(Error::InvalidArgument)?;
+        let padded_end = offset
+            .checked_add(padded_len)
+            .ok_or(Error::InvalidArgument)?;
+        if padded_end > packet.len() {
+            return Err(Error::InvalidArgument);
+        }
+
+        match SctpChunkType::from_raw(raw_type) {
+            Ok(chunk_type) => {
+                if raw_type == CHUNK_COOKIE_ECHO && chunk_count != 0 {
+                    return Err(Error::InvalidArgument);
+                }
+                shape::validate(chunk_type, &packet[offset..declared_end], verification_tag)?;
+                has_singleton |= is_singleton_chunk(raw_type);
+                has_data |= raw_type == CHUNK_DATA;
+                has_abort |= raw_type == CHUNK_ABORT;
+                has_shutdown_family |= matches!(raw_type, CHUNK_SHUTDOWN | CHUNK_SHUTDOWN_ACK);
+            }
+            Err(_) if raw_type & 0x80 == 0 => return Err(Error::InvalidArgument),
+            Err(_) => {}
+        }
+
+        chunk_count = chunk_count.saturating_add(1);
+        offset = padded_end;
+    }
+
+    if chunk_count == 0
+        || (has_singleton && chunk_count != 1)
+        || (has_data && (has_abort || has_shutdown_family))
+    {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+const fn is_singleton_chunk(raw_type: u8) -> bool {
+    matches!(
+        raw_type,
+        CHUNK_INIT | CHUNK_INIT_ACK | CHUNK_SHUTDOWN_COMPLETE
+    )
+}
+
+#[cfg(test)]
+#[path = "sctp_packet_test_support.rs"]
+mod test_support;
+
+#[cfg(test)]
+#[path = "sctp_packet_crc_tests.rs"]
+mod crc_tests;
+
+#[cfg(test)]
+#[path = "sctp_packet_framing_tests.rs"]
+mod framing_tests;
+
+#[cfg(test)]
+#[path = "sctp_packet_init_tests.rs"]
+mod init_tests;
+
+#[cfg(test)]
+#[path = "sctp_packet_shape_tests.rs"]
+mod shape_tests;
+
+#[cfg(test)]
+#[path = "sctp_packet_parameter_tests.rs"]
+mod parameter_tests;
