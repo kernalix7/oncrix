@@ -350,6 +350,9 @@ pub const PROTO_UDP: u8 = 17;
 /// IP protocol number for GRE (RFC 2784).
 pub const PROTO_GRE: u8 = 47;
 
+/// IP protocol number for SCTP (RFC 9260).
+pub const PROTO_SCTP: u8 = 132;
+
 /// Parsed IPv4 header.
 ///
 /// Stored in host byte order; the raw on-wire format uses
@@ -642,6 +645,10 @@ pub struct NetworkStack {
     gre_admitted: u64,
     /// Count of GRE frames rejected by [`crate::gre::validate_gre_packet`].
     gre_dropped: u64,
+    /// Count of SCTP packets admitted by the protocol-132 gate.
+    sctp_admitted: u64,
+    /// Count of SCTP packets rejected by the protocol-132 gate.
+    sctp_dropped: u64,
 }
 
 impl NetworkStack {
@@ -661,6 +668,8 @@ impl NetworkStack {
             ipv6: Ipv6Stack::new(Ipv6Addr::link_local_from_mac(&mac), mac),
             gre_admitted: 0,
             gre_dropped: 0,
+            sctp_admitted: 0,
+            sctp_dropped: 0,
         }
     }
 
@@ -672,6 +681,16 @@ impl NetworkStack {
     /// Number of GRE frames dropped by the protocol-47 admission gate.
     pub const fn gre_dropped(&self) -> u64 {
         self.gre_dropped
+    }
+
+    /// Number of SCTP packets admitted by the protocol-132 gate.
+    pub const fn sctp_admitted(&self) -> u64 {
+        self.sctp_admitted
+    }
+
+    /// Number of SCTP packets dropped by the protocol-132 gate.
+    pub const fn sctp_dropped(&self) -> u64 {
+        self.sctp_dropped
     }
 
     /// Process an incoming Ethernet frame.
@@ -826,11 +845,11 @@ impl NetworkStack {
     /// Dispatches by IP protocol after verifying the IPv4 header checksum and
     /// that the datagram is addressed to us: ICMP echo requests are answered
     /// (returning the reply frame length), UDP datagrams pass a checksum and
-    /// per-port framing admission gate, and GRE (protocol 47) is validated
-    /// structurally with C-bit checksum verification. Only ICMP produces a
-    /// reply; UDP and GRE are consumed and return `Ok(0)`, which also covers
-    /// every silently dropped malformed frame. Any other protocol returns
-    /// [`Error::NotImplemented`].
+    /// per-port framing admission gate, GRE (protocol 47) is validated with
+    /// C-bit checksum verification, and SCTP (protocol 132) passes a stateless
+    /// CRC32c and chunk-chain gate. Only ICMP produces a reply; UDP, GRE, and
+    /// SCTP are consumed and return `Ok(0)`, including silently dropped
+    /// malformed frames. Any other protocol returns [`Error::NotImplemented`].
     fn handle_ipv4(
         &mut self,
         eth: &EtherHeader,
@@ -869,6 +888,13 @@ impl NetworkStack {
                 match self.handle_gre_packet(ip_payload) {
                     Ok(()) => self.gre_admitted = self.gre_admitted.saturating_add(1),
                     Err(_) => self.gre_dropped = self.gre_dropped.saturating_add(1),
+                }
+                Ok(0)
+            }
+            PROTO_SCTP => {
+                match self.handle_sctp_packet(&ip_hdr, ip_payload) {
+                    Ok(()) => self.sctp_admitted = self.sctp_admitted.saturating_add(1),
+                    Err(_) => self.sctp_dropped = self.sctp_dropped.saturating_add(1),
                 }
                 Ok(0)
             }
@@ -931,6 +957,21 @@ impl NetworkStack {
     fn handle_gre_packet(&self, gre_payload: &[u8]) -> Result<()> {
         crate::gre::validate_gre_packet(gre_payload)?;
         Ok(())
+    }
+
+    /// Validate an SCTP packet before protocol-132 admission.
+    ///
+    /// This stack has no IPv4 reassembly, so MF or a nonzero fragment offset
+    /// is rejected locally. DF is outside the mask and remains admissible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] for fragments or malformed SCTP.
+    fn handle_sctp_packet(&self, ip_hdr: &Ipv4Header, sctp_payload: &[u8]) -> Result<()> {
+        if ip_hdr.flags_frag & 0x3FFF != 0 {
+            return Err(Error::InvalidArgument);
+        }
+        crate::sctp_packet::validate_sctp_packet(sctp_payload)
     }
 
     /// Validate an incoming UDP datagram before delivery.
@@ -1046,6 +1087,10 @@ impl NetworkStack {
         Ok(offset)
     }
 }
+
+#[cfg(test)]
+#[path = "net_sctp_tests.rs"]
+mod sctp_tests;
 
 // =========================================================================
 // Tests
