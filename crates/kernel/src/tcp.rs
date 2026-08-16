@@ -373,6 +373,12 @@ pub const TCP_ACK: u16 = 0x10;
 /// TCP URG flag — urgent pointer field is significant.
 pub const TCP_URG: u16 = 0x20;
 
+/// TCP ECE flag — ECN echo indication.
+pub const TCP_ECE: u16 = 0x40;
+
+/// TCP CWR flag — congestion window reduced indication.
+pub const TCP_CWR: u16 = 0x80;
+
 /// Minimum TCP header size in bytes (no options).
 const TCP_HEADER_MIN_LEN: usize = 20;
 
@@ -393,7 +399,7 @@ const TCP_TABLE_SIZE: usize = 32;
 ///
 /// Fields are stored in host byte order after parsing.  The
 /// `data_offset_flags` field packs the data offset (upper 4 bits),
-/// reserved bits, and 6 control flags into a single `u16`.
+/// reserved bits, and 8 control flags into a single `u16`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct TcpHeader {
@@ -405,8 +411,8 @@ pub struct TcpHeader {
     pub seq_num: u32,
     /// Acknowledgement number.
     pub ack_num: u32,
-    /// Data offset (upper 4 bits), reserved (6 bits), flags
-    /// (lower 6 bits).
+    /// Data offset (upper 4 bits), reserved (4 bits), and eight
+    /// control flags (lower 8 bits).
     pub data_offset_flags: u16,
     /// Receive window size.
     pub window_size: u16,
@@ -452,9 +458,9 @@ impl TcpHeader {
         (self.data_offset_flags & TCP_PSH) != 0
     }
 
-    /// Return the raw 6-bit flags portion.
+    /// Return the raw 8-bit control flags portion.
     pub fn flags(&self) -> u16 {
-        self.data_offset_flags & 0x3F
+        self.data_offset_flags & 0x00FF
     }
 }
 
@@ -475,6 +481,9 @@ impl TcpHeader {
 /// - The data offset indicates a header longer than the available
 ///   data.
 /// - The data offset is less than 5 (the minimum valid value).
+/// - A TCP option is truncated, has an invalid length, or extends past
+///   the declared header.
+/// - Bytes after the end-of-option-list marker contain nonzero padding.
 pub fn parse_tcp(data: &[u8]) -> Result<(TcpHeader, &[u8])> {
     if data.len() < TCP_HEADER_MIN_LEN {
         return Err(Error::InvalidArgument);
@@ -507,6 +516,34 @@ pub fn parse_tcp(data: &[u8]) -> Result<(TcpHeader, &[u8])> {
     let hdr_len = (offset as usize) * 4;
     if data.len() < hdr_len {
         return Err(Error::InvalidArgument);
+    }
+
+    let options = &data[TCP_HEADER_MIN_LEN..hdr_len];
+    let mut position = 0;
+    while position < options.len() {
+        match options[position] {
+            0 => {
+                if options[position + 1..].iter().any(|byte| *byte != 0) {
+                    return Err(Error::InvalidArgument);
+                }
+                break;
+            }
+            1 => position += 1,
+            kind => {
+                let option_len = options
+                    .get(position + 1)
+                    .copied()
+                    .map(usize::from)
+                    .ok_or(Error::InvalidArgument)?;
+                let option_end = position
+                    .checked_add(option_len)
+                    .ok_or(Error::InvalidArgument)?;
+                if option_len < 2 || option_end > options.len() || (kind == 2 && option_len != 4) {
+                    return Err(Error::InvalidArgument);
+                }
+                position = option_end;
+            }
+        }
     }
 
     Ok((header, &data[hdr_len..]))
@@ -1219,6 +1256,10 @@ impl TcpTable {
 // =========================================================================
 // Tests
 // =========================================================================
+
+#[cfg(test)]
+#[path = "tcp_parser_tests.rs"]
+mod parser_tests;
 
 #[cfg(test)]
 mod tests {
