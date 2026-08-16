@@ -495,30 +495,32 @@ impl FidTable {
     ///
     /// Returns `OutOfMemory` if the table is full.
     pub fn alloc(&mut self) -> Result<(usize, u32)> {
-        let mut slot = None;
+        let (slot, fid) = self.preview_alloc()?;
+        self.commit_alloc(slot, fid);
+        Ok((slot, fid))
+    }
+
+    fn preview_alloc(&self) -> Result<(usize, u32)> {
         let mut i = 0;
         while i < MAX_FIDS {
             if matches!(self.fids[i].state, FidState::Free) {
-                slot = Some(i);
-                break;
+                return Ok((i, self.next_fid));
             }
             i += 1;
         }
-        let idx = slot.ok_or(Error::OutOfMemory)?;
-        let fid_num = self.next_fid;
-        // Advance next_fid with checked arithmetic; skip the reserved NOFID
-        // sentinel and wrap back to 1 on exhaustion so the counter never
-        // produces an invalid FID number.
+        Err(Error::OutOfMemory)
+    }
+
+    fn commit_alloc(&mut self, slot: usize, fid: u32) {
         self.next_fid = match self.next_fid.checked_add(1) {
             Some(n) if n != NOFID => n,
             _ => 1,
         };
-        self.fids[idx].fid = fid_num;
-        self.fids[idx].state = FidState::Allocated;
-        self.fids[idx].offset = 0;
-        self.fids[idx].path_len = 0;
+        self.fids[slot].fid = fid;
+        self.fids[slot].state = FidState::Allocated;
+        self.fids[slot].offset = 0;
+        self.fids[slot].path_len = 0;
         self.active_count += 1;
-        Ok((idx, fid_num))
     }
 
     /// Look up a FID by its numeric value.
@@ -586,6 +588,8 @@ pub struct Plan9Message {
     buf: [u8; MAX_MESSAGE_SIZE as usize],
     /// Current write position in the buffer.
     pos: usize,
+    /// Active outbound frame limit.
+    limit: usize,
 }
 
 impl Plan9Message {
@@ -594,7 +598,25 @@ impl Plan9Message {
         Self {
             buf: [0; MAX_MESSAGE_SIZE as usize],
             pos: HEADER_SIZE,
+            limit: MAX_MESSAGE_SIZE as usize,
         }
+    }
+
+    fn set_limit(&mut self, limit: u32) -> Result<()> {
+        let limit = limit as usize;
+        if !(HEADER_SIZE..=MAX_MESSAGE_SIZE as usize).contains(&limit) {
+            return Err(Error::InvalidArgument);
+        }
+        self.limit = limit;
+        Ok(())
+    }
+
+    fn reserve(&self, len: usize) -> Result<core::ops::Range<usize>> {
+        let end = self.pos.checked_add(len).ok_or(Error::InvalidArgument)?;
+        if end > self.limit {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(self.pos..end)
     }
 
     /// Reset the message for building a new request.
@@ -610,41 +632,33 @@ impl Plan9Message {
 
     /// Append a u8 value to the message payload.
     pub fn put_u8(&mut self, v: u8) -> Result<()> {
-        if self.pos + 1 > self.buf.len() {
-            return Err(Error::InvalidArgument);
-        }
-        self.buf[self.pos] = v;
-        self.pos += 1;
+        let range = self.reserve(1)?;
+        self.buf[range.start] = v;
+        self.pos = range.end;
         Ok(())
     }
 
     /// Append a u16 (little-endian) to the message payload.
     pub fn put_u16(&mut self, v: u16) -> Result<()> {
-        if self.pos + 2 > self.buf.len() {
-            return Err(Error::InvalidArgument);
-        }
-        self.buf[self.pos..self.pos + 2].copy_from_slice(&v.to_le_bytes());
-        self.pos += 2;
+        let range = self.reserve(2)?;
+        self.buf[range.clone()].copy_from_slice(&v.to_le_bytes());
+        self.pos = range.end;
         Ok(())
     }
 
     /// Append a u32 (little-endian) to the message payload.
     pub fn put_u32(&mut self, v: u32) -> Result<()> {
-        if self.pos + 4 > self.buf.len() {
-            return Err(Error::InvalidArgument);
-        }
-        self.buf[self.pos..self.pos + 4].copy_from_slice(&v.to_le_bytes());
-        self.pos += 4;
+        let range = self.reserve(4)?;
+        self.buf[range.clone()].copy_from_slice(&v.to_le_bytes());
+        self.pos = range.end;
         Ok(())
     }
 
     /// Append a u64 (little-endian) to the message payload.
     pub fn put_u64(&mut self, v: u64) -> Result<()> {
-        if self.pos + 8 > self.buf.len() {
-            return Err(Error::InvalidArgument);
-        }
-        self.buf[self.pos..self.pos + 8].copy_from_slice(&v.to_le_bytes());
-        self.pos += 8;
+        let range = self.reserve(8)?;
+        self.buf[range.clone()].copy_from_slice(&v.to_le_bytes());
+        self.pos = range.end;
         Ok(())
     }
 
@@ -654,22 +668,20 @@ impl Plan9Message {
         if len > u16::MAX as usize {
             return Err(Error::InvalidArgument);
         }
-        self.put_u16(len as u16)?;
-        if self.pos + len > self.buf.len() {
-            return Err(Error::InvalidArgument);
-        }
-        self.buf[self.pos..self.pos + len].copy_from_slice(s);
-        self.pos += len;
+        let total = len.checked_add(2).ok_or(Error::InvalidArgument)?;
+        let range = self.reserve(total)?;
+        let data_start = range.start + 2;
+        self.buf[range.start..data_start].copy_from_slice(&(len as u16).to_le_bytes());
+        self.buf[data_start..range.end].copy_from_slice(s);
+        self.pos = range.end;
         Ok(())
     }
 
     /// Append raw data bytes.
     pub fn put_data(&mut self, data: &[u8]) -> Result<()> {
-        if self.pos + data.len() > self.buf.len() {
-            return Err(Error::InvalidArgument);
-        }
-        self.buf[self.pos..self.pos + data.len()].copy_from_slice(data);
-        self.pos += data.len();
+        let range = self.reserve(data.len())?;
+        self.buf[range.clone()].copy_from_slice(data);
+        self.pos = range.end;
         Ok(())
     }
 
@@ -825,14 +837,145 @@ impl Plan9Session {
         self.msize
     }
 
-    /// Allocate the next tag for a request.
-    fn alloc_tag(&mut self) -> u16 {
-        let tag = self.next_tag;
-        self.next_tag = self.next_tag.wrapping_add(1);
+    fn commit_tag(&mut self, tag: u16) {
+        self.pending_tag = tag;
+        self.next_tag = tag.wrapping_add(1);
         if self.next_tag == NOTAG {
             self.next_tag = 1;
         }
-        tag
+    }
+
+    fn prepare_message(&mut self, msg_type: P9MessageType, tag: u16) -> Result<()> {
+        self.msg_buf.set_limit(self.msize)?;
+        self.msg_buf.reset(msg_type, tag);
+        Ok(())
+    }
+
+    fn ensure_frame_size(&self, size: usize) -> Result<()> {
+        if size > self.msize as usize {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    fn reply_header(
+        &self,
+        reply: &[u8],
+        required_state: SessionState,
+    ) -> Result<(P9MessageType, usize)> {
+        if self.state != required_state || reply.len() > self.msize as usize {
+            return Err(Error::InvalidArgument);
+        }
+        let (msg_type, tag, offset) = Plan9Message::parse_header(reply)?;
+        if tag != self.pending_tag {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((msg_type, offset))
+    }
+
+    fn parse_rversion(&self, reply: &[u8]) -> Result<u32> {
+        let (msg_type, offset) = self.reply_header(reply, SessionState::Negotiating)?;
+        if msg_type != P9MessageType::Rversion {
+            return Err(if msg_type == P9MessageType::Rerror {
+                Error::IoError
+            } else {
+                Error::InvalidArgument
+            });
+        }
+        let (server_msize, offset) = Plan9Message::read_u32(reply, offset)?;
+        if !(MIN_MSIZE..=self.msize).contains(&server_msize) {
+            return Err(Error::InvalidArgument);
+        }
+        let (version, end) = Plan9Message::read_string(reply, offset)?;
+        if version != P9_VERSION || end != reply.len() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(server_msize)
+    }
+
+    fn parse_rattach(&self, reply: &[u8]) -> Result<P9Qid> {
+        let (msg_type, offset) = self.reply_header(reply, SessionState::Versioned)?;
+        if msg_type != P9MessageType::Rattach {
+            return Err(if msg_type == P9MessageType::Rerror {
+                Error::IoError
+            } else {
+                Error::InvalidArgument
+            });
+        }
+        let (qid, consumed) = P9Qid::from_bytes(reply, offset)?;
+        let end = offset.checked_add(consumed).ok_or(Error::InvalidArgument)?;
+        if end != reply.len() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(qid)
+    }
+
+    fn parse_rwalk(&self, reply: &[u8]) -> Result<(usize, [P9Qid; MAX_WALK_ELEMS])> {
+        let (msg_type, mut offset) = self.reply_header(reply, SessionState::Attached)?;
+        if msg_type != P9MessageType::Rwalk {
+            return Err(if msg_type == P9MessageType::Rerror {
+                Error::NotFound
+            } else {
+                Error::InvalidArgument
+            });
+        }
+        let count_end = offset.checked_add(2).ok_or(Error::InvalidArgument)?;
+        let count_bytes = reply.get(offset..count_end).ok_or(Error::InvalidArgument)?;
+        let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
+        if count > MAX_WALK_ELEMS {
+            return Err(Error::InvalidArgument);
+        }
+        offset = count_end;
+        let mut qids = [P9Qid::new(P9QidType::FILE, 0, 0); MAX_WALK_ELEMS];
+        let mut i = 0;
+        while i < count {
+            let (qid, consumed) = P9Qid::from_bytes(reply, offset)?;
+            qids[i] = qid;
+            offset = offset.checked_add(consumed).ok_or(Error::InvalidArgument)?;
+            i += 1;
+        }
+        if offset != reply.len() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((count, qids))
+    }
+
+    fn parse_ropen(&self, reply: &[u8]) -> Result<(P9Qid, u32)> {
+        let (msg_type, offset) = self.reply_header(reply, SessionState::Attached)?;
+        if msg_type != P9MessageType::Ropen {
+            return Err(if msg_type == P9MessageType::Rerror {
+                Error::PermissionDenied
+            } else {
+                Error::InvalidArgument
+            });
+        }
+        let (qid, consumed) = P9Qid::from_bytes(reply, offset)?;
+        let iounit_offset = offset.checked_add(consumed).ok_or(Error::InvalidArgument)?;
+        let (raw_iounit, end) = Plan9Message::read_u32(reply, iounit_offset)?;
+        if end != reply.len() {
+            return Err(Error::InvalidArgument);
+        }
+        let iounit = if raw_iounit == 0 {
+            MAX_IO_SIZE as u32
+        } else {
+            raw_iounit.min(MAX_IO_SIZE as u32)
+        };
+        Ok((qid, iounit))
+    }
+
+    fn parse_rclunk(&self, reply: &[u8]) -> Result<()> {
+        let (msg_type, offset) = self.reply_header(reply, SessionState::Attached)?;
+        if msg_type != P9MessageType::Rclunk {
+            return Err(if msg_type == P9MessageType::Rerror {
+                Error::IoError
+            } else {
+                Error::InvalidArgument
+            });
+        }
+        if offset != reply.len() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
     }
 
     /// Build a Tversion message to initiate protocol negotiation.
@@ -840,13 +983,14 @@ impl Plan9Session {
     /// The caller must send the returned bytes to the server and call
     /// [`handle_rversion`](Self::handle_rversion) with the reply.
     pub fn build_tversion(&mut self) -> Result<&[u8]> {
-        self.state = SessionState::Negotiating;
-        // SECURITY: Tversion always uses NOTAG (0xFFFF) per 9P spec; record it
-        // in pending_tag so handle_rversion can enforce the required value (F2).
-        self.pending_tag = NOTAG;
-        self.msg_buf.reset(P9MessageType::Tversion, NOTAG);
+        if self.state != SessionState::Disconnected {
+            return Err(Error::InvalidArgument);
+        }
+        self.prepare_message(P9MessageType::Tversion, NOTAG)?;
         self.msg_buf.put_u32(self.msize)?;
         self.msg_buf.put_string(&P9_VERSION)?;
+        self.pending_tag = NOTAG;
+        self.state = SessionState::Negotiating;
         Ok(self.msg_buf.finalize())
     }
 
@@ -861,68 +1005,20 @@ impl Plan9Session {
     ///   is bounded by `min(received_len, VERSION_STR_LEN)` so a crafted
     ///   short string cannot cause an out-of-bounds index).
     pub fn handle_rversion(&mut self, reply: &[u8]) -> Result<()> {
-        let (msg_type, reply_tag, offset) = Plan9Message::parse_header(reply)?;
-        if msg_type != P9MessageType::Rversion {
-            self.state = SessionState::Error;
-            return Err(Error::IoError);
-        }
-        // SECURITY: 9P spec §4.1 requires the Rversion tag to equal NOTAG
-        // (0xFFFF).  A server that sends any other tag value is either broken
-        // or adversarial; reject it before consuming any body fields (F1/F2).
-        if reply_tag != NOTAG {
-            self.state = SessionState::Error;
+        if self.state != SessionState::Negotiating {
             return Err(Error::InvalidArgument);
         }
-        let (server_msize, offset) = Plan9Message::read_u32(reply, offset)?;
-
-        // Reject degenerate msize values that would make the message buffer
-        // zero-sized or too small to hold a single 9P header.
-        if server_msize < MIN_MSIZE {
-            self.state = SessionState::Error;
-            return Err(Error::InvalidArgument);
-        }
-
-        let (version_str, _offset) = Plan9Message::read_string(reply, offset)?;
-
-        // Compare only up to min(received_len, VERSION_STR_LEN) bytes so a
-        // server that sends a shorter string can never make the index walk
-        // past the received slice.
-        let cmp_len = if version_str.len() < VERSION_STR_LEN {
-            version_str.len()
-        } else {
-            VERSION_STR_LEN
-        };
-        // The lengths must also be equal for the strings to match.
-        let len_ok = version_str.len() == VERSION_STR_LEN;
-        let mut bytes_ok = true;
-        let mut i = 0;
-        while i < cmp_len {
-            if version_str[i] != P9_VERSION[i] {
-                bytes_ok = false;
-                break;
+        match self.parse_rversion(reply) {
+            Ok(msize) => {
+                self.msize = msize;
+                self.state = SessionState::Versioned;
+                Ok(())
             }
-            i += 1;
+            Err(error) => {
+                self.state = SessionState::Error;
+                Err(error)
+            }
         }
-        if !len_ok || !bytes_ok {
-            self.state = SessionState::Error;
-            return Err(Error::InvalidArgument);
-        }
-
-        // Accept the smaller of the two advertised sizes and clamp to the
-        // local maximum so we never allocate beyond our own buffer.
-        let negotiated = if server_msize < self.msize {
-            server_msize
-        } else {
-            self.msize
-        };
-        self.msize = if negotiated > MAX_MESSAGE_SIZE {
-            MAX_MESSAGE_SIZE
-        } else {
-            negotiated
-        };
-
-        self.state = SessionState::Versioned;
-        Ok(())
     }
 
     /// Build a Tattach message to attach to the filesystem root.
@@ -932,14 +1028,17 @@ impl Plan9Session {
         if self.state != SessionState::Versioned {
             return Err(Error::InvalidArgument);
         }
-        self.uid = uid;
-        let (slot, fid_num) = self.fid_table.alloc()?;
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag so handle_rattach can reject
-        // any reply whose tag does not match this outstanding request (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Tattach, tag);
-        self.msg_buf.put_u32(fid_num)?;
+        if aname.len() > u16::MAX as usize {
+            return Err(Error::InvalidArgument);
+        }
+        let frame_size = 23usize
+            .checked_add(aname.len())
+            .ok_or(Error::InvalidArgument)?;
+        self.ensure_frame_size(frame_size)?;
+        let (slot, fid) = self.fid_table.preview_alloc()?;
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Tattach, tag)?;
+        self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u32(NOFID)?; // afid (no auth)
         // uname
         self.msg_buf.put_string(b"")?;
@@ -947,35 +1046,32 @@ impl Plan9Session {
         self.msg_buf.put_string(aname)?;
         // n_uname (9P2000.L extension: numeric uid)
         self.msg_buf.put_u32(uid)?;
-        self.root_fid = fid_num;
-        let fid_entry = self.fid_table.get_mut(slot)?;
-        fid_entry.state = FidState::Attached;
+        self.fid_table.commit_alloc(slot, fid);
+        self.root_fid = fid;
+        self.uid = uid;
+        self.commit_tag(tag);
         Ok(self.msg_buf.finalize())
     }
 
     /// Handle an Rattach reply from the server.
     pub fn handle_rattach(&mut self, reply: &[u8]) -> Result<P9Qid> {
-        let (msg_type, reply_tag, offset) = Plan9Message::parse_header(reply)?;
-        // SECURITY: reject any reply whose tag does not match the tag sent in
-        // the outstanding Tattach; prevents FID/QID spoofing via forged replies
-        // from an adversarial server (F1).
-        if reply_tag != self.pending_tag {
-            self.state = SessionState::Error;
+        if self.state != SessionState::Versioned {
             return Err(Error::InvalidArgument);
         }
-        if msg_type == P9MessageType::Rerror {
-            self.state = SessionState::Error;
-            return Err(Error::IoError);
-        }
-        if msg_type != P9MessageType::Rattach {
-            self.state = SessionState::Error;
-            return Err(Error::InvalidArgument);
-        }
-        let (qid, _) = P9Qid::from_bytes(reply, offset)?;
-        // Update root FID with the server's QID.
+        let qid = match self.parse_rattach(reply) {
+            Ok(qid) => qid,
+            Err(error) => {
+                if self.root_fid != NOFID {
+                    let _ = self.fid_table.release(self.root_fid);
+                }
+                self.root_fid = NOFID;
+                return Err(error);
+            }
+        };
         let slot = self.fid_table.lookup(self.root_fid)?;
         let fid_entry = self.fid_table.get_mut(slot)?;
         fid_entry.qid = qid;
+        fid_entry.state = FidState::Attached;
         self.state = SessionState::Attached;
         Ok(qid)
     }
@@ -993,14 +1089,21 @@ impl Plan9Session {
         if names.len() > MAX_WALK_ELEMS {
             return Err(Error::InvalidArgument);
         }
-        // Verify src_fid exists.
-        let _src_slot = self.fid_table.lookup(src_fid)?;
-        let (_dst_slot, dst_fid) = self.fid_table.alloc()?;
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag so handle_rwalk can reject
-        // any reply whose tag does not match this outstanding request (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Twalk, tag);
+        self.fid_table.lookup(src_fid)?;
+        let mut frame_size = 17usize;
+        for name in names {
+            if name.len() > u16::MAX as usize {
+                return Err(Error::InvalidArgument);
+            }
+            frame_size = frame_size
+                .checked_add(2)
+                .and_then(|size| size.checked_add(name.len()))
+                .ok_or(Error::InvalidArgument)?;
+        }
+        self.ensure_frame_size(frame_size)?;
+        let (slot, dst_fid) = self.fid_table.preview_alloc()?;
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Twalk, tag)?;
         self.msg_buf.put_u32(src_fid)?;
         self.msg_buf.put_u32(dst_fid)?;
         self.msg_buf.put_u16(names.len() as u16)?;
@@ -1009,6 +1112,8 @@ impl Plan9Session {
             self.msg_buf.put_string(names[i])?;
             i += 1;
         }
+        self.fid_table.commit_alloc(slot, dst_fid);
+        self.commit_tag(tag);
         Ok((self.msg_buf.finalize(), dst_fid))
     }
 
@@ -1020,71 +1125,23 @@ impl Plan9Session {
         reply: &[u8],
         dst_fid: u32,
     ) -> Result<(usize, [P9Qid; MAX_WALK_ELEMS])> {
-        let (msg_type, reply_tag, mut offset) = Plan9Message::parse_header(reply)?;
-        // SECURITY: reject any reply whose tag does not match the tag sent in
-        // the outstanding Twalk; prevents FID/QID spoofing via forged replies
-        // from an adversarial server (F1).
-        if reply_tag != self.pending_tag {
-            let _ = self.fid_table.release(dst_fid);
+        if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
-        if msg_type == P9MessageType::Rerror {
-            // Walk failed — release the destination FID.
-            let _ = self.fid_table.release(dst_fid);
-            return Err(Error::NotFound);
-        }
-        if msg_type != P9MessageType::Rwalk {
-            let _ = self.fid_table.release(dst_fid);
-            return Err(Error::InvalidArgument);
-        }
-        if reply.len() < offset + 2 {
-            let _ = self.fid_table.release(dst_fid);
-            return Err(Error::InvalidArgument);
-        }
-        let nwqid = u16::from_le_bytes([reply[offset], reply[offset + 1]]) as usize;
-        offset += 2;
-        // nwqid must not exceed the protocol maximum (16 elements).
-        if nwqid > MAX_WALK_ELEMS {
-            let _ = self.fid_table.release(dst_fid);
-            return Err(Error::InvalidArgument);
-        }
-        // Validate upfront that the buffer holds all nwqid QIDs before
-        // entering the loop.  Use checked arithmetic to prevent overflow
-        // when computing the required byte span.
-        let qid_bytes = match nwqid.checked_mul(P9Qid::WIRE_SIZE) {
-            Some(n) => n,
-            None => {
+        let (count, qids) = match self.parse_rwalk(reply) {
+            Ok(parsed) => parsed,
+            Err(error) => {
                 let _ = self.fid_table.release(dst_fid);
-                return Err(Error::InvalidArgument);
+                return Err(error);
             }
         };
-        let required_end = match offset.checked_add(qid_bytes) {
-            Some(n) => n,
-            None => {
-                let _ = self.fid_table.release(dst_fid);
-                return Err(Error::InvalidArgument);
-            }
-        };
-        if required_end > reply.len() {
-            let _ = self.fid_table.release(dst_fid);
-            return Err(Error::InvalidArgument);
-        }
-        let mut qids = [P9Qid::new(P9QidType::FILE, 0, 0); MAX_WALK_ELEMS];
-        let mut i = 0;
-        while i < nwqid {
-            let (qid, consumed) = P9Qid::from_bytes(reply, offset)?;
-            qids[i] = qid;
-            offset += consumed;
-            i += 1;
-        }
-        // Update the destination FID with the final QID.
-        if nwqid > 0 {
+        if count > 0 {
             let slot = self.fid_table.lookup(dst_fid)?;
             let fid_entry = self.fid_table.get_mut(slot)?;
             fid_entry.state = FidState::Attached;
-            fid_entry.qid = qids[nwqid - 1];
+            fid_entry.qid = qids[count - 1];
         }
-        Ok((nwqid, qids))
+        Ok((count, qids))
     }
 
     /// Build a Topen message to open a file identified by FID.
@@ -1092,14 +1149,12 @@ impl Plan9Session {
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
-        let _slot = self.fid_table.lookup(fid)?;
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag so handle_ropen can reject
-        // any reply whose tag does not match this outstanding request (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Topen, tag);
+        self.fid_table.lookup(fid)?;
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Topen, tag)?;
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u8(mode.0)?;
+        self.commit_tag(tag);
         Ok(self.msg_buf.finalize())
     }
 
@@ -1119,49 +1174,7 @@ impl Plan9Session {
         fid: u32,
         mode: P9OpenMode,
     ) -> Result<(P9Qid, u32)> {
-        let (msg_type, reply_tag, offset) = Plan9Message::parse_header(reply)?;
-        // SECURITY: reject any reply whose tag does not match the tag sent in
-        // the outstanding Topen; prevents FID/QID spoofing via forged replies
-        // from an adversarial server (F1).
-        if reply_tag != self.pending_tag {
-            return Err(Error::InvalidArgument);
-        }
-        if msg_type == P9MessageType::Rerror {
-            return Err(Error::PermissionDenied);
-        }
-        if msg_type != P9MessageType::Ropen {
-            return Err(Error::InvalidArgument);
-        }
-        // Validate that the buffer holds the QID and iounit fields before
-        // reading them, using the absolute end position of each field.
-        let qid_end = match offset.checked_add(P9Qid::WIRE_SIZE) {
-            Some(n) => n,
-            None => return Err(Error::InvalidArgument),
-        };
-        let iounit_end = match qid_end.checked_add(4) {
-            Some(n) => n,
-            None => return Err(Error::InvalidArgument),
-        };
-        if iounit_end > reply.len() {
-            return Err(Error::InvalidArgument);
-        }
-        // `from_bytes` performs its own length check; the upfront guard above
-        // ensures it will succeed without an allocation-driven panic.
-        let (qid, _consumed) = P9Qid::from_bytes(reply, offset)?;
-        // Pass the absolute offset of the iounit field, not `offset + consumed`
-        // (which would be correct here only by coincidence and would fail if the
-        // header offset were ever non-zero relative to the QID start).
-        let (raw_iounit, _) = Plan9Message::read_u32(reply, qid_end)?;
-        // SECURITY: clamp the server-supplied iounit to MAX_IO_SIZE (F3).
-        // An adversarial server can send iounit=0 to cause a divide-by-zero in
-        // a read/write loop, or iounit > MAX_IO_SIZE to cause a buffer overflow.
-        // When iounit is 0, substitute MAX_IO_SIZE (the agreed-upon maximum)
-        // rather than propagating a value that callers cannot safely use.
-        let iounit = if raw_iounit == 0 {
-            MAX_IO_SIZE as u32
-        } else {
-            raw_iounit.min(MAX_IO_SIZE as u32)
-        };
+        let (qid, iounit) = self.parse_ropen(reply)?;
         let slot = self.fid_table.lookup(fid)?;
         let fid_entry = self.fid_table.get_mut(slot)?;
         fid_entry.state = FidState::Open;
@@ -1181,18 +1194,14 @@ impl Plan9Session {
         if fid_entry.state != FidState::Open {
             return Err(Error::InvalidArgument);
         }
-        let clamped = if count as usize > MAX_IO_SIZE {
-            MAX_IO_SIZE as u32
-        } else {
-            count
-        };
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag for reply validation (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Tread, tag);
+        let budget = (self.msize - 11).min(MAX_IO_SIZE as u32);
+        let clamped = count.min(budget);
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Tread, tag)?;
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u64(offset)?;
         self.msg_buf.put_u32(clamped)?;
+        self.commit_tag(tag);
         Ok(self.msg_buf.finalize())
     }
 
@@ -1209,71 +1218,60 @@ impl Plan9Session {
         if !fid_entry.mode.is_writable() {
             return Err(Error::PermissionDenied);
         }
-        let len = if data.len() > MAX_IO_SIZE {
-            MAX_IO_SIZE
-        } else {
-            data.len()
-        };
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag for reply validation (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Twrite, tag);
+        let budget = (self.msize as usize - 23).min(MAX_IO_SIZE);
+        let len = data.len().min(budget);
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Twrite, tag)?;
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u64(offset)?;
         self.msg_buf.put_u32(len as u32)?;
         self.msg_buf.put_data(&data[..len])?;
+        self.commit_tag(tag);
         Ok(self.msg_buf.finalize())
     }
 
     /// Build a Tclunk message to release a FID.
     pub fn build_tclunk(&mut self, fid: u32) -> Result<&[u8]> {
-        let _slot = self.fid_table.lookup(fid)?;
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag so handle_rclunk can reject
-        // any reply whose tag does not match this outstanding request (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Tclunk, tag);
+        if self.state != SessionState::Attached {
+            return Err(Error::InvalidArgument);
+        }
+        self.fid_table.lookup(fid)?;
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Tclunk, tag)?;
         self.msg_buf.put_u32(fid)?;
+        self.commit_tag(tag);
         Ok(self.msg_buf.finalize())
     }
 
     /// Handle an Rclunk reply and release the FID.
     pub fn handle_rclunk(&mut self, reply: &[u8], fid: u32) -> Result<()> {
-        let (msg_type, reply_tag, _offset) = Plan9Message::parse_header(reply)?;
-        // SECURITY: reject any reply whose tag does not match the tag sent in
-        // the outstanding Tclunk; prevents FID spoofing via forged replies
-        // from an adversarial server (F1).
-        if reply_tag != self.pending_tag {
-            return Err(Error::InvalidArgument);
-        }
-        if msg_type == P9MessageType::Rerror {
-            return Err(Error::IoError);
-        }
-        if msg_type != P9MessageType::Rclunk {
-            return Err(Error::InvalidArgument);
-        }
+        self.parse_rclunk(reply)?;
         self.fid_table.release(fid)
     }
 
     /// Build a Tremove message to delete a file and release the FID.
     pub fn build_tremove(&mut self, fid: u32) -> Result<&[u8]> {
-        let _slot = self.fid_table.lookup(fid)?;
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag for reply validation (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Tremove, tag);
+        if self.state != SessionState::Attached {
+            return Err(Error::InvalidArgument);
+        }
+        self.fid_table.lookup(fid)?;
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Tremove, tag)?;
         self.msg_buf.put_u32(fid)?;
+        self.commit_tag(tag);
         Ok(self.msg_buf.finalize())
     }
 
     /// Build a Tstat message to retrieve file attributes.
     pub fn build_tstat(&mut self, fid: u32) -> Result<&[u8]> {
-        let _slot = self.fid_table.lookup(fid)?;
-        let tag = self.alloc_tag();
-        // SECURITY: record the client-chosen tag for reply validation (F1).
-        self.pending_tag = tag;
-        self.msg_buf.reset(P9MessageType::Tstat, tag);
+        if self.state != SessionState::Attached {
+            return Err(Error::InvalidArgument);
+        }
+        self.fid_table.lookup(fid)?;
+        let tag = self.next_tag;
+        self.prepare_message(P9MessageType::Tstat, tag)?;
         self.msg_buf.put_u32(fid)?;
+        self.commit_tag(tag);
         Ok(self.msg_buf.finalize())
     }
 
@@ -1470,5 +1468,9 @@ impl Plan9Registry {
 }
 
 #[cfg(test)]
-#[path = "plan9fs_tests.rs"]
-mod tests;
+#[path = "plan9fs_frame_tests.rs"]
+mod frame_tests;
+
+#[cfg(test)]
+#[path = "plan9fs_session_tests.rs"]
+mod session_tests;
