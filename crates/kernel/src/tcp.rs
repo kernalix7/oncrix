@@ -464,6 +464,50 @@ impl TcpHeader {
     }
 }
 
+/// Verify an IPv4 TCP segment checksum, including its wire checksum field.
+///
+/// The checksum covers the IPv4 pseudo-header and every segment byte. An odd
+/// final byte is treated as the high byte of a word whose low byte is zero.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] when the segment is shorter than a TCP
+/// header, exceeds the IPv4 16-bit length field, or has an invalid checksum.
+pub(crate) fn verify_tcp_checksum(
+    source: [u8; 4],
+    destination: [u8; 4],
+    segment: &[u8],
+) -> Result<()> {
+    if segment.len() < TCP_HEADER_MIN_LEN || segment.len() > usize::from(u16::MAX) {
+        return Err(Error::InvalidArgument);
+    }
+
+    let segment_len = u16::try_from(segment.len()).map_err(|_| Error::InvalidArgument)?;
+    let mut sum = u32::from(u16::from_be_bytes([source[0], source[1]]))
+        + u32::from(u16::from_be_bytes([source[2], source[3]]))
+        + u32::from(u16::from_be_bytes([destination[0], destination[1]]))
+        + u32::from(u16::from_be_bytes([destination[2], destination[3]]))
+        + 6
+        + u32::from(segment_len);
+
+    let mut words = segment.chunks_exact(2);
+    for word in &mut words {
+        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+    }
+    if let [byte] = words.remainder() {
+        sum += u32::from(*byte) << 8;
+    }
+
+    while sum > u32::from(u16::MAX) {
+        sum = (sum & u32::from(u16::MAX)) + (sum >> 16);
+    }
+    if sum != u32::from(u16::MAX) {
+        return Err(Error::InvalidArgument);
+    }
+
+    Ok(())
+}
+
 // =========================================================================
 // parse_tcp
 // =========================================================================
@@ -1260,6 +1304,10 @@ impl TcpTable {
 #[cfg(test)]
 #[path = "tcp_parser_tests.rs"]
 mod parser_tests;
+
+#[cfg(test)]
+#[path = "tcp_checksum_tests.rs"]
+mod checksum_tests;
 
 #[cfg(test)]
 mod tests {
