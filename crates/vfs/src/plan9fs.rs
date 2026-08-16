@@ -268,26 +268,25 @@ impl P9Qid {
     ///
     /// Returns the parsed QID and the number of bytes consumed.
     pub fn from_bytes(buf: &[u8], offset: usize) -> Result<(Self, usize)> {
-        if buf.len() < offset + Self::WIRE_SIZE {
-            return Err(Error::InvalidArgument);
-        }
-        let qtype = P9QidType(buf[offset]);
-        let version = u32::from_le_bytes([
-            buf[offset + 1],
-            buf[offset + 2],
-            buf[offset + 3],
-            buf[offset + 4],
-        ]);
-        let path = u64::from_le_bytes([
-            buf[offset + 5],
-            buf[offset + 6],
-            buf[offset + 7],
-            buf[offset + 8],
-            buf[offset + 9],
-            buf[offset + 10],
-            buf[offset + 11],
-            buf[offset + 12],
-        ]);
+        let end = offset
+            .checked_add(Self::WIRE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        let frame = buf.get(offset..end).ok_or(Error::InvalidArgument)?;
+        let qtype = P9QidType(*frame.first().ok_or(Error::InvalidArgument)?);
+        let version = u32::from_le_bytes(
+            frame
+                .get(1..5)
+                .ok_or(Error::InvalidArgument)?
+                .try_into()
+                .map_err(|_| Error::InvalidArgument)?,
+        );
+        let path = u64::from_le_bytes(
+            frame
+                .get(5..13)
+                .ok_or(Error::InvalidArgument)?
+                .try_into()
+                .map_err(|_| Error::InvalidArgument)?,
+        );
         Ok((
             Self {
                 qtype,
@@ -302,12 +301,19 @@ impl P9Qid {
     ///
     /// Returns the number of bytes written.
     pub fn to_bytes(&self, buf: &mut [u8], offset: usize) -> Result<usize> {
-        if buf.len() < offset + Self::WIRE_SIZE {
-            return Err(Error::InvalidArgument);
-        }
-        buf[offset] = self.qtype.0;
-        buf[offset + 1..offset + 5].copy_from_slice(&self.version.to_le_bytes());
-        buf[offset + 5..offset + 13].copy_from_slice(&self.path.to_le_bytes());
+        let end = offset
+            .checked_add(Self::WIRE_SIZE)
+            .ok_or(Error::InvalidArgument)?;
+        let frame = buf.get_mut(offset..end).ok_or(Error::InvalidArgument)?;
+        *frame.first_mut().ok_or(Error::InvalidArgument)? = self.qtype.0;
+        frame
+            .get_mut(1..5)
+            .ok_or(Error::InvalidArgument)?
+            .copy_from_slice(&self.version.to_le_bytes());
+        frame
+            .get_mut(5..13)
+            .ok_or(Error::InvalidArgument)?
+            .copy_from_slice(&self.path.to_le_bytes());
         Ok(Self::WIRE_SIZE)
     }
 }
@@ -702,49 +708,40 @@ impl Plan9Message {
 
     /// Read a u32 from a buffer at the given offset.
     pub fn read_u32(buf: &[u8], offset: usize) -> Result<(u32, usize)> {
-        if buf.len() < offset + 4 {
-            return Err(Error::InvalidArgument);
-        }
-        let v = u32::from_le_bytes([
-            buf[offset],
-            buf[offset + 1],
-            buf[offset + 2],
-            buf[offset + 3],
-        ]);
-        Ok((v, offset + 4))
+        let end = offset.checked_add(4).ok_or(Error::InvalidArgument)?;
+        let bytes = buf
+            .get(offset..end)
+            .ok_or(Error::InvalidArgument)?
+            .try_into()
+            .map_err(|_| Error::InvalidArgument)?;
+        Ok((u32::from_le_bytes(bytes), end))
     }
 
     /// Read a u64 from a buffer at the given offset.
     pub fn read_u64(buf: &[u8], offset: usize) -> Result<(u64, usize)> {
-        if buf.len() < offset + 8 {
-            return Err(Error::InvalidArgument);
-        }
-        let v = u64::from_le_bytes([
-            buf[offset],
-            buf[offset + 1],
-            buf[offset + 2],
-            buf[offset + 3],
-            buf[offset + 4],
-            buf[offset + 5],
-            buf[offset + 6],
-            buf[offset + 7],
-        ]);
-        Ok((v, offset + 8))
+        let end = offset.checked_add(8).ok_or(Error::InvalidArgument)?;
+        let bytes = buf
+            .get(offset..end)
+            .ok_or(Error::InvalidArgument)?
+            .try_into()
+            .map_err(|_| Error::InvalidArgument)?;
+        Ok((u64::from_le_bytes(bytes), end))
     }
 
     /// Read a length-prefixed string from a buffer at the given offset.
     ///
     /// Returns (byte slice, next offset). The slice borrows from `buf`.
     pub fn read_string(buf: &[u8], offset: usize) -> Result<(&[u8], usize)> {
-        if buf.len() < offset + 2 {
-            return Err(Error::InvalidArgument);
-        }
-        let len = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
-        let start = offset + 2;
-        if buf.len() < start + len {
-            return Err(Error::InvalidArgument);
-        }
-        Ok((&buf[start..start + len], start + len))
+        let start = offset.checked_add(2).ok_or(Error::InvalidArgument)?;
+        let length_bytes = buf
+            .get(offset..start)
+            .ok_or(Error::InvalidArgument)?
+            .try_into()
+            .map_err(|_| Error::InvalidArgument)?;
+        let len = u16::from_le_bytes(length_bytes) as usize;
+        let end = start.checked_add(len).ok_or(Error::InvalidArgument)?;
+        let value = buf.get(start..end).ok_or(Error::InvalidArgument)?;
+        Ok((value, end))
     }
 }
 
@@ -1471,3 +1468,7 @@ impl Plan9Registry {
         self.count
     }
 }
+
+#[cfg(test)]
+#[path = "plan9fs_tests.rs"]
+mod tests;
