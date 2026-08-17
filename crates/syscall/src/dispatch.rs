@@ -9,34 +9,33 @@
 use crate::handler::{self, SyscallResult};
 use crate::number::*;
 
-/// System call register frame (x86_64 SYSCALL convention).
+/// Normalized system call arguments.
 ///
-/// On `SYSCALL`, the kernel receives arguments in:
-/// - RAX = syscall number
-/// - RDI = arg0, RSI = arg1, RDX = arg2
-/// - R10 = arg3, R8 = arg4, R9 = arg5
+/// `number` uses the Linux x86_64 namespace defined by [`crate::number`].
+/// Architecture entry code translates native syscall numbers into that
+/// namespace before constructing this value.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct SyscallArgs {
-    /// Syscall number (RAX).
+    /// Normalized syscall number.
     pub number: u64,
-    /// First argument (RDI).
+    /// First argument.
     pub arg0: u64,
-    /// Second argument (RSI).
+    /// Second argument.
     pub arg1: u64,
-    /// Third argument (RDX).
+    /// Third argument.
     pub arg2: u64,
-    /// Fourth argument (R10).
+    /// Fourth argument.
     pub arg3: u64,
-    /// Fifth argument (R8).
+    /// Fifth argument.
     pub arg4: u64,
-    /// Sixth argument (R9).
+    /// Sixth argument.
     pub arg5: u64,
 }
 
 /// Dispatch a system call by number.
 ///
-/// Returns the result to be placed in RAX on return to user space.
+/// Returns the result to be placed in the architecture's syscall return register.
 pub fn dispatch(args: &SyscallArgs) -> SyscallResult {
     match args.number {
         SYS_READ => handler::sys_read(args.arg0, args.arg1, args.arg2),
