@@ -13,11 +13,11 @@
 //! primitive plus a seeded-stack spawn path). The `usermode` submodule
 //! provides a smoke-only EL1->EL0 transition on a dedicated 4KiB RX code
 //! page, followed by an invalid guard page and four RW/NX stack pages. Its
-//! SVC #7 canary and SVC #8 sequence proves a real exception-vector `eret`
-//! back to EL0 (see [`jump_to_el0`]); it performs no syscall dispatch. The
-//! `clone`, `init_embed`, and `syscall_entry` submodules remain aarch64 build
-//! stubs that mirror the x86_64 public API so architecture-neutral kernel
-//! code type-checks.
+//! SVC #7 canary, Linux AArch64 `getpid(2)` SVC #0, and SVC #8 sequence proves
+//! a real exception-vector `eret` back to EL0 (see [`jump_to_el0`]). Only this
+//! dedicated getpid smoke is dispatched; the `clone`, `init_embed`, and
+//! `syscall_entry` submodules remain aarch64 build stubs that mirror the x86_64
+//! public API so architecture-neutral kernel code type-checks.
 //!
 //! [`switch_context`]: context::switch_context
 //! [`jump_to_el0`]: usermode::jump_to_el0
