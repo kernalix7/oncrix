@@ -507,18 +507,34 @@ impl FidTable {
     }
 
     fn preview_alloc(&self) -> Result<(usize, u32)> {
-        let mut i = 0;
-        while i < MAX_FIDS {
-            if matches!(self.fids[i].state, FidState::Free) {
-                return Ok((i, self.next_fid));
+        let mut slot = 0;
+        while slot < MAX_FIDS && !matches!(self.fids[slot].state, FidState::Free) {
+            slot += 1;
+        }
+        if slot == MAX_FIDS {
+            return Err(Error::OutOfMemory);
+        }
+        let mut fid = if self.next_fid == NOFID {
+            1
+        } else {
+            self.next_fid
+        };
+        let mut attempts = 0;
+        while attempts <= self.active_count {
+            if self.lookup(fid) == Err(Error::NotFound) {
+                return Ok((slot, fid));
             }
-            i += 1;
+            fid = match fid.checked_add(1) {
+                Some(next) if next != NOFID => next,
+                _ => 1,
+            };
+            attempts += 1;
         }
         Err(Error::OutOfMemory)
     }
 
     fn commit_alloc(&mut self, slot: usize, fid: u32) {
-        self.next_fid = match self.next_fid.checked_add(1) {
+        self.next_fid = match fid.checked_add(1) {
             Some(n) if n != NOFID => n,
             _ => 1,
         };

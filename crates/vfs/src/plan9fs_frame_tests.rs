@@ -205,6 +205,18 @@ fn lifecycle_stale_reply_cannot_complete_newer_request() {
 }
 
 #[test]
+fn fid_allocator_skips_live_id_after_rollover() {
+    // Given / When / Then
+    let mut session = Plan9Session::new();
+    let (_, first) = session.fid_table.alloc().unwrap();
+    session.fid_table.next_fid = NOFID - 1;
+    let (_, last) = session.fid_table.alloc().unwrap();
+    let (_, wrapped) = session.fid_table.alloc().unwrap();
+    assert_eq!((first, last, wrapped), (1, NOFID - 1, 2));
+    assert_eq!(session.fid_table.next_fid, 3);
+}
+
+#[test]
 fn characterization_header_rejects_unknown_message_type() {
     // Given
     let frame = [7, 0, 0, 0, 0, 0, 0];
