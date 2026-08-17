@@ -12,9 +12,9 @@
 //! SIMD registers plus `FPCR`/`FPSR` across its first SVC round trip.
 //!
 //! [`el0_test_entry`] verifies a stack canary, seeds SIMD/FP state, and issues
-//! `svc #7`. That handler deliberately overwrites the seeded state. The payload
-//! issues `svc #8` only after the exception vector restores the state and
-//! returns to EL0, proving the complete round trip without syscall dispatch.
+//! `svc #7`. After the vector restores that state, the payload invokes Linux
+//! AArch64 `getpid(2)` through `svc #0`, checks its returned `x0`, and issues
+//! `svc #8` to report the complete round trip.
 
 use oncrix_hal::arch::aarch64::pl011::{PL011_BASE, Pl011};
 use oncrix_hal::serial::SerialPort;
@@ -24,7 +24,7 @@ use oncrix_hal::serial::SerialPort;
 /// - `M[4:0] = 0b00000` -> return to EL0 using `SP_EL0` (EL0t).
 /// - `DAIF` (bits `[9:6]`) all set -> Debug, SError, IRQ, and FIQ masked.
 ///
-/// Masking is deliberate for the smoke test so the two SVCs are the only
+/// Masking is deliberate for the smoke test so its synchronous SVCs are the only
 /// exceptions the round-trip depends on. `PSTATE.I` at EL0 does *not* mask a
 /// physical IRQ that targets EL1 (a higher EL), so the caller additionally
 /// disarms the generic timer before descending. A real userspace launch would
@@ -222,13 +222,20 @@ pub unsafe fn jump_to_el0(entry: u64, user_sp: u64) -> ! {
 
 /// Synchronous-exception handler for a *lower* Exception Level (EL0).
 ///
-/// The lower-EL synchronous vector calls this function with a saved trap
-/// frame. SVC #7 reports the validated stack canary and deliberately overwrites
-/// representative SIMD/FP state. SVC #8 reports that the vector restored that
-/// state and returned to EL0. A verification failure, unexpected SVC, or other
-/// lower-EL exception reports diagnostics and fail-stops at EL1.
+/// The lower-EL synchronous vector passes the saved user `x8` syscall number
+/// followed by `x0..x5`. SVC #0 dispatches the Linux AArch64 syscall ABI and
+/// returns its result for writeback to saved user `x0`. SVC #7 and SVC #8
+/// retain the smoke-test control path. Any other exception fail-stops at EL1.
 #[unsafe(no_mangle)]
-pub extern "C" fn aarch64_handle_sync_lower() {
+pub extern "C" fn aarch64_handle_sync_lower(
+    native_number: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+) -> u64 {
     let esr: u64;
     // SAFETY: `mrs` from `ESR_EL1` reads the Exception Syndrome Register,
     // which is always accessible at EL1 and has no side effects. It still
@@ -261,6 +268,13 @@ pub extern "C" fn aarch64_handle_sync_lower() {
     // ESR_EL1.ISS[15:0] contains the immediate from the trapped SVC.
     let imm = (esr & 0xFFFF) as u16;
     match imm {
+        0 => {
+            let result = oncrix_syscall::aarch64::dispatch_from_trap_registers(
+                native_number,
+                [arg0, arg1, arg2, arg3, arg4, arg5],
+            );
+            u64::from_ne_bytes(result.to_ne_bytes())
+        }
         7 => {
             let _ = serial.write_str("[ONCRIX/aarch64] EL0 stack canary verified\n");
             // Deliberately destroy every state item seeded by the EL0 payload.
@@ -282,12 +296,15 @@ pub extern "C" fn aarch64_handle_sync_lower() {
                     options(nostack),
                 );
             }
+            arg0
         }
         8 => {
             let _ = serial.write_str(
                 "[ONCRIX/aarch64] EL0 SIMD/FP state preserved and round-trip verified\n",
             );
+            let _ = serial.write_str("[ONCRIX/aarch64] EL0 getpid syscall round trip verified\n");
             let _ = serial.write_str("[ONCRIX/aarch64] EL0 round trip verified\n");
+            arg0
         }
         SVC_STACK_FAILURE => {
             let _ = serial.write_str("[ONCRIX/aarch64] EL0 stack/SIMD/FP verification FAILED\n");
@@ -317,7 +334,8 @@ fn fail_stop() -> ! {
 /// or literal pool. It verifies a stack canary, seeds both 64-bit lanes of
 /// `q0`, `q15`, and `q31` plus nonzero valid `FPCR`/`FPSR` values, then traps
 /// with SVC #7. It compares every seeded value after `eret`; only complete
-/// restoration reaches SVC #8. A mismatch uses the existing failure SVC.
+/// restoration reaches the `getpid` SVC. Only a zero result reaches SVC #8; a
+/// mismatch uses the existing failure SVC.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 #[unsafe(link_section = ".text.user")]
@@ -393,10 +411,15 @@ pub extern "C" fn el0_test_entry() -> ! {
         "movk x9, #0x0800, lsl #16",
         "cmp x9, x10",
         "b.ne 1f",
+        "mov x0, #1",
+        "mov x8, #{getpid}",
+        "svc #0",
+        "cbnz x0, 1f",
         "svc #8",
         "b .",
         "1:",
         "svc #0xbad",
         "b .",
+        getpid = const oncrix_syscall::aarch64::LINUX_SYS_GETPID,
     );
 }

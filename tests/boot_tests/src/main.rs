@@ -707,8 +707,8 @@ struct ArchBootSpec {
 }
 
 /// Mirrors `scripts/run-qemu-aarch64.sh`. Asserts the full chain: boot, GICv3,
-/// cooperative switch, timer preemption, and the three FP/SIMD preservation
-/// proofs across context switch, timer IRQ, and the EL0 round trip.
+/// cooperative switch, timer preemption, the three FP/SIMD preservation
+/// proofs, and the live EL0 getpid syscall round trip.
 const AARCH64_SPEC: ArchBootSpec = ArchBootSpec {
     name: "aarch64",
     target: "aarch64-unknown-none",
@@ -734,6 +734,7 @@ const AARCH64_SPEC: ArchBootSpec = ArchBootSpec {
         "[ONCRIX/aarch64] kernel SIMD/FP state preserved across timer IRQ",
         "[ONCRIX/aarch64] EL0 stack canary verified",
         "[ONCRIX/aarch64] EL0 SIMD/FP state preserved and round-trip verified",
+        "[ONCRIX/aarch64] EL0 getpid syscall round trip verified",
         "[ONCRIX/aarch64] EL0 round trip verified",
     ],
     failure: &["FAILED", PANIC_MARKER],
