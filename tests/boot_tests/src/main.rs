@@ -40,6 +40,7 @@ const REQUIRED_MARKERS: &[&str] = &[
     "[ONCRIX] Root filesystem mounted",
     "[ONCRIX] Service manager boot complete",
     "[init] hello from pid 1",
+    "[exec] loaded VFS image /bin/sh",
 ];
 
 /// If this string appears the boot is considered failed immediately.

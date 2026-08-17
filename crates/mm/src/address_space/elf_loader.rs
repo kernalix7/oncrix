@@ -161,10 +161,18 @@ pub fn load_elf_into(elf_bytes: &[u8], dst: &mut [u8]) -> Result<ElfLoadInfo> {
     if header.e_type != ET_EXEC && header.e_type != ET_DYN {
         return Err(Error::InvalidArgument);
     }
+    if header.e_ident[6] != 1 || header.e_version != 1 {
+        return Err(Error::InvalidArgument);
+    }
+    if usize::from(header.e_ehsize) != core::mem::size_of::<Elf64Header>()
+        || usize::from(header.e_phentsize) != core::mem::size_of::<Elf64Phdr>()
+    {
+        return Err(Error::InvalidArgument);
+    }
 
-    let ph_offset = header.e_phoff as usize;
-    let ph_size = header.e_phentsize as usize;
-    let ph_count = header.e_phnum as usize;
+    let ph_offset = usize::try_from(header.e_phoff).map_err(|_| Error::InvalidArgument)?;
+    let ph_size = usize::from(header.e_phentsize);
+    let ph_count = usize::from(header.e_phnum);
 
     let ph_end = ph_size
         .checked_mul(ph_count)
@@ -294,10 +302,42 @@ fn read_phdr(elf_bytes: &[u8], ph_offset: usize, ph_size: usize, i: usize) -> Re
     let offset = ph_offset
         .checked_add(i.checked_mul(ph_size).ok_or(Error::InvalidArgument)?)
         .ok_or(Error::InvalidArgument)?;
-    if offset.checked_add(ph_size).ok_or(Error::InvalidArgument)? > elf_bytes.len() {
+    let read_end = offset
+        .checked_add(core::mem::size_of::<Elf64Phdr>())
+        .ok_or(Error::InvalidArgument)?;
+    if read_end > elf_bytes.len() {
         return Err(Error::InvalidArgument);
     }
-    // SAFETY: Bounds checked above (offset + ph_size <= elf_bytes.len()).
-    // `read_unaligned` handles potentially unaligned input.
+    // SAFETY: Bounds checked above: offset + size_of::<Elf64Phdr>() <=
+    // elf_bytes.len(). `read_unaligned` handles potentially unaligned input.
     Ok(unsafe { core::ptr::read_unaligned(elf_bytes.as_ptr().add(offset) as *const Elf64Phdr) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_short_program_header_entry_returns_invalid_argument() {
+        // Given
+        let mut elf = [0u8; 64];
+        elf[..4].copy_from_slice(&ELF_MAGIC);
+        elf[4] = ELFCLASS64;
+        elf[5] = ELFDATA2LSB;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[32..40].copy_from_slice(&63u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&1u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let mut dst = [0u8; 1];
+
+        // When
+        let result = load_elf_into(&elf, &mut dst);
+
+        // Then
+        assert!(matches!(result, Err(Error::InvalidArgument)));
+    }
 }

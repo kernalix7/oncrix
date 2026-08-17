@@ -23,6 +23,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::cred_check::{AccessResult, VfsCred, check_exec_access};
 use crate::dentry::{Dentry, DentryCache, DentryName};
 use crate::file::OpenFlags;
 use crate::inode::{FileMode, FileType, Inode, InodeNumber, InodeOps};
@@ -559,6 +560,45 @@ impl KernelVfs {
         let n = self.ramfs.read(&inode, 0, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
+    }
+
+    /// Read a bounded regular executable file into owned memory.
+    ///
+    /// The inode must be regular, executable by `cred`, and no larger than
+    /// `max_bytes`. Short reads are rejected rather than returning a partial
+    /// executable image.
+    pub fn read_executable_bytes(
+        &self,
+        path: &[u8],
+        cred: &VfsCred,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let inode = self.lookup_path(path)?;
+        if inode.file_type != FileType::Regular
+            || check_exec_access(cred, inode.uid, inode.gid, inode.mode.0) != AccessResult::Granted
+        {
+            return Err(Error::PermissionDenied);
+        }
+        let size = usize::try_from(inode.size).map_err(|_| Error::OutOfMemory)?;
+        if size > max_bytes {
+            return Err(Error::OutOfMemory);
+        }
+        let mut image = Vec::new();
+        image
+            .try_reserve_exact(size)
+            .map_err(|_| Error::OutOfMemory)?;
+        image.resize(size, 0);
+        let mut offset = 0;
+        while offset < size {
+            let count = self
+                .ramfs
+                .read(&inode, offset as u64, &mut image[offset..])?;
+            if count == 0 {
+                return Err(Error::IoError);
+            }
+            offset += count;
+        }
+        Ok(image)
     }
 
     /// Read a `/proc/<name>` virtual file by name.

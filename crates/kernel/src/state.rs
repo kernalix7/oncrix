@@ -132,7 +132,7 @@ impl KernelState {
     /// directories.
     ///
     /// Creates a ramfs root and populates it with `/dev`, `/proc`,
-    /// `/tmp`, `/sbin`, and `/etc` (which contains `/etc/motd`).
+    /// `/tmp`, `/bin`, `/sbin`, and `/etc` (which contains `/etc/motd`).
     pub fn init_rootfs(&mut self) -> oncrix_lib::Result<()> {
         let root_ino = self.vfs.ramfs.root_inode();
         let root_sb = Superblock::new(FsType::Ramfs, root_ino);
@@ -150,7 +150,14 @@ impl KernelState {
 
         let _ = self.vfs.ramfs.mkdir(&root, "proc", FileMode::DIR_DEFAULT);
         let _ = self.vfs.ramfs.mkdir(&root, "tmp", FileMode::DIR_DEFAULT);
+        let bin = self.vfs.ramfs.mkdir(&root, "bin", FileMode::DIR_DEFAULT)?;
         let _ = self.vfs.ramfs.mkdir(&root, "sbin", FileMode::DIR_DEFAULT);
+
+        if let Some(shell) = crate::arch::init_embed::embedded_lookup(b"/bin/sh") {
+            self.vfs
+                .ramfs
+                .create_static_file(&bin, "sh", FileMode(0o555), shell)?;
+        }
 
         // /etc and /etc/motd
         let etc = self.vfs.ramfs.mkdir(&root, "etc", FileMode::DIR_DEFAULT)?;

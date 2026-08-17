@@ -3,9 +3,9 @@
 
 //! RAM filesystem — a simple in-memory filesystem for early boot.
 //!
-//! Ramfs stores all data in fixed-size memory buffers. It provides
-//! a minimal but functional filesystem for the kernel's initial
-//! root before a real filesystem is mounted.
+//! Writable files use fixed-size in-memory buffers. Static read-only
+//! files borrow immutable `'static` byte slices. Ramfs remains the
+//! early-boot root filesystem.
 
 extern crate alloc;
 
@@ -45,6 +45,11 @@ enum RamInodeData {
         data: [u8; MAX_FILE_SIZE],
         /// Actual data length.
         len: usize,
+    },
+    /// Borrowed read-only file data with static lifetime.
+    StaticFile {
+        /// Immutable file contents.
+        data: &'static [u8],
     },
     /// Directory entries.
     Dir {
@@ -193,6 +198,34 @@ impl Ramfs {
     /// (free inodes = `MAX_INODES - used_inodes()`). O(MAX_INODES).
     pub fn used_inodes(&self) -> usize {
         self.inodes.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// Create a read-only regular file backed by static bytes.
+    ///
+    /// Static files are not constrained by [`MAX_FILE_SIZE`] and reject
+    /// subsequent write and truncate operations.
+    pub fn create_static_file(
+        &mut self,
+        parent: &Inode,
+        name: &str,
+        mode: FileMode,
+        data: &'static [u8],
+    ) -> Result<Inode> {
+        let parent_slot = self.slot_of(parent.ino).ok_or(Error::NotFound)?;
+        let (child_slot, child_ino) = self.alloc_inode(FileType::Regular, mode)?;
+        self.data[child_slot] = Some(RamInodeData::StaticFile { data });
+        if let Some(inode) = self.inodes[child_slot].as_mut() {
+            inode.size = data.len() as u64;
+        }
+        if let Err(err) = self.add_dir_entry(parent_slot, name, child_ino) {
+            self.inodes[child_slot] = None;
+            self.data[child_slot] = None;
+            return Err(err);
+        }
+        self.inodes[child_slot]
+            .as_ref()
+            .copied()
+            .ok_or(Error::NotFound)
     }
 
     /// Find the slot index for an inode number.
@@ -736,21 +769,32 @@ impl InodeOps for Ramfs {
         let slot = self.slot_of(inode.ino).ok_or(Error::NotFound)?;
         let data = self.data[slot].as_ref().ok_or(Error::NotFound)?;
 
-        if let RamInodeData::File {
-            data: file_data,
-            len,
-        } = data
-        {
-            let offset = offset as usize;
-            if offset >= *len {
-                return Ok(0);
+        match data {
+            RamInodeData::File {
+                data: file_data,
+                len,
+            } => {
+                let offset = offset as usize;
+                if offset >= *len {
+                    return Ok(0);
+                }
+                let available = *len - offset;
+                let to_read = buf.len().min(available);
+                buf[..to_read].copy_from_slice(&file_data[offset..offset + to_read]);
+                Ok(to_read)
             }
-            let available = *len - offset;
-            let to_read = buf.len().min(available);
-            buf[..to_read].copy_from_slice(&file_data[offset..offset + to_read]);
-            Ok(to_read)
-        } else {
-            Err(Error::InvalidArgument)
+            RamInodeData::StaticFile { data } => {
+                let offset = offset as usize;
+                if offset >= data.len() {
+                    return Ok(0);
+                }
+                let to_read = buf.len().min(data.len() - offset);
+                buf[..to_read].copy_from_slice(&data[offset..offset + to_read]);
+                Ok(to_read)
+            }
+            RamInodeData::Dir { .. } | RamInodeData::Symlink { .. } | RamInodeData::Fifo { .. } => {
+                Err(Error::InvalidArgument)
+            }
         }
     }
 
@@ -758,31 +802,33 @@ impl InodeOps for Ramfs {
         let slot = self.slot_of(inode.ino).ok_or(Error::NotFound)?;
         let inode_data = self.data[slot].as_mut().ok_or(Error::NotFound)?;
 
-        if let RamInodeData::File {
-            data: file_data,
-            len,
-        } = inode_data
-        {
-            let offset = offset as usize;
-            let end = offset
-                .checked_add(data.len())
-                .ok_or(Error::InvalidArgument)?;
-            if end > MAX_FILE_SIZE {
-                return Err(Error::OutOfMemory);
-            }
-            file_data[offset..end].copy_from_slice(data);
-            if end > *len {
-                *len = end;
-            }
+        match inode_data {
+            RamInodeData::File {
+                data: file_data,
+                len,
+            } => {
+                let offset = offset as usize;
+                let end = offset
+                    .checked_add(data.len())
+                    .ok_or(Error::InvalidArgument)?;
+                if end > MAX_FILE_SIZE {
+                    return Err(Error::OutOfMemory);
+                }
+                file_data[offset..end].copy_from_slice(data);
+                if end > *len {
+                    *len = end;
+                }
 
-            // Update inode size.
-            if let Some(inode_meta) = self.inodes[slot].as_mut() {
-                inode_meta.size = *len as u64;
-            }
+                if let Some(inode_meta) = self.inodes[slot].as_mut() {
+                    inode_meta.size = *len as u64;
+                }
 
-            Ok(data.len())
-        } else {
-            Err(Error::InvalidArgument)
+                Ok(data.len())
+            }
+            RamInodeData::StaticFile { .. } => Err(Error::PermissionDenied),
+            RamInodeData::Dir { .. } | RamInodeData::Symlink { .. } | RamInodeData::Fifo { .. } => {
+                Err(Error::InvalidArgument)
+            }
         }
     }
 
@@ -790,24 +836,26 @@ impl InodeOps for Ramfs {
         let slot = self.slot_of(inode.ino).ok_or(Error::NotFound)?;
         let inode_data = self.data[slot].as_mut().ok_or(Error::NotFound)?;
 
-        if let RamInodeData::File {
-            data: file_data,
-            len,
-        } = inode_data
-        {
-            let new_len = (size as usize).min(MAX_FILE_SIZE);
-            if new_len < *len {
-                // Zero out truncated region.
-                file_data[new_len..*len].fill(0);
-            }
-            *len = new_len;
+        match inode_data {
+            RamInodeData::File {
+                data: file_data,
+                len,
+            } => {
+                let new_len = (size as usize).min(MAX_FILE_SIZE);
+                if new_len < *len {
+                    file_data[new_len..*len].fill(0);
+                }
+                *len = new_len;
 
-            if let Some(inode_meta) = self.inodes[slot].as_mut() {
-                inode_meta.size = new_len as u64;
+                if let Some(inode_meta) = self.inodes[slot].as_mut() {
+                    inode_meta.size = new_len as u64;
+                }
+                Ok(())
             }
-            Ok(())
-        } else {
-            Err(Error::InvalidArgument)
+            RamInodeData::StaticFile { .. } => Err(Error::PermissionDenied),
+            RamInodeData::Dir { .. } | RamInodeData::Symlink { .. } | RamInodeData::Fifo { .. } => {
+                Err(Error::InvalidArgument)
+            }
         }
     }
 
@@ -815,3 +863,7 @@ impl InodeOps for Ramfs {
         self.read_link(inode.ino, buf)
     }
 }
+
+#[cfg(test)]
+#[path = "ramfs_exec_tests.rs"]
+mod exec_tests;
