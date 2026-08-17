@@ -15,6 +15,7 @@
 
 #![no_std]
 
+pub mod aarch64;
 pub mod clock;
 pub mod copy_range;
 pub mod dispatch;
