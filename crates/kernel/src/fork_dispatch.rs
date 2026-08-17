@@ -21,10 +21,11 @@
 //!   immediately. Writes the exit code (shifted left 8) to the user `*wstatus`
 //!   pointer if non-null.
 //!
-//! * `sys_execve` — path-validated in-kernel exec. Only `"/bin/sh"` is
-//!   recognized. A new [`UserAddressSpace`] is allocated, the embedded shell
-//!   ELF is loaded into it, the calling thread's previous address space is
-//!   released, and the SYSCALL epilogue is redirected to the new entry point.
+//! * `sys_execve` — path-validated in-kernel exec. VFS is consulted first,
+//!   with an embedded compatibility fallback only when the path is absent. A
+//!   new [`UserAddressSpace`] is allocated, the ELF is loaded, the previous
+//!   address space is released, and the SYSCALL epilogue is redirected to the
+//!   new entry point.
 //!   argv/envp are read from user space and laid out on the System V AMD64
 //!   initial stack at user VA 0x5FF000.
 //!
@@ -45,10 +46,12 @@
 
 use oncrix_hal::arch::uart::{COM1, Uart16550};
 use oncrix_hal::serial::SerialPort;
+use oncrix_lib::Error;
 use oncrix_process::pid::{Pid, alloc_pid};
 use oncrix_process::process::Process;
 use oncrix_process::signal::Signal;
 use oncrix_process::table::{ExitStatus, ProcessEntry, ProcessTable};
+use oncrix_vfs::cred_check::VfsCred;
 
 use crate::arch::clone::ForkSnapshot;
 use crate::arch::sched_glue::read_cr3;
@@ -596,6 +599,8 @@ const MAX_ARGV: usize = 64;
 /// Maximum bytes copied per argv/envp string.
 const MAX_ARG_STR: usize = 256;
 
+const BIN_PREFIX_LEN: usize = 5;
+
 /// Kernel handler for `SYS_EXECVE`.
 ///
 /// POSIX.1-2024 `execve(3p)` semantics:
@@ -604,13 +609,14 @@ const MAX_ARG_STR: usize = 256;
 ///   overwriting the saved user RIP / RSP / RFLAGS atomics.
 /// - On failure: returns a negative errno; the caller continues normally.
 ///
-/// # Phase 13 implementation
+/// # Phase 24 implementation
 ///
-/// Only `"/bin/sh"` is recognized. A fresh [`UserAddressSpace`] is
-/// allocated via [`crate::frame_alloc`], the embedded `/bin/sh` ELF is
-/// loaded into it, the calling thread's previous address space is
-/// `release`d (so its frames return to the global pool), and the new
-/// UAS is installed both on the thread and at `PD_0_1G[2]`. argv and
+/// The executable image is read from VFS first, with an embedded compatibility
+/// fallback only when the path is absent. A fresh [`UserAddressSpace`] is
+/// allocated via [`crate::frame_alloc`], the ELF is loaded into it, and the
+/// calling thread's previous address space is `release`d so its frames return
+/// to the global pool. The new UAS is installed both on the thread and at
+/// `PD_0_1G[2]`. argv and
 /// envp are read from user space and written to the System V AMD64
 /// initial stack at the top 4 KiB of the user region (user VA 0x5FF000).
 /// The SYSCALL epilogue is redirected to the new entry point with
@@ -635,20 +641,48 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
         Some(s) => s,
         None => return -22, // EINVAL — too long or non-ASCII
     };
+    if path.is_empty() {
+        return -2;
+    }
 
-    // Resolve `path` against the embedded binary set. Phase 23
-    // recognises `/bin/{sh,echo,cat,true,false}` plus the matching
-    // bare names (a primitive `$PATH=/bin` shortcut).
-    let elf_bytes = match crate::arch::init_embed::embedded_lookup(path) {
-        Some(bytes) => bytes,
-        None => {
-            let _ = serial.write_str("[exec] path not in embedded set: ");
-            for &b in path {
-                let _ = serial.write_byte(b);
+    let mut path_buf = [0u8; MAX_PATHNAME + BIN_PREFIX_LEN];
+    let vfs_path = if path.contains(&b'/') {
+        path
+    } else {
+        path_buf[..BIN_PREFIX_LEN].copy_from_slice(b"/bin/");
+        path_buf[BIN_PREFIX_LEN..BIN_PREFIX_LEN + path.len()].copy_from_slice(path);
+        &path_buf[..BIN_PREFIX_LEN + path.len()]
+    };
+    let vfs_image = match crate::state::with_global(|state| {
+        state.vfs.read_executable_bytes(
+            vfs_path,
+            &VfsCred::root(),
+            oncrix_mm::address_space::USER_REGION_SIZE,
+        )
+    }) {
+        Some(Ok(image)) => Some(image),
+        Some(Err(Error::NotFound)) => None,
+        Some(Err(Error::PermissionDenied)) => return -13,
+        Some(Err(Error::OutOfMemory)) => return -12,
+        Some(Err(Error::InvalidArgument)) => return -22,
+        Some(Err(Error::Busy)) => return -16,
+        Some(Err(Error::WouldBlock)) => return -11,
+        Some(Err(Error::Interrupted)) => return -4,
+        Some(Err(Error::NotImplemented)) => return -38,
+        Some(Err(Error::AlreadyExists)) => return -17,
+        Some(Err(Error::IoError)) | None => return -5,
+    };
+    let elf_bytes = match vfs_image.as_deref() {
+        Some(image) => image,
+        None => match crate::arch::init_embed::embedded_lookup(path) {
+            Some(bytes) => bytes,
+            None => {
+                let _ = serial.write_str("[exec] path not found: ");
+                write_exec_path(&mut serial, path);
+                let _ = serial.write_str("\n");
+                return -2;
             }
-            let _ = serial.write_str("\n");
-            return -2; // ENOENT
-        }
+        },
     };
 
     // Snapshot argv/envp from the CALLING process's address space
@@ -699,9 +733,7 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
         match new_uas.map_elf_segments(elf_bytes) {
             Ok(e) => {
                 let _ = serial.write_str("[exec] loaded ");
-                for &b in path {
-                    let _ = serial.write_byte(b);
-                }
+                write_exec_path(&mut serial, path);
                 let _ = serial.write_str(" at entry=0x");
                 write_hex(&mut serial, e);
                 let _ = serial.write_str("\n");
@@ -737,9 +769,7 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
             }
             Err(_) => {
                 let _ = serial.write_str("[exec] ELF parse/load failed for ");
-                for &b in path {
-                    let _ = serial.write_byte(b);
-                }
+                write_exec_path(&mut serial, path);
                 let _ = serial.write_str("\n");
                 new_uas.release(alloc);
                 return -8; // ENOEXEC
@@ -856,6 +886,12 @@ pub unsafe fn sys_execve(pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64
     set_saved_user_rsp(0x5FF000);
     set_saved_user_rflags(DEFAULT_USER_RFLAGS);
 
+    if vfs_image.is_some() {
+        let _ = serial.write_str("[exec] loaded VFS image ");
+        write_exec_path(&mut serial, vfs_path);
+        let _ = serial.write_str("\n");
+    }
+
     // Return 0 — the SYSCALL epilogue will sysretq into sh's _start.
     0
 }
@@ -903,6 +939,13 @@ unsafe fn collect_user_argv(
         count += 1;
     }
     count
+}
+
+fn write_exec_path(serial: &mut Uart16550, path: &[u8]) {
+    for &b in path {
+        let out = if b < 0x20 || b == 0x7F { b'?' } else { b };
+        let _ = serial.write_byte(out);
+    }
 }
 
 /// Write a 64-bit value as `0x`-prefixed hex to the serial console.
