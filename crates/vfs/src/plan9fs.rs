@@ -85,6 +85,8 @@ const NOFID: u32 = 0xFFFF_FFFF;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum P9MessageType {
+    /// Linux 9P error response carrying a numeric errno.
+    Rlerror = 7,
     /// Negotiate protocol version.
     Tversion = 100,
     /// Version negotiation reply.
@@ -145,6 +147,7 @@ impl P9MessageType {
     /// Parse a message type from its on-disk byte value.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
+            7 => Some(Self::Rlerror),
             100 => Some(Self::Tversion),
             101 => Some(Self::Rversion),
             102 => Some(Self::Tauth),
@@ -443,6 +446,8 @@ pub struct P9Fid {
     pub mode: P9OpenMode,
     /// Current I/O offset for sequential reads/writes.
     pub offset: u64,
+    /// Effective server I/O unit, bounded by the negotiated message size.
+    pub iounit: u32,
     /// Path name associated with this FID (for debugging/display).
     pub path: [u8; MAX_NAME_LEN],
     /// Length of the path name.
@@ -458,6 +463,7 @@ impl P9Fid {
             qid: P9Qid::new(P9QidType::FILE, 0, 0),
             mode: P9OpenMode::OREAD,
             offset: 0,
+            iounit: 0,
             path: [0; MAX_NAME_LEN],
             path_len: 0,
         }
@@ -516,10 +522,9 @@ impl FidTable {
             Some(n) if n != NOFID => n,
             _ => 1,
         };
+        self.fids[slot] = P9Fid::free();
         self.fids[slot].fid = fid;
         self.fids[slot].state = FidState::Allocated;
-        self.fids[slot].offset = 0;
-        self.fids[slot].path_len = 0;
         self.active_count += 1;
     }
 
@@ -562,11 +567,7 @@ impl FidTable {
     /// Release (clunk) a FID, freeing its slot.
     pub fn release(&mut self, fid: u32) -> Result<()> {
         let idx = self.lookup(fid)?;
-        self.fids[idx].state = FidState::Free;
-        self.fids[idx].fid = 0;
-        self.fids[idx].qid = P9Qid::new(P9QidType::FILE, 0, 0);
-        self.fids[idx].offset = 0;
-        self.fids[idx].path_len = 0;
+        self.fids[idx] = P9Fid::free();
         self.active_count = self.active_count.saturating_sub(1);
         Ok(())
     }
@@ -574,6 +575,12 @@ impl FidTable {
     /// Return the number of active FIDs.
     pub fn active_count(&self) -> usize {
         self.active_count
+    }
+
+    fn clear(&mut self) {
+        self.fids = [const { P9Fid::free() }; MAX_FIDS];
+        self.active_count = 0;
+        self.next_fid = 1;
     }
 }
 
@@ -776,6 +783,146 @@ pub enum SessionState {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    Version,
+    Attach,
+    Walk,
+    Open,
+    Read,
+    Write,
+    Clunk,
+    Remove,
+    Stat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOperation {
+    Version,
+    Attach { fid: u32 },
+    Walk { src: u32, dst: u32, nwname: usize },
+    Open { fid: u32, mode: P9OpenMode },
+    Read { fid: u32, count: u32 },
+    Write { fid: u32, count: u32 },
+    Clunk { fid: u32 },
+    Remove { fid: u32 },
+    Stat { fid: u32 },
+}
+
+impl PendingOperation {
+    const fn kind(self) -> PendingKind {
+        match self {
+            Self::Version => PendingKind::Version,
+            Self::Attach { .. } => PendingKind::Attach,
+            Self::Walk { .. } => PendingKind::Walk,
+            Self::Open { .. } => PendingKind::Open,
+            Self::Read { .. } => PendingKind::Read,
+            Self::Write { .. } => PendingKind::Write,
+            Self::Clunk { .. } => PendingKind::Clunk,
+            Self::Remove { .. } => PendingKind::Remove,
+            Self::Stat { .. } => PendingKind::Stat,
+        }
+    }
+
+    const fn expected_response(self) -> P9MessageType {
+        match self {
+            Self::Version => P9MessageType::Rversion,
+            Self::Attach { .. } => P9MessageType::Rattach,
+            Self::Walk { .. } => P9MessageType::Rwalk,
+            Self::Open { .. } => P9MessageType::Ropen,
+            Self::Read { .. } => P9MessageType::Rread,
+            Self::Write { .. } => P9MessageType::Rwrite,
+            Self::Clunk { .. } => P9MessageType::Rclunk,
+            Self::Remove { .. } => P9MessageType::Rremove,
+            Self::Stat { .. } => P9MessageType::Rstat,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingRequest {
+    tag: u16,
+    expected_response: P9MessageType,
+    operation: PendingOperation,
+}
+
+impl PendingRequest {
+    const fn new(tag: u16, operation: PendingOperation) -> Self {
+        Self {
+            tag,
+            expected_response: operation.expected_response(),
+            operation,
+        }
+    }
+}
+
+/// Result of completing a 9P walk request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P9WalkResult {
+    /// A zero-name walk cloned all source metadata into the destination FID.
+    Cloned {
+        /// Source FID.
+        source: u32,
+        /// Destination FID.
+        destination: u32,
+    },
+    /// Every requested name was walked and the destination FID was committed.
+    Full {
+        /// Source FID.
+        source: u32,
+        /// Destination FID.
+        destination: u32,
+        /// Number of returned QIDs.
+        count: usize,
+        /// Returned QIDs in wire order.
+        qids: [P9Qid; MAX_WALK_ELEMS],
+    },
+    /// Only a prefix was walked; the provisional destination was released.
+    Partial {
+        /// Source FID.
+        source: u32,
+        /// Number of successfully walked names.
+        count: usize,
+        /// Returned prefix QIDs in wire order.
+        qids: [P9Qid; MAX_WALK_ELEMS],
+    },
+}
+
+/// Request context for a response whose body is intentionally not parsed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P9RawRequest {
+    /// Read request envelope.
+    Read {
+        /// Target FID.
+        fid: u32,
+        /// Encoded maximum byte count.
+        count: u32,
+    },
+    /// Write request envelope.
+    Write {
+        /// Target FID.
+        fid: u32,
+        /// Encoded byte count.
+        count: u32,
+    },
+    /// Stat request envelope.
+    Stat {
+        /// Target FID.
+        fid: u32,
+    },
+}
+
+/// Correlated terminal response envelope without body interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct P9RawResponse<'a> {
+    /// Request context retired by this response.
+    pub request: P9RawRequest,
+    /// Exact response message type that matched the pending request.
+    pub response_type: P9MessageType,
+    /// Unparsed response bytes following the 9P envelope.
+    pub payload: &'a [u8],
+}
+
 // ── Plan9Session ────────────────────────────────────────────────
 
 /// 9P2000.L client session.
@@ -793,13 +940,8 @@ pub struct Plan9Session {
     root_fid: u32,
     /// Next tag number for request/response matching.
     next_tag: u16,
-    // SECURITY: every build_t* stores the tag it allocated here; every
-    // handle_r* reads the reply tag from parse_header and rejects it unless
-    // it matches this field.  This prevents a malicious/compromised 9P server
-    // from replying with a forged tag that would be accepted as the response
-    // to a different in-flight request (FID/QID spoofing, F1 fix).
-    /// Tag of the most-recently-sent request; validated on every reply.
-    pending_tag: u16,
+    /// Single in-flight request correlation state.
+    pending: Option<PendingRequest>,
     /// Message serialization buffer.
     msg_buf: Plan9Message,
     /// User ID for authentication.
@@ -819,7 +961,7 @@ impl Plan9Session {
             fid_table: FidTable::new(),
             root_fid: NOFID,
             next_tag: 1,
-            pending_tag: 0,
+            pending: None,
             msg_buf: Plan9Message::new(),
             uid: 0,
             mount_path: [0; MAX_MOUNT_PATH],
@@ -837,12 +979,140 @@ impl Plan9Session {
         self.msize
     }
 
-    fn commit_tag(&mut self, tag: u16) {
-        self.pending_tag = tag;
+    /// Abort the active connection and invalidate every tracked FID.
+    pub fn abort_connection(&mut self) {
+        self.pending = None;
+        self.fid_table.clear();
+        self.root_fid = NOFID;
+        self.state = SessionState::Error;
+    }
+
+    fn ensure_idle(&self) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+
+    fn commit_request(&mut self, tag: u16, operation: PendingOperation) {
+        self.pending = Some(PendingRequest::new(tag, operation));
+        if tag == NOTAG {
+            return;
+        }
         self.next_tag = tag.wrapping_add(1);
         if self.next_tag == NOTAG {
             self.next_tag = 1;
         }
+    }
+
+    fn pending_for(&self, kind: PendingKind) -> Result<PendingRequest> {
+        let pending = self.pending.ok_or(Error::InvalidArgument)?;
+        if pending.operation.kind() != kind {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(pending)
+    }
+
+    fn map_errno(errno: u32) -> Error {
+        use oncrix_lib::errno;
+
+        match errno as i32 {
+            errno::EPERM | errno::EACCES => Error::PermissionDenied,
+            errno::ENOENT | errno::ESRCH | errno::EBADF => Error::NotFound,
+            errno::ENOMEM => Error::OutOfMemory,
+            errno::EBUSY => Error::Busy,
+            errno::EAGAIN => Error::WouldBlock,
+            errno::EINTR => Error::Interrupted,
+            errno::EEXIST => Error::AlreadyExists,
+            errno::EINVAL | errno::EFAULT => Error::InvalidArgument,
+            errno::ENOSYS => Error::NotImplemented,
+            _ => Error::IoError,
+        }
+    }
+
+    fn release_fid(&mut self, fid: u32) -> Result<()> {
+        self.fid_table.release(fid)?;
+        if self.root_fid == fid {
+            self.root_fid = NOFID;
+        }
+        Ok(())
+    }
+
+    fn finish_error(&mut self, operation: PendingOperation) {
+        match operation {
+            PendingOperation::Attach { fid } => {
+                let _ = self.release_fid(fid);
+            }
+            PendingOperation::Walk { dst, .. } => {
+                let _ = self.fid_table.release(dst);
+            }
+            PendingOperation::Clunk { fid } | PendingOperation::Remove { fid } => {
+                let _ = self.release_fid(fid);
+            }
+            PendingOperation::Version => {
+                self.state = SessionState::Disconnected;
+            }
+            PendingOperation::Open { .. }
+            | PendingOperation::Read { .. }
+            | PendingOperation::Write { .. }
+            | PendingOperation::Stat { .. } => {}
+        }
+        self.pending = None;
+    }
+
+    fn terminal_start(
+        &mut self,
+        reply: &[u8],
+        kind: PendingKind,
+    ) -> Result<(PendingRequest, usize)> {
+        let pending = self.pending_for(kind)?;
+        if reply.len() < HEADER_SIZE {
+            return Err(Error::InvalidArgument);
+        }
+        let tag = u16::from_le_bytes([reply[5], reply[6]]);
+        if tag != pending.tag {
+            return Err(Error::InvalidArgument);
+        }
+        if reply.len() > self.msize as usize {
+            self.abort_connection();
+            return Err(Error::InvalidArgument);
+        }
+        let (msg_type, _, offset) = match Plan9Message::parse_header(reply) {
+            Ok(header) => header,
+            Err(error) => {
+                self.abort_connection();
+                return Err(error);
+            }
+        };
+        if msg_type == pending.expected_response {
+            return Ok((pending, offset));
+        }
+        if msg_type == P9MessageType::Rlerror {
+            if reply.len() != HEADER_SIZE + 4 {
+                self.abort_connection();
+                return Err(Error::InvalidArgument);
+            }
+            let (errno, end) = match Plan9Message::read_u32(reply, offset) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.abort_connection();
+                    return Err(error);
+                }
+            };
+            if end != reply.len() {
+                self.abort_connection();
+                return Err(Error::InvalidArgument);
+            }
+            self.finish_error(pending.operation);
+            return Err(Self::map_errno(errno));
+        }
+        self.abort_connection();
+        Err(Error::InvalidArgument)
+    }
+
+    fn malformed_terminal<T>(&mut self) -> Result<T> {
+        self.abort_connection();
+        Err(Error::InvalidArgument)
     }
 
     fn prepare_message(&mut self, msg_type: P9MessageType, tag: u16) -> Result<()> {
@@ -858,138 +1128,19 @@ impl Plan9Session {
         Ok(())
     }
 
-    fn reply_header(
-        &self,
-        reply: &[u8],
-        required_state: SessionState,
-    ) -> Result<(P9MessageType, usize)> {
-        if self.state != required_state || reply.len() > self.msize as usize {
-            return Err(Error::InvalidArgument);
-        }
-        let (msg_type, tag, offset) = Plan9Message::parse_header(reply)?;
-        if tag != self.pending_tag {
-            return Err(Error::InvalidArgument);
-        }
-        Ok((msg_type, offset))
-    }
-
-    fn parse_rversion(&self, reply: &[u8]) -> Result<u32> {
-        let (msg_type, offset) = self.reply_header(reply, SessionState::Negotiating)?;
-        if msg_type != P9MessageType::Rversion {
-            return Err(if msg_type == P9MessageType::Rerror {
-                Error::IoError
-            } else {
-                Error::InvalidArgument
-            });
-        }
-        let (server_msize, offset) = Plan9Message::read_u32(reply, offset)?;
-        if !(MIN_MSIZE..=self.msize).contains(&server_msize) {
-            return Err(Error::InvalidArgument);
-        }
-        let (version, end) = Plan9Message::read_string(reply, offset)?;
-        if version != P9_VERSION || end != reply.len() {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(server_msize)
-    }
-
-    fn parse_rattach(&self, reply: &[u8]) -> Result<P9Qid> {
-        let (msg_type, offset) = self.reply_header(reply, SessionState::Versioned)?;
-        if msg_type != P9MessageType::Rattach {
-            return Err(if msg_type == P9MessageType::Rerror {
-                Error::IoError
-            } else {
-                Error::InvalidArgument
-            });
-        }
-        let (qid, consumed) = P9Qid::from_bytes(reply, offset)?;
-        let end = offset.checked_add(consumed).ok_or(Error::InvalidArgument)?;
-        if end != reply.len() {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(qid)
-    }
-
-    fn parse_rwalk(&self, reply: &[u8]) -> Result<(usize, [P9Qid; MAX_WALK_ELEMS])> {
-        let (msg_type, mut offset) = self.reply_header(reply, SessionState::Attached)?;
-        if msg_type != P9MessageType::Rwalk {
-            return Err(if msg_type == P9MessageType::Rerror {
-                Error::NotFound
-            } else {
-                Error::InvalidArgument
-            });
-        }
-        let count_end = offset.checked_add(2).ok_or(Error::InvalidArgument)?;
-        let count_bytes = reply.get(offset..count_end).ok_or(Error::InvalidArgument)?;
-        let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
-        if count > MAX_WALK_ELEMS {
-            return Err(Error::InvalidArgument);
-        }
-        offset = count_end;
-        let mut qids = [P9Qid::new(P9QidType::FILE, 0, 0); MAX_WALK_ELEMS];
-        let mut i = 0;
-        while i < count {
-            let (qid, consumed) = P9Qid::from_bytes(reply, offset)?;
-            qids[i] = qid;
-            offset = offset.checked_add(consumed).ok_or(Error::InvalidArgument)?;
-            i += 1;
-        }
-        if offset != reply.len() {
-            return Err(Error::InvalidArgument);
-        }
-        Ok((count, qids))
-    }
-
-    fn parse_ropen(&self, reply: &[u8]) -> Result<(P9Qid, u32)> {
-        let (msg_type, offset) = self.reply_header(reply, SessionState::Attached)?;
-        if msg_type != P9MessageType::Ropen {
-            return Err(if msg_type == P9MessageType::Rerror {
-                Error::PermissionDenied
-            } else {
-                Error::InvalidArgument
-            });
-        }
-        let (qid, consumed) = P9Qid::from_bytes(reply, offset)?;
-        let iounit_offset = offset.checked_add(consumed).ok_or(Error::InvalidArgument)?;
-        let (raw_iounit, end) = Plan9Message::read_u32(reply, iounit_offset)?;
-        if end != reply.len() {
-            return Err(Error::InvalidArgument);
-        }
-        let iounit = if raw_iounit == 0 {
-            MAX_IO_SIZE as u32
-        } else {
-            raw_iounit.min(MAX_IO_SIZE as u32)
-        };
-        Ok((qid, iounit))
-    }
-
-    fn parse_rclunk(&self, reply: &[u8]) -> Result<()> {
-        let (msg_type, offset) = self.reply_header(reply, SessionState::Attached)?;
-        if msg_type != P9MessageType::Rclunk {
-            return Err(if msg_type == P9MessageType::Rerror {
-                Error::IoError
-            } else {
-                Error::InvalidArgument
-            });
-        }
-        if offset != reply.len() {
-            return Err(Error::InvalidArgument);
-        }
-        Ok(())
-    }
-
     /// Build a Tversion message to initiate protocol negotiation.
     ///
     /// The caller must send the returned bytes to the server and call
     /// [`handle_rversion`](Self::handle_rversion) with the reply.
     pub fn build_tversion(&mut self) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Disconnected {
             return Err(Error::InvalidArgument);
         }
         self.prepare_message(P9MessageType::Tversion, NOTAG)?;
         self.msg_buf.put_u32(self.msize)?;
         self.msg_buf.put_string(&P9_VERSION)?;
-        self.pending_tag = NOTAG;
+        self.commit_request(NOTAG, PendingOperation::Version);
         self.state = SessionState::Negotiating;
         Ok(self.msg_buf.finalize())
     }
@@ -1008,23 +1159,33 @@ impl Plan9Session {
         if self.state != SessionState::Negotiating {
             return Err(Error::InvalidArgument);
         }
-        match self.parse_rversion(reply) {
-            Ok(msize) => {
-                self.msize = msize;
-                self.state = SessionState::Versioned;
-                Ok(())
-            }
-            Err(error) => {
-                self.state = SessionState::Error;
-                Err(error)
-            }
+        let (_, mut offset) = self.terminal_start(reply, PendingKind::Version)?;
+        let (server_msize, next) = match Plan9Message::read_u32(reply, offset) {
+            Ok(value) => value,
+            Err(_) => return self.malformed_terminal(),
+        };
+        offset = next;
+        let (version, end) = match Plan9Message::read_string(reply, offset) {
+            Ok(value) => value,
+            Err(_) => return self.malformed_terminal(),
+        };
+        if !(MIN_MSIZE..=self.msize).contains(&server_msize)
+            || version != P9_VERSION
+            || end != reply.len()
+        {
+            return self.malformed_terminal();
         }
+        self.pending = None;
+        self.msize = server_msize;
+        self.state = SessionState::Versioned;
+        Ok(())
     }
 
     /// Build a Tattach message to attach to the filesystem root.
     ///
     /// `aname` is the filesystem name on the server to attach to.
     pub fn build_tattach(&mut self, uid: u32, aname: &[u8]) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Versioned {
             return Err(Error::InvalidArgument);
         }
@@ -1049,7 +1210,7 @@ impl Plan9Session {
         self.fid_table.commit_alloc(slot, fid);
         self.root_fid = fid;
         self.uid = uid;
-        self.commit_tag(tag);
+        self.commit_request(tag, PendingOperation::Attach { fid });
         Ok(self.msg_buf.finalize())
     }
 
@@ -1058,20 +1219,25 @@ impl Plan9Session {
         if self.state != SessionState::Versioned {
             return Err(Error::InvalidArgument);
         }
-        let qid = match self.parse_rattach(reply) {
-            Ok(qid) => qid,
-            Err(error) => {
-                if self.root_fid != NOFID {
-                    let _ = self.fid_table.release(self.root_fid);
-                }
-                self.root_fid = NOFID;
-                return Err(error);
-            }
+        let (pending, offset) = self.terminal_start(reply, PendingKind::Attach)?;
+        let PendingOperation::Attach { fid } = pending.operation else {
+            return Err(Error::InvalidArgument);
         };
-        let slot = self.fid_table.lookup(self.root_fid)?;
+        let (qid, consumed) = match P9Qid::from_bytes(reply, offset) {
+            Ok(value) => value,
+            Err(_) => return self.malformed_terminal(),
+        };
+        let Some(end) = offset.checked_add(consumed) else {
+            return self.malformed_terminal();
+        };
+        if end != reply.len() {
+            return self.malformed_terminal();
+        }
+        let slot = self.fid_table.lookup(fid)?;
         let fid_entry = self.fid_table.get_mut(slot)?;
         fid_entry.qid = qid;
         fid_entry.state = FidState::Attached;
+        self.pending = None;
         self.state = SessionState::Attached;
         Ok(qid)
     }
@@ -1083,13 +1249,18 @@ impl Plan9Session {
     ///
     /// Returns the wire message and the newly allocated destination FID number.
     pub fn build_twalk(&mut self, src_fid: u32, names: &[&[u8]]) -> Result<(&[u8], u32)> {
+        self.ensure_idle()?;
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
         if names.len() > MAX_WALK_ELEMS {
             return Err(Error::InvalidArgument);
         }
-        self.fid_table.lookup(src_fid)?;
+        let src_slot = self.fid_table.lookup(src_fid)?;
+        let source = self.fid_table.get(src_slot)?;
+        if source.state != FidState::Attached || (!names.is_empty() && !source.qid.qtype.is_dir()) {
+            return Err(Error::InvalidArgument);
+        }
         let mut frame_size = 17usize;
         for name in names {
             if name.len() > u16::MAX as usize {
@@ -1113,48 +1284,106 @@ impl Plan9Session {
             i += 1;
         }
         self.fid_table.commit_alloc(slot, dst_fid);
-        self.commit_tag(tag);
+        self.commit_request(
+            tag,
+            PendingOperation::Walk {
+                src: src_fid,
+                dst: dst_fid,
+                nwname: names.len(),
+            },
+        );
         Ok((self.msg_buf.finalize(), dst_fid))
     }
 
-    /// Handle an Rwalk reply from the server.
-    ///
-    /// Returns the array of QIDs for each successfully walked element.
-    pub fn handle_rwalk(
-        &mut self,
-        reply: &[u8],
-        dst_fid: u32,
-    ) -> Result<(usize, [P9Qid; MAX_WALK_ELEMS])> {
+    /// Handle an Rwalk reply and apply its full, partial, or clone result.
+    pub fn handle_rwalk(&mut self, reply: &[u8]) -> Result<P9WalkResult> {
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
-        let (count, qids) = match self.parse_rwalk(reply) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                let _ = self.fid_table.release(dst_fid);
-                return Err(error);
-            }
+        let (pending, mut offset) = self.terminal_start(reply, PendingKind::Walk)?;
+        let PendingOperation::Walk { src, dst, nwname } = pending.operation else {
+            return Err(Error::InvalidArgument);
         };
-        if count > 0 {
-            let slot = self.fid_table.lookup(dst_fid)?;
-            let fid_entry = self.fid_table.get_mut(slot)?;
-            fid_entry.state = FidState::Attached;
-            fid_entry.qid = qids[count - 1];
+        let Some(count_end) = offset.checked_add(2) else {
+            return self.malformed_terminal();
+        };
+        let Some(count_bytes) = reply.get(offset..count_end) else {
+            return self.malformed_terminal();
+        };
+        let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
+        if count > nwname || count > MAX_WALK_ELEMS {
+            return self.malformed_terminal();
         }
-        Ok((count, qids))
+        offset = count_end;
+        let mut qids = [P9Qid::new(P9QidType::FILE, 0, 0); MAX_WALK_ELEMS];
+        let mut index = 0;
+        while index < count {
+            let (qid, consumed) = match P9Qid::from_bytes(reply, offset) {
+                Ok(value) => value,
+                Err(_) => return self.malformed_terminal(),
+            };
+            qids[index] = qid;
+            let Some(next) = offset.checked_add(consumed) else {
+                return self.malformed_terminal();
+            };
+            offset = next;
+            index += 1;
+        }
+        if offset != reply.len() {
+            return self.malformed_terminal();
+        }
+        if nwname == 0 {
+            let src_slot = self.fid_table.lookup(src)?;
+            let mut cloned = self.fid_table.get(src_slot)?.clone();
+            cloned.fid = dst;
+            let dst_slot = self.fid_table.lookup(dst)?;
+            *self.fid_table.get_mut(dst_slot)? = cloned;
+            self.pending = None;
+            return Ok(P9WalkResult::Cloned {
+                source: src,
+                destination: dst,
+            });
+        }
+        if count == 0 {
+            return self.malformed_terminal();
+        }
+        if count < nwname {
+            let _ = self.fid_table.release(dst);
+            self.pending = None;
+            return Ok(P9WalkResult::Partial {
+                source: src,
+                count,
+                qids,
+            });
+        }
+        let slot = self.fid_table.lookup(dst)?;
+        let fid_entry = self.fid_table.get_mut(slot)?;
+        fid_entry.state = FidState::Attached;
+        fid_entry.qid = qids[count - 1];
+        self.pending = None;
+        Ok(P9WalkResult::Full {
+            source: src,
+            destination: dst,
+            count,
+            qids,
+        })
     }
 
     /// Build a Topen message to open a file identified by FID.
     pub fn build_topen(&mut self, fid: u32, mode: P9OpenMode) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
-        self.fid_table.lookup(fid)?;
+        let slot = self.fid_table.lookup(fid)?;
+        if self.fid_table.get(slot)?.state != FidState::Attached {
+            return Err(Error::InvalidArgument);
+        }
         let tag = self.next_tag;
         self.prepare_message(P9MessageType::Topen, tag)?;
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u8(mode.0)?;
-        self.commit_tag(tag);
+        self.commit_request(tag, PendingOperation::Open { fid, mode });
         Ok(self.msg_buf.finalize())
     }
 
@@ -1168,24 +1397,45 @@ impl Plan9Session {
     /// (which would double-count the header offset and produce an OOB read
     /// on a crafted reply that is just long enough to pass the header check
     /// but shorter than `2 * HEADER_SIZE + QID_SIZE + 4`).
-    pub fn handle_ropen(
-        &mut self,
-        reply: &[u8],
-        fid: u32,
-        mode: P9OpenMode,
-    ) -> Result<(P9Qid, u32)> {
-        let (qid, iounit) = self.parse_ropen(reply)?;
+    pub fn handle_ropen(&mut self, reply: &[u8]) -> Result<(P9Qid, u32)> {
+        let (pending, offset) = self.terminal_start(reply, PendingKind::Open)?;
+        let PendingOperation::Open { fid, mode } = pending.operation else {
+            return Err(Error::InvalidArgument);
+        };
+        let (qid, consumed) = match P9Qid::from_bytes(reply, offset) {
+            Ok(value) => value,
+            Err(_) => return self.malformed_terminal(),
+        };
+        let Some(iounit_offset) = offset.checked_add(consumed) else {
+            return self.malformed_terminal();
+        };
+        let (raw_iounit, end) = match Plan9Message::read_u32(reply, iounit_offset) {
+            Ok(value) => value,
+            Err(_) => return self.malformed_terminal(),
+        };
+        if end != reply.len() {
+            return self.malformed_terminal();
+        }
+        let server_iounit = if raw_iounit == 0 {
+            self.msize
+        } else {
+            raw_iounit
+        };
+        let iounit = server_iounit.min(self.msize).min(MAX_IO_SIZE as u32);
         let slot = self.fid_table.lookup(fid)?;
         let fid_entry = self.fid_table.get_mut(slot)?;
         fid_entry.state = FidState::Open;
         fid_entry.qid = qid;
         fid_entry.mode = mode;
         fid_entry.offset = 0;
+        fid_entry.iounit = iounit;
+        self.pending = None;
         Ok((qid, iounit))
     }
 
     /// Build a Tread message to read data from an open FID.
     pub fn build_tread(&mut self, fid: u32, offset: u64, count: u32) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
@@ -1195,18 +1445,30 @@ impl Plan9Session {
             return Err(Error::InvalidArgument);
         }
         let budget = (self.msize - 11).min(MAX_IO_SIZE as u32);
+        let budget = if fid_entry.iounit == 0 {
+            budget
+        } else {
+            budget.min(fid_entry.iounit)
+        };
         let clamped = count.min(budget);
         let tag = self.next_tag;
         self.prepare_message(P9MessageType::Tread, tag)?;
         self.msg_buf.put_u32(fid)?;
         self.msg_buf.put_u64(offset)?;
         self.msg_buf.put_u32(clamped)?;
-        self.commit_tag(tag);
+        self.commit_request(
+            tag,
+            PendingOperation::Read {
+                fid,
+                count: clamped,
+            },
+        );
         Ok(self.msg_buf.finalize())
     }
 
     /// Build a Twrite message to write data to an open FID.
     pub fn build_twrite(&mut self, fid: u32, offset: u64, data: &[u8]) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
@@ -1219,6 +1481,11 @@ impl Plan9Session {
             return Err(Error::PermissionDenied);
         }
         let budget = (self.msize as usize - 23).min(MAX_IO_SIZE);
+        let budget = if fid_entry.iounit == 0 {
+            budget
+        } else {
+            budget.min(fid_entry.iounit as usize)
+        };
         let len = data.len().min(budget);
         let tag = self.next_tag;
         self.prepare_message(P9MessageType::Twrite, tag)?;
@@ -1226,12 +1493,19 @@ impl Plan9Session {
         self.msg_buf.put_u64(offset)?;
         self.msg_buf.put_u32(len as u32)?;
         self.msg_buf.put_data(&data[..len])?;
-        self.commit_tag(tag);
+        self.commit_request(
+            tag,
+            PendingOperation::Write {
+                fid,
+                count: len as u32,
+            },
+        );
         Ok(self.msg_buf.finalize())
     }
 
     /// Build a Tclunk message to release a FID.
     pub fn build_tclunk(&mut self, fid: u32) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
@@ -1239,18 +1513,27 @@ impl Plan9Session {
         let tag = self.next_tag;
         self.prepare_message(P9MessageType::Tclunk, tag)?;
         self.msg_buf.put_u32(fid)?;
-        self.commit_tag(tag);
+        self.commit_request(tag, PendingOperation::Clunk { fid });
         Ok(self.msg_buf.finalize())
     }
 
-    /// Handle an Rclunk reply and release the FID.
-    pub fn handle_rclunk(&mut self, reply: &[u8], fid: u32) -> Result<()> {
-        self.parse_rclunk(reply)?;
-        self.fid_table.release(fid)
+    /// Handle an Rclunk reply and release its correlated FID.
+    pub fn handle_rclunk(&mut self, reply: &[u8]) -> Result<()> {
+        let (pending, offset) = self.terminal_start(reply, PendingKind::Clunk)?;
+        let PendingOperation::Clunk { fid } = pending.operation else {
+            return Err(Error::InvalidArgument);
+        };
+        if offset != reply.len() {
+            return self.malformed_terminal();
+        }
+        self.release_fid(fid)?;
+        self.pending = None;
+        Ok(())
     }
 
     /// Build a Tremove message to delete a file and release the FID.
     pub fn build_tremove(&mut self, fid: u32) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
@@ -1258,12 +1541,13 @@ impl Plan9Session {
         let tag = self.next_tag;
         self.prepare_message(P9MessageType::Tremove, tag)?;
         self.msg_buf.put_u32(fid)?;
-        self.commit_tag(tag);
+        self.commit_request(tag, PendingOperation::Remove { fid });
         Ok(self.msg_buf.finalize())
     }
 
     /// Build a Tstat message to retrieve file attributes.
     pub fn build_tstat(&mut self, fid: u32) -> Result<&[u8]> {
+        self.ensure_idle()?;
         if self.state != SessionState::Attached {
             return Err(Error::InvalidArgument);
         }
@@ -1271,8 +1555,47 @@ impl Plan9Session {
         let tag = self.next_tag;
         self.prepare_message(P9MessageType::Tstat, tag)?;
         self.msg_buf.put_u32(fid)?;
-        self.commit_tag(tag);
+        self.commit_request(tag, PendingOperation::Stat { fid });
         Ok(self.msg_buf.finalize())
+    }
+
+    /// Retire a correlated read, write, or stat response without parsing its body.
+    pub fn finalize_unhandled_response<'a>(
+        &mut self,
+        reply: &'a [u8],
+    ) -> Result<P9RawResponse<'a>> {
+        let pending = self.pending.ok_or(Error::InvalidArgument)?;
+        let (kind, request) = match pending.operation {
+            PendingOperation::Read { fid, count } => {
+                (PendingKind::Read, P9RawRequest::Read { fid, count })
+            }
+            PendingOperation::Write { fid, count } => {
+                (PendingKind::Write, P9RawRequest::Write { fid, count })
+            }
+            PendingOperation::Stat { fid } => (PendingKind::Stat, P9RawRequest::Stat { fid }),
+            _ => return Err(Error::InvalidArgument),
+        };
+        let (_, offset) = self.terminal_start(reply, kind)?;
+        self.pending = None;
+        Ok(P9RawResponse {
+            request,
+            response_type: pending.expected_response,
+            payload: &reply[offset..],
+        })
+    }
+
+    /// Handle an Rremove response and release its correlated FID.
+    pub fn handle_rremove(&mut self, reply: &[u8]) -> Result<()> {
+        let (pending, offset) = self.terminal_start(reply, PendingKind::Remove)?;
+        let PendingOperation::Remove { fid } = pending.operation else {
+            return Err(Error::InvalidArgument);
+        };
+        if offset != reply.len() {
+            return self.malformed_terminal();
+        }
+        self.release_fid(fid)?;
+        self.pending = None;
+        Ok(())
     }
 
     /// Get the root FID for this session.
@@ -1474,3 +1797,7 @@ mod frame_tests;
 #[cfg(test)]
 #[path = "plan9fs_session_tests.rs"]
 mod session_tests;
+
+#[cfg(test)]
+#[path = "plan9fs_protocol_tests.rs"]
+mod protocol_tests;

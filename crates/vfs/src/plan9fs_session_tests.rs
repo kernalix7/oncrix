@@ -4,26 +4,21 @@
 
 extern crate std;
 
-use super::{FidState, NOFID, NOTAG, P9MessageType, P9OpenMode, Plan9Session, SessionState};
+use super::{
+    FidState, NOFID, NOTAG, P9MessageType, P9OpenMode, P9QidType, P9WalkResult, Plan9Session,
+    SessionState,
+};
 use oncrix_lib::Error;
 use std::vec::Vec;
 
-const VERSION_256: [u8; 14] = [
+pub(super) const VERSION_256: [u8; 14] = [
     0, 1, 0, 0, 8, 0, b'9', b'P', b'2', b'0', b'0', b'0', b'.', b'L',
 ];
-const VERSION_8192: [u8; 14] = [
-    0, 32, 0, 0, 8, 0, b'9', b'P', b'2', b'0', b'0', b'0', b'.', b'L',
-];
-const VERSION_8193: [u8; 14] = [
-    1, 32, 0, 0, 8, 0, b'9', b'P', b'2', b'0', b'0', b'0', b'.', b'L',
-];
-const QID: [u8; 13] = [0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
-const RWALK_ONE: [u8; 15] = [1, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
-const ROPEN: [u8; 17] = [0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(super) const QID: [u8; 13] = [0x80, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
+pub(super) const RWALK_ONE: [u8; 15] = [1, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
+pub(super) const ROPEN: [u8; 17] = [0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-const HANDLERS: [u8; 5] = [0, 1, 2, 3, 4];
-
-fn reply(kind: P9MessageType, tag: u16, payload: &[u8]) -> Vec<u8> {
+pub(super) fn reply(kind: P9MessageType, tag: u16, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::from([0, 0, 0, 0, kind as u8]);
     frame.extend_from_slice(&tag.to_le_bytes());
     frame.extend_from_slice(payload);
@@ -32,11 +27,11 @@ fn reply(kind: P9MessageType, tag: u16, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn tag(request: &[u8]) -> u16 {
+pub(super) fn tag(request: &[u8]) -> u16 {
     u16::from_le_bytes([request[5], request[6]])
 }
 
-fn versioned() -> Plan9Session {
+pub(super) fn versioned() -> Plan9Session {
     let mut session = Plan9Session::new();
     session.build_tversion().unwrap();
     session
@@ -45,7 +40,7 @@ fn versioned() -> Plan9Session {
     session
 }
 
-fn attached() -> Plan9Session {
+pub(super) fn attached() -> Plan9Session {
     let mut session = versioned();
     let tag = tag(session.build_tattach(7, b"").unwrap());
     session
@@ -54,91 +49,55 @@ fn attached() -> Plan9Session {
     session
 }
 
-fn walked() -> (Plan9Session, u32) {
+pub(super) fn walked() -> (Plan9Session, u32) {
     let mut session = attached();
     let root = session.root_fid();
     let (request, fid) = session.build_twalk(root, &[b"x"]).unwrap();
     let tag = tag(request);
-    session
-        .handle_rwalk(&reply(P9MessageType::Rwalk, tag, &RWALK_ONE), fid)
+    let result = session
+        .handle_rwalk(&reply(P9MessageType::Rwalk, tag, &RWALK_ONE))
         .unwrap();
+    assert!(matches!(
+        result,
+        P9WalkResult::Full { source, destination, count: 1, qids }
+            if source == root && destination == fid && qids[0].qtype == P9QidType::FILE
+    ));
     (session, fid)
 }
 
-fn opened(mode: P9OpenMode) -> (Plan9Session, u32) {
+pub(super) fn opened(mode: P9OpenMode) -> (Plan9Session, u32) {
     let (mut session, fid) = walked();
     let tag = tag(session.build_topen(fid, mode).unwrap());
-    session
-        .handle_ropen(&reply(P9MessageType::Ropen, tag, &ROPEN), fid, mode)
+    let (_, iounit) = session
+        .handle_ropen(&reply(P9MessageType::Ropen, tag, &ROPEN))
         .unwrap();
+    assert_eq!(iounit, 256);
     (session, fid)
 }
 
-fn fid_state(session: &Plan9Session, fid: u32) -> FidState {
+pub(super) fn fid_state(session: &Plan9Session, fid: u32) -> FidState {
     let slot = session.fid_table().lookup(fid).unwrap();
     session.fid_table().get(slot).unwrap().state
 }
 
-fn handler_result(handler: u8, matching: bool, extra: bool) -> Result<(), Error> {
-    let mut session = Plan9Session::new();
-    session.state = match handler {
-        0 => SessionState::Negotiating,
-        1 => SessionState::Versioned,
-        2..=4 => SessionState::Attached,
-        _ => unreachable!(),
-    };
-    session.pending_tag = if handler == 0 { NOTAG } else { 7 };
-    let fid = if handler == 0 {
-        NOFID
-    } else {
-        let (slot, fid) = session.fid_table.alloc().unwrap();
-        session.fid_table.get_mut(slot).unwrap().state = FidState::Attached;
-        session.root_fid = fid;
-        fid
-    };
-    let (kind, payload) = match handler {
-        0 => (P9MessageType::Rversion, &VERSION_8192[..]),
-        1 => (P9MessageType::Rattach, &QID[..]),
-        2 => (P9MessageType::Rwalk, &RWALK_ONE[..]),
-        3 => (P9MessageType::Ropen, &ROPEN[..]),
-        4 => (P9MessageType::Rclunk, &[][..]),
-        _ => unreachable!(),
-    };
-    let tag = session.pending_tag.wrapping_add(u16::from(!matching));
-    let mut response = reply(kind, tag, payload);
-    if extra {
-        response.push(0xEE);
-        response[0] += 1;
-    }
-    match handler {
-        0 => session.handle_rversion(&response),
-        1 => session.handle_rattach(&response).map(|_| ()),
-        2 => session.handle_rwalk(&response, fid).map(|_| ()),
-        3 => session
-            .handle_ropen(&response, fid, P9OpenMode::OREAD)
-            .map(|_| ()),
-        4 => session.handle_rclunk(&response, fid),
-        _ => unreachable!(),
-    }
-}
-
-fn handler_results(matching: bool, extra: bool) -> [Result<(), Error>; 5] {
-    HANDLERS.map(|handler| handler_result(handler, matching, extra))
+pub(super) fn assert_poisoned(session: &Plan9Session) {
+    assert_eq!(session.state(), SessionState::Error);
+    assert_eq!(session.root_fid(), NOFID);
+    assert_eq!(session.fid_table().active_count(), 0);
 }
 
 #[test]
 fn session_red_rversion_order_is_enforced() {
     // Given / When / Then
     let mut first_session = Plan9Session::new();
-    let first =
-        first_session.handle_rversion(&reply(P9MessageType::Rversion, NOTAG, &VERSION_8192));
+    let first = first_session.handle_rversion(&reply(P9MessageType::Rversion, NOTAG, &VERSION_256));
     let mut second_session = Plan9Session::new();
     second_session.build_tversion().unwrap();
     let second = second_session.build_tversion().map(|frame| frame.len());
     assert!(
         matches!(first, Err(Error::InvalidArgument))
             && first_session.state() == SessionState::Disconnected
-            && second == Err(Error::InvalidArgument)
+            && second == Err(Error::Busy)
     );
 }
 
@@ -147,7 +106,9 @@ fn session_red_msize_offer_is_enforced_without_mutation() {
     // Given / When / Then
     let mut session = Plan9Session::new();
     session.build_tversion().unwrap();
-    let result = session.handle_rversion(&reply(P9MessageType::Rversion, NOTAG, &VERSION_8193));
+    let mut version = VERSION_256;
+    version[..4].copy_from_slice(&8193u32.to_le_bytes());
+    let result = session.handle_rversion(&reply(P9MessageType::Rversion, NOTAG, &version));
     assert!(matches!(result, Err(Error::InvalidArgument)) && session.msize() == 8192);
 }
 
@@ -157,9 +118,8 @@ fn session_red_inbound_negotiated_msize_is_checked_before_dispatch() {
     let mut session = versioned();
     let tag = tag(session.build_tattach(7, b"").unwrap());
     let result = session.handle_rattach(&reply(P9MessageType::Rerror, tag, &[0xA5; 250]));
-    assert!(
-        matches!(result, Err(Error::InvalidArgument)) && session.state() == SessionState::Versioned
-    );
+    assert_eq!(result, Err(Error::InvalidArgument));
+    assert_poisoned(&session);
 }
 
 #[test]
@@ -191,9 +151,11 @@ fn session_red_oversized_twalk_does_not_leak_destination_fid() {
 fn session_red_tread_count_fits_negotiated_msize() {
     // Given / When / Then
     let (mut session, fid) = opened(P9OpenMode::OREAD);
+    let slot = session.fid_table().lookup(fid).unwrap();
+    assert_eq!(session.fid_table().get(slot).unwrap().iounit, 256);
     let frame = session.build_tread(fid, 0, u32::MAX).unwrap();
     let count = u32::from_le_bytes([frame[19], frame[20], frame[21], frame[22]]);
-    assert!(count <= 245);
+    assert_eq!(count, 245);
 }
 
 #[test]
@@ -203,7 +165,82 @@ fn session_red_twrite_frame_and_count_fit_negotiated_msize() {
     let data = [0xA5; 300];
     let frame = session.build_twrite(fid, 0, &data).unwrap();
     let count = u32::from_le_bytes([frame[19], frame[20], frame[21], frame[22]]) as usize;
-    assert!(frame.len() <= 256 && count <= 233 && frame[23..] == data[..count]);
+    assert!(frame.len() == 256 && count == 233 && frame[23..] == data[..count]);
+}
+
+#[test]
+fn session_exact_and_overflow_variable_request_boundaries() {
+    // Given / When / Then
+    let mut attach = versioned();
+    assert_eq!(attach.build_tattach(7, &[b'a'; 233]).unwrap().len(), 256);
+    let mut attach_over = versioned();
+    let result = attach_over
+        .build_tattach(7, &[b'a'; 234])
+        .map(|frame| frame.len());
+    assert_eq!(result, Err(Error::InvalidArgument));
+    let mut walk = attached();
+    let root = walk.root_fid();
+    assert_eq!(
+        walk.build_twalk(root, &[&[b'w'; 237]]).unwrap().0.len(),
+        256
+    );
+    let mut walk_over = attached();
+    let root = walk_over.root_fid();
+    let result = walk_over
+        .build_twalk(root, &[&[b'w'; 238]])
+        .map(|value| value.0.len());
+    assert_eq!(result, Err(Error::InvalidArgument));
+    let (mut open, fid) = opened(P9OpenMode::OREAD);
+    let result = open.build_twalk(fid, &[]).map(|_| ());
+    assert_eq!(result, Err(Error::InvalidArgument));
+}
+
+#[test]
+fn session_walk_and_open_require_legal_fid_states() {
+    // Given / When / Then
+    let mut walk = attached();
+    let root = walk.root_fid();
+    let slot = walk.fid_table.lookup(root).unwrap();
+    walk.fid_table.get_mut(slot).unwrap().qid.qtype = P9QidType::FILE;
+    let result = walk.build_twalk(root, &[b"x"]).map(|_| ());
+    assert!(result == Err(Error::InvalidArgument) && walk.fid_table().active_count() == 1);
+    let mut allocated = attached();
+    let (_, fid) = allocated.fid_table.alloc().unwrap();
+    let result = allocated.build_topen(fid, P9OpenMode::OREAD).map(|_| ());
+    assert!(
+        result == Err(Error::InvalidArgument) && fid_state(&allocated, fid) == FidState::Allocated
+    );
+    let (mut open, fid) = opened(P9OpenMode::OREAD);
+    let result = open.build_topen(fid, P9OpenMode::OREAD).map(|_| ());
+    assert_eq!(result, Err(Error::InvalidArgument));
+}
+
+#[test]
+fn session_iounit_caps_io_and_open_error_preserves_fid() {
+    // Given / When / Then
+    let (mut session, fid) = walked();
+    let open_tag = tag(session.build_topen(fid, P9OpenMode::OREAD).unwrap());
+    let mut payload = Vec::from(QID);
+    payload.extend_from_slice(&10u32.to_le_bytes());
+    assert_eq!(
+        session
+            .handle_ropen(&reply(P9MessageType::Ropen, open_tag, &payload))
+            .unwrap()
+            .1,
+        10
+    );
+    let frame = session.build_tread(fid, 0, 100).unwrap();
+    assert_eq!(
+        u32::from_le_bytes([frame[19], frame[20], frame[21], frame[22]]),
+        10
+    );
+    let (mut denied, fid) = walked();
+    let tag = tag(denied.build_topen(fid, P9OpenMode::OREAD).unwrap());
+    assert_eq!(
+        denied.handle_ropen(&reply(P9MessageType::Rlerror, tag, &13u32.to_le_bytes())),
+        Err(Error::PermissionDenied),
+    );
+    assert_eq!(fid_state(&denied, fid), FidState::Attached);
 }
 
 #[test]
@@ -223,68 +260,48 @@ fn session_red_preversion_fid_builders_reject_without_mutation() {
 }
 
 #[test]
-fn session_red_success_handlers_require_exact_payloads() {
-    // Given / When / Then
-    assert!(handler_results(true, true).iter().all(Result::is_err));
-}
-
-#[test]
-fn session_red_wrong_tags_are_rejected_by_every_handler() {
-    // Given / When / Then
-    assert_eq!(
-        handler_results(false, false),
-        [Err(Error::InvalidArgument); 5]
-    );
-}
-
-#[test]
-fn session_red_malformed_rattach_rolls_back_provisional_root() {
+fn session_red_malformed_rattach_poisons_connection() {
     // Given / When / Then
     let mut session = versioned();
     let tag = tag(session.build_tattach(7, b"").unwrap());
     assert_eq!(fid_state(&session, session.root_fid()), FidState::Allocated);
     let result = session.handle_rattach(&reply(P9MessageType::Rattach, tag, &[0]));
-    assert!(
-        result.is_err() && session.root_fid() == NOFID && session.fid_table().active_count() == 0
-    );
+    assert!(result.is_err());
+    assert_poisoned(&session);
 }
 
 #[test]
-fn session_red_malformed_rwalk_rolls_back_destination() {
+fn session_red_malformed_rwalk_poisons_connection() {
     // Given / When / Then
     let mut session = attached();
     let root = session.root_fid();
-    let (request, fid) = session.build_twalk(root, &[b"x"]).unwrap();
+    let (request, _fid) = session.build_twalk(root, &[b"x"]).unwrap();
     let tag = tag(request);
-    let result = session.handle_rwalk(&reply(P9MessageType::Rwalk, tag, &[1, 0, 0]), fid);
-    assert!(
-        result.is_err()
-            && session.state() == SessionState::Attached
-            && session.fid_table().lookup(fid) == Err(Error::NotFound)
-    );
+    let result = session.handle_rwalk(&reply(P9MessageType::Rwalk, tag, &[1, 0, 0]));
+    assert!(result.is_err());
+    assert_poisoned(&session);
 }
 
 #[test]
-fn session_red_malformed_ropen_preserves_fid() {
+fn session_red_malformed_ropen_poisons_connection() {
     // Given / When / Then
     let (mut session, fid) = walked();
     let tag = tag(session.build_topen(fid, P9OpenMode::OREAD).unwrap());
-    let result = session.handle_ropen(
-        &reply(P9MessageType::Ropen, tag, &[0]),
-        fid,
-        P9OpenMode::OREAD,
-    );
-    assert!(result.is_err() && fid_state(&session, fid) == FidState::Attached);
+    let result = session.handle_ropen(&reply(P9MessageType::Ropen, tag, &[0]));
+    assert!(result.is_err());
+    assert_poisoned(&session);
 }
 
 #[test]
-fn session_red_malformed_rclunk_preserves_fid() {
+fn session_red_malformed_rclunk_poisons_connection() {
     // Given / When / Then
     let mut session = attached();
     let fid = session.root_fid();
     let tag = tag(session.build_tclunk(fid).unwrap());
     let mut malformed = reply(P9MessageType::Rclunk, tag, &[]);
     malformed[0] = 8;
-    let result = session.handle_rclunk(&malformed, fid);
-    assert!(result.is_err() && fid_state(&session, fid) == FidState::Attached);
+    let result = session.handle_rclunk(&malformed);
+    assert!(result.is_err());
+    assert_poisoned(&session);
+    assert_eq!(session.fid_table().lookup(fid), Err(Error::NotFound));
 }
