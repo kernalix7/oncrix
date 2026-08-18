@@ -3,13 +3,13 @@
 
 //! AArch64 SYSCALL-entry saved-register mirrors.
 //!
-//! aarch64 build stub — not yet functional.
+//! aarch64 fork/exec/signal register-state stub — not yet functional.
 //!
 //! Provides the saved-user-register atomics and accessors that
 //! architecture-neutral fork/exec/signal dispatch reads, mirroring
 //! [`crate::arch::x86_64::syscall_entry`]. The atomics themselves are real
-//! (they are plain shared storage); what is missing is the aarch64 `svc`
-//! exception vector that would populate them on a real syscall entry.
+//! plain storage, but the live lower-EL `getpid` smoke does not populate them;
+//! full fork/exec/signal syscall entry remains unwired.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

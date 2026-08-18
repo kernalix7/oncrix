@@ -5,7 +5,7 @@
 //!
 //! Each handler validates user-space arguments and delegates to the
 //! appropriate kernel subsystem. Returns a `SyscallResult` that is
-//! passed back to user space in the RAX register.
+//! passed back through the architecture's syscall return register.
 
 use oncrix_lib::Error;
 

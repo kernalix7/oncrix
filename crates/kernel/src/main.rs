@@ -955,9 +955,9 @@ pub extern "C" fn kernel_main() -> ! {
         // Prove the EL1->EL0 transition on a dedicated 4KiB RX code page,
         // followed by an invalid guard page and four RW/NX stack pages.
         // The EL0 payload issues an SVC #7 canary, resumes after the vector's
-        // `eret`, then issues SVC #8 to prove a real EL0->EL1->EL0 round-trip.
-        // The handler is smoke-only and performs no syscall dispatch. After
-        // the proof EL0 idles, so this is the last action on the aarch64 path.
+        // `eret`, dispatches Linux AArch64 getpid through SVC #0, validates the
+        // returned x0, then issues SVC #8. After the proof EL0 idles, so this is
+        // the last action on the aarch64 path.
         {
             use oncrix_hal::arch::aarch64::timer::AArch64Timer;
             use oncrix_hal::timer::Timer;
@@ -979,9 +979,8 @@ pub extern "C" fn kernel_main() -> ! {
             let mut timer = AArch64Timer::new();
             let _ = timer.stop();
 
-            let _ = serial.write_str(
-                "[ONCRIX/aarch64] entering EL0 (dedicated-page smoke; no syscall dispatch)...\n",
-            );
+            let _ = serial
+                .write_str("[ONCRIX/aarch64] entering EL0 (dedicated-page getpid smoke)...\n");
 
             // SAFETY: the boot tables map `EL0_ENTRY_VA` as the dedicated 4KiB
             // RX code page and `EL0_STACK_TOP_VA` above four RW/NX stack pages,

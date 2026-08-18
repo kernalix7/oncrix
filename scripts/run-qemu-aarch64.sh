@@ -26,13 +26,14 @@
 #   [ONCRIX/aarch64] preemptive: thread D scheduled
 #   [ONCRIX/aarch64] preemptive: C and D both ran - timer preemption verified.
 #   [ONCRIX/aarch64] kernel SIMD/FP state preserved across timer IRQ
-#   [ONCRIX/aarch64] entering EL0 (dedicated-page smoke; no syscall dispatch)...
+#   [ONCRIX/aarch64] entering EL0 (dedicated-page getpid smoke)...
 #   [ONCRIX/aarch64] Transitioning to EL0...
 #   [debug] entry=0xc0000000 sp=0xc0006000
-# SVC proof: #7 validates the canary and clobbers SIMD/FP state; #8 runs only
-# after returning to EL0 and validating full-width q0/q15/q31 plus FPCR/FPSR.
+# SVC proof: #7 validates the canary and clobbers SIMD/FP state; SVC #0 then
+# dispatches getpid and writes its result to x0; #8 runs only after EL0 checks it.
 #   [ONCRIX/aarch64] EL0 stack canary verified
 #   [ONCRIX/aarch64] EL0 SIMD/FP state preserved and round-trip verified
+#   [ONCRIX/aarch64] EL0 getpid syscall round trip verified
 #   [ONCRIX/aarch64] EL0 round trip verified
 
 set -euo pipefail
